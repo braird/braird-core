@@ -1,0 +1,62 @@
+name: Synced-schema drift check
+
+# SUR-723 §7. Fails the build if the vendored synced-schema fixture diverges from
+# surfc/main — i.e. if a synced column was added, removed, or retyped in surfc's
+# `supabase.js` upsert*/fetchSince (the synced set) or its migrations (the types)
+# without the native SQLite mirror being re-vendored. This is the silent-desync guard:
+# without it, a new synced column (the `content_tag`/SUR-638 case) would round-trip in
+# the PWA but be dropped on native, undetectably.
+#
+# The single source of truth is surfc; this repo vendors a DERIVED fixture
+# (vendored/schema/sync-schema.json) and `scripts/extract-sync-schema.mjs` re-derives it
+# from surfc/main here to prove the copy is current. Sibling of vendored-drift.yml (which
+# byte-diffs the crypto vectors); the schema is derived, not copied, so it runs the
+# extractor in --check mode rather than a raw diff.
+#
+# Requires the SURFC_READ_PAT secret (cross-repo read-only PAT).
+
+on:
+  push:
+    paths:
+      - 'vendored/schema/**'
+      - 'scripts/extract-sync-schema.mjs'
+      - '.github/workflows/schema-drift.yml'
+  schedule:
+    - cron: '0 9 * * 1' # weekly Monday 09:00 UTC (with the crypto drift check)
+  workflow_dispatch:
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard — skip until the fixture is vendored
+        id: guard
+        run: |
+          if [ -f vendored/schema/sync-schema.json ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "No vendored/schema/sync-schema.json yet — nothing to drift-check."
+          fi
+
+      - name: Set up Node
+        if: steps.guard.outputs.ready == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.15.0'
+
+      # Sparse, blobless clone of surfc/main — only the two inputs the extractor reads
+      # (supabase.js for the synced column set, supabase/migrations for the types).
+      - name: Fetch surfc/main sources (sparse)
+        if: steps.guard.outputs.ready == 'true'
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            "https://x-access-token:${{ secrets.SURFC_READ_PAT }}@github.com/pentoaswordfight/surfc.git" \
+            /tmp/surfc
+          git -C /tmp/surfc sparse-checkout set src/supabase.js supabase/migrations
+
+      - name: Assert sync-schema.json has not drifted from surfc/main
+        if: steps.guard.outputs.ready == 'true'
+        run: node scripts/extract-sync-schema.mjs /tmp/surfc --check vendored/schema/sync-schema.json
