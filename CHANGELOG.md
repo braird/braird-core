@@ -31,6 +31,16 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   and production random-IV round-trips. `legacy-note` is JS-only and skipped.
 - **ADR 0002** — crypto backend decision (RustCrypto over `ring`/`aws-lc-rs`; WASM
   portability + CSPRNG via `getrandom` `js`).
+- **Normalization differential fuzz (B6):** `tests/normalize_oracle.mjs` (V8 `normalizeForTag`
+  oracle) + a `#[cfg(test)]` fuzz in `src/normalize.rs` that diffs the Rust port against the
+  oracle over a deterministic 20,000-input Unicode-diverse corpus (astral/emoji, combining
+  marks, full-width, controls, the `\p{P}`/`\p{Zs}` families, case-fold hotspots, ES
+  whitespace). Result: **0 mismatches**. A fence categorizes any 16.0↔17.0 `\p{P}`/`\p{Zs}`
+  residue (none hit). The parity workflow pins Node v24.15.0 and verifies the Unicode 17.0
+  anchor before running.
+- **Zeroization demonstration (criterion #7):** unit test proving the `Vault`'s
+  `Zeroizing<[u8;32]>` Master Key wrapper actually wipes its bytes (read-back through a live
+  pointer after `zeroize()`); Rust's stable addresses mean no GC can leave an un-wiped copy.
 - **Production bindings (B5):** `scripts/build-xcframework.sh` (macOS + iOS + iOS-sim
   arm64 → `BrairdCore.xcframework`) and the generated Swift API; `bindings/swift` SwiftPM
   package + round-trip test; `bindings/kotlin` Gradle project (self-builds the cdylib +

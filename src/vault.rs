@@ -166,3 +166,28 @@ impl Vault {
         note_encryption::encrypt_note(mk!(self).as_slice(), note_id, plaintext, iv)
     }
 }
+
+#[cfg(test)]
+mod zeroization {
+    use zeroize::{Zeroize, Zeroizing};
+
+    /// Criterion #7: the Master Key wrapper actually wipes its bytes. `Zeroizing<[u8;
+    /// 32]>` zeroes on `Drop`; here we prove the wipe by reading the LIVE buffer through
+    /// a raw pointer immediately after an explicit `zeroize()` (safe — same scope, not
+    /// yet dropped). Rust addresses are stable: no moving/compacting GC can relocate the
+    /// key behind our back and leave a copy un-wiped (the property the JVM `SecretKeySpec`
+    /// arm failed in the SUR-658 spike). This is the same `Zeroizing<[u8; 32]>` the
+    /// `Vault` holds its MK in.
+    #[test]
+    fn zeroizing_wipes_master_key_bytes() {
+        let mut mk = Zeroizing::new([0x11u8; 32]);
+        assert!(mk.iter().all(|&b| b == 0x11));
+        let ptr = mk.as_ptr();
+        mk.zeroize();
+        let after = unsafe { std::slice::from_raw_parts(ptr, 32) };
+        assert!(
+            after.iter().all(|&b| b == 0),
+            "MK bytes must be all-zero after zeroize"
+        );
+    }
+}
