@@ -54,7 +54,23 @@ jobs:
         if: steps.guard.outputs.ready == 'true'
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Parity tests (10 in-scope + normalization vectors, foreign-decrypt, rewrap, seal)
+      # The normalization differential fuzz diffs the Rust port against the V8
+      # `normalizeForTag` oracle, which MUST run at the parity anchor (Unicode 17.0).
+      # The runner's default Node lags, so pin it and fail loudly if it isn't 17.0.
+      - name: Pin Node to the parity anchor (Unicode 17.0)
+        if: steps.guard.outputs.ready == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.15.0'
+
+      - name: Verify Node carries the Unicode 17.0 anchor
+        if: steps.guard.outputs.ready == 'true'
+        run: |
+          uni=$(node -p 'process.versions.unicode')
+          echo "node $(node --version), Unicode $uni"
+          [ "$uni" = "17.0" ] || { echo "::error::Node Unicode is $uni; the differential-fuzz anchor is 17.0"; exit 1; }
+
+      - name: Parity tests + normalization differential fuzz (foreign-decrypt, rewrap, seal, zeroization)
         if: steps.guard.outputs.ready == 'true'
         run: cargo test --all-features
 

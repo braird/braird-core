@@ -10,3 +10,42 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 - Repository scaffolding: `GATING.md` (all-spine GCE policy), `CLAUDE.md` (agent context),
   `README.md`, and CI workflows (`parity`, `vendored-drift`, `changelog-check`,
   `nightly-macos`). Anchored by SUR-716.
+- **Crypto core (`src/`)** mirroring `surfc/src/crypto/*` + `src/lib/text.js` byte-for-byte:
+  MK generate / PRF wrap+unwrap / re-wrap / PIN transfer (PBKDF2-SHA256 @ 600k), `enc:v1`
+  and `enc:v2` (AAD = noteId) note sealing, the HMAC-SHA256 content tag (64-byte HKDF
+  subkey), `normalizeForTag`, and the `0x02` embedding seal. Frozen `surfc-*` HKDF info
+  strings + the 600k count preserved verbatim (SUR-680 allowlist); standard base64.
+- **`Vault` UniFFI handle** (Option B): owns the Master Key in `Zeroizing` memory behind a
+  `Mutex`; the MK never crosses the FFI as raw bytes. Production salt/IV are generated
+  in-core. The `with_raw_mk` constructor + fixed-salt/IV overrides + raw-MK readback are
+  `--features test-seams`-only and **absent from the generated Swift/Kotlin bindings**
+  (verified) — closing the naming-reviewer GCM-nonce-reuse-footgun condition.
+- **`normalizeForTag` on real Unicode-property tables** (not the spike's hand-coded
+  ranges): `\p{Cc}` via std `char::is_control` (Unicode 17.0), NFKC + lowercase via std /
+  `unicode-normalization` (17.0), `\p{P}`/`\p{Zs}` via `unicode-general-category` (16.0).
+  The 16.0↔17.0 `\p{P}` skew vs the V8/Node anchor is documented (`src/normalize.rs`,
+  ADR 0002) as the one residual for the B6 differential fuzz to characterize.
+- **`vendored/crypto-parity/`** fixtures (vendored byte-identical from `surfc/main`) and the
+  Rust parity harness (`tests/parity.rs`, `--features test-seams`): all **19 in-scope
+  golden vectors bit-identical**, plus foreign-ciphertext decrypt (PWA→native coexistence)
+  and production random-IV round-trips. `legacy-note` is JS-only and skipped.
+- **ADR 0002** — crypto backend decision (RustCrypto over `ring`/`aws-lc-rs`; WASM
+  portability + CSPRNG via `getrandom` `js`).
+- **Normalization differential fuzz (B6):** `tests/normalize_oracle.mjs` (V8 `normalizeForTag`
+  oracle) + a `#[cfg(test)]` fuzz in `src/normalize.rs` that diffs the Rust port against the
+  oracle over a deterministic 20,000-input Unicode-diverse corpus (astral/emoji, combining
+  marks, full-width, controls, the `\p{P}`/`\p{Zs}` families, case-fold hotspots, ES
+  whitespace). Result: **0 mismatches**. A fence categorizes any 16.0↔17.0 `\p{P}`/`\p{Zs}`
+  residue (none hit). The parity workflow pins Node v24.15.0 and verifies the Unicode 17.0
+  anchor before running.
+- **Zeroization demonstration (criterion #7):** unit test proving the `Vault`'s
+  `Zeroizing<[u8;32]>` Master Key wrapper actually wipes its bytes (read-back through a live
+  pointer after `zeroize()`); Rust's stable addresses mean no GC can leave an un-wiped copy.
+- **Production bindings (B5):** `scripts/build-xcframework.sh` (macOS + iOS + iOS-sim
+  arm64 → `BrairdCore.xcframework`) and the generated Swift API; `bindings/swift` SwiftPM
+  package + round-trip test; `bindings/kotlin` Gradle project (self-builds the cdylib +
+  regenerates the binding, JNA-loaded) + round-trip test. Both round-trips decrypt FOREIGN
+  JS-produced ciphertext and reproduce all 10 content tags byte-for-byte through the FFI.
+  Swift verified via `swift test`; Kotlin verified via `kotlinc` + JNA offline (this box's
+  JVM egress is firewalled, so `./gradlew test` runs in CI). Activates the `kotlin-roundtrip`
+  + `nightly-macos` jobs.
