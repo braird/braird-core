@@ -6,6 +6,7 @@ Cargo.lock.orig
 # UniFFI / bindings build output
 /bindings/**/build
 /bindings/**/.gradle
+/bindings/**/.build
 *.xcframework
 /out
 

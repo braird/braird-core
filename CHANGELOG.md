@@ -31,3 +31,11 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   and production random-IV round-trips. `legacy-note` is JS-only and skipped.
 - **ADR 0002** — crypto backend decision (RustCrypto over `ring`/`aws-lc-rs`; WASM
   portability + CSPRNG via `getrandom` `js`).
+- **Production bindings (B5):** `scripts/build-xcframework.sh` (macOS + iOS + iOS-sim
+  arm64 → `BrairdCore.xcframework`) and the generated Swift API; `bindings/swift` SwiftPM
+  package + round-trip test; `bindings/kotlin` Gradle project (self-builds the cdylib +
+  regenerates the binding, JNA-loaded) + round-trip test. Both round-trips decrypt FOREIGN
+  JS-produced ciphertext and reproduce all 10 content tags byte-for-byte through the FFI.
+  Swift verified via `swift test`; Kotlin verified via `kotlinc` + JNA offline (this box's
+  JVM egress is firewalled, so `./gradlew test` runs in CI). Activates the `kotlin-roundtrip`
+  + `nightly-macos` jobs.
