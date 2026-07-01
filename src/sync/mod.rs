@@ -90,7 +90,9 @@ impl SyncEngine {
             .map_err(|e| SyncError::Store(format!("tokio runtime: {e}")))?;
         Ok(Arc::new(SyncEngine {
             store: Mutex::new(store),
-            client: Mutex::new(PostgrestClient::new(supabase_url, anon_key)),
+            client: Mutex::new(
+                PostgrestClient::new(supabase_url, anon_key).map_err(SyncError::Store)?,
+            ),
             vault,
             runtime,
         }))

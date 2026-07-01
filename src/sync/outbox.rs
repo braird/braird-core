@@ -30,6 +30,7 @@ pub struct OutboxItem {
 
 /// A collapsed group ready to upsert: the table, the outbox ids it absorbed (cleared as a
 /// unit on success), and the merged row payload.
+#[derive(Clone)]
 pub struct Collapsed {
     pub table: String,
     pub ids: Vec<i64>,
@@ -253,5 +254,21 @@ mod tests {
         ];
         let out = collapse(items, &BTreeMap::new());
         assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn truthy_variants() {
+        // Truthy: real bool, non-zero number, non-empty string other than "false"/"0".
+        assert!(truthy(Some(&json!(true))));
+        assert!(truthy(Some(&json!(1))));
+        assert!(truthy(Some(&json!("1"))));
+        // Falsy: false, zero, "0"/"false", null, absent, and non-scalar values.
+        assert!(!truthy(Some(&json!(false))));
+        assert!(!truthy(Some(&json!(0))));
+        assert!(!truthy(Some(&json!("0"))));
+        assert!(!truthy(Some(&json!("false"))));
+        assert!(!truthy(Some(&Value::Null)));
+        assert!(!truthy(None));
+        assert!(!truthy(Some(&json!([1, 2]))));
     }
 }

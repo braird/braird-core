@@ -130,7 +130,7 @@ pub async fn flush(store: &Store, client: &PostgrestClient) -> Result<FlushResul
         }
 
         // Repoint the payload's book_id to the resolved value before dispatch.
-        let mut group = clone_group(group);
+        let mut group = group.clone();
         if let Some(b) = book_id {
             group.payload.insert("book_id".into(), Value::String(b));
         }
@@ -163,14 +163,6 @@ async fn upsert_group(
         .upsert(&group.table, on_conflict_for(&group.table), &body)
         .await
         .map_err(|e| e.to_string())
-}
-
-fn clone_group(group: &Collapsed) -> Collapsed {
-    Collapsed {
-        table: group.table.clone(),
-        ids: group.ids.clone(),
-        payload: group.payload.clone(),
-    }
 }
 
 fn load_remap(store: &Store) -> Result<BTreeMap<String, String>, String> {

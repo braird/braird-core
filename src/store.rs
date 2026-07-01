@@ -415,4 +415,42 @@ mod tests {
             assert!(names.contains(&"deleted"), "{} lacks deleted", t.name);
         }
     }
+
+    // ── SUR-724 outbox + meta helpers (fast-gate coverage, no network) ────────
+
+    #[test]
+    fn outbox_enqueue_read_and_clear_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        // Enqueue newest-first; outbox_items must return oldest-first by created_at.
+        let id_new = store
+            .enqueue("notes", "n1", r#"{"id":"n1","text":"enc:v2:b"}"#, 200)
+            .unwrap();
+        let id_old = store
+            .enqueue("notes", "n0", r#"{"id":"n0","text":"enc:v2:a"}"#, 100)
+            .unwrap();
+        let items = store.outbox_items().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].0, id_old, "oldest created_at first");
+        assert_eq!(items[1].0, id_new);
+        // clear_outbox removes only the named ids, leaving the rest queued.
+        store.clear_outbox(&[id_old]).unwrap();
+        let left = store.outbox_items().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].0, id_new);
+    }
+
+    #[test]
+    fn meta_set_get_roundtrip_and_upsert() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.meta_get("bookIdRemap").unwrap(), None);
+        store.meta_set("bookIdRemap", r#"{"a":"b"}"#).unwrap();
+        // Set twice — the ON CONFLICT upsert replaces the value, not inserts a duplicate.
+        store
+            .meta_set("bookIdRemap", r#"{"a":"server-1"}"#)
+            .unwrap();
+        assert_eq!(
+            store.meta_get("bookIdRemap").unwrap().as_deref(),
+            Some(r#"{"a":"server-1"}"#)
+        );
+    }
 }

@@ -41,14 +41,17 @@ pub struct PostgrestClient {
 }
 
 impl PostgrestClient {
-    pub fn new(base_url: String, anon_key: String) -> Self {
-        Self {
-            // Trim a trailing slash so `{base}/rest/v1/{table}` never doubles up.
-            base_url: base_url.trim_end_matches('/').to_string(),
+    pub fn new(base_url: String, anon_key: String) -> Result<Self, String> {
+        // Trim a trailing slash so `{base}/rest/v1/{table}` never doubles up.
+        let base_url = base_url.trim_end_matches('/').to_string();
+        // Defense-in-depth: a Bearer JWT + apikey must never leave over plaintext http.
+        require_secure_base_url(&base_url)?;
+        Ok(Self {
+            base_url,
             anon_key,
             access_token: None,
             http: reqwest::Client::new(),
-        }
+        })
     }
 
     pub fn set_access_token(&mut self, jwt: String) {
@@ -114,6 +117,24 @@ impl PostgrestClient {
     }
 }
 
+/// Reject a non-https `base_url` unless it targets loopback — a real user's Bearer JWT +
+/// apikey must never transit plaintext http. The local Supabase the integration harness
+/// drives is `http://localhost`, which stays allowed.
+fn require_secure_base_url(base_url: &str) -> Result<(), String> {
+    if base_url.starts_with("https://") {
+        return Ok(());
+    }
+    if let Some(rest) = base_url.strip_prefix("http://") {
+        let host = rest.split(['/', ':']).next().unwrap_or("");
+        if matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "refusing non-https base_url {base_url:?}: a Bearer JWT + apikey must not transit plaintext http (loopback excepted)"
+    ))
+}
+
 /// Extract the `sub` (user id) claim from a JWT WITHOUT verifying the signature. The token
 /// was minted by GoTrue and PostgREST verifies it server-side; the core only needs the
 /// `user_id` to stamp rows. Decodes the middle (payload) segment as base64url-no-pad JSON.
@@ -160,7 +181,20 @@ mod tests {
 
     #[test]
     fn base_url_trailing_slash_is_trimmed() {
-        let c = PostgrestClient::new("http://localhost:54321/".into(), "anon".into());
+        let c = PostgrestClient::new("http://localhost:54321/".into(), "anon".into()).unwrap();
         assert_eq!(c.base_url, "http://localhost:54321");
+    }
+
+    #[test]
+    fn rejects_remote_plaintext_http() {
+        // A real remote over http would leak the Bearer JWT + apikey — refuse it.
+        assert!(PostgrestClient::new("http://evil.example.com".into(), "anon".into()).is_err());
+    }
+
+    #[test]
+    fn allows_https_and_loopback_http() {
+        assert!(PostgrestClient::new("https://proj.supabase.co".into(), "anon".into()).is_ok());
+        assert!(PostgrestClient::new("http://127.0.0.1:54321".into(), "anon".into()).is_ok());
+        assert!(PostgrestClient::new("http://localhost:54321".into(), "anon".into()).is_ok());
     }
 }
