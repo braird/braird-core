@@ -85,9 +85,13 @@ impl PostgrestClient {
             HeaderValue::from_str(&format!("Bearer {token}"))?,
         );
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        // `resolution=merge-duplicates` = PostgREST's "upsert" (ON CONFLICT DO UPDATE).
+        // `return=minimal` = 204 No Content: the flush only needs success/failure, and a
+        // representation response would force a RLS SELECT-back of every upserted row.
+        // Together these are what supabase-js `.upsert()` (without `.select()`) emits.
         headers.insert(
             "Prefer",
-            HeaderValue::from_static("resolution=merge-duplicates"),
+            HeaderValue::from_static("resolution=merge-duplicates, return=minimal"),
         );
 
         let resp = self
