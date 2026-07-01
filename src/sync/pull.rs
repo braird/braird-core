@@ -7,12 +7,15 @@
 //!   - **Ciphertext stays at rest.** A pulled note's `text` is the enc:v2 ciphertext and is stored
 //!     VERBATIM — never decrypted here (the inverse of push's seal-at-write). The host decrypts on
 //!     demand via `Vault::decrypt_note`. Writing plaintext to SQLite would defeat E2EE.
-//!   - **The cursor is the puller's own `now()`**, captured BEFORE the fetch and persisted only
-//!     after the table's merge succeeds (mirrors the JS `Date.now()` checkpoint). NOT
-//!     `max(updated_at)`: `updated_at` is client-authored (surfc migrations 0001…), so a batch max
-//!     inherits every writer's clock skew and could skip a slower-clocked device's later write
-//!     forever. The puller's own clock as the low watermark + the inclusive `>=` fetch re-pull the
-//!     boundary window idempotently under LWW.
+//!   - **The cursor is the puller's own clock**, captured BEFORE the fetch and persisted only after
+//!     the table's merge succeeds (mirrors the JS `Date.now()` checkpoint). NOT `max(updated_at)`:
+//!     `updated_at` is client-authored (surfc migrations 0001…), so a batch max inherits every
+//!     writer's clock skew and could skip a slower-clocked device's later write. The caller passes
+//!     the watermark (`now_ms`); the FFI passes `now() - PULL_CURSOR_OVERLAP_MS`, a lookback that
+//!     also catches a **delayed/offline flush** — a row stamped (at enqueue) before the cursor
+//!     advanced but made server-visible (at flush) after. That overlap is a bounded mitigation only;
+//!     any client-timestamp cursor is incomplete under long-delayed flushes, and the durable fix (a
+//!     server-assigned monotonic watermark, distinct from the LWW `updated_at`) is **SUR-739**.
 //!
 //! Source of truth: surfc `src/supabase.js` (`fetchSince`) + `src/db.js` (`mergeCloudRecords`).
 
@@ -39,10 +42,11 @@ struct TableStats {
     skipped_tombstones: usize,
 }
 
-/// Pull `tables` incrementally. `now_ms` is the puller's wall-clock (epoch ms) captured by the
-/// caller BEFORE any fetch — the value each succeeding table's cursor advances to (mirrors the JS
-/// single pre-fetch `nextCheckpoint`; capturing once, earlier, is a strictly-safer low watermark
-/// than per-table). A table that fails is isolated: its cursor stays put and other tables proceed.
+/// Pull `tables` incrementally. `now_ms` is the watermark each succeeding table's cursor advances
+/// to — captured by the caller BEFORE any fetch (mirrors the JS single pre-fetch `nextCheckpoint`;
+/// capturing once, earlier, is a strictly-safer low watermark than per-table). The FFI passes a
+/// lookback-adjusted `now() - PULL_CURSOR_OVERLAP_MS` (SUR-739) so a delayed flush isn't skipped.
+/// A table that fails is isolated: its cursor stays put and other tables proceed.
 pub async fn pull<S: PostgrestSink>(
     store: &Store,
     sink: &S,

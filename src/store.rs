@@ -502,6 +502,36 @@ impl Store {
         Ok(())
     }
 
+    /// Atomically stage a local write: merge the partial edit onto any existing row, upsert the
+    /// merged row into the synced table, AND enqueue the outbox payload — all in ONE transaction
+    /// (SUR-725 review). If any step fails (e.g. an I/O / disk-full / `SQLITE_BUSY` error mid-write)
+    /// the whole thing rolls back, so the store can never end up with a locally-visible edit that
+    /// has no queued outbox row (which would silently never flush yet still win an LWW compare).
+    ///
+    /// The synced row is the MERGED row (a partial edit can't null pulled-only columns like a book
+    /// cover); the outbox payload is the PARTIAL row as supplied (the server upsert `merge-duplicates`
+    /// patches only the changed columns — sending the merged full row could clobber a newer field).
+    pub fn stage_local_write(
+        &self,
+        table: &str,
+        record_id: &str,
+        partial: Map<String, Value>,
+        created_at: i64,
+    ) -> rusqlite::Result<()> {
+        // `unchecked_transaction` is safe here: `Store` is driven behind the SyncEngine's `Mutex`,
+        // so there is no concurrent use of this connection. On any early `?` the `Transaction` drops
+        // and rolls back (its default drop behaviour); only `commit()` persists the pair.
+        let tx = self.conn.unchecked_transaction()?;
+        let mut merged = self.get_row(table, record_id)?.unwrap_or_default();
+        for (k, v) in &partial {
+            merged.insert(k.clone(), v.clone());
+        }
+        self.apply_row(table, &merged)?;
+        let payload = Value::Object(partial).to_string();
+        self.enqueue(table, record_id, &payload, created_at)?;
+        tx.commit()
+    }
+
     /// The per-table incremental-pull cursor (epoch-ms watermark), or `None` on the first pull.
     /// Local-only (in `meta`, keyed `sync:cursor:<table>`) — an intentional divergence from the
     /// PWA's single global `meta.lastSyncAt` (founder, SUR-659): each table advances independently
@@ -690,6 +720,25 @@ mod tests {
     fn get_row_absent_is_none() {
         let store = Store::open_in_memory().unwrap();
         assert!(store.get_row("notes", "nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn stage_local_write_rolls_back_when_the_outbox_insert_fails() {
+        use serde_json::json;
+        let store = Store::open_in_memory().unwrap();
+        // Force the outbox INSERT to fail (drop the table) so we can prove the synced-row apply is
+        // rolled back with it — no locally-visible edit that would never flush (SUR-725 review).
+        store.conn.execute_batch("DROP TABLE outbox").unwrap();
+        let partial = json!({ "id": "b1", "title": "T", "updated_at": 1, "deleted": false });
+        let res = store.stage_local_write("books", "b1", partial.as_object().unwrap().clone(), 100);
+        assert!(
+            res.is_err(),
+            "the outbox insert must fail with the table dropped"
+        );
+        assert!(
+            store.get_row("books", "b1").unwrap().is_none(),
+            "apply_row must roll back when the outbox enqueue fails (atomic stage)"
+        );
     }
 
     #[test]

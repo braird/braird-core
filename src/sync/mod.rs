@@ -201,7 +201,8 @@ impl SyncEngine {
     /// Pull incrementally from Supabase for the in-scope tables (`books` + `notes` this slice; the
     /// other six follow in SUR-726 by extending `TABLES`). Merges last-write-wins by `updated_at`,
     /// applies tombstones without resurrecting soft-deleted rows, and advances each per-table
-    /// cursor to this call's pre-fetch `now()`. Synchronous FFI — the async GETs run on the owned
+    /// cursor to a lookback watermark (`now()` minus [`PULL_CURSOR_OVERLAP_MS`], SUR-739 — so a
+    /// delayed/offline flush isn't skipped). Synchronous FFI — the async GETs run on the owned
     /// runtime via `block_on`, exactly like `flush`. Note text stays ciphertext at rest (never
     /// decrypted on pull); the host decrypts on demand via `Vault::decrypt_note`.
     ///
@@ -221,8 +222,12 @@ impl SyncEngine {
             ));
         }
         // One pre-fetch watermark for the whole pull (mirrors the JS single `nextCheckpoint`);
-        // each table that succeeds advances its cursor to it.
-        let now = epoch_ms();
+        // each table that succeeds advances its cursor to it. Advance to `now() - OVERLAP`, not bare
+        // `now()`: `updated_at` is client-stamped at ENQUEUE, but a row becomes server-visible only
+        // at FLUSH — so a delayed/offline flush lands with a timestamp older than `now()` and a bare
+        // `now()` cursor would skip it forever. The overlap re-fetches that window (idempotent under
+        // LWW). Bounded mitigation only; the durable server-watermark fix is SUR-739.
+        let now = epoch_ms().saturating_sub(PULL_CURSOR_OVERLAP_MS);
         let result = self
             .runtime
             .block_on(pull::pull(&store, &*client, TABLES, now))
@@ -252,38 +257,34 @@ impl SyncEngine {
     /// (seal-at-write), so nothing plaintext is ever persisted here either.
     ///
     /// `enqueue_*` payloads are PARTIAL (this FFI doesn't yet carry every column — e.g. a book's
-    /// cover fields, a note's `image_path`/`source_meta`/`chapter`). `apply_row` is a FULL-row
-    /// replace (correct for pull's `select('*')`, destructive for a partial write — it would null
-    /// the omitted columns). So the local write **merges** the partial payload onto any existing
-    /// row before applying; a pulled book keeps its cover when the user renames it. The OUTBOX,
-    /// however, carries the partial payload as-is — the server upsert (`merge-duplicates`) patches
-    /// only the changed columns, and sending the merged full row could clobber a newer server field.
+    /// cover fields, a note's `image_path`/`source_meta`/`chapter`). The local synced row is the
+    /// partial edit **merged** onto any existing row (so it can't null pulled-only columns), while
+    /// the outbox keeps the partial payload (the server upsert patches only the changed columns).
+    /// Both writes happen in ONE transaction ([`Store::stage_local_write`]) — a partial failure
+    /// can't leave a locally-visible edit with no queued outbox row (SUR-725 review).
     fn stage_write(
         &self,
         table: &str,
         record_id: &str,
         row: Map<String, Value>,
     ) -> Result<(), SyncError> {
-        let store = lock!(self.store);
-        // Local synced row = the existing row (if any) with the partial edit overlaid.
-        let mut local_row = store
-            .get_row(table, record_id)
-            .map_err(|e| SyncError::Store(e.to_string()))?
-            .unwrap_or_default();
-        for (k, v) in &row {
-            local_row.insert(k.clone(), v.clone());
-        }
-        store
-            .apply_row(table, &local_row)
-            .map_err(|e| SyncError::Store(e.to_string()))?;
-        // Outbox: the PARTIAL payload, unchanged (SUR-724 flush semantics).
-        let payload = Value::Object(row).to_string();
-        store
-            .enqueue(table, record_id, &payload, epoch_ms())
-            .map(|_| ())
+        lock!(self.store)
+            .stage_local_write(table, record_id, row, epoch_ms())
             .map_err(|e| SyncError::Store(e.to_string()))
     }
 }
+
+/// Lookback the pull cursor keeps behind wall-clock `now()` when it advances (SUR-725 review /
+/// SUR-739). `updated_at` is client-stamped at ENQUEUE, but a row becomes server-visible only at
+/// FLUSH — so a delayed/offline flush lands on the server with a timestamp OLDER than a cursor that
+/// advanced to `now()`, and would be skipped forever. Advancing to `now() - OVERLAP` re-fetches this
+/// window each pull (idempotent under LWW), catching flushes delayed up to the window.
+///
+/// HEURISTIC, not a guarantee: a flush delayed beyond the window (long offline) is still missed
+/// until a full re-pull (reset the cursor to 0). The complete fix — a server-assigned monotonic
+/// watermark the cursor tracks, distinct from the client `updated_at` used for LWW — is SUR-739.
+/// Tunable: larger = fewer misses, more re-fetch per pull (bounded by pagination, SUR-652).
+const PULL_CURSOR_OVERLAP_MS: i64 = 60 * 60 * 1000; // 1 hour
 
 /// Epoch milliseconds — the PWA `Date.now()` unit the cloud data is stamped in. `SystemTime`
 /// before the epoch is impossible on a sane clock; clamp to 0 rather than panic.
