@@ -65,7 +65,7 @@ impl PostgrestClient {
     /// Upsert `rows` into `table`, conflict target `on_conflict` (the PK). `rows` is a JSON
     /// array of already-`user_id`-stamped objects. `merge-duplicates` = the PostgREST spelling
     /// of "upsert" (`ON CONFLICT DO UPDATE`), matching supabase-js `.upsert()`.
-    pub async fn upsert(
+    pub async fn post_upsert(
         &self,
         table: &str,
         on_conflict: &str,
@@ -114,6 +114,26 @@ impl PostgrestClient {
             }));
         }
         Ok(())
+    }
+}
+
+/// The upsert sink [`push::flush`](super::push::flush) writes through. `PostgrestClient` is the
+/// production impl (a real reqwest POST); a `#[cfg(test)]` stub lets the flush orchestration
+/// (books-first ordering, failed-parent guard, remap-persist) be unit-tested without a live
+/// Supabase — the SUR-724 Gate-2 testability concern.
+///
+/// `async fn` in a trait is fine here: the flush runs single-threaded on the engine's
+/// current-thread runtime, so the returned futures never need to be `Send`.
+#[allow(async_fn_in_trait)]
+pub trait PostgrestSink {
+    async fn upsert(&self, table: &str, on_conflict: &str, rows: &Value) -> Result<(), String>;
+}
+
+impl PostgrestSink for PostgrestClient {
+    async fn upsert(&self, table: &str, on_conflict: &str, rows: &Value) -> Result<(), String> {
+        self.post_upsert(table, on_conflict, rows)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 

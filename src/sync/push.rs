@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
-use super::http::{user_id_from_jwt, PostgrestClient};
+use super::http::PostgrestSink;
 use super::outbox::{collapse, resolve_book_id, Collapsed, OutboxItem};
 use crate::store::Store;
 
@@ -42,12 +42,11 @@ pub struct FlushResult {
 /// Run one flush. `runtime` block_on-drives the async upserts from the SyncEngine's sync FFI
 /// method; this fn is itself async so the engine owns the `block_on` (keeping the runtime in
 /// one place). `client` carries the access token set by `set_access_token`.
-pub async fn flush(store: &Store, client: &PostgrestClient) -> Result<FlushResult, String> {
-    let token = client
-        .access_token()
-        .ok_or_else(|| "no access token set — call set_access_token before flush".to_string())?;
-    let user_id = user_id_from_jwt(token).map_err(|e| format!("bad access token: {e}"))?;
-
+pub async fn flush<S: PostgrestSink>(
+    store: &Store,
+    sink: &S,
+    user_id: &str,
+) -> Result<FlushResult, String> {
     // Load the queued writes + the persisted remap.
     let raw = store
         .outbox_items()
@@ -86,7 +85,7 @@ pub async fn flush(store: &Store, client: &PostgrestClient) -> Result<FlushResul
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        match upsert_group(client, group, &user_id).await {
+        match upsert_group(sink, group, user_id).await {
             Ok(()) => {
                 result.ok.extend(&group.ids);
                 // A book that flushed under a temp id and carries its server id maps temp→server.
@@ -135,7 +134,7 @@ pub async fn flush(store: &Store, client: &PostgrestClient) -> Result<FlushResul
             group.payload.insert("book_id".into(), Value::String(b));
         }
 
-        match upsert_group(client, &group, &user_id).await {
+        match upsert_group(sink, &group, user_id).await {
             Ok(()) => result.ok.extend(&group.ids),
             Err(_) => result.failed.extend(&group.ids),
         }
@@ -149,8 +148,8 @@ pub async fn flush(store: &Store, client: &PostgrestClient) -> Result<FlushResul
 }
 
 /// Upsert one collapsed group: stamp `user_id`, wrap in a single-element array, POST.
-async fn upsert_group(
-    client: &PostgrestClient,
+async fn upsert_group<S: PostgrestSink>(
+    sink: &S,
     group: &Collapsed,
     user_id: &str,
 ) -> Result<(), String> {
@@ -159,10 +158,8 @@ async fn upsert_group(
     // as the PWA injects the auth user id at write.
     row.insert("user_id".into(), json!(user_id));
     let body = Value::Array(vec![Value::Object(row)]);
-    client
-        .upsert(&group.table, on_conflict_for(&group.table), &body)
+    sink.upsert(&group.table, on_conflict_for(&group.table), &body)
         .await
-        .map_err(|e| e.to_string())
 }
 
 fn load_remap(store: &Store) -> Result<BTreeMap<String, String>, String> {
@@ -180,4 +177,116 @@ fn persist_remap(store: &Store, remap: &BTreeMap<String, String>) -> Result<(), 
     store
         .meta_set(BOOK_ID_REMAP_KEY, &json)
         .map_err(|e| format!("write remap: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    fn block<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    /// In-memory sink: records the table of every upsert (in call order); can fail one table.
+    struct VecSink {
+        calls: RefCell<Vec<String>>,
+        fail_table: Option<String>,
+    }
+
+    impl PostgrestSink for VecSink {
+        async fn upsert(
+            &self,
+            table: &str,
+            _on_conflict: &str,
+            _rows: &Value,
+        ) -> Result<(), String> {
+            self.calls.borrow_mut().push(table.to_string());
+            match &self.fail_table {
+                Some(t) if t == table => Err(format!("{table} sink error")),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    fn sink(fail_table: Option<&str>) -> VecSink {
+        VecSink {
+            calls: RefCell::new(Vec::new()),
+            fail_table: fail_table.map(String::from),
+        }
+    }
+
+    #[test]
+    fn flush_upserts_books_before_notes() {
+        let store = Store::open_in_memory().unwrap();
+        // Enqueue the note first; flush must still dispatch the book before the note.
+        store
+            .enqueue(
+                "notes",
+                "n1",
+                r#"{"id":"n1","book_id":"b1","text":"enc:v2:x"}"#,
+                100,
+            )
+            .unwrap();
+        store
+            .enqueue("books", "b1", r#"{"id":"b1","title":"T"}"#, 90)
+            .unwrap();
+        let s = sink(None);
+        let res = block(flush(&store, &s, "user-1")).unwrap();
+        assert_eq!(
+            *s.calls.borrow(),
+            vec!["books".to_string(), "notes".to_string()]
+        );
+        assert_eq!(res.ok.len(), 2);
+        assert!(res.failed.is_empty());
+    }
+
+    #[test]
+    fn note_held_back_when_parent_book_flush_fails() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .enqueue("books", "b1", r#"{"id":"b1","title":"T"}"#, 90)
+            .unwrap();
+        store
+            .enqueue(
+                "notes",
+                "n1",
+                r#"{"id":"n1","book_id":"b1","text":"enc:v2:x"}"#,
+                100,
+            )
+            .unwrap();
+        let s = sink(Some("books"));
+        let res = block(flush(&store, &s, "user-1")).unwrap();
+        // The book upsert failed → the note must NOT be dispatched (no server FK violation).
+        assert_eq!(*s.calls.borrow(), vec!["books".to_string()]);
+        assert!(res.ok.is_empty());
+        assert_eq!(
+            res.failed.len(),
+            2,
+            "book + held-back note both stay queued"
+        );
+    }
+
+    #[test]
+    fn remap_persisted_to_meta_on_server_id_hint() {
+        let store = Store::open_in_memory().unwrap();
+        // A book carrying a server_id hint records temp→server in meta on a successful flush.
+        store
+            .enqueue(
+                "books",
+                "temp1",
+                r#"{"id":"temp1","title":"T","server_id":"srv-1"}"#,
+                90,
+            )
+            .unwrap();
+        block(flush(&store, &sink(None), "user-1")).unwrap();
+        let remap = store.meta_get("bookIdRemap").unwrap().unwrap();
+        assert!(
+            remap.contains("temp1") && remap.contains("srv-1"),
+            "remap persisted to meta: {remap}"
+        );
+    }
 }

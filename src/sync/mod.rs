@@ -29,7 +29,7 @@ use serde_json::{json, Map, Value};
 
 use crate::store::Store;
 use crate::vault::Vault;
-use http::PostgrestClient;
+use http::{user_id_from_jwt, PostgrestClient};
 
 /// Errors that cross the FFI from the sync engine. Coarse like [`crate::CryptoError`]: enough
 /// for a host to distinguish "couldn't open the store" from "the flush hit the network", never
@@ -172,9 +172,14 @@ impl SyncEngine {
     pub fn flush(&self) -> Result<FlushSummary, SyncError> {
         let store = lock!(self.store);
         let client = lock!(self.client);
+        let token = client.access_token().ok_or_else(|| {
+            SyncError::Flush("no access token set — call set_access_token before flush".into())
+        })?;
+        let user_id = user_id_from_jwt(token)
+            .map_err(|e| SyncError::Flush(format!("bad access token: {e}")))?;
         let result = self
             .runtime
-            .block_on(push::flush(&store, &client))
+            .block_on(push::flush(&store, &*client, &user_id))
             .map_err(SyncError::Flush)?;
         Ok(FlushSummary {
             pushed: result.ok.len() as u32,
@@ -253,7 +258,9 @@ mod tests {
             "plaintext must never reach the outbox"
         );
         assert!(
-            payload["content_tag"].as_str().is_some_and(|t| !t.is_empty()),
+            payload["content_tag"]
+                .as_str()
+                .is_some_and(|t| !t.is_empty()),
             "content_tag must be present (computed pre-seal, from plaintext)"
         );
     }
