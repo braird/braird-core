@@ -204,6 +204,13 @@ impl SyncEngine {
     /// cursor to this call's pre-fetch `now()`. Synchronous FFI — the async GETs run on the owned
     /// runtime via `block_on`, exactly like `flush`. Note text stays ciphertext at rest (never
     /// decrypted on pull); the host decrypts on demand via `Vault::decrypt_note`.
+    ///
+    /// **Call `flush()` BEFORE `pull()`** (as the PWA's `syncFromCloud` does). If a local edit is
+    /// still queued in the outbox and a pull merges a strictly-newer remote row for that record,
+    /// the stale outbox entry survives and the next unconditional `flush()` would re-push it over
+    /// the newer server row — a lost remote edit. Flushing first empties the outbox, closing the
+    /// window. The durable fix (rebase the outbox on an LWW win, or a `sync()` that enforces the
+    /// order) is tracked in SUR-736.
     pub fn pull(&self) -> Result<PullSummary, SyncError> {
         const TABLES: &[&str] = &["books", "notes"];
         let store = lock!(self.store);
