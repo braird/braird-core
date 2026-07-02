@@ -7,6 +7,20 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 ## [Unreleased]
 
 ### Added
+- **FFI bindings-drift guard (SUR-742).** New `scripts/gen-bindings.sh` — the single canonical
+  UniFFI bindgen invocation: builds the library and regenerates the committed Swift + Kotlin
+  bindings in library mode with **`--no-format`**, so output is deterministic across hosts (no
+  ktlint/swiftformat version drift → no spurious diffs; the committed bindings are now
+  script-produced by definition). New `bindings-drift` CI job in `parity.yml` (Linux, per-PR,
+  on the shared `src/**`/Cargo/tests filter — bindings are generated from `src/**`, so any FFI
+  change trips it without firing the macOS smoke on binding-only PRs) regenerates through that
+  script and fails with
+  *"FFI surface changed — run scripts/gen-bindings.sh and commit the bindings"* on any diff. This
+  catches what UniFFI's runtime checksum guard cannot: a newly-exported symbol never regenerated,
+  and **docstring-only** changes to `#[uniffi::export]` items (verified — a docstring edit
+  propagates into both bindings and trips the guard). `build-xcframework.sh` and the
+  `build.gradle.kts` regen doc-comment now delegate to the script (DRY); CLAUDE.md § Workflow
+  records the regenerate-and-commit rule. Founder-only paths (`.github/workflows/**` + `CLAUDE.md`).
 - **Sync fanned out to all eight synced stores + the full coexistence matrix (SUR-726, closes
   Phase 2 / SUR-659).** Pull and flush now cover every synced table — `custom_ideas`, `note_links`,
   `lenses`, `collections`, `collection_memberships`, `note_signals` — alongside `books`/`notes`.

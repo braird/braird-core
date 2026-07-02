@@ -112,6 +112,59 @@ jobs:
         working-directory: bindings/kotlin
         run: ./gradlew test --no-daemon
 
+  # SUR-742: the committed Swift/Kotlin bindings must match what the crate's current FFI
+  # surface generates. UniFFI's runtime checksum guard (in the round-trip tests) catches a
+  # SIGNATURE drift, but NOT a new exported symbol that was never regenerated, nor a
+  # docstring change — the diff catches both structurally. Library-mode generation is
+  # host-agnostic, so this runs on Linux per-PR (no macOS minute multiplier). Debug profile:
+  # the binding text derives from embedded metadata, identical to release, and builds faster.
+  #
+  # Trigger note: this rides the workflow's shared `on.paths` (src/**, Cargo.*, tests/**,
+  # vendored/**, *.udl) — deliberately NOT a widened filter. Bindings are GENERATED from
+  # src/**, so any real FFI change (incl. SUR-741's enqueue widening) already trips it; adding
+  # bindings/** would fire the macOS `ios-crosscompile` smoke (10× billing) on every
+  # binding-regen PR for no coverage gain (a hand-edit to committed bindings with no src change
+  # isn't a supported workflow — CLAUDE.md forbids hand-editing them).
+  bindings-drift:
+    name: FFI bindings up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard — skip until the crate exists
+        id: guard
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "No Cargo.toml yet — scaffolding only, skipping the bindings-drift check."
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.guard.outputs.ready == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        if: steps.guard.outputs.ready == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Regenerate bindings (canonical script, --no-format)
+        if: steps.guard.outputs.ready == 'true'
+        run: bash scripts/gen-bindings.sh
+
+      - name: Fail if the committed bindings are stale
+        if: steps.guard.outputs.ready == 'true'
+        run: |
+          if [ -n "$(git status --porcelain -- bindings/)" ]; then
+            echo "::error::FFI surface changed — run scripts/gen-bindings.sh and commit the bindings"
+            echo "── drift ──────────────────────────────────────────────"
+            git --no-pager diff -- bindings/
+            git status --porcelain -- bindings/
+            exit 1
+          fi
+          echo "✓ committed bindings match the current FFI surface"
+
   # SUR-723: bundled SQLite (rusqlite) is the first C-compile in the crate. The Linux
   # parity job can't catch a break on the mobile target triples, and the nightly-macos
   # xcframework job only runs after merge — so smoke-build the two primary device triples
