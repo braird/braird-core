@@ -15,18 +15,20 @@ cargo build --release
 cargo build --release --target aarch64-apple-ios
 cargo build --release --target aarch64-apple-ios-sim
 
-echo "▸ generating Swift bindings from the library"
+# Refresh the COMMITTED Kotlin + Swift bindings via the single canonical generator (DRY,
+# --no-format) — same script the `bindings-drift` CI guard runs, so this can never drift
+# from CI. The binding text is target-independent, so generating from the release host lib
+# here matches CI's debug-host generation byte-for-byte.
+echo "▸ refreshing committed bindings (scripts/gen-bindings.sh)"
+scripts/gen-bindings.sh release
+
+# The xcframework additionally needs the C shim header + modulemap (NOT committed — only
+# live inside the gitignored xcframework), generated here from the iOS device lib.
+echo "▸ generating FFI header + modulemap for the xcframework"
 GEN=$(mktemp -d)
 cargo run --quiet --bin uniffi-bindgen -- generate \
   --library "target/aarch64-apple-ios/release/${LIB}" \
-  --language swift --out-dir "${GEN}"
-
-# Commit-tracked Swift API source for the SwiftPM package.
-mkdir -p bindings/swift/Sources/BrairdCore
-cp "${GEN}/${NAME}.swift" bindings/swift/Sources/BrairdCore/BrairdCore.swift
-
-# Headers folder for the xcframework: the C shim + a `module.modulemap` so the
-# binaryTarget exposes the `braird_coreFFI` module the Swift API imports.
+  --language swift --no-format --out-dir "${GEN}"
 HDRS=$(mktemp -d)
 cp "${GEN}/${NAME}FFI.h" "${HDRS}/"
 cp "${GEN}/${NAME}FFI.modulemap" "${HDRS}/module.modulemap"

@@ -7,10 +7,10 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 // JNA-backed test against it; UniFFI's runtime checksum guard fails loudly if the
 // committed binding and the freshly-built lib ever diverge.
 //
-// Regenerate after any crate FFI change:
-//   cargo build --release && cargo run --bin uniffi-bindgen -- generate \
-//     --library target/release/libbraird_core.<dylib|so> --language kotlin \
-//     --out-dir bindings/kotlin/src/main/kotlin
+// Regenerate after any crate FFI change (incl. a docstring on an exported item) via the
+// single canonical script — do NOT hand-run uniffi-bindgen; the `bindings-drift` CI job
+// (parity.yml) regenerates through this same script and fails the PR on any diff:
+//   scripts/gen-bindings.sh   # emits both Kotlin + Swift, --no-format, from repo root
 plugins {
     kotlin("jvm") version "2.4.0"
 }

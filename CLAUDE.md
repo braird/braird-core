@@ -101,6 +101,12 @@ name the persona(s), propose changes. **Do not merge.**
   every PR's base is `main`. If a branch needs `main` merged in, **STOP and flag the
   founder** — do not rebase/merge `main` yourself.
 - Conventional Commits; reference the `SUR-XXX` ticket where relevant.
+- **FFI bindings are generated, never hand-edited.** Any change to a `#[uniffi::export]`
+  item — **including its docstring** — requires regenerating and committing the Swift +
+  Kotlin bindings via `scripts/gen-bindings.sh`. The `bindings-drift` CI job (parity.yml)
+  regenerates through that same script and fails the PR on any diff. UniFFI's runtime
+  checksum guard only catches signature drift; the diff also catches a newly-exported
+  symbol that was never regenerated and docstring-only changes (SUR-742).
 - Never commit `.env`, the `SURFC_READ_PAT`, or any credential. CI references secrets by
   name only.
 - After merge, the parity contract is the regression net — keep it green.
