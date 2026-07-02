@@ -12,10 +12,10 @@ name: Parity
 on:
   push:
     branches: [main]
-    paths: ['Cargo.toml', 'Cargo.lock', 'build.rs', 'src/**', 'tests/**', 'vendored/**', 'bindings/**', 'scripts/gen-bindings.sh', '**/*.udl']
+    paths: ['Cargo.toml', 'Cargo.lock', 'build.rs', 'src/**', 'tests/**', 'vendored/**', '**/*.udl']
   pull_request:
     branches: [main]
-    paths: ['Cargo.toml', 'Cargo.lock', 'build.rs', 'src/**', 'tests/**', 'vendored/**', 'bindings/**', 'scripts/gen-bindings.sh', '**/*.udl']
+    paths: ['Cargo.toml', 'Cargo.lock', 'build.rs', 'src/**', 'tests/**', 'vendored/**', '**/*.udl']
   workflow_dispatch:
 
 jobs:
@@ -118,6 +118,13 @@ jobs:
   # docstring change — the diff catches both structurally. Library-mode generation is
   # host-agnostic, so this runs on Linux per-PR (no macOS minute multiplier). Debug profile:
   # the binding text derives from embedded metadata, identical to release, and builds faster.
+  #
+  # Trigger note: this rides the workflow's shared `on.paths` (src/**, Cargo.*, tests/**,
+  # vendored/**, *.udl) — deliberately NOT a widened filter. Bindings are GENERATED from
+  # src/**, so any real FFI change (incl. SUR-741's enqueue widening) already trips it; adding
+  # bindings/** would fire the macOS `ios-crosscompile` smoke (10× billing) on every
+  # binding-regen PR for no coverage gain (a hand-edit to committed bindings with no src change
+  # isn't a supported workflow — CLAUDE.md forbids hand-editing them).
   bindings-drift:
     name: FFI bindings up to date
     runs-on: ubuntu-latest

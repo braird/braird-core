@@ -12,7 +12,9 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   bindings in library mode with **`--no-format`**, so output is deterministic across hosts (no
   ktlint/swiftformat version drift → no spurious diffs; the committed bindings are now
   script-produced by definition). New `bindings-drift` CI job in `parity.yml` (Linux, per-PR,
-  gated on `src/**`/`bindings/**`/the script) regenerates through that script and fails with
+  on the shared `src/**`/Cargo/tests filter — bindings are generated from `src/**`, so any FFI
+  change trips it without firing the macOS smoke on binding-only PRs) regenerates through that
+  script and fails with
   *"FFI surface changed — run scripts/gen-bindings.sh and commit the bindings"* on any diff. This
   catches what UniFFI's runtime checksum guard cannot: a newly-exported symbol never regenerated,
   and **docstring-only** changes to `#[uniffi::export]` items (verified — a docstring edit
