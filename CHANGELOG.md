@@ -27,21 +27,32 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   - **`release.yml` restructured into a `validate → {build-android, build-ios} → publish` DAG.** The
     two build legs run in parallel off one validated tag; a single `publish` job assembles every
     artifact into one `SHA256SUMS.txt` and cuts the release once (create-only immutability
-    preserved). The new **`build-ios`** leg (`macos-14`) builds the xcframework and runs the Swift
-    FFI round-trip (`swift test`) against the exact bytes it zips, mirroring the Android leg's
-    consumer self-containment round-trip. `contents: write` is now held by the `publish` job **alone**
-    — the build legs run read-only, so no attacker-influenceable string reaches a release-writing lane.
+    preserved). The new **`build-ios`** leg (`macos-14`) builds the xcframework and drives the FFI
+    round-trip through **two shipped slices** before publish — `swift test` (macOS-host slice) and
+    `xcodebuild test` on a real iOS **simulator** (arm64-sim) — mirroring the Android leg's
+    consumer self-containment round-trip. `contents: write` is held by the `publish` job **alone**
+    (build legs run read-only). Third-party actions (`dtolnay/rust-toolchain`, `Swatinem/rust-cache`)
+    are **SHA-pinned** in both legs — they run pre-compile, so a hijacked release could poison the
+    artifact before it is checksummed.
   - **`scripts/build-xcframework.sh` takes an optional `[version]`** (mirrors `build-aar.sh`): with a
     version it additionally stages `dist/braird-core-<version>.xcframework.zip` (via `ditto
     --keepParent`, the layout SwiftPM's remote binary target requires) and prints its
     `swift package compute-checksum` value. No version → xcframework-only, so `nightly-macos.yml`'s
     bare call is unchanged.
-  - **`docs/pinning.md`** gains the xcframework artifact row + a *Consumer pin — iOS* section: pin the
-    zip by `url` + `checksum` (the `SHA256SUMS.txt` entry is the SwiftPM checksum) **and** vendor the
-    matching `BrairdCore.swift` wrapper from the same tag — the iOS analog of the AAR bundling the
-    Kotlin binding, since the xcframework carries only the C FFI + native slices. Slices: arm64 iOS
-    device + arm64 iOS simulator + arm64 macOS host (the bytes `swift test` runs against; inert for
-    an iOS consumer). Apple-Silicon-only simulator; an Intel-sim (`x86_64`) slice is out of scope.
+  - **The Swift wrapper ships as its own checksummed release asset.** The xcframework carries only
+    the C FFI + native `.a` slices, not the generated `BrairdCore.swift` wrapper (unlike the AAR,
+    which bundles its Kotlin binding). Rather than have the consumer vendor the wrapper from the
+    mutable git tag — which would leave half of a checksum-coupled pair pinned to a movable ref —
+    `build-ios` publishes the exact `BrairdCore.swift` the two round-trips validated against the
+    xcframework, checksummed in `SHA256SUMS.txt`. The iOS consumer pins **both** SHA-256s and fetches
+    both from the immutable release. (Fix from the `release-integrity-reviewer` gate.)
+  - **`docs/pinning.md`** gains the xcframework + wrapper artifact rows and a *Consumer pin — iOS*
+    section: pin the zip by `url` + `checksum` (its `SHA256SUMS.txt` hex is the SwiftPM checksum) and
+    fetch-and-verify `BrairdCore.swift` from the release (fail-closed), never from the tag. Slices:
+    arm64 iOS device + arm64 iOS simulator + arm64 macOS host. Two slices are FFI-tested pre-publish
+    (macOS-host + iOS-sim); the **iOS device slice can't run in CI** and is documented as a residual
+    covered by the SUR-660 on-device verification wave. Apple-Silicon-only simulator; an Intel-sim
+    (`x86_64`) slice is out of scope.
   - Deliberately **not** changed: `bindings/swift/Package.swift` stays path-based (this repo's own
     `swift test` consumes the local xcframework); the reviewed remote-`binaryTarget` consuming
     manifest lands in braird-ios (SUR-660), as the Android consumer wiring did in braird-android.

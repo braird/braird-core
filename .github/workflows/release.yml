@@ -98,8 +98,10 @@ jobs:
         with:
           targets: aarch64-linux-android, x86_64-linux-android
 
+      # SHA-pinned like the toolchain action above — rust-cache runs pre-compile; a compromised
+      # release could poison the artifact before it is checksummed. SHA = Swatinem/rust-cache v2.9.1.
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
 
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
@@ -172,28 +174,54 @@ jobs:
         with:
           targets: aarch64-apple-ios, aarch64-apple-ios-sim
 
+      # SHA-pinned for the same reason as the toolchain action above: rust-cache runs in the
+      # pre-compile window and a compromised release could poison the artifact before it is
+      # checksummed. SHA = Swatinem/rust-cache v2.9.1.
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
 
       # Builds the xcframework AND (given a version) stages dist/braird-core-<version>.xcframework.zip
-      # + prints its SwiftPM checksum. The committed bindings-drift guard (parity.yml) already covers
-      # the binding refresh this triggers; nothing published here is committed.
+      # + prints its SwiftPM checksum. build-xcframework.sh runs gen-bindings.sh, so BrairdCore.swift
+      # here is regenerated from the SAME compiled lib the xcframework packages — the wrapper we test
+      # and publish below is provably from this one generation run.
       - name: Build + zip BrairdCore.xcframework
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         run: scripts/build-xcframework.sh "$VERSION"
 
-      # Prove the exact xcframework we're about to zip + publish works through the FFI — the iOS
-      # analog of the Android consumer round-trip, runs BEFORE the artifact is handed to publish.
-      - name: Swift round-trip against the built xcframework
+      # Prove the exact bytes we're about to publish work through the FFI — the iOS analog of the
+      # Android consumer round-trip. `swift test` exercises the macOS-host slice; the xcodebuild run
+      # exercises the ios-arm64-simulator slice on a real simulator (an arm64 macos-14 runner can
+      # execute it). Both shipped, testable slices are driven before publish. The ios-arm64 DEVICE
+      # slice cannot run in CI — that residual is documented in docs/pinning.md, not silently shipped.
+      - name: Swift round-trip — macOS-host slice
         working-directory: bindings/swift
         run: swift test
 
-      - name: Upload xcframework artifact for publish
+      - name: Swift round-trip — iOS-simulator slice (arm64-sim)
+        working-directory: bindings/swift
+        run: |
+          # Target whatever iPhone simulator the runner's Xcode provides — don't hard-pin a device
+          # name/OS that a future image might drop. Fail closed if none is available.
+          SIM_ID=$(xcrun simctl list devices available --json \
+            | jq -r 'first(.devices[][] | select(.name | startswith("iPhone")) | .udid) // empty')
+          [ -n "$SIM_ID" ] || { echo "::error::no iPhone simulator available on this runner"; exit 1; }
+          echo "Testing on simulator $SIM_ID"
+          xcodebuild test -scheme BrairdCore -destination "id=$SIM_ID"
+
+      # Stage the wrapper the two round-trips just validated against this exact xcframework, so it
+      # ships as a CHECKSUMMED release asset (SUR-745 review). The iOS consumer pins its SHA-256 the
+      # same way it pins the zip's — the wrapper is never acquired by a mutable tag alone.
+      - name: Stage BrairdCore.swift wrapper for publish
+        run: cp bindings/swift/Sources/BrairdCore/BrairdCore.swift dist/BrairdCore.swift
+
+      - name: Upload iOS artifacts for publish
         uses: actions/upload-artifact@v4
         with:
           name: ios-artifacts
-          path: dist/braird-core-*.xcframework.zip
+          path: |
+            dist/braird-core-*.xcframework.zip
+            dist/BrairdCore.swift
           if-no-files-found: error
           retention-days: 1
 
@@ -221,10 +249,14 @@ jobs:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           cd dist
+          # BrairdCore.swift is checksummed alongside the binary: an iOS consumer pins BOTH hashes
+          # so the wrapper is never trusted to a mutable tag (SUR-745 review). Hashed here from the
+          # exact bytes about to be published — no rebuild, no re-download.
           ( sha256sum \
               "braird-core-$VERSION.aar" \
               "braird-core-desktop-$VERSION.jar" \
-              "braird-core-$VERSION.xcframework.zip" | tee SHA256SUMS.txt )
+              "braird-core-$VERSION.xcframework.zip" \
+              "BrairdCore.swift" | tee SHA256SUMS.txt )
 
       # Create-only. Published assets are immutable: if a release for this tag already exists we
       # hard-fail rather than overwrite — every consumer pin (tag + SHA-256) stays valid forever.
@@ -242,10 +274,11 @@ jobs:
             "dist/braird-core-$VERSION.aar" \
             "dist/braird-core-desktop-$VERSION.jar" \
             "dist/braird-core-$VERSION.xcframework.zip" \
+            "dist/BrairdCore.swift" \
             "dist/SHA256SUMS.txt" \
             --title "braird-core $TAG" \
             --verify-tag \
             --notes "Pinned artifacts for the Braird native clients — verify every download against SHA256SUMS.txt. Pin/bump protocol: docs/pinning.md.
 
-          - **iOS** (braird-ios): \`braird-core-$VERSION.xcframework.zip\` — arm64 iOS device + arm64 iOS simulator (+ an arm64 macOS-host slice). The zip's SHA-256 (in SHA256SUMS.txt) is the value for SwiftPM's \`.binaryTarget(checksum:)\`. Vendor the matching \`BrairdCore.swift\` wrapper from tag $TAG.
+          - **iOS** (braird-ios): \`braird-core-$VERSION.xcframework.zip\` (arm64 iOS device + arm64 iOS simulator + an arm64 macOS-host slice) **and** \`BrairdCore.swift\` (the generated wrapper — the xcframework doesn't carry it). Pin BOTH SHA-256s from SHA256SUMS.txt; the zip's is SwiftPM's \`.binaryTarget(checksum:)\`. Do not vendor the wrapper from the tag — fetch it from this release and verify its checksum.
           - **Android** (braird-android): \`braird-core-$VERSION.aar\` (arm64-v8a + x86_64, 16 KB-aligned) + self-contained \`braird-core-desktop-$VERSION.jar\`. Add JNA 5.17.0 @aar alongside the AAR."
