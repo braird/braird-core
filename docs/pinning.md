@@ -159,6 +159,7 @@ The bump is **one hand-made PR in the app repo** — and that PR *is* the integr
 Android AAR + desktop jar (SUR-760) and the iOS xcframework (SUR-745) today. The release/pin shape
 (one tag, one `SHA256SUMS.txt`, checksum-verified fetch) is deliberately artifact-agnostic: the
 iOS xcframework attaches to the same release and pins the same way, no protocol change — the only
-iOS-specific wrinkle is that the Swift wrapper vendors from the tag rather than riding inside the
-binary artifact (see *Consumer pin — iOS*). A future Android/desktop or additional Apple-platform
-slice attaches the same way.
+iOS-specific wrinkle is that the Swift wrapper ships as its own **checksummed release asset**
+(pinned by SHA-256 and fetched-and-verified from the release, exactly like the binary — **never**
+vendored from the tag) rather than riding inside the binary artifact (see *Consumer pin — iOS*). A
+future Android/desktop or additional Apple-platform slice attaches the same way.
