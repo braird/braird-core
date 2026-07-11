@@ -389,35 +389,37 @@ async fn reconcile_covers<S: PostgrestSink + CoverEgress>(
         }
 
         let id = row_str(book, "id").to_string();
-        let isbn = book
-            .get("isbn")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
 
-        let outcome = if let Some(isbn) = isbn {
-            // ISBN path: construct-only, no egress (byte-matches the PWA's `resolveCover`). A book
-            // with an ISBN always yields a URL — `?default=false` lets the host render nothing if
-            // the edition has no cover, so there is no resolve-time "miss" here.
-            CoverOutcome::Hit(cover_url_from_isbn(isbn))
+        let outcome = if let Some(isbn) = normalize_isbn(book.get("isbn").and_then(Value::as_str)) {
+            // ISBN path: construct-only, no egress — the ISBN is normalized first, exactly as the
+            // PWA's `resolveCover` does (`normalizeIsbn`). A *valid* ISBN always yields a URL;
+            // `?default=false` lets the host render nothing if the edition has no cover, so there
+            // is no resolve-time "miss" here.
+            CoverOutcome::Hit(cover_url_from_isbn(&isbn))
         } else {
-            // No-ISBN path: the Search API — the actual Open Library egress, budget-capped.
-            if search_budget == 0 {
+            // No ISBN (or an unparseable one) → the title/author Search API. Mirror the PWA's
+            // short-circuit: a titleless book is a miss with NO egress.
+            let title = row_str(book, "title").trim();
+            if title.is_empty() {
+                CoverOutcome::Miss
+            } else if search_budget == 0 {
                 continue; // over budget this pass — leave UNSTAMPED so it retries next pull.
-            }
-            search_budget -= 1;
-            let author = book.get("author").and_then(Value::as_str);
-            match sink.search_cover(row_str(book, "title"), author).await {
-                Ok(Some(hit)) => match (hit.cover_i, hit.isbn) {
-                    (Some(cover_i), _) => CoverOutcome::Hit(cover_url_from_cover_id(cover_i)),
-                    (None, Some(healed)) => CoverOutcome::Hit(cover_url_from_isbn(&healed)),
-                    (None, None) => CoverOutcome::Miss, // searched, no usable cover → definitive miss
-                },
-                Ok(None) => CoverOutcome::Miss, // no docs → definitive miss
-                Err(e) => {
-                    // Transient outage: never fail the pass; leave the book unstamped to retry.
-                    eprintln!("reconcile_covers: Open Library search for book {id} failed, will retry: {e}");
-                    CoverOutcome::Outage
+            } else {
+                search_budget -= 1;
+                let author = book.get("author").and_then(Value::as_str);
+                match sink.search_cover(title, author).await {
+                    // Healed ISBN from the search hit is normalized too (SUR-566 self-heal parity).
+                    Ok(Some(hit)) => match (hit.cover_i, normalize_isbn(hit.isbn.as_deref())) {
+                        (Some(cover_i), _) => CoverOutcome::Hit(cover_url_from_cover_id(cover_i)),
+                        (None, Some(healed)) => CoverOutcome::Hit(cover_url_from_isbn(&healed)),
+                        (None, None) => CoverOutcome::Miss, // searched, no usable cover → definitive miss
+                    },
+                    Ok(None) => CoverOutcome::Miss, // no docs → definitive miss
+                    Err(e) => {
+                        // Transient outage: never fail the pass; leave the book unstamped to retry.
+                        eprintln!("reconcile_covers: Open Library search for book {id} failed, will retry: {e}");
+                        CoverOutcome::Outage
+                    }
                 }
             }
         };
@@ -471,6 +473,28 @@ enum CoverOutcome {
 
 fn row_str<'a>(row: &'a Map<String, Value>, key: &str) -> &'a str {
     row.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+/// Byte-mirror of the PWA's `normalizeIsbn` (`surfc/src/lib/coverResolver.js`): strip everything
+/// but digits and `X`, uppercase, then accept ONLY a valid ISBN-10 (`\d{9}[\dX]`) or ISBN-13
+/// (`\d{13}`) shape — anything else (a hyphenated value, a garbage string, `None`) yields `None`,
+/// and the caller falls through to the title/author search exactly as the PWA does. Load-bearing
+/// for URL parity: a hyphenated or malformed `isbn` column must not construct a divergent
+/// `covers.openlibrary.org` URL or a bogus "resolved" book.
+fn normalize_isbn(raw: Option<&str>) -> Option<String> {
+    let cleaned: String = raw?
+        .chars()
+        .filter(|c| c.is_ascii_digit() || c.eq_ignore_ascii_case(&'X'))
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    let b = cleaned.as_bytes();
+    // ISBN-10: 9 digits + a check char that is a digit or 'X' (already uppercased above).
+    let is_isbn10 = b.len() == 10
+        && b[..9].iter().all(u8::is_ascii_digit)
+        && (b[9].is_ascii_digit() || b[9] == b'X');
+    // ISBN-13: 13 digits, no 'X'.
+    let is_isbn13 = b.len() == 13 && b.iter().all(u8::is_ascii_digit);
+    (is_isbn10 || is_isbn13).then_some(cleaned)
 }
 
 /// `covers.openlibrary.org/b/isbn/<isbn>-M.jpg?default=false` — the PWA's `coverUrlFromIsbn`.
@@ -1139,10 +1163,103 @@ mod tests {
     #[test]
     fn a_malformed_or_missing_flag_fails_open() {
         let store = Store::open_in_memory().unwrap();
-        put(&store, "books", &cbook("b1", "Dune", Some("111")));
+        put(&store, "books", &cbook("b1", "Dune", Some("9780441172719")));
         // No app_config row at all → fetch_app_config returns None → fail OPEN (egress allowed).
         let sink = StubSink::new();
         assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_hyphenated_isbn_is_normalized_before_the_url_is_built() {
+        let store = Store::open_in_memory().unwrap();
+        put(
+            &store,
+            "books",
+            &cbook("b1", "Dune", Some("978-0-441-17271-9")),
+        );
+        let sink = StubSink::new();
+
+        assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 1);
+        assert_eq!(sink.search_count(), 0, "still the construct-only ISBN path");
+        assert_eq!(
+            cover_of(&store, "b1").0,
+            json!("https://covers.openlibrary.org/b/isbn/9780441172719-M.jpg?default=false"),
+            "hyphens stripped to match the PWA's normalizeIsbn"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_isbn_falls_through_to_the_search_path() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &cbook("b1", "Dune", Some("N/A")));
+        let sink = StubSink::new().with_cover("Dune", hit(Some(42), None));
+
+        assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 1);
+        assert_eq!(
+            sink.search_count(),
+            1,
+            "a garbage ISBN is not treated as valid → search"
+        );
+        assert_eq!(
+            cover_of(&store, "b1").0,
+            json!("https://covers.openlibrary.org/b/id/42-M.jpg?default=false")
+        );
+    }
+
+    #[test]
+    fn a_healed_search_isbn_is_normalized_too() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &cbook("b1", "Dune", None));
+        let sink = StubSink::new().with_cover("Dune", hit(None, Some("978-0-441-17271-9")));
+
+        assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 1);
+        assert_eq!(
+            cover_of(&store, "b1").0,
+            json!("https://covers.openlibrary.org/b/isbn/9780441172719-M.jpg?default=false")
+        );
+    }
+
+    #[test]
+    fn a_titleless_no_isbn_book_misses_without_any_egress() {
+        let store = Store::open_in_memory().unwrap();
+        put(
+            &store,
+            "books",
+            &json!({ "id": "b1", "title": "",
+            "created_at": 1, "updated_at": 1, "deleted": false }),
+        );
+        let sink = StubSink::new();
+
+        assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 1);
+        assert_eq!(
+            sink.search_count(),
+            0,
+            "empty title short-circuits — no Open Library call"
+        );
+        assert!(
+            !cover_of(&store, "b1").2.is_null(),
+            "but the miss is stamped"
+        );
+    }
+
+    #[test]
+    fn normalize_isbn_matches_the_oracle_shapes() {
+        assert_eq!(
+            normalize_isbn(Some("978-0-441-17271-9")).as_deref(),
+            Some("9780441172719")
+        );
+        assert_eq!(
+            normalize_isbn(Some("0441172717")).as_deref(),
+            Some("0441172717")
+        ); // ISBN-10
+        assert_eq!(
+            normalize_isbn(Some("080442957x")).as_deref(),
+            Some("080442957X")
+        ); // X check char
+        assert_eq!(normalize_isbn(Some("12345")), None); // too short
+        assert_eq!(normalize_isbn(Some("N/A")), None);
+        assert_eq!(normalize_isbn(Some("978044117271X")), None); // 13 digits can't carry X
+        assert_eq!(normalize_isbn(None), None);
     }
 
     #[test]
