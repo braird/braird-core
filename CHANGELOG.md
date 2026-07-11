@@ -6,6 +6,18 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-07-11
+
+Seventh tagged release. Ships two new cases on the post-pull reconciliation pass (SUR-820):
+**content-tag retroactive dedup** (SUR-835 — collapse duplicate notes into one deterministic,
+cross-device-convergent survivor via the full `mergeNotes` port) and **Open Library cover
+resolution** (SUR-828 — the core's FIRST non-Supabase egress, behind the SUR-492
+`openlibrary_egress` kill-switch, paced at ≤10 Search-API calls per pass and fail-soft). Both ride
+the existing SUR-820 pass; `ReconcileSummary` gains two additive `u32` fields (`dupesCollapsed`,
+`coversResolved`) and the Kotlin + Swift bindings are regenerated — hosts regenerate when they pin.
+Delivery to devices is the `chore(core): pin braird-core v0.4.3` bump in braird-ios (SUR-829) +
+braird-android (SUR-857). No crypto constants touched; note text / ciphertext unchanged.
+
 ### Added
 
 - **SUR-835 — content-tag retroactive dedup as a reconciliation case.** A fourth case on the
