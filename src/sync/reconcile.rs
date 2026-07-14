@@ -1161,6 +1161,14 @@ pub fn unmerge_books(store: &Store, undo: &BookMergeUndo) -> Result<(), String> 
     }
 
     for lid in &undo.loser_ids {
+        // Neutralize an un-flushed merge tombstone FIRST: the outbox collapse makes `deleted`
+        // sticky ("delete wins" — SUR-724), so a resurrection staged behind a queued tombstone
+        // would flush as `deleted:true` and leave the undo ineffective on the server. If the
+        // tombstone already flushed there's nothing to drop and the resurrection un-deletes via
+        // the server's LWW.
+        store
+            .drop_pending_deletes("books", lid)
+            .map_err(|e| format!("unmerge_books: drop pending tombstone {lid}: {e}"))?;
         let mut patch = Map::new();
         patch.insert("id".into(), json!(lid));
         patch.insert("deleted".into(), json!(false));
@@ -2876,6 +2884,57 @@ mod tests {
             map.get("other").map(String::as_str),
             Some("z"),
             "unrelated redirect kept"
+        );
+    }
+
+    /// The `deleted` field a flush would push for `book_id`, collapsing the CURRENT outbox exactly
+    /// as `flush` does (`Some(true)` = tombstone on the wire, `Some(false)` = live, `None` = no
+    /// queued write for that book).
+    fn collapsed_book_deleted(store: &Store, book_id: &str) -> Option<bool> {
+        let items: Vec<crate::sync::outbox::OutboxItem> = store
+            .outbox_items()
+            .unwrap()
+            .into_iter()
+            .map(|(id, table_name, record_id, payload, created_at)| {
+                crate::sync::outbox::OutboxItem {
+                    id,
+                    table_name,
+                    record_id,
+                    payload: serde_json::from_str(&payload).unwrap(),
+                    created_at,
+                }
+            })
+            .collect();
+        crate::sync::outbox::collapse(items, &BTreeMap::new())
+            .into_iter()
+            .find(|g| {
+                g.table == "books" && g.payload.get("id").and_then(Value::as_str) == Some(book_id)
+            })
+            .map(|g| matches!(g.payload.get("deleted"), Some(Value::Bool(true))))
+    }
+
+    #[test]
+    fn unmerge_before_flush_resurrects_loser_on_the_wire_not_a_sticky_tombstone() {
+        // Merge then undo BEFORE any flush. The outbox collapse makes `deleted` sticky, so without
+        // neutralizing the queued tombstone the loser would flush as deleted:true and the undo would
+        // never reach the server — this asserts the flush now pushes it LIVE.
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &book_at("s", 100));
+        put(&store, "books", &book_at("l1", 50));
+        put(&store, "notes", &note("n1", Some("l1"), &["a"], 1));
+
+        let undo = merge_books(&store, "s", &["l1".into()]).unwrap();
+        assert_eq!(
+            collapsed_book_deleted(&store, "l1"),
+            Some(true),
+            "merge queues the tombstone"
+        );
+
+        unmerge_books(&store, &undo).unwrap();
+        assert_eq!(
+            collapsed_book_deleted(&store, "l1"),
+            Some(false),
+            "undo-before-flush must resurrect the loser on the wire, not a sticky tombstone"
         );
     }
 

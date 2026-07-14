@@ -462,6 +462,49 @@ impl Store {
         rows.collect()
     }
 
+    /// Drop un-flushed outbox entries for `record_id` in `table` that carry a truthy `deleted` — a
+    /// pending tombstone. Returns the count dropped. For RESURRECTION paths (SUR-915
+    /// `unmerge_books` undoing a merge's loser tombstone before it flushes): the outbox collapse
+    /// treats `deleted` as **sticky** (a queued delete is never un-set by a later edit in the same
+    /// batch — the SUR-724 "delete wins, never resurrect" hardening), so a pending tombstone would
+    /// force `deleted:true` onto the collapsed upsert and defeat a resurrection staged after it.
+    /// Dropping the pending tombstone first lets the resurrection flush clean; if the tombstone
+    /// already flushed there is nothing here to drop and the resurrection un-deletes via the
+    /// server's own LWW (the queued `deleted:false` carries the later `updated_at`).
+    pub fn drop_pending_deletes(&self, table: &str, record_id: &str) -> rusqlite::Result<usize> {
+        let entries: Vec<(i64, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, payload FROM outbox WHERE table_name = ?1 AND record_id = ?2",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![table, record_id], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let mut dropped = 0;
+        for (id, payload) in entries {
+            // Match the collapse's `truthy` semantics (Bool true / non-zero number / non-empty
+            // string other than "false"/"0"); the enqueue paths write a JSON bool, but be liberal.
+            let is_delete = serde_json::from_str::<Value>(&payload)
+                .ok()
+                .map(|v| match v.get("deleted") {
+                    Some(Value::Bool(b)) => *b,
+                    Some(Value::Number(n)) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+                    Some(Value::String(s)) => !s.is_empty() && s != "false" && s != "0",
+                    _ => false,
+                })
+                .unwrap_or(false);
+            if is_delete {
+                self.conn
+                    .execute("DELETE FROM outbox WHERE id = ?1", [id])?;
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
+    }
+
     /// Clear the given outbox ids (a collapsed group that flushed successfully). Failed
     /// groups are simply NOT passed here, so they stay queued for the next flush.
     pub fn clear_outbox(&self, ids: &[i64]) -> rusqlite::Result<()> {
