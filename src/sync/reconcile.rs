@@ -1082,17 +1082,31 @@ pub fn merge_books(
     undo.survivor_prior_created_at = Some(survivor_created);
     let mut earliest = survivor_created;
 
+    // Snapshot the redirect map BEFORE this invocation writes it: a loser already pointing at this
+    // survivor here means a PRIOR (crashed) attempt already recorded it — so its notes may already
+    // have been rehomed. Used below to detect a resumed partial merge.
+    let prior_map = map.clone();
+
     // ── 1. Record redirects FIRST (idempotent, preserves existing). ──
     for lid in &losers {
         map.insert(lid.clone(), survivor_id.to_string());
     }
     save_merged_book_ids(store, &map)?;
 
-    // ── 2. Rehome each LIVE loser's notes; capture undo; track earliest created_at. A loser that's
-    // missing locally OR already soft-deleted (e.g. a completed-merge retry) is NOT something this
-    // invocation tombstones, so it's skipped — never added to the undo token or the tombstone loop.
-    // Its redirect stays recorded (step 1) so a later pull still converges. This keeps a retry a
-    // true no-op and stops `unmerge_books` on a retry token from resurrecting an empty duplicate. ──
+    // ── 2. Rehome each LIVE loser's notes; capture undo; track earliest created_at. Two kinds of
+    // loser are completed but deliberately kept OUT of the undo token, so `unmerge_books` on the
+    // returned token can never half-undo:
+    //   • missing / already soft-deleted (a completed-merge retry) — skipped entirely; its redirect
+    //     stays recorded (step 1) so a later pull still converges;
+    //   • a RESUMED merge — a live loser with ANY prior mapping (to this survivor OR a different one
+    //     a crashed earlier attempt chose), meaning some of its notes may already have moved
+    //     elsewhere (we can't tell which, or where). We complete it — rehome whatever notes are still
+    //     live, then tombstone — but leave it un-undoable: the full set of reassignments is
+    //     unrecoverable, so an undo could only move back the suffix THIS retry saw and would strand
+    //     the earlier-moved notes.
+    // Every loser we tombstone goes in `to_tombstone`; only faithfully-undoable ones (and their note
+    // reassignments) go in `undo.loser_ids` / `undo.reassignments`. ──
+    let mut to_tombstone: Vec<String> = Vec::new();
     for lid in &losers {
         let loser = match store
             .get_row("books", lid)
@@ -1102,6 +1116,11 @@ pub fn merge_books(
             _ => continue, // missing or already-deleted — nothing for this invocation to merge
         };
         earliest = earliest.min(row_i64(&loser, "created_at"));
+
+        // ANY prior mapping for this loser marks a resumed merge — a crashed earlier attempt (to
+        // THIS survivor or a different one) may have already moved some of its notes. Complete it,
+        // but it can't be undone: the full reassignment set isn't knowable here.
+        let resumed = prior_map.contains_key(lid);
 
         let notes = store
             .list_live("notes", Some(("book_id", lid)), -1, 0)
@@ -1116,18 +1135,23 @@ pub fn merge_books(
             store
                 .stage_local_write("notes", &note_id, patch, now)
                 .map_err(|e| format!("merge_books: rehome note {note_id}: {e}"))?;
-            undo.reassignments.push(NoteBookAssignment {
-                note_id,
-                prior_book_id: Some(lid.clone()),
-            });
+            if !resumed {
+                undo.reassignments.push(NoteBookAssignment {
+                    note_id,
+                    prior_book_id: Some(lid.clone()),
+                });
+            }
         }
-        undo.loser_ids.push(lid.clone());
+        to_tombstone.push(lid.clone());
+        if !resumed {
+            undo.loser_ids.push(lid.clone());
+        }
     }
 
-    // No live loser was merged this invocation (a completed-merge retry, or an all-missing/deleted
-    // loser set): skip the survivor bump + tombstone loop and return an empty undo token, which
-    // `unmerge_books` treats as a no-op. The redirect map was still (idempotently) recorded above.
-    if undo.loser_ids.is_empty() {
+    // Nothing live was merged this invocation (all losers missing/already-deleted): skip the
+    // survivor bump + tombstone loop and return the (empty) undo token, which `unmerge_books` treats
+    // as a no-op. The redirect map was still (idempotently) recorded above.
+    if to_tombstone.is_empty() {
         return Ok(undo);
     }
 
@@ -1141,8 +1165,8 @@ pub fn merge_books(
         .stage_local_write("books", survivor_id, sp, now)
         .map_err(|e| format!("merge_books: stage survivor created_at: {e}"))?;
 
-    // ── 4. Tombstone the losers — only now that every rehome has staged. ──
-    for lid in &undo.loser_ids {
+    // ── 4. Tombstone every merged loser (undoable or resumed) — only now that every rehome staged. ──
+    for lid in &to_tombstone {
         let mut patch = Map::new();
         patch.insert("id".into(), json!(lid));
         patch.insert("deleted".into(), json!(true));
@@ -1195,18 +1219,39 @@ pub fn unmerge_books(store: &Store, undo: &BookMergeUndo) -> Result<(), String> 
             .map_err(|e| format!("unmerge_books: resurrect loser {lid}: {e}"))?;
     }
 
-    let mut sp = Map::new();
-    sp.insert("id".into(), json!(undo.survivor_id));
+    // Load the redirect map once — used to recompute the survivor's created_at over the STILL-merged
+    // cluster and then to prune this merge's entries.
+    let mut map = load_merged_book_ids(store)?;
+
+    // Restore the survivor's created_at to the EARLIEST of its pre-merge value and any loser STILL
+    // merged into it. A LATER merge into the same survivor may have lowered it further; restoring
+    // unconditionally to this token's captured value would clobber that, leaving the survivor no
+    // longer holding the current cluster's earliest. "Still merged" = redirects pointing at this
+    // survivor that this undo is NOT removing. (Undoing every same-survivor merge strictly out of
+    // order can still leave an intermediate value — an accepted 10s-window edge; the common LIFO and
+    // the older-while-newer-stands cases both resolve correctly.)
     if let Some(prev) = undo.survivor_prior_created_at {
-        sp.insert("created_at".into(), json!(prev));
+        let mut earliest = prev;
+        for (lid, sid) in &map {
+            if sid == &undo.survivor_id && !undo.loser_ids.contains(lid) {
+                if let Some(b) = store
+                    .get_row("books", lid)
+                    .map_err(|e| format!("unmerge_books: get still-merged loser {lid}: {e}"))?
+                {
+                    earliest = earliest.min(row_i64(&b, "created_at"));
+                }
+            }
+        }
+        let mut sp = Map::new();
+        sp.insert("id".into(), json!(undo.survivor_id));
+        sp.insert("created_at".into(), json!(earliest));
+        sp.insert("updated_at".into(), json!(now));
+        store
+            .stage_local_write("books", &undo.survivor_id, sp, now)
+            .map_err(|e| format!("unmerge_books: restore survivor created_at: {e}"))?;
     }
-    sp.insert("updated_at".into(), json!(now));
-    store
-        .stage_local_write("books", &undo.survivor_id, sp, now)
-        .map_err(|e| format!("unmerge_books: restore survivor created_at: {e}"))?;
 
     // Prune only redirects still pointing at THIS survivor.
-    let mut map = load_merged_book_ids(store)?;
     for lid in &undo.loser_ids {
         if map.get(lid).map(String::as_str) == Some(undo.survivor_id.as_str()) {
             map.remove(lid);
@@ -2853,26 +2898,113 @@ mod tests {
     }
 
     #[test]
-    fn merge_books_resumes_after_interruption_before_tombstone() {
-        // Simulate a crash AFTER the map write + note rehome but BEFORE the loser tombstone:
-        // the map has l1→s and the note lives on s, but l1 is still live. A re-run must complete.
+    fn resumed_partial_merge_completes_but_is_not_undoable() {
+        // A prior attempt recorded the map and rehomed SOME of l1's notes (n1→s), then crashed with
+        // others (n2) STILL under l1. The retry must complete the merge (rehome n2, tombstone l1) but
+        // return a NON-undoable token — it can't reconstruct that n1 also came from l1, so offering
+        // undo would move only n2 back and strand n1 on the survivor (the half-undo #7 guards).
         let store = Store::open_in_memory().unwrap();
         put(&store, "books", &book_at("s", 100));
         put(&store, "books", &book_at("l1", 50));
-        put(&store, "notes", &note("n1", Some("s"), &["a"], 1)); // already rehomed
+        put(&store, "notes", &note("n1", Some("s"), &["a"], 1)); // already rehomed by the crash
+        put(&store, "notes", &note("n2", Some("l1"), &["b"], 2)); // NOT yet rehomed
         save_merged_book_ids(&store, &BTreeMap::from([("l1".into(), "s".into())])).unwrap();
         assert!(
             !is_deleted(&store, "books", "l1"),
             "precondition: loser still live"
         );
 
-        merge_books(&store, "s", &["l1".into()]).unwrap();
-
+        let undo = merge_books(&store, "s", &["l1".into()]).unwrap();
         assert!(
             is_deleted(&store, "books", "l1"),
-            "re-run completes the tombstone"
+            "retry completes the tombstone"
         );
+        assert_eq!(
+            book_id_of(&store, "n2").as_deref(),
+            Some("s"),
+            "remaining note rehomed"
+        );
+        assert!(
+            undo.loser_ids.is_empty(),
+            "a resumed merge (any prior progress) is not undoable"
+        );
+        assert!(undo.reassignments.is_empty());
+
+        // Undo is a no-op — l1 stays merged away, BOTH notes stay on s (no half-undo).
+        unmerge_books(&store, &undo).unwrap();
+        assert!(is_deleted(&store, "books", "l1"));
         assert_eq!(book_id_of(&store, "n1").as_deref(), Some("s"));
+        assert_eq!(book_id_of(&store, "n2").as_deref(), Some("s"));
+    }
+
+    #[test]
+    fn resumed_merge_into_a_different_survivor_is_also_not_undoable() {
+        // A crashed attempt mapped l1→old and moved n1 to `old`. The user retries into a DIFFERENT
+        // survivor `new`, with n2 still under l1. The retry completes (n2→new, tombstone l1) but must
+        // be non-undoable: `resumed` keyed on the survivor id alone would miss this (l1 maps to `old`,
+        // not `new`) and undo would restore only n2, stranding n1 under `old`.
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &book_at("old", 10));
+        put(&store, "books", &book_at("new", 20));
+        put(&store, "books", &book_at("l1", 50));
+        put(&store, "notes", &note("n1", Some("old"), &["a"], 1)); // moved by the crashed attempt
+        put(&store, "notes", &note("n2", Some("l1"), &["b"], 2)); // still on the loser
+        save_merged_book_ids(&store, &BTreeMap::from([("l1".into(), "old".into())])).unwrap();
+
+        let undo = merge_books(&store, "new", &["l1".into()]).unwrap();
+        assert!(
+            is_deleted(&store, "books", "l1"),
+            "retry completes the tombstone"
+        );
+        assert_eq!(
+            book_id_of(&store, "n2").as_deref(),
+            Some("new"),
+            "remaining note rehomed to the new survivor"
+        );
+        assert!(
+            undo.loser_ids.is_empty(),
+            "any prior mapping (even to a different survivor) → not undoable"
+        );
+        assert!(undo.reassignments.is_empty());
+    }
+
+    #[test]
+    fn unmerge_of_an_older_merge_keeps_a_later_merges_earliest_created_at() {
+        // s=100; merge l1(50) → s=50; merge l2(20) → s=20. Undo the FIRST merge (l1) while l2 stays
+        // merged: the survivor must keep 20 (the still-merged cluster's earliest), not snap to 100.
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &book_at("s", 100));
+        put(&store, "books", &book_at("l1", 50));
+        put(&store, "books", &book_at("l2", 20));
+        put(&store, "notes", &note("n1", Some("l1"), &["a"], 1));
+        put(&store, "notes", &note("n2", Some("l2"), &["b"], 2));
+
+        let undo1 = merge_books(&store, "s", &["l1".into()]).unwrap();
+        merge_books(&store, "s", &["l2".into()]).unwrap();
+        assert_eq!(
+            store.get_row("books", "s").unwrap().unwrap()["created_at"].as_i64(),
+            Some(20)
+        );
+
+        unmerge_books(&store, &undo1).unwrap();
+
+        assert_eq!(
+            store.get_row("books", "s").unwrap().unwrap()["created_at"].as_i64(),
+            Some(20),
+            "undoing the older merge must not clobber the later merge's earliest"
+        );
+        assert_eq!(
+            book_id_of(&store, "n1").as_deref(),
+            Some("l1"),
+            "l1's note restored"
+        );
+        assert_eq!(
+            book_id_of(&store, "n2").as_deref(),
+            Some("s"),
+            "l2's note stays merged"
+        );
+        assert!(!is_deleted(&store, "books", "l1"));
+        assert!(is_deleted(&store, "books", "l2"), "l2 stays merged");
     }
 
     #[test]
