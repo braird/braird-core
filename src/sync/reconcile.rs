@@ -1013,6 +1013,14 @@ fn clean_loser_ids(survivor_id: &str, loser_ids: &[String]) -> Vec<String> {
 /// the device-local `mergedBookIds` map so the fleet + decrypt-failed stragglers converge via
 /// [`reconcile_stranded_notes`] on their next pull. Returns the [`BookMergeUndo`] snapshot.
 ///
+/// **Known residual (SUR-916, matches the PWA's own deferral).** The redirect map is device-local,
+/// so a note that lives on a device which never received the map AND that this device never saw
+/// (created offline elsewhere, or not-yet-pulled here at merge time) can't be resolved by that
+/// device: it pulls the loser tombstone with an empty map and `reconcile_stranded_notes` DETACHES
+/// it (`book_id=null`) rather than rehoming it to the survivor. Full always-to-survivor convergence
+/// (a synced redirect or a server-side rehome) is tracked in SUR-916 — the native equivalent of the
+/// PWA's deferred server-side merge; native ships at parity with the web here, not behind it.
+///
 /// **Replay-safe, ordered for crash-safety.** The core can't span one SQLite transaction across the
 /// separate outbox writes the oracle does in one Dexie transaction, so it ORDERS the writes and
 /// fail-fasts (like [`merge_into_survivor`]):

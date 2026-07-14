@@ -48,10 +48,15 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     (the core can't span one SQLite transaction across the outbox writes the oracle does in one Dexie
     transaction): redirects recorded FIRST (an interrupted merge still converges), then notes rehomed,
     then losers tombstoned LAST — only after every rehome staged (fail-fast via `?`). A completed-merge
-    re-run is a no-op. Returns the `BookMergeUndo` token for the host's 10-second window.
+    re-run is a no-op. Returns the `BookMergeUndo` token for the host's 10-second window. The map is
+    device-local (PWA parity), so full always-to-survivor convergence of a straggler note the merging
+    device never saw is deferred to **SUR-916** (native equivalent of the PWA's deferred server-side
+    merge) — native ships at parity here, not behind the web.
   - `unmerge_books(undo)` — the inverse: restore each note's prior book, un-tombstone the losers,
     restore the survivor's prior `created_at`, and prune ONLY the redirects still pointing at this
     merge's survivor. Idempotent. The token is ephemeral (not persisted) — the 10s window is host UX.
+    Un-merging BEFORE the merge's outbox flush drops the loser's pending tombstone first (the outbox
+    collapse makes `deleted` sticky), so the resurrection reaches the server instead of a stale delete.
   - `merge_content_duplicates(survivor_id, loser_ids, allow_cross_cluster) -> u32` — a checked,
     explicit-survivor wrapper over the existing `merge_into_survivor` (union tags, adopt image,
     re-point `note_links` + `collection_memberships`, tombstone loser notes last). The exact path
