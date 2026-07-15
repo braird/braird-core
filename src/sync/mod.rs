@@ -18,6 +18,7 @@
 //! Source of truth: surfc `src/supabase.js` (`collapseOutboxItems`, `flushOutbox`, `upsertBook`,
 //! `upsertNote`) — mirrored faithfully in `outbox.rs` / `push.rs` / `http.rs`.
 
+mod export_import;
 pub mod http;
 pub mod outbox;
 pub mod pull;
@@ -665,6 +666,14 @@ impl SyncEngine {
                 still_queued: flush.failed.len() as u32,
             },
         })
+    }
+
+    /// Export a plaintext, PWA-compatible snapshot of every live synced row. Note ciphertext is
+    /// decrypted inside the core; a single decryption failure aborts the entire export so neither
+    /// ciphertext nor a partial archive can cross the FFI. Local-only tables are never included.
+    pub fn export_snapshot(&self) -> Result<String, SyncError> {
+        let store = lock!(self.store);
+        export_import::build_snapshot_at(&store, &self.vault, epoch_ms())
     }
 
     // ── read/query surface (SUR-744) ─────────────────────────────────────────

@@ -581,7 +581,7 @@ impl Store {
     // master key, so the ADR 0003 ciphertext-at-rest boundary is preserved.
 
     /// List live (`deleted = 0`) rows of a synced table, newest-first (`created_at DESC`,
-    /// `id DESC` tiebreak for deterministic offset pagination), as JSON objects. An optional
+    /// primary-key `DESC` tiebreak for deterministic offset pagination), as JSON objects. An optional
     /// single-column equality filter serves notes-by-book. `limit < 0` = no limit (the
     /// search-index scan wants the whole corpus). The table + filter-column identifiers are
     /// descriptor-derived or fixed literals from the caller — **never host input** — so
@@ -607,7 +607,10 @@ impl Store {
             sql.push_str(&format!(" AND {col} = ?"));
             params.push(SqlValue::Text(val.to_string()));
         }
-        sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?");
+        sql.push_str(&format!(
+            " ORDER BY created_at DESC, {} DESC LIMIT ? OFFSET ?",
+            schema.pk[0]
+        ));
         params.push(SqlValue::Integer(limit));
         params.push(SqlValue::Integer(offset));
 
