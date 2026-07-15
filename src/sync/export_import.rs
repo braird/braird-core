@@ -173,10 +173,12 @@ fn map_fields(row: &Map<String, Value>, fields: &[(&str, &str)]) -> Value {
     let mapped = fields
         .iter()
         .map(|(sqlite, pwa)| {
-            (
-                (*pwa).to_string(),
-                row.get(*sqlite).cloned().unwrap_or(Value::Null),
-            )
+            let value = if *sqlite == "deleted" && *pwa == "deleted" {
+                json!(0)
+            } else {
+                row.get(*sqlite).cloned().unwrap_or(Value::Null)
+            };
+            ((*pwa).to_string(), value)
         })
         .collect();
     Value::Object(mapped)
@@ -433,13 +435,30 @@ mod tests {
 
         let root: Value = serde_json::from_str(&snapshot_at(&store, &vault, 0)).unwrap();
 
+        for store_name in [
+            "books",
+            "notes",
+            "customIdeas",
+            "noteLinks",
+            "lenses",
+            "collections",
+            "collectionMemberships",
+            "noteSignals",
+        ] {
+            assert_eq!(
+                root[store_name][0]["deleted"],
+                json!(0),
+                "{store_name} must match the PWA's numeric live-row flag"
+            );
+        }
+
         assert_eq!(
             root["books"][0],
             json!({
                 "id": "b1", "title": "The Republic", "author": "Plato", "isbn": "9781",
                 "coverUrl": "https://covers/b1", "coverSource": "openlibrary",
                 "coverResolvedAt": 101, "createdAt": 100, "updatedAt": 102,
-                "deleted": false
+                "deleted": 0
             })
         );
         assert_eq!(
@@ -450,14 +469,14 @@ mod tests {
                 "inkCropPath": "user/n1-crop.jpg", "source": "image",
                 "sourceId": "scan:1", "sourceMeta": {"case": 2}, "chapter": "IV",
                 "contentTag": "tag-opaque", "createdAt": 200, "updatedAt": 201,
-                "deleted": false
+                "deleted": 0
             })
         );
         assert_eq!(
             root["customIdeas"][0],
             json!({
                 "id": "ci1", "name": "Attention", "description": "Reader-defined",
-                "createdAt": 300, "updatedAt": 301, "deleted": false
+                "createdAt": 300, "updatedAt": 301, "deleted": 0
             })
         );
         assert_eq!(
@@ -465,7 +484,7 @@ mod tests {
             json!({
                 "id": "link1", "fromNoteId": "n1", "toNoteId": "n2",
                 "relationType": "related", "createdAt": 400, "updatedAt": 401,
-                "deleted": false
+                "deleted": 0
             })
         );
         assert_eq!(
@@ -473,21 +492,21 @@ mod tests {
             json!({
                 "id": "lens1", "name": "Justice and Virtue",
                 "leafIds": ["Justice", "Virtue"], "combinator": "COOCCUR",
-                "threshold": 60, "createdAt": 500, "updatedAt": 501, "deleted": false
+                "threshold": 60, "createdAt": 500, "updatedAt": 501, "deleted": 0
             })
         );
         assert_eq!(
             root["collections"][0],
             json!({
                 "id": "col1", "name": "Study", "createdAt": 600,
-                "updatedAt": 601, "deleted": false
+                "updatedAt": 601, "deleted": 0
             })
         );
         assert_eq!(
             root["collectionMemberships"][0],
             json!({
                 "id": "col1:n1", "noteId": "n1", "collectionId": "col1",
-                "createdAt": 700, "updatedAt": 701, "deleted": false
+                "createdAt": 700, "updatedAt": 701, "deleted": 0
             })
         );
         assert_eq!(
@@ -497,7 +516,7 @@ mod tests {
                 "hasAnnotation": true, "stitchSpawns": 2,
                 "exposureRecencyAt": 800, "engagementRecencyAt": 801,
                 "importance": 0.9, "createdAt": 802, "updatedAt": 803,
-                "deleted": false
+                "deleted": 0
             })
         );
     }
