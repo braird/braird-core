@@ -11,12 +11,13 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 - **SUR-918 — checksum-pinned canon release assets.** Byte-vendor the surfc idea-tree YAML and
   guard it together with `great-ideas.json`: the combined drift check requires byte equality with
   `surfc/main`, duplicate-free equal counts, and set equality between all 97 YAML leaf assignments
-  and `GREAT_IDEAS`. Releases now
-  attach both canon files with their own entries in `SHA256SUMS.txt`, so consumers pin the pair to
-  one exact tag and both checksums. Their most-specific GATING route combines canon parity review
-  with release checksum/publication review, preserving `sync-reviewer` + `crypto-reviewer` while
-  adding `release-integrity-reviewer`. Documentation/release-data only; no crate, FFI, or generated
-  binding change.
+  and `GREAT_IDEAS`. A read-only release gate re-runs the current live contract against the exact
+  resolved release commit, then hands only the validated bytes to the publisher. Releases attach
+  both files with their own entries in `SHA256SUMS.txt`, so consumers pin the pair to one exact tag
+  and both checksums. Their most-specific GATING route combines canon parity review with release
+  checksum/publication review, preserving `sync-reviewer` + `crypto-reviewer` while adding
+  `release-integrity-reviewer`. Documentation/release-data only; no crate, FFI, or generated binding
+  change.
 
 ## [0.5.0] - 2026-07-14
 
