@@ -47,7 +47,7 @@ impl<S: PostgrestSink> PostgrestSink for SanitizedSink<'_, S> {
             .fetch_page(table, after_seq, limit)
             .await
             .map_err(|_| IMPORT_PREFLIGHT_FAILED.to_string())?;
-        validate_pull_page(table, &rows)?;
+        validate_pull_page(table, after_seq, &rows)?;
         Ok(rows)
     }
 
@@ -67,10 +67,12 @@ impl<S: PostgrestSink> PostgrestSink for SanitizedSink<'_, S> {
 /// Import's protective pull must fail closed on a malformed server page. Ordinary sync keeps its
 /// established per-row defensive skipping/defaulting semantics; this validation lives on the
 /// import-only sink wrapper so an incomplete or malformed preflight can never authorize staging.
-fn validate_pull_page(table: &str, rows: &[Value]) -> Result<(), String> {
+/// The page must also honor PostgREST's exclusive ascending `change_seq` keyset contract.
+fn validate_pull_page(table: &str, after_seq: i64, rows: &[Value]) -> Result<(), String> {
     let primary_key = table_schema(table)
         .ok_or_else(|| IMPORT_PREFLIGHT_FAILED.to_string())?
         .pk[0];
+    let mut prior_change_seq = after_seq;
 
     for value in rows {
         let Some(row) = value.as_object() else {
@@ -80,16 +82,20 @@ fn validate_pull_page(table: &str, rows: &[Value]) -> Result<(), String> {
             .get(primary_key)
             .and_then(Value::as_str)
             .is_some_and(|primary_key| !primary_key.is_empty());
-        let valid_change_seq = row
+        let change_seq = row
             .get("change_seq")
             .and_then(Value::as_i64)
-            .is_some_and(|change_seq| change_seq >= 0);
+            .filter(|change_seq| *change_seq >= 0)
+            .ok_or_else(|| IMPORT_PREFLIGHT_FAILED.to_string())?;
         let valid_updated_at = row.get("updated_at").and_then(Value::as_i64).is_some();
         let valid_deleted = row.get("deleted").and_then(Value::as_bool).is_some();
 
-        if !(valid_primary_key && valid_change_seq && valid_updated_at && valid_deleted) {
+        if !(valid_primary_key && valid_updated_at && valid_deleted)
+            || change_seq <= prior_change_seq
+        {
             return Err(IMPORT_PREFLIGHT_FAILED.into());
         }
+        prior_change_seq = change_seq;
     }
 
     Ok(())
@@ -632,6 +638,91 @@ mod tests {
         assert!(
             accepted.is_empty(),
             "malformed pull rows passed import preflight: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn replayed_or_non_monotonic_pull_pages_fail_before_fetch_or_import_staging() {
+        let scenarios = [
+            (
+                "sequence equal to cursor",
+                10,
+                vec![json!({
+                    "id":"remote-a","updated_at":20,"deleted":false,"change_seq":10
+                })],
+            ),
+            (
+                "sequence below cursor",
+                10,
+                vec![json!({
+                    "id":"remote-a","updated_at":20,"deleted":false,"change_seq":9
+                })],
+            ),
+            (
+                "out-of-order sequence",
+                0,
+                vec![
+                    json!({
+                        "id":"remote-a","updated_at":20,"deleted":false,"change_seq":2
+                    }),
+                    json!({
+                        "id":"remote-b","updated_at":20,"deleted":false,"change_seq":1
+                    }),
+                ],
+            ),
+            (
+                "duplicate sequence",
+                0,
+                vec![
+                    json!({
+                        "id":"remote-a","updated_at":20,"deleted":false,"change_seq":1
+                    }),
+                    json!({
+                        "id":"remote-b","updated_at":20,"deleted":false,"change_seq":1
+                    }),
+                ],
+            ),
+        ];
+        let mut accepted = Vec::new();
+
+        for (name, cursor, page) in scenarios {
+            let archive = parsed(
+                "books",
+                vec![json!({"id":"import-b","title":"archive","updatedAt":50})],
+                10,
+            );
+            let store = Store::open_in_memory().unwrap();
+            store.set_seq_cursor("books", cursor).unwrap();
+            let sink = RecordingSink::default();
+            sink.pull_result("books", Ok(page));
+
+            let outcome = run(merge_parsed_with_sink(
+                &store,
+                &sink,
+                &Vault::generate(),
+                archive,
+                10,
+            ));
+            let fetched = sink
+                .calls()
+                .iter()
+                .any(|call| matches!(call, Call::Fetch { .. }));
+            let staged = store.get_row("books", "import-b").unwrap().is_some()
+                || !store.outbox_items().unwrap().is_empty();
+            match outcome {
+                Ok(_) => accepted.push(name),
+                Err(_) if fetched || staged => accepted.push(name),
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(!message.contains("remote-a"));
+                    assert!(!message.contains("remote-b"));
+                }
+            }
+        }
+
+        assert!(
+            accepted.is_empty(),
+            "invalid pull pagination passed import preflight: {accepted:?}"
         );
     }
 
