@@ -119,70 +119,43 @@ pub(in crate::sync) fn parse_import_at(
     }
     let schema_version = schema_version(root)?;
 
-    let books = normalize_rows(
-        archive_array(root, "books")?,
-        "books",
-        "id",
-        "id",
-        |row, _| normalize_book(row, now),
-    )?;
+    let books = normalize_rows(archive_array(root, "books")?, "id", "id", |row, _| {
+        normalize_book(row, now)
+    })?;
 
     let mut raw_note_sources = HashMap::new();
-    let notes = normalize_rows(
-        archive_array(root, "notes")?,
-        "notes",
-        "id",
-        "id",
-        |row, id| {
-            let normalized = normalize_note(row, now, schema_version)?;
-            raw_note_sources.insert(
-                id.to_string(),
-                row.get("source")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-            );
-            Ok(normalized)
-        },
-    )?;
+    let notes = normalize_rows(archive_array(root, "notes")?, "id", "id", |row, id| {
+        let normalized = normalize_note(row, now, schema_version)?;
+        raw_note_sources.insert(
+            id.to_string(),
+            row.get("source")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        );
+        Ok(normalized)
+    })?;
 
-    let custom_ideas = normalize_rows(
-        archive_array(root, "customIdeas")?,
-        "customIdeas",
-        "id",
-        "id",
-        |row, _| normalize_custom_idea(row, now),
-    )?;
-    let note_links = normalize_rows(
-        archive_array(root, "noteLinks")?,
-        "noteLinks",
-        "id",
-        "id",
-        |row, _| normalize_note_link(row, now),
-    )?;
-    let lenses = normalize_rows(
-        archive_array(root, "lenses")?,
-        "lenses",
-        "id",
-        "id",
-        |row, _| normalize_lens(row, now),
-    )?;
-    let collections = normalize_rows(
-        archive_array(root, "collections")?,
-        "collections",
-        "id",
-        "id",
-        |row, _| normalize_collection(row, now),
-    )?;
+    let custom_ideas =
+        normalize_rows(archive_array(root, "customIdeas")?, "id", "id", |row, _| {
+            normalize_custom_idea(row, now)
+        })?;
+    let note_links = normalize_rows(archive_array(root, "noteLinks")?, "id", "id", |row, _| {
+        normalize_note_link(row, now)
+    })?;
+    let lenses = normalize_rows(archive_array(root, "lenses")?, "id", "id", |row, _| {
+        normalize_lens(row, now)
+    })?;
+    let collections = normalize_rows(archive_array(root, "collections")?, "id", "id", |row, _| {
+        normalize_collection(row, now)
+    })?;
     let collection_memberships = normalize_rows(
         archive_array(root, "collectionMemberships")?,
-        "collectionMemberships",
         "id",
         "id",
         |row, _| normalize_membership(row, now),
     )?;
     let note_signals = normalize_rows(
         archive_array(root, "noteSignals")?,
-        "noteSignals",
         "noteId",
         "note_id",
         |row, note_id| {
@@ -236,7 +209,6 @@ fn archive_array<'a>(root: &'a Map<String, Value>, field: &str) -> Result<&'a [V
 
 fn normalize_rows<F>(
     values: &[Value],
-    table: &str,
     input_key: &str,
     output_key: &str,
     mut normalize: F,
@@ -250,6 +222,7 @@ where
         let input = value
             .as_object()
             .ok_or_else(|| invalid("archive store row must be an object"))?;
+        validate_deleted(input)?;
         let primary_key = input
             .get(input_key)
             .and_then(Value::as_str)
@@ -275,8 +248,15 @@ where
             updated_at,
         });
     }
-    let _ = table;
     Ok(rows)
+}
+
+fn validate_deleted(input: &Map<String, Value>) -> Result<(), SyncError> {
+    match input.get("deleted") {
+        None | Some(Value::Null | Value::Bool(false)) => Ok(()),
+        Some(Value::Number(number)) if number.as_f64() == Some(0.0) => Ok(()),
+        Some(_) => Err(invalid("deleted must identify a live archive row")),
+    }
 }
 
 fn normalize_book(input: &Map<String, Value>, now: i64) -> Result<Map<String, Value>, SyncError> {
@@ -863,6 +843,52 @@ mod import_tests {
                 Value::Array(vec![duplicate.clone(), duplicate]),
             );
             assert!(parse(root).is_err(), "duplicate keys in {table} must fail");
+        }
+    }
+
+    #[test]
+    fn validates_deleted_live_shape_for_all_eight_store_rows() {
+        for (table, key) in [
+            ("books", "id"),
+            ("notes", "id"),
+            ("customIdeas", "id"),
+            ("noteLinks", "id"),
+            ("lenses", "id"),
+            ("collections", "id"),
+            ("collectionMemberships", "id"),
+            ("noteSignals", "noteId"),
+        ] {
+            for accepted in [Value::Null, json!(0), json!(0.0), json!(false)] {
+                let mut item = Map::new();
+                item.insert(key.into(), json!("row"));
+                item.insert("deleted".into(), accepted);
+                let mut root = archive(19);
+                root.as_object_mut()
+                    .unwrap()
+                    .insert(table.into(), Value::Array(vec![Value::Object(item)]));
+                assert!(parse(root).is_ok(), "supported {table}.deleted must import");
+            }
+
+            for rejected in [
+                json!(true),
+                json!(1),
+                json!(-1),
+                json!(0.5),
+                json!("PLAINTEXT-MUST-NOT-ECHO"),
+                json!([]),
+                json!({}),
+            ] {
+                let mut item = Map::new();
+                item.insert(key.into(), json!("row"));
+                item.insert("deleted".into(), rejected);
+                let mut root = archive(19);
+                root.as_object_mut()
+                    .unwrap()
+                    .insert(table.into(), Value::Array(vec![Value::Object(item)]));
+                let error = parse(root).expect_err("malformed deleted must fail");
+                assert!(matches!(error, SyncError::InvalidImport(_)));
+                assert!(!error.to_string().contains("PLAINTEXT-MUST-NOT-ECHO"));
+            }
         }
     }
 
