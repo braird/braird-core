@@ -248,19 +248,38 @@ if (checkFlag === '--check') {
     if (liveTree) {
       try {
         const leafNames = extractIdeaTreeLeafNames(liveTree.toString('utf8'));
-        const leafSet = new Set(leafNames);
-        const greatIdeasSet = new Set(list);
-        const missingFromTree = [...greatIdeasSet].filter((name) => !leafSet.has(name));
-        const extraInTree = [...leafSet].filter((name) => !greatIdeasSet.has(name));
+        const greatIdeaCounts = new Map();
+        for (const name of list) greatIdeaCounts.set(name, (greatIdeaCounts.get(name) ?? 0) + 1);
+        const duplicateGreatIdeas = [...greatIdeaCounts]
+          .filter(([, count]) => count > 1)
+          .map(([name, count]) => `${name} (${count}x)`);
+        const hasCountMismatch = leafNames.length !== list.length;
 
-        if (missingFromTree.length > 0 || extraInTree.length > 0) {
+        if (duplicateGreatIdeas.length > 0 || hasCountMismatch) {
           console.error('::error::idea-tree leaf names differ from live GREAT_IDEAS.');
-          if (missingFromTree.length > 0) console.error(`Missing from idea tree: ${missingFromTree.join(', ')}`);
-          if (extraInTree.length > 0) console.error(`Extra in idea tree: ${extraInTree.join(', ')}`);
+          if (duplicateGreatIdeas.length > 0) {
+            console.error(`::error::duplicate GREAT_IDEAS entries: ${duplicateGreatIdeas.join(', ')}`);
+          }
+          if (hasCountMismatch) {
+            console.error(`::error::count mismatch: idea-tree has ${leafNames.length} leaves; GREAT_IDEAS has ${list.length} entries.`);
+          }
           console.error('Update GREAT_IDEAS and surfc-idea-tree.yaml together, then re-vendor both canon fixtures.');
           failed = true;
         } else {
-          console.log(`${leafSet.size} unique leaf names match live GREAT_IDEAS.`);
+          const leafSet = new Set(leafNames);
+          const greatIdeasSet = new Set(list);
+          const missingFromTree = [...greatIdeasSet].filter((name) => !leafSet.has(name));
+          const extraInTree = [...leafSet].filter((name) => !greatIdeasSet.has(name));
+
+          if (missingFromTree.length > 0 || extraInTree.length > 0) {
+            console.error('::error::idea-tree leaf names differ from live GREAT_IDEAS.');
+            if (missingFromTree.length > 0) console.error(`Missing from idea tree: ${missingFromTree.join(', ')}`);
+            if (extraInTree.length > 0) console.error(`Extra in idea tree: ${extraInTree.join(', ')}`);
+            console.error('Update GREAT_IDEAS and surfc-idea-tree.yaml together, then re-vendor both canon fixtures.');
+            failed = true;
+          } else {
+            console.log(`${leafNames.length} unique leaf names match live GREAT_IDEAS.`);
+          }
         }
       } catch (error) {
         console.error(`::error::unsupported idea-tree leaf surface: ${error.message}`);
