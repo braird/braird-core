@@ -42,10 +42,13 @@ impl<S: PostgrestSink> PostgrestSink for SanitizedSink<'_, S> {
         after_seq: i64,
         limit: i64,
     ) -> Result<Vec<Value>, String> {
-        self.0
+        let rows = self
+            .0
             .fetch_page(table, after_seq, limit)
             .await
-            .map_err(|_| IMPORT_PREFLIGHT_FAILED.into())
+            .map_err(|_| IMPORT_PREFLIGHT_FAILED.to_string())?;
+        validate_pull_page(table, &rows)?;
+        Ok(rows)
     }
 
     async fn fetch_by_ids(
@@ -59,6 +62,37 @@ impl<S: PostgrestSink> PostgrestSink for SanitizedSink<'_, S> {
             .await
             .map_err(|_| IMPORT_PREFLIGHT_FAILED.into())
     }
+}
+
+/// Import's protective pull must fail closed on a malformed server page. Ordinary sync keeps its
+/// established per-row defensive skipping/defaulting semantics; this validation lives on the
+/// import-only sink wrapper so an incomplete or malformed preflight can never authorize staging.
+fn validate_pull_page(table: &str, rows: &[Value]) -> Result<(), String> {
+    let primary_key = table_schema(table)
+        .ok_or_else(|| IMPORT_PREFLIGHT_FAILED.to_string())?
+        .pk[0];
+
+    for value in rows {
+        let Some(row) = value.as_object() else {
+            return Err(IMPORT_PREFLIGHT_FAILED.into());
+        };
+        let valid_primary_key = row
+            .get(primary_key)
+            .and_then(Value::as_str)
+            .is_some_and(|primary_key| !primary_key.is_empty());
+        let valid_change_seq = row
+            .get("change_seq")
+            .and_then(Value::as_i64)
+            .is_some_and(|change_seq| change_seq >= 0);
+        let valid_updated_at = row.get("updated_at").and_then(Value::as_i64).is_some();
+        let valid_deleted = row.get("deleted").and_then(Value::as_bool).is_some();
+
+        if !(valid_primary_key && valid_change_seq && valid_updated_at && valid_deleted) {
+            return Err(IMPORT_PREFLIGHT_FAILED.into());
+        }
+    }
+
+    Ok(())
 }
 
 /// Operational half of `SyncEngine::import_merge`, generic over the network seam for deterministic
@@ -520,6 +554,85 @@ mod tests {
             .calls()
             .iter()
             .any(|call| matches!(call, Call::Fetch { .. })));
+    }
+
+    #[test]
+    fn malformed_short_pull_rows_fail_preflight_before_fetch_or_import_staging() {
+        let scenarios = [
+            ("non-object", json!("not an object")),
+            (
+                "missing primary key",
+                json!({"updated_at":20,"deleted":false,"change_seq":1}),
+            ),
+            (
+                "empty primary key",
+                json!({"id":"","updated_at":20,"deleted":false,"change_seq":1}),
+            ),
+            (
+                "missing change_seq",
+                json!({"id":"remote-b","updated_at":20,"deleted":false}),
+            ),
+            (
+                "negative change_seq",
+                json!({"id":"remote-b","updated_at":20,"deleted":false,"change_seq":-1}),
+            ),
+            (
+                "non-integer change_seq",
+                json!({"id":"remote-b","updated_at":20,"deleted":false,"change_seq":"bad"}),
+            ),
+            (
+                "missing updated_at",
+                json!({"id":"remote-b","deleted":false,"change_seq":1}),
+            ),
+            (
+                "non-integer updated_at",
+                json!({"id":"remote-b","updated_at":"bad","deleted":false,"change_seq":1}),
+            ),
+            (
+                "missing deleted",
+                json!({"id":"remote-b","updated_at":20,"change_seq":1}),
+            ),
+            (
+                "invalid deleted",
+                json!({"id":"remote-b","updated_at":20,"deleted":0,"change_seq":1}),
+            ),
+        ];
+        let mut accepted = Vec::new();
+
+        for (name, malformed) in scenarios {
+            let archive = parsed(
+                "books",
+                vec![json!({"id":"import-b","title":"archive","updatedAt":50})],
+                10,
+            );
+            let store = Store::open_in_memory().unwrap();
+            let sink = RecordingSink::default();
+            sink.pull_result("books", Ok(vec![malformed]));
+
+            let outcome = run(merge_parsed_with_sink(
+                &store,
+                &sink,
+                &Vault::generate(),
+                archive,
+                10,
+            ));
+            let fetched = sink
+                .calls()
+                .iter()
+                .any(|call| matches!(call, Call::Fetch { .. }));
+            let staged = store.get_row("books", "import-b").unwrap().is_some()
+                || !store.outbox_items().unwrap().is_empty();
+            match outcome {
+                Ok(_) => accepted.push(name),
+                Err(_) if fetched || staged => accepted.push(name),
+                Err(error) => assert!(!error.to_string().contains("remote-b")),
+            }
+        }
+
+        assert!(
+            accepted.is_empty(),
+            "malformed pull rows passed import preflight: {accepted:?}"
+        );
     }
 
     #[test]
