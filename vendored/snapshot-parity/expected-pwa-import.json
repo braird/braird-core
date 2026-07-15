@@ -44,6 +44,7 @@
     },
     "schema-19-all-stores.json": {
       "schemaVersion": 19,
+      "fullRows": "expected-schema-19-all-stores.json",
       "arrayLengths": {
         "books": 1,
         "notes": 2,
@@ -76,8 +77,23 @@
         "deleted": 0
       }
     },
+    "schema-19-defaults.json": {
+      "schemaVersion": 19,
+      "fullRows": "expected-schema-19-defaults.json",
+      "arrayLengths": {
+        "books": 1,
+        "notes": 1,
+        "customIdeas": 1,
+        "noteLinks": 1,
+        "lenses": 1,
+        "collections": 1,
+        "collectionMemberships": 1,
+        "noteSignals": 1
+      }
+    },
     "schema-19-core-export.json": {
       "schemaVersion": 19,
+      "fullRows": "expected-schema-19-core-export.json",
       "exportedAt": "2026-07-15T09:10:11.012Z",
       "arrayLengths": {
         "books": 1,

@@ -269,6 +269,14 @@ fn format_utc_iso8601(epoch_ms: i64) -> Result<String, SyncError> {
         format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");
     let timestamp = OffsetDateTime::from_unix_timestamp_nanos(i128::from(epoch_ms) * 1_000_000)
         .map_err(|_| SyncError::Store("snapshot export timestamp formatting failed".into()))?;
+    // JavaScript uses a signed six-digit extended year before 0000, while `time`'s
+    // default `[year]` component uses four digits. Production `epoch_ms()` clamps a
+    // pre-epoch clock to zero; fail closed for an incompatible injected test clock.
+    if timestamp.year() < 0 {
+        return Err(SyncError::Store(
+            "snapshot export timestamp formatting failed".into(),
+        ));
+    }
     timestamp
         .format(UTC_MILLISECONDS)
         .map_err(|_| SyncError::Store("snapshot export timestamp formatting failed".into()))
@@ -366,6 +374,19 @@ mod tests {
                 "store error: snapshot export timestamp formatting failed"
             );
         }
+    }
+
+    #[test]
+    fn utc_formatter_fails_closed_for_javascript_incompatible_bce_years() {
+        let store = Store::open_in_memory().unwrap();
+        let vault = Vault::generate();
+
+        let error = super::build_snapshot_at(&store, &vault, -62_198_755_200_000).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "store error: snapshot export timestamp formatting failed"
+        );
     }
 
     #[cfg(feature = "test-seams")]
@@ -751,6 +772,40 @@ mod tests {
             json!(["first margin", "second margin"])
         );
         assert!(plain.get("user_metadata").is_none());
+    }
+
+    #[test]
+    fn equal_time_annotations_follow_edge_id_not_insertion_order() {
+        let store = Store::open_in_memory().unwrap();
+        let vault = Vault::generate();
+        for row in [
+            note_row(&vault, "parent", "printed passage", 1, false),
+            note_row(&vault, "a-child", "A margin", 2, false),
+            note_row(&vault, "m-child", "M margin", 3, false),
+            note_row(&vault, "z-child", "Z margin", 4, false),
+        ] {
+            put(&store, "notes", row);
+        }
+        for edge in [
+            json!({"id":"z-edge","from_note_id":"parent","to_note_id":"z-child","relation_type":"handwritten_annotation","created_at":10,"updated_at":10,"deleted":false}),
+            json!({"id":"m-edge","from_note_id":"parent","to_note_id":"m-child","relation_type":"handwritten_annotation","created_at":10,"updated_at":10,"deleted":false}),
+            json!({"id":"a-edge","from_note_id":"parent","to_note_id":"a-child","relation_type":"handwritten_annotation","created_at":10,"updated_at":10,"deleted":false}),
+        ] {
+            put(&store, "note_links", edge);
+        }
+
+        let root: Value = serde_json::from_str(&snapshot_at(&store, &vault, 0)).unwrap();
+        let parent = root["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|note| note["id"] == "parent")
+            .unwrap();
+
+        assert_eq!(
+            parent["user_metadata"]["user_annotation"],
+            json!(["A margin", "M margin", "Z margin"])
+        );
     }
 
     #[test]

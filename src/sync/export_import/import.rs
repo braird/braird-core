@@ -654,7 +654,7 @@ mod import_tests {
     use super::{
         parse_import_at, NormalizedImport, NormalizedRow, CANON_REMAP_V14, GREAT_IDEAS_RENAMES,
     };
-    use crate::store::{table_schema, Store};
+    use crate::store::Store;
     use crate::sync::http::PostgrestSink;
     use crate::sync::{ImportCounts, ImportSummary, SyncError};
     use crate::vault::Vault;
@@ -671,6 +671,12 @@ mod import_tests {
         include_str!("../../../vendored/snapshot-parity/schema-14-current-tags.json");
     const SCHEMA_19_FIXTURE: &str =
         include_str!("../../../vendored/snapshot-parity/schema-19-all-stores.json");
+    const SCHEMA_19_EXPECTED: &str =
+        include_str!("../../../vendored/snapshot-parity/expected-schema-19-all-stores.json");
+    const SCHEMA_19_DEFAULTS_FIXTURE: &str =
+        include_str!("../../../vendored/snapshot-parity/schema-19-defaults.json");
+    const SCHEMA_19_DEFAULTS_EXPECTED: &str =
+        include_str!("../../../vendored/snapshot-parity/expected-schema-19-defaults.json");
 
     fn parse_raw(raw: &str) -> Result<NormalizedImport, SyncError> {
         parse_import_at(raw, NOW)
@@ -1305,11 +1311,21 @@ mod import_tests {
         assert_eq!(EXPECTED_V14.len(), 58);
     }
 
-    #[test]
-    fn frozen_schema_19_import_stages_exact_rows_for_all_eight_stores() {
+    fn assert_fixture_import_matches_independent_oracle(fixture: &str, expected_json: &str) {
+        const TABLES: [&str; 8] = [
+            "books",
+            "notes",
+            "custom_ideas",
+            "note_links",
+            "lenses",
+            "collections",
+            "collection_memberships",
+            "note_signals",
+        ];
+
         let store = Store::open_in_memory().unwrap();
         let vault = Vault::generate();
-        let parsed = parse_import_at(SCHEMA_19_FIXTURE, FIXTURE_NOW).unwrap();
+        let parsed = parse_import_at(fixture, FIXTURE_NOW).unwrap();
 
         let summary = run(merge_parsed_with_sink(
             &store,
@@ -1320,57 +1336,81 @@ mod import_tests {
         ))
         .unwrap();
 
-        assert_eq!(summary.schema_version, 19);
-        assert_eq!(summary.imported.books, 1);
-        assert_eq!(summary.imported.notes, 2);
-        assert_eq!(summary.imported.custom_ideas, 1);
-        assert_eq!(summary.imported.note_links, 1);
-        assert_eq!(summary.imported.lenses, 1);
-        assert_eq!(summary.imported.collections, 1);
-        assert_eq!(summary.imported.collection_memberships, 1);
-        assert_eq!(summary.imported.note_signals, 1);
-        assert_eq!(summary.skipped_stale.books, 0);
-        assert_eq!(summary.skipped_stale.notes, 0);
-        assert_eq!(summary.skipped_stale.custom_ideas, 0);
-        assert_eq!(summary.skipped_stale.note_links, 0);
-        assert_eq!(summary.skipped_stale.lenses, 0);
-        assert_eq!(summary.skipped_stale.collections, 0);
-        assert_eq!(summary.skipped_stale.collection_memberships, 0);
-        assert_eq!(summary.skipped_stale.note_signals, 0);
+        let expected_document: Value = serde_json::from_str(expected_json).unwrap();
+        let expected = expected_document["nativeRows"]
+            .as_object()
+            .expect("fixture must carry an independent complete native-row oracle");
+        assert_eq!(expected.len(), TABLES.len());
+        let newest_original_updated_at = expected_document["pwaRows"]
+            .as_object()
+            .unwrap()
+            .values()
+            .flat_map(|rows| rows.as_array().unwrap())
+            .filter_map(|row| row.get("updatedAt").and_then(Value::as_i64))
+            .max()
+            .unwrap();
+        let expected_batch_updated_at =
+            FIXTURE_NOW.max(newest_original_updated_at.checked_add(1).unwrap());
 
-        let expected = parse_import_at(SCHEMA_19_FIXTURE, FIXTURE_NOW).unwrap();
-        for (table, candidates) in [
-            ("books", expected.books),
-            ("notes", expected.notes),
-            ("custom_ideas", expected.custom_ideas),
-            ("note_links", expected.note_links),
-            ("lenses", expected.lenses),
-            ("collections", expected.collections),
-            ("collection_memberships", expected.collection_memberships),
-            ("note_signals", expected.note_signals),
-        ] {
-            let schema = table_schema(table).unwrap();
-            for candidate in candidates {
-                let mut expected_row = candidate.row;
-                expected_row.insert("updated_at".into(), Value::from(FIXTURE_NOW));
-                expected_row.insert("deleted".into(), Value::Bool(false));
-                let mut actual = store
-                    .get_row(table, &candidate.primary_key)
+        let row_count = |table: &str| expected[table].as_array().unwrap().len() as u32;
+        assert_eq!(summary.schema_version, 19);
+        assert_eq!(
+            summary.imported,
+            ImportCounts {
+                books: row_count("books"),
+                notes: row_count("notes"),
+                custom_ideas: row_count("custom_ideas"),
+                note_links: row_count("note_links"),
+                lenses: row_count("lenses"),
+                collections: row_count("collections"),
+                collection_memberships: row_count("collection_memberships"),
+                note_signals: row_count("note_signals"),
+            }
+        );
+        assert_eq!(summary.skipped_stale, ImportCounts::default());
+
+        let mut observed_batch_updated_at = None;
+        let mut expected_outbox = Vec::new();
+        for table in TABLES {
+            for expected_value in expected[table].as_array().unwrap() {
+                let expected_row = expected_value.as_object().unwrap().clone();
+                let primary_key_field = if table == "note_signals" {
+                    "note_id"
+                } else {
+                    "id"
+                };
+                let primary_key = expected_row[primary_key_field]
+                    .as_str()
                     .unwrap()
-                    .unwrap();
+                    .to_string();
+                let mut actual = store.get_row(table, &primary_key).unwrap().unwrap();
+                let actual_updated_at = actual["updated_at"].as_i64().unwrap();
+                if let Some(observed) = observed_batch_updated_at {
+                    assert_eq!(actual_updated_at, observed);
+                } else {
+                    observed_batch_updated_at = Some(actual_updated_at);
+                }
+                // Merge-import deliberately replaces every original timestamp with one
+                // collision-safe batch stamp. The independent rows normalize that one
+                // documented difference back to the fixed oracle clock for comparison.
+                actual.insert("updated_at".into(), expected_row["updated_at"].clone());
 
                 if table == "notes" {
                     let plaintext = expected_row
-                        .remove("text")
-                        .and_then(|text| text.as_str().map(str::to_owned))
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
                         .unwrap();
                     let ciphertext = actual
-                        .remove("text")
-                        .and_then(|text| text.as_str().map(str::to_owned))
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
                         .unwrap();
+                    assert!(ciphertext.starts_with("enc:v2:"));
+                    assert_ne!(ciphertext, plaintext);
                     assert_eq!(
                         vault
-                            .decrypt_note(Some(candidate.primary_key.clone()), ciphertext)
+                            .decrypt_note(Some(primary_key.clone()), ciphertext)
                             .unwrap(),
                         plaintext
                     );
@@ -1378,57 +1418,68 @@ mod import_tests {
                         .get("book_id")
                         .and_then(Value::as_str)
                         .map(str::to_owned);
-                    let expected_tag = vault.content_tag(plaintext, book_id);
+                    let expected_tag = vault.content_tag(plaintext.clone(), book_id);
                     assert_eq!(
-                        actual.remove("content_tag"),
-                        Some(Value::String(expected_tag))
+                        actual.get("content_tag"),
+                        Some(&Value::String(expected_tag))
                     );
-                    expected_row.remove("content_tag");
+                    // The independent oracle stores plaintext and a null exporting-key tag;
+                    // normalize only after proving the persisted row was freshly sealed and
+                    // tagged under this Vault key.
+                    actual.insert("text".into(), Value::String(plaintext));
+                    actual.insert("content_tag".into(), Value::Null);
                 }
 
-                let mut complete_expected: Map<String, Value> = schema
-                    .columns
-                    .iter()
-                    .map(|(column, _)| {
-                        (
-                            (*column).to_owned(),
-                            expected_row.remove(*column).unwrap_or(Value::Null),
-                        )
-                    })
-                    .collect();
-                if table == "notes" {
-                    complete_expected.remove("text");
-                    complete_expected.remove("content_tag");
-                }
-                assert_eq!(actual, complete_expected, "persisted {table} row mismatch");
+                assert_eq!(actual, expected_row, "persisted {table} row mismatch");
+                expected_outbox.push((table, primary_key));
             }
         }
+        assert_eq!(observed_batch_updated_at, Some(expected_batch_updated_at));
 
-        let expected_order = [
-            ("books", "b-v19"),
-            ("notes", "n-v19-parent"),
-            ("notes", "n-v19-child"),
-            ("custom_ideas", "ci-v19"),
-            ("note_links", "link-v19"),
-            ("lenses", "lens-v19"),
-            ("collections", "col-v19"),
-            ("collection_memberships", "col-v19:n-v19-parent"),
-            ("note_signals", "n-v19-parent"),
-        ];
         let queued = store.outbox_items().unwrap();
-        assert_eq!(queued.len(), expected_order.len());
+        assert_eq!(queued.len(), expected_outbox.len());
         for ((_, table, record_id, payload, created_at), (expected_table, expected_id)) in
-            queued.iter().zip(expected_order)
+            queued.iter().zip(expected_outbox)
         {
             assert_eq!(table, expected_table);
-            assert_eq!(record_id.as_deref(), Some(expected_id));
-            assert_eq!(*created_at, FIXTURE_NOW);
+            assert_eq!(record_id.as_deref(), Some(expected_id.as_str()));
+            assert_eq!(*created_at, expected_batch_updated_at);
             let payload: Value = serde_json::from_str(payload).unwrap();
             assert_eq!(
                 payload.as_object(),
-                store.get_row(table, expected_id).unwrap().as_ref()
+                store.get_row(table, &expected_id).unwrap().as_ref()
             );
+            if table == "notes" {
+                let ciphertext = payload["text"].as_str().unwrap();
+                assert!(ciphertext.starts_with("enc:v2:"));
+                assert_eq!(
+                    vault
+                        .decrypt_note(Some(expected_id.clone()), ciphertext.to_string())
+                        .unwrap(),
+                    expected[table]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|row| row["id"] == expected_id)
+                        .unwrap()["text"]
+                        .as_str()
+                        .unwrap()
+                );
+            }
         }
+    }
+
+    #[test]
+    fn frozen_schema_19_import_stages_exact_rows_for_all_eight_stores() {
+        assert_fixture_import_matches_independent_oracle(SCHEMA_19_FIXTURE, SCHEMA_19_EXPECTED);
+    }
+
+    #[test]
+    fn frozen_schema_19_defaults_match_the_independent_all_store_oracle() {
+        assert_fixture_import_matches_independent_oracle(
+            SCHEMA_19_DEFAULTS_FIXTURE,
+            SCHEMA_19_DEFAULTS_EXPECTED,
+        );
     }
 
     #[test]

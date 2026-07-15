@@ -277,6 +277,22 @@ function assertArrayLengths(parsed, rows, expected, label) {
   }
 }
 
+function assertCompleteRows(actual, expected, label) {
+  assert.deepEqual(
+    Object.keys(expected),
+    Object.keys(ARRAY_TO_TABLE),
+    `${label}: expected oracle covers all eight stores`
+  );
+  assert.deepEqual(actual, expected, `${label}: complete normalized PWA rows`);
+}
+
+function readFullRows(expected, label) {
+  assert.equal(typeof expected.fullRows, 'string', `${label}: full-row oracle reference`);
+  const fullRows = JSON.parse(readFileSync(join(FIXTURE_DIR, expected.fullRows), 'utf8'));
+  assert.ok(fullRows && typeof fullRows === 'object', `${label}: full-row oracle object`);
+  return fullRows;
+}
+
 function assertCoreExportSurface(raw) {
   const topLevel = new Set([
     '_syntopicon',
@@ -428,8 +444,10 @@ async function validate() {
       const name = 'schema-19-all-stores.json';
       const { parsed, rows } = results.get(name);
       const expected = EXPECTED.fixtures[name];
+      const fullRows = readFullRows(expected, name);
       assert.equal(parsed.schemaVersion, expected.schemaVersion);
       assertArrayLengths(parsed, rows, expected.arrayLengths, name);
+      assertCompleteRows(rows, fullRows.pwaRows, name);
       const parent = rows.notes.find((note) => note.id === 'n-v19-parent');
       assert.equal(parent.contentTag, expected.parentContentTag);
       for (const key of expected.pwaPreservedExtraKeys) assert.ok(Object.hasOwn(parent, key));
@@ -440,13 +458,25 @@ async function validate() {
     }
 
     {
+      const name = 'schema-19-defaults.json';
+      const { parsed, rows } = results.get(name);
+      const expected = EXPECTED.fixtures[name];
+      const fullRows = readFullRows(expected, name);
+      assert.equal(parsed.schemaVersion, expected.schemaVersion);
+      assertArrayLengths(parsed, rows, expected.arrayLengths, name);
+      assertCompleteRows(rows, fullRows.pwaRows, name);
+    }
+
+    {
       const name = MANIFEST.coreExportFixture;
       const { raw, parsed, rows } = results.get(name);
       const expected = EXPECTED.fixtures[name];
+      const fullRows = readFullRows(expected, name);
       assertCoreExportSurface(raw);
       assert.equal(raw.exportedAt, expected.exportedAt);
       assert.equal(parsed.schemaVersion, expected.schemaVersion);
       assertArrayLengths(parsed, rows, expected.arrayLengths, name);
+      assertCompleteRows(rows, fullRows.pwaRows, name);
       const parent = rows.notes.find((note) => note.id === 'core-n-v19-parent');
       assert.equal(parent.contentTag, expected.parentContentTag);
       assert.deepEqual(parent.user_metadata.user_annotation, expected.parentUserAnnotation);
@@ -463,6 +493,7 @@ async function validate() {
     console.log(`pwa_fixtures_validated=${MANIFEST.pwaFixtures.length}`);
     console.log('core_export_fixtures_validated=1');
     console.log('stores_per_schema19_fixture=8');
+    console.log('full_row_oracles_validated=3');
     console.log(`v11_compositions_validated=${V11_THEN_V14.length}`);
     console.log(`v14_remaps_validated=${V14_REMAP.length}`);
     console.log('assertions=passed');
