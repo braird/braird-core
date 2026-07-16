@@ -246,5 +246,52 @@ fn flush_seals_text_and_upserts_via_token_handoff() {
     assert_eq!(patched["content_tag"], json!(server_tag));
     assert_eq!(patched["created_at"], server_created_at);
 
+    // A concurrent server-side removal between the host's live-row read and its PATCH must not be
+    // mistaken for success. PostgREST returns a successful status with an empty representation for
+    // the zero-match PATCH; the core must retain the outbox item for re-query/recovery.
+    let deleted = test_support::hard_delete(&env, "notes", &format!("id=eq.{note_id}"));
+    assert_eq!(
+        deleted.as_array().map(Vec::len),
+        Some(1),
+        "the test must remove exactly one remote note"
+    );
+    engine
+        .enqueue_note(NoteUpsert {
+            id: note_id.clone(),
+            book_id: None,
+            plaintext: None,
+            page: None,
+            tags: vec!["remote-missing".into()],
+            source: None,
+            source_id: None,
+            source_meta_json: None,
+            chapter: None,
+            image_path: None,
+            ink_crop_path: None,
+            created_at: 9_999_999_999_999,
+            deleted: false,
+            clear_nullable_fields: vec![],
+        })
+        .expect("enqueue patch for remotely missing note");
+
+    let missing_summary = engine.flush().expect("flush remotely missing patch");
+    assert_eq!(missing_summary.pushed, 0);
+    assert_eq!(missing_summary.still_queued, 1);
+    assert_eq!(
+        store.outbox_items().expect("retained patch outbox").len(),
+        1,
+        "the unconfirmed patch must stay queued"
+    );
+    assert_eq!(
+        test_support::select(
+            &env,
+            &user.access_token,
+            "notes",
+            &format!("id=eq.{note_id}")
+        ),
+        json!([]),
+        "a zero-match patch must not recreate the missing server row"
+    );
+
     let _ = std::fs::remove_file(&db_path);
 }
