@@ -8,10 +8,11 @@
 //!   Prefer: resolution=merge-duplicates
 //!   body: [ {row}, ... ]
 //!
-//!   PATCH {SUPABASE_URL}/rest/v1/{table}?{pk}=eq.{record_id}
+//!   PATCH {SUPABASE_URL}/rest/v1/{table}?{pk}=eq.{record_id}&select={pk}
 //!   apikey / Authorization / Content-Type as above
-//!   Prefer: return=minimal
+//!   Prefer: return=representation
 //!   body: {partial row without the primary key}
+//!   success: exactly one returned row with the expected primary key
 //!
 //! `user_id` is stamped onto each row by the caller (from the JWT `sub`), never stored in
 //! the outbox — exactly as the PWA injects the auth user id at write.
@@ -19,7 +20,9 @@
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value;
 
-/// A PostgREST error surfaced from a failed upsert. Coarse on purpose: the flush only needs
+const PATCH_CONFIRMATION_ERROR: &str = "targeted patch did not affect exactly one row";
+
+/// A PostgREST error surfaced from a failed mutation. Coarse on purpose: the flush only needs
 /// "did this table write succeed", and per-record failures stay queued for the next flush.
 #[derive(Debug)]
 pub struct PostgrestError {
@@ -123,6 +126,8 @@ impl PostgrestClient {
 
     /// Patch one existing row selected by `primary_key = record_id`. Unlike an upsert, PostgREST
     /// does not construct an INSERT candidate, so a narrow notes patch may omit NOT-NULL `text`.
+    /// The returned primary-key representation must confirm exactly one affected row before the
+    /// caller may clear the outbox item.
     pub async fn patch_existing(
         &self,
         table: &str,
@@ -137,7 +142,8 @@ impl PostgrestClient {
 
         let mut url = reqwest::Url::parse(&format!("{}/rest/v1/{}", self.base_url, table))?;
         url.query_pairs_mut()
-            .append_pair(primary_key, &format!("eq.{record_id}"));
+            .append_pair(primary_key, &format!("eq.{record_id}"))
+            .append_pair("select", primary_key);
 
         let mut headers = HeaderMap::new();
         headers.insert("apikey", HeaderValue::from_str(&self.anon_key)?);
@@ -146,7 +152,7 @@ impl PostgrestClient {
             HeaderValue::from_str(&format!("Bearer {token}"))?,
         );
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert("Prefer", HeaderValue::from_static("return=minimal"));
+        headers.insert("Prefer", HeaderValue::from_static("return=representation"));
 
         let resp = self
             .http
@@ -164,6 +170,24 @@ impl PostgrestClient {
                 body,
             }));
         }
+
+        let body = resp.text().await?;
+        let returned: Vec<Value> = serde_json::from_str(&body).map_err(|_| PostgrestError {
+            status: status.as_u16(),
+            body: PATCH_CONFIRMATION_ERROR.into(),
+        })?;
+        let confirmed = matches!(
+            returned.as_slice(),
+            [row]
+                if row.get(primary_key).and_then(Value::as_str) == Some(record_id)
+        );
+        if !confirmed {
+            return Err(Box::new(PostgrestError {
+                status: status.as_u16(),
+                body: PATCH_CONFIRMATION_ERROR.into(),
+            }));
+        }
+
         Ok(())
     }
 
@@ -568,6 +592,81 @@ pub fn user_id_from_jwt(jwt: &str) -> Result<String, Box<dyn std::error::Error +
 mod tests {
     use super::*;
     use base64::Engine;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc::{self, Receiver};
+    use std::time::Duration;
+
+    fn block_network<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    fn serve_once(body: &str) -> (String, Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = body.to_string();
+        let (request_tx, request_rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request_is_complete(&request) {
+                    break;
+                }
+            }
+            request_tx
+                .send(String::from_utf8_lossy(&request).into_owned())
+                .unwrap();
+
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        (format!("http://{address}"), request_rx)
+    }
+
+    fn request_is_complete(request: &[u8]) -> bool {
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        request.len() >= header_end + 4 + content_length
+    }
+
+    fn patch_client(base_url: String) -> PostgrestClient {
+        let mut client = PostgrestClient::new(base_url, "anon".into()).unwrap();
+        client.set_access_token("token".into());
+        client
+    }
 
     #[test]
     fn extracts_sub_from_jwt() {
@@ -603,6 +702,84 @@ mod tests {
         assert!(PostgrestClient::new("https://proj.supabase.co".into(), "anon".into()).is_ok());
         assert!(PostgrestClient::new("http://127.0.0.1:54321".into(), "anon".into()).is_ok());
         assert!(PostgrestClient::new("http://localhost:54321".into(), "anon".into()).is_ok());
+    }
+
+    #[test]
+    fn targeted_patch_rejects_a_success_response_that_affected_no_row() {
+        let (base_url, request_rx) = serve_once("[]");
+        let client = patch_client(base_url);
+
+        let result = block_network(client.patch_existing(
+            "notes",
+            "id",
+            "note-1",
+            &serde_json::json!({"tags":["after"]}),
+        ));
+
+        assert!(
+            result.is_err(),
+            "zero matched rows must keep the outbox patch queued"
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "PostgREST 200 — targeted patch did not affect exactly one row"
+        );
+
+        let request = request_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let request_line = request.lines().next().unwrap();
+        let target = request_line.split_whitespace().nth(1).unwrap();
+        let parsed = reqwest::Url::parse(&format!("http://localhost{target}")).unwrap();
+        let query: Vec<_> = parsed.query_pairs().collect();
+        assert_eq!(
+            query,
+            vec![
+                ("id".into(), "eq.note-1".into()),
+                ("select".into(), "id".into())
+            ]
+        );
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("prefer: return=representation")),
+            "the PATCH must request the affected row representation"
+        );
+    }
+
+    #[test]
+    fn targeted_patch_accepts_exactly_one_matching_returned_row() {
+        let (base_url, _request_rx) = serve_once(r#"[{"id":"note-1"}]"#);
+        let client = patch_client(base_url);
+
+        block_network(client.patch_existing(
+            "notes",
+            "id",
+            "note-1",
+            &serde_json::json!({"tags":["after"]}),
+        ))
+        .expect("one matching row confirms the targeted patch");
+    }
+
+    #[test]
+    fn targeted_patch_rejects_multiple_or_mismatched_returned_rows() {
+        for body in [
+            r#"[{"id":"note-1"},{"id":"note-1"}]"#,
+            r#"[{"id":"note-2"}]"#,
+        ] {
+            let (base_url, _request_rx) = serve_once(body);
+            let client = patch_client(base_url);
+
+            let result = block_network(client.patch_existing(
+                "notes",
+                "id",
+                "note-1",
+                &serde_json::json!({"tags":["after"]}),
+            ));
+
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "PostgREST 200 — targeted patch did not affect exactly one row"
+            );
+        }
     }
 
     #[test]

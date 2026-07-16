@@ -126,6 +126,23 @@ pub fn select(env: &SupabaseEnv, access_token: &str, table: &str, query: &str) -
         .expect("select body")
 }
 
+/// Hard-delete rows through the service-role client and return the deleted representation.
+/// Integration tests use this to simulate a row disappearing remotely while a live local row
+/// still has a queued patch.
+pub fn hard_delete(env: &SupabaseEnv, table: &str, query: &str) -> Value {
+    reqwest::blocking::Client::new()
+        .delete(format!("{}/rest/v1/{}?{}", env.url, table, query))
+        .header("apikey", &env.service_role_key)
+        .header("Authorization", format!("Bearer {}", env.service_role_key))
+        .header("Prefer", "return=representation")
+        .send()
+        .expect("hard delete send")
+        .error_for_status()
+        .expect("hard delete status")
+        .json()
+        .expect("hard delete body")
+}
+
 /// Upsert rows for the authenticated user in the PWA wire shape — the seed seam for the SUR-726
 /// coexistence matrix, where a test needs FULL column sets the partial `enqueue_*` FFI can't yet
 /// carry (a book's cover fields, a note's `image_path`/`source_meta`/…). `rows` is a JSON array of

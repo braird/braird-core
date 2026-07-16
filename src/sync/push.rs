@@ -383,6 +383,30 @@ mod tests {
     }
 
     #[test]
+    fn failed_plaintext_free_note_patch_stays_queued() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .enqueue(
+                "notes",
+                "n1",
+                r#"{"id":"n1","tags":["after"],"updated_at":20,"deleted":false}"#,
+                100,
+            )
+            .unwrap();
+
+        let sink = sink(Some("notes"));
+        let result = block(flush(&store, &sink, "user-1")).unwrap();
+
+        assert!(result.ok.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(
+            store.outbox_items().unwrap().len(),
+            1,
+            "an unconfirmed server patch must remain retryable"
+        );
+    }
+
+    #[test]
     fn unflushed_note_create_then_patch_still_upserts_the_collapsed_full_row() {
         let store = Store::open_in_memory().unwrap();
         store

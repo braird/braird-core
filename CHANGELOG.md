@@ -6,6 +6,14 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Fixed
+
+- **SUR-921 follow-up — retain sparse note patches when the server target is missing.** Targeted
+  note `PATCH` requests now ask PostgREST to return only the affected primary key and clear their
+  outbox entries only after exactly one matching row is confirmed. A successful zero-row response
+  (for example, when another device removed the server row after the local work list was read) is
+  treated as a retryable flush failure instead of silently dropping the plaintext-free patch.
+
 ## [0.7.0] - 2026-07-16
 
 Eleventh release batch. **SUR-921** adds the true tags-only note patch required by the native
