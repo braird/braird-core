@@ -6,6 +6,15 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-07-17
+
+Fifteenth release batch. Patch release: a silent lost-write on the collection-membership sync path,
+surfaced by the SUR-927 (Android Add-to-collection) sync-reviewer gate — the first host feature to
+queue a membership tombstone. An offline (or between-flush) toggle-off→on of the same membership
+collapsed in the outbox to a sticky `deleted:true`, dropping the note from the collection on push
+while the local mirror still showed it filed. Internal staging only — no FFI signature/docstring
+change, bindings unchanged; consumers bump their pin to v0.8.1 for the corrected offline behavior.
+
 ### Fixed
 - **`enqueue_collection_membership` re-add now resurrects past the outbox sticky-delete (SUR-940).**
   A `deleted = false` file/re-add routes through `stage_local_write_resurrecting` (dropping any
