@@ -210,8 +210,9 @@ fn map_note(row: &Map<String, Value>, vault: &Vault) -> Result<Value, SyncError>
     mapped
         .as_object_mut()
         .expect("mapped note is an object")
-        // A note with no text exports `text: null` — the shape import already contracts for ("a
-        // supported legacy note with omitted text remains null"), so this round-trips.
+        // A note with no text exports `text: null`, like every other absent field in this shape.
+        // `normalize_note` had to be taught to accept that (it was the one non-nullable string field),
+        // so the core can re-import its own export — pinned by `a_null_text_note_survives_export_then_import`.
         .insert("text".into(), text.map_or(Value::Null, Value::String));
     Ok(mapped)
 }
@@ -397,6 +398,49 @@ mod tests {
                 snapshot.err(),
             );
         }
+    }
+
+    /// The core must be able to re-import its OWN export (SUR-934, crypto-reviewer BLOCKER).
+    ///
+    /// The exporter emits every note key via `map_fields`, so a note with no text ships an explicit
+    /// `"text": null` — and `normalize_note` was rejecting exactly that (`text` was the ONE string field
+    /// marked non-nullable, while `bookId`/`page`/`imagePath`/… are all nullable). So export→import, the
+    /// whole point of a backup, failed on the very shape this ticket just made reachable. Nothing caught
+    /// it because neither side had an end-to-end round-trip test: the import fixture omitted `text`
+    /// entirely rather than setting it null.
+    ///
+    /// This walks the real path — `build_snapshot_at` → `parse_import_at` — rather than asserting on a
+    /// hand-written archive, so the two halves cannot drift apart again.
+    #[test]
+    fn a_null_text_note_survives_export_then_import() {
+        let store = Store::open_in_memory().unwrap();
+        let vault = Vault::generate();
+        put(&store, "notes", raw_note_row("no-text", Value::Null, 1));
+        put(
+            &store,
+            "notes",
+            note_row(&vault, "sealed", "the sealed body", 2, false),
+        );
+
+        let snapshot = super::build_snapshot_at(&store, &vault, 0).expect("export must survive");
+        let root: Value = serde_json::from_str(&snapshot).unwrap();
+        let exported = root["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == "no-text")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            exported["text"],
+            Value::Null,
+            "a note with no text exports null"
+        );
+
+        let parsed = crate::sync::export_import::import::parse_import_at(&snapshot, 0)
+            .expect("the core must be able to re-import its own export");
+
+        assert_eq!(parsed.notes.len(), 2, "both notes survive the round-trip");
     }
 
     /// The sealed note must still survive an export that also contains an unsealed one — a partial

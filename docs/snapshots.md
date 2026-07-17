@@ -94,6 +94,9 @@ Validation happens before token checks, network access, crypto work, or store wr
 - each known store must be an array when present (`null` or absent is treated as empty);
 - each row must be an object with its required non-empty string primary key (`noteId` for
   `noteSignals`, `id` for the other stores);
+- a note's `text` may be omitted **or** explicitly `null` — both mean "this note has no text", and
+  neither is given an invented plaintext or content tag. The exporter emits every note key, so an
+  explicit `null` is the shape a native export actually produces (SUR-934);
 - primary keys must be unique within each archive store;
 - known fields must have their documented JSON types, including integer timestamps/counts and
   finite signal numbers; and

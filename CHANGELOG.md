@@ -16,8 +16,16 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   resolves `text` through the read path's own `decrypt_note_text`, so there is one rule instead of two.
   Genuine fail-closed behaviour is unchanged: a *sealed* row that fails to decrypt still fails the
   whole export — never a partial archive, never ciphertext in place of plaintext, never a dropped row.
-  A note with no text exports `text: null`, which import already contracts for. `docs/snapshots.md`
-  now states the four-case contract that was previously only implied by "Note `text` is plaintext".
+  A note with no text exports `text: null`. `docs/snapshots.md` now states the four-case contract that
+  was previously only implied by "Note `text` is plaintext".
+- **The core can re-import its own export (SUR-934).** `normalize_note` rejected an explicit
+  `"text": null` — `text` was the one string field marked non-nullable, while `bookId`, `page`,
+  `imagePath`, `inkCropPath`, and `sourceId` all accept null. Since the exporter emits every note key,
+  a text-less note ships `"text": null`, so export→import — the entire point of a backup — failed on
+  the shape the fix above makes reachable. An omitted `text` was always accepted; an explicit null is
+  the same fact stated out loud, and `merge`'s `prepare_write` already handled it. Caught by
+  crypto-reviewer, and now pinned by an end-to-end `build_snapshot_at` → `parse_import_at` round-trip
+  test — neither side had one, which is why the two halves could disagree.
 
 ## [0.7.1] - 2026-07-16
 
