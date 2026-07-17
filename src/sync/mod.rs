@@ -558,7 +558,25 @@ impl SyncEngine {
         row.insert("created_at".into(), json!(created_at));
         row.insert("updated_at".into(), json!(now));
         row.insert("deleted".into(), json!(deleted));
-        self.stage_write("collection_memberships", &id, row)
+        // A re-add (deleted=false) must RESURRECT: atomically drop any un-flushed tombstone for this
+        // deterministic membership id, so the outbox collapse can't eat the un-delete. Without it, an
+        // offline (or between-flush) file→off→on collapses to a sticky `deleted:true` (SUR-724 "delete
+        // wins") and the note is silently dropped from the collection on push, while the local mirror
+        // still shows it filed (SUR-940). A soft-delete (deleted=true) stays on the sticky path — a
+        // delete SHOULD win. Memberships are the only reachable resurrection case:
+        //  - note_links use a random per-edge pk (a re-add is a new row, not a same-pk un-delete);
+        //  - custom_ideas re-create with a fresh host uuid (a new row, same reason) — the only same-id
+        //    re-create is the reconcile pass's deterministic `cidea_sur597_*`, which runs POST-PULL
+        //    (across a flush), so the prior soft-delete is already pushed and its tombstone gone;
+        //  - collections/lenses have no re-add-after-delete host UI yet.
+        // Extend the split here if any of those grows a same-pk, same-batch re-add path.
+        if deleted {
+            self.stage_write("collection_memberships", &id, row)
+        } else {
+            lock!(self.store)
+                .stage_local_write_resurrecting("collection_memberships", &id, row, now)
+                .map_err(|e| SyncError::Store(e.to_string()))
+        }
     }
 
     /// Enqueue a note-signals upsert (SUR-726) — per-note behavioural counters, keyed by `note_id`
@@ -2270,6 +2288,85 @@ mod tests {
         assert_eq!(payload["id"], json!("colY:noteX"));
         assert_eq!(payload["note_id"], json!("noteX"));
         assert_eq!(payload["collection_id"], json!("colY"));
+    }
+
+    /// Collapse the store's whole outbox exactly as the flush would, and return the pushed `deleted`
+    /// field of the sole `collection_memberships` upsert. The tests assert the COLLAPSED OUTBOX (what
+    /// push sends) rather than a `collection_ids_for_note` read, because the local synced mirror is
+    /// correct under the SUR-940 bug — only the pushed payload was wrong.
+    fn collapsed_membership_deleted(db_path: &str) -> Value {
+        let items: Vec<crate::sync::outbox::OutboxItem> = Store::open(db_path)
+            .unwrap()
+            .outbox_items()
+            .unwrap()
+            .into_iter()
+            .map(|(id, table_name, record_id, payload, created_at)| {
+                crate::sync::outbox::OutboxItem {
+                    id,
+                    table_name,
+                    record_id,
+                    payload: serde_json::from_str(&payload).unwrap(),
+                    created_at,
+                }
+            })
+            .collect();
+        crate::sync::outbox::collapse(items, &std::collections::BTreeMap::new())
+            .iter()
+            .find(|c| c.table == "collection_memberships")
+            .expect("a membership upsert is queued")
+            .payload["deleted"]
+            .clone()
+    }
+
+    #[test]
+    fn membership_re_add_resurrects_past_the_outbox_sticky_delete() {
+        // SUR-940: file → toggle-off → toggle-on of the same membership within one un-flushed batch.
+        // The re-add must drop the queued tombstone so the collapsed push payload is deleted=false —
+        // otherwise the note is silently dropped from the collection server-side.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        engine
+            .enqueue_collection_membership("n1".into(), "c1".into(), 100, false)
+            .unwrap(); // file
+        engine
+            .enqueue_collection_membership("n1".into(), "c1".into(), 100, true)
+            .unwrap(); // off
+        engine
+            .enqueue_collection_membership("n1".into(), "c1".into(), 100, false)
+            .unwrap(); // on
+
+        assert_eq!(
+            collapsed_membership_deleted(db_path),
+            json!(false),
+            "re-add wins: the collapsed push payload un-deletes the membership, not a sticky tombstone",
+        );
+    }
+
+    #[test]
+    fn membership_delete_without_re_add_still_wins_the_collapse() {
+        // The OTHER branch (guards against a refactor routing the soft-delete through the resurrecting
+        // stage too): file → toggle-off with NO re-add must collapse to a sticky deleted=true — a
+        // genuine removal must still push a tombstone.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        engine
+            .enqueue_collection_membership("n1".into(), "c1".into(), 100, false)
+            .unwrap(); // file
+        engine
+            .enqueue_collection_membership("n1".into(), "c1".into(), 100, true)
+            .unwrap(); // off
+
+        assert_eq!(
+            collapsed_membership_deleted(db_path),
+            json!(true),
+            "a genuine remove must still win the collapse — the sticky-delete is intact",
+        );
     }
 
     #[test]
