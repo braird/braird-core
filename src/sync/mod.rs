@@ -551,24 +551,6 @@ impl SyncEngine {
     ) -> Result<(), SyncError> {
         let now = epoch_ms();
         let id = crate::store::membership_id(&collection_id, &note_id);
-        // A tombstone PRESERVES the membership's original `created_at`, mirroring surfc's
-        // `removeNoteFromCollection` → `softDeleteMembershipRows` (which tombstones the *stored* row,
-        // `{ ...m, deleted: 1 }`, rather than reconstructing it from the two ids). The pushed payload
-        // IS the outbox partial and the server column is NOT NULL, so a reconstruct-from-ids tombstone
-        // would carry the host clock, not the filed-at instant — and the host can't supply the real
-        // one (`collection_ids_for_note` exposes no timestamp). Read it from the local mirror here;
-        // fall back to the host value only when no row exists (parity with the PWA's
-        // `?? { createdAt: now }`). An active add/re-add keeps the host value — `addNoteToCollection`
-        // stamps `now` too. Same preserve reconcile's `repoint_memberships` already does.
-        let created_at = if deleted {
-            lock!(self.store)
-                .get_row("collection_memberships", &id)
-                .map_err(|e| SyncError::Store(e.to_string()))?
-                .and_then(|r| r.get("created_at").and_then(Value::as_i64))
-                .unwrap_or(created_at)
-        } else {
-            created_at
-        };
         let mut row = Map::new();
         row.insert("id".into(), json!(id));
         row.insert("note_id".into(), json!(note_id));
@@ -589,7 +571,29 @@ impl SyncEngine {
         //  - collections/lenses have no re-add-after-delete host UI yet.
         // Extend the split here if any of those grows a same-pk, same-batch re-add path.
         if deleted {
-            self.stage_write("collection_memberships", &id, row)
+            // A tombstone PRESERVES the membership's filed-at `created_at`, mirroring surfc's
+            // `removeNoteFromCollection` → `softDeleteMembershipRows` (which tombstones the *stored*
+            // row, `{ ...m, deleted: 1 }`, not a reconstruct-from-ids): the host can't supply it
+            // (`collection_ids_for_note` exposes no timestamp) and the pushed payload IS the outbox
+            // partial (server column NOT NULL), so read it here and overwrite the host stand-in;
+            // fall back to the host value when no row exists (parity with the PWA's
+            // `?? { createdAt: now }`). The same preserve reconcile's `repoint_memberships` does. The
+            // lookup and the stage share ONE held guard — `SyncEngine` is called from any host thread,
+            // and a released-then-reacquired lock would let a concurrent re-add stage `deleted:false`
+            // between them, with this tombstone landing after it and collapsing sticky-deleted (the
+            // SUR-940 loss, re-opened as a race). `stage_local_write` on the held guard does not
+            // re-lock.
+            let store = lock!(self.store);
+            if let Some(existing) = store
+                .get_row("collection_memberships", &id)
+                .map_err(|e| SyncError::Store(e.to_string()))?
+                .and_then(|r| r.get("created_at").and_then(Value::as_i64))
+            {
+                row.insert("created_at".into(), json!(existing));
+            }
+            store
+                .stage_local_write("collection_memberships", &id, row, now)
+                .map_err(|e| SyncError::Store(e.to_string()))
         } else {
             lock!(self.store)
                 .stage_local_write_resurrecting("collection_memberships", &id, row, now)
