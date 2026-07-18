@@ -520,7 +520,9 @@ impl SyncEngine {
     ///   ciphertext is never read or re-sealed.
     /// - Children carry `source = "handwritten"`, empty tags, the parent's book, and `created_at`
     ///   staggered by index so review order survives LWW. Note-links are a random-pk bag (host ids), so
-    ///   a re-run just adds a fresh set and tombstones the prior one — no resurrect hazard.
+    ///   a re-run with fresh ids adds a new set and tombstones the prior one; a retry re-sending the SAME
+    ///   ids is idempotent — a row in the new set is NEVER retired, so the batch can't stage a create then
+    ///   a sticky delete for it (SUR-724 collapse) and destroy the margins it meant to preserve.
     /// - Retiring the prior set ALWAYS tombstones this parent's edges, but tombstones a child NOTE only
     ///   when it is still a live handwritten note that NO OTHER live edge — any relation type, either
     ///   direction — still touches. `note_links` are generic and the reconciler preserves/repoints every
@@ -616,8 +618,20 @@ impl SyncEngine {
             .iter()
             .map(|(edge_id, _)| edge_id.clone())
             .collect();
+        // Ids the create loop just staged LIVE. An idempotent retry re-sends the same MarginChild ids, so
+        // a prior child/edge sits in BOTH old_edges and the new set; retiring it here would stage a
+        // tombstone for a row this same batch just created, and the outbox collapse makes deletes sticky
+        // (SUR-724 "delete wins, never resurrect") — turning the margins we meant to preserve into
+        // tombstones. Never retire a row that's part of the new set.
+        let new_child_ids: std::collections::HashSet<&str> =
+            children.iter().map(|c| c.id.as_str()).collect();
+        let new_link_ids: std::collections::HashSet<&str> =
+            children.iter().map(|c| c.link_id.as_str()).collect();
         let mut tombstoned: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (edge_id, child_id) in &old_edges {
+            if new_link_ids.contains(edge_id.as_str()) {
+                continue; // the new set re-creates this edge live — don't tombstone it (retry preservation)
+            }
             let mut edge_tomb = Map::new();
             edge_tomb.insert("id".into(), json!(edge_id));
             edge_tomb.insert("deleted".into(), json!(true));
@@ -626,6 +640,9 @@ impl SyncEngine {
 
             if tombstoned.contains(child_id) {
                 continue; // this parent has >1 edge to the same child — tombstone the note once
+            }
+            if new_child_ids.contains(child_id.as_str()) {
+                continue; // the new set re-creates this child live — never tombstone it (retry preservation)
             }
             // Target still a live handwritten child? (A repointed edge can sit on a regular survivor.)
             let is_live_handwritten = store
@@ -2985,6 +3002,49 @@ mod tests {
         assert!(
             c1_edges.contains("e-rel"),
             "the non-handwritten edge survives, its target intact"
+        );
+    }
+
+    #[test]
+    fn replace_handwritten_annotations_idempotent_retry_with_same_ids_preserves_margins() {
+        // A retry re-sends the SAME MarginChild ids. The prior child/edge are in old_edges AND the new
+        // set; retiring them in the same batch would stage a create then a sticky tombstone (SUR-724
+        // collapse) and destroy the very margins being preserved. Rows in the new set must never retire.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+        let make = || vec![margin("c1", "e1", "keep me"), margin("c2", "e2", "and me")];
+
+        engine
+            .replace_handwritten_annotations("p".into(), make())
+            .unwrap();
+        let n = engine
+            .replace_handwritten_annotations("p".into(), make())
+            .unwrap(); // idempotent retry
+
+        assert_eq!(n, 2);
+        assert!(
+            engine.get_note("c1".into()).unwrap().is_some(),
+            "c1 preserved across the retry"
+        );
+        assert!(
+            engine.get_note("c2".into()).unwrap().is_some(),
+            "c2 preserved across the retry"
+        );
+        let edges: std::collections::HashSet<String> = engine
+            .note_links_for_note("p".into())
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(
+            edges,
+            ["e1".to_string(), "e2".to_string()]
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>(),
+            "both edges stay live — no self-inflicted tombstone",
         );
     }
 

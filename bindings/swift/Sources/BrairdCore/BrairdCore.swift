@@ -847,7 +847,9 @@ public protocol SyncEngineProtocol : AnyObject {
      * ciphertext is never read or re-sealed.
      * - Children carry `source = "handwritten"`, empty tags, the parent's book, and `created_at`
      * staggered by index so review order survives LWW. Note-links are a random-pk bag (host ids), so
-     * a re-run just adds a fresh set and tombstones the prior one — no resurrect hazard.
+     * a re-run with fresh ids adds a new set and tombstones the prior one; a retry re-sending the SAME
+     * ids is idempotent — a row in the new set is NEVER retired, so the batch can't stage a create then
+     * a sticky delete for it (SUR-724 collapse) and destroy the margins it meant to preserve.
      * - Retiring the prior set ALWAYS tombstones this parent's edges, but tombstones a child NOTE only
      * when it is still a live handwritten note that NO OTHER live edge — any relation type, either
      * direction — still touches. `note_links` are generic and the reconciler preserves/repoints every
@@ -1484,7 +1486,9 @@ open func recentNote(nowMs: Int64, seed: UInt64)throws  -> NoteRecord? {
      * ciphertext is never read or re-sealed.
      * - Children carry `source = "handwritten"`, empty tags, the parent's book, and `created_at`
      * staggered by index so review order survives LWW. Note-links are a random-pk bag (host ids), so
-     * a re-run just adds a fresh set and tombstones the prior one — no resurrect hazard.
+     * a re-run with fresh ids adds a new set and tombstones the prior one; a retry re-sending the SAME
+     * ids is idempotent — a row in the new set is NEVER retired, so the batch can't stage a create then
+     * a sticky delete for it (SUR-724 collapse) and destroy the margins it meant to preserve.
      * - Retiring the prior set ALWAYS tombstones this parent's edges, but tombstones a child NOTE only
      * when it is still a live handwritten note that NO OTHER live edge — any relation type, either
      * direction — still touches. `note_links` are generic and the reconciler preserves/repoints every
@@ -5063,7 +5067,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_recent_note() != 17557) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 57913) {
+    if (uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 37832) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_search() != 14411) {
