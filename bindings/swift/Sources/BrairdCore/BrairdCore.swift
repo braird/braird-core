@@ -839,8 +839,13 @@ public protocol SyncEngineProtocol : AnyObject {
      * re-run reads prior children from live edges, so an edgeless orphan is invisible to cleanup). One
      * transaction closes that window — the whole replace commits or rolls back, and a retry re-does it.
      *
-     * - Empty [`children`] is a no-op that leaves existing margins intact (PWA early-return parity) —
-     * guarded before any read so it can't error on a missing/locked parent.
+     * - Texts are trimmed and blank items dropped IN CORE (the PWA filters before its length check);
+     * an empty or all-blank [`children`] is a no-op that leaves existing margins intact — guarded
+     * before any read so it can't error on a missing/locked parent.
+     * - Host-minted ids are validated fail-loud before staging: a child/link id equal to the parent, a
+     * duplicate id within the call, a child id colliding with an existing non-margin note, or a link
+     * id owned by another note's edge rejects the WHOLE call — each would silently corrupt or orphan
+     * a row (re-seal over a foreign note, an edgeless child, a stolen edge).
      * - The parent must exist and be live; its CURRENT `book_id` is read here, so children file where
      * the parent lives now, not where a host snapshot thought it did.
      * - Allowed on a decrypt-failed parent: only the NEW child bodies are sealed; the parent's
@@ -851,13 +856,21 @@ public protocol SyncEngineProtocol : AnyObject {
      * Note-links are a random-pk bag (host ids), so
      * a re-run with fresh ids adds a new set and tombstones the prior one; a retry re-sending the SAME
      * ids is idempotent — a row in the new set is NEVER retired, so the batch can't stage a create then
-     * a sticky delete for it (SUR-724 collapse) and destroy the margins it meant to preserve.
-     * - Retiring the prior set ALWAYS tombstones this parent's edges, but tombstones a child NOTE only
-     * when it is still a live handwritten note that NO OTHER live edge — any relation type, either
-     * direction — still touches. `note_links` are generic and the reconciler preserves/repoints every
-     * type, so a margin child can be a repointed regular survivor, a shared child of several parents,
-     * or carry a non-handwritten edge (e.g. an imported `related` row); in each case deleting the note
-     * would dangle another edge or destroy a regular note, so only the edge is retired.
+     * a sticky delete for it (SUR-724 collapse) and destroy the margins it meant to preserve. The same
+     * holds ACROSS batches: a live write in this batch drops any still-queued tombstone for its id from
+     * a PREVIOUS (offline, un-flushed) replace ([`Store::stage_local_writes`]' resurrect rule), so a
+     * retry/restore that re-creates a previously retired id flushes live, not as a sticky delete the
+     * strict-tie LWW pull could never repair.
+     * - Retiring the prior set ALWAYS tombstones this parent's edges — as the STORED row's full
+     * NOT-NULL shape with its `created_at` preserved (the SUR-942 membership convention; note_links
+     * has no sparse-PATCH flush fallback, so a bare tombstone would 23502 and wedge the outbox) —
+     * but tombstones a child NOTE only when it is still a live handwritten note that NO OTHER live
+     * edge — any relation type, either direction — still touches, and never the parent itself (a
+     * corrupt self-edge retires the edge only). `note_links` are generic and the reconciler
+     * preserves/repoints every type, so a margin child can be a repointed regular survivor, a shared
+     * child of several parents, or carry a non-handwritten edge (e.g. an imported `related` row); in
+     * each case deleting the note would dangle another edge or destroy a regular note, so only the
+     * edge is retired.
      *
      * Returns the count of margin children created.
      */
@@ -1480,8 +1493,13 @@ open func recentNote(nowMs: Int64, seed: UInt64)throws  -> NoteRecord? {
      * re-run reads prior children from live edges, so an edgeless orphan is invisible to cleanup). One
      * transaction closes that window — the whole replace commits or rolls back, and a retry re-does it.
      *
-     * - Empty [`children`] is a no-op that leaves existing margins intact (PWA early-return parity) —
-     * guarded before any read so it can't error on a missing/locked parent.
+     * - Texts are trimmed and blank items dropped IN CORE (the PWA filters before its length check);
+     * an empty or all-blank [`children`] is a no-op that leaves existing margins intact — guarded
+     * before any read so it can't error on a missing/locked parent.
+     * - Host-minted ids are validated fail-loud before staging: a child/link id equal to the parent, a
+     * duplicate id within the call, a child id colliding with an existing non-margin note, or a link
+     * id owned by another note's edge rejects the WHOLE call — each would silently corrupt or orphan
+     * a row (re-seal over a foreign note, an edgeless child, a stolen edge).
      * - The parent must exist and be live; its CURRENT `book_id` is read here, so children file where
      * the parent lives now, not where a host snapshot thought it did.
      * - Allowed on a decrypt-failed parent: only the NEW child bodies are sealed; the parent's
@@ -1492,13 +1510,21 @@ open func recentNote(nowMs: Int64, seed: UInt64)throws  -> NoteRecord? {
      * Note-links are a random-pk bag (host ids), so
      * a re-run with fresh ids adds a new set and tombstones the prior one; a retry re-sending the SAME
      * ids is idempotent — a row in the new set is NEVER retired, so the batch can't stage a create then
-     * a sticky delete for it (SUR-724 collapse) and destroy the margins it meant to preserve.
-     * - Retiring the prior set ALWAYS tombstones this parent's edges, but tombstones a child NOTE only
-     * when it is still a live handwritten note that NO OTHER live edge — any relation type, either
-     * direction — still touches. `note_links` are generic and the reconciler preserves/repoints every
-     * type, so a margin child can be a repointed regular survivor, a shared child of several parents,
-     * or carry a non-handwritten edge (e.g. an imported `related` row); in each case deleting the note
-     * would dangle another edge or destroy a regular note, so only the edge is retired.
+     * a sticky delete for it (SUR-724 collapse) and destroy the margins it meant to preserve. The same
+     * holds ACROSS batches: a live write in this batch drops any still-queued tombstone for its id from
+     * a PREVIOUS (offline, un-flushed) replace ([`Store::stage_local_writes`]' resurrect rule), so a
+     * retry/restore that re-creates a previously retired id flushes live, not as a sticky delete the
+     * strict-tie LWW pull could never repair.
+     * - Retiring the prior set ALWAYS tombstones this parent's edges — as the STORED row's full
+     * NOT-NULL shape with its `created_at` preserved (the SUR-942 membership convention; note_links
+     * has no sparse-PATCH flush fallback, so a bare tombstone would 23502 and wedge the outbox) —
+     * but tombstones a child NOTE only when it is still a live handwritten note that NO OTHER live
+     * edge — any relation type, either direction — still touches, and never the parent itself (a
+     * corrupt self-edge retires the edge only). `note_links` are generic and the reconciler
+     * preserves/repoints every type, so a margin child can be a repointed regular survivor, a shared
+     * child of several parents, or carry a non-handwritten edge (e.g. an imported `related` row); in
+     * each case deleting the note would dangle another edge or destroy a regular note, so only the
+     * edge is retired.
      *
      * Returns the count of margin children created.
      */
@@ -5085,7 +5111,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_recent_note() != 17557) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 41694) {
+    if (uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 53570) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_search() != 14411) {

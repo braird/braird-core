@@ -29,7 +29,19 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   Retiring the prior set only ever tombstones this parent's edges — a child NOTE is tombstoned only when
   it's a live handwritten note that no other live edge (any relation/direction) touches and that isn't
   part of the new set (so a repointed regular survivor, a shared child, a child with a non-handwritten
-  edge, or an idempotent same-id retry can't lose data). New FFI symbol + `MarginChild` record →
+  edge, or an idempotent same-id retry can't lose data). Live writes in the batch drop any still-queued
+  tombstone for their id from a previous un-flushed replace (`stage_local_writes` resurrect rule, the
+  `stage_import_batch` sibling) — otherwise the SUR-724 sticky collapse would flush a re-created margin
+  as deleted with a fresh `updated_at`, a divergence the strict-tie LWW pull can never repair. Prior-edge
+  tombstones carry the STORED row's full NOT-NULL shape with `created_at` preserved (the SUR-942
+  membership convention; `note_links` has no sparse-PATCH flush fallback, so a bare `{id, deleted}`
+  tombstone would 23502 on every flush and wedge the outbox — found by the SUR-952 adversarial sweep).
+  Texts are trimmed and blank items dropped in core (PWA filters before its length check — an all-blank
+  call preserves existing margins); create rows write `book_id`/`ink_crop_path` as EXPLICIT nulls when
+  absent so an id-reusing restore can't resurrect stale fields off its tombstoned row; host-minted ids
+  are validated fail-loud (parent collision, in-call duplicates, collision with a non-margin note, a
+  link id owned by another note's edge — each would corrupt or orphan a row); a corrupt p→p self-edge
+  retires the edge only, never the parent. New FFI symbol + `MarginChild` record →
   bindings regenerated; 2 args (`String` + `Vec<MarginChild>`), record lowers as one `RustBuffer`, so
   no arm64 >8-slot spill. Consumers bump their pin to pick it up.
 
