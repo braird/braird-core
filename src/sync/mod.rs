@@ -639,14 +639,17 @@ impl SyncEngine {
             children.iter().map(|c| c.link_id.as_str()).collect();
         let mut tombstoned: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (edge_id, child_id) in &old_edges {
-            if new_link_ids.contains(edge_id.as_str()) {
-                continue; // the new set re-creates this edge live — don't tombstone it (retry preservation)
+            // Tombstone this parent's edge UNLESS the new set re-creates/repoints it live (the create loop
+            // keeps it). But do NOT `continue` on a reused edge: the create loop may have repointed that
+            // edge to a NEW child, orphaning THIS old child — so the old-child retirement check below must
+            // still run (skipping only the edge tombstone, never the child cleanup).
+            if !new_link_ids.contains(edge_id.as_str()) {
+                let mut edge_tomb = Map::new();
+                edge_tomb.insert("id".into(), json!(edge_id));
+                edge_tomb.insert("deleted".into(), json!(true));
+                edge_tomb.insert("updated_at".into(), json!(now));
+                writes.push(("note_links", edge_id.clone(), edge_tomb));
             }
-            let mut edge_tomb = Map::new();
-            edge_tomb.insert("id".into(), json!(edge_id));
-            edge_tomb.insert("deleted".into(), json!(true));
-            edge_tomb.insert("updated_at".into(), json!(now));
-            writes.push(("note_links", edge_id.clone(), edge_tomb));
 
             if tombstoned.contains(child_id) {
                 continue; // this parent has >1 edge to the same child — tombstone the note once
@@ -3056,6 +3059,54 @@ mod tests {
                 .into_iter()
                 .collect::<std::collections::HashSet<_>>(),
             "both edges stay live — no self-inflicted tombstone",
+        );
+    }
+
+    #[test]
+    fn replace_handwritten_annotations_reused_link_with_new_child_retires_the_old_orphan() {
+        // A rebuild reuses a prior link_id but with a DIFFERENT child id. The create loop repoints that
+        // edge to the new child; the OLD child would be left live + edgeless — the exact orphan this op
+        // exists to prevent. Skipping the edge tombstone must NOT skip the old-child retirement.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+        engine
+            .replace_handwritten_annotations("p".into(), vec![margin("old", "e1", "old margin")])
+            .unwrap();
+
+        // Reuse link id e1, new child id "new".
+        engine
+            .replace_handwritten_annotations(
+                "p".into(),
+                vec![margin("new", "e1", "rebuilt margin")],
+            )
+            .unwrap();
+
+        assert!(
+            engine.get_note("old".into()).unwrap().is_none(),
+            "the orphaned old child is retired, not leaked"
+        );
+        assert!(
+            engine.get_note("new".into()).unwrap().is_some(),
+            "the new child is live"
+        );
+        let from_p: Vec<_> = engine
+            .note_links_for_note("p".into())
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.from_note_id == "p")
+            .collect();
+        assert_eq!(
+            from_p.len(),
+            1,
+            "exactly one live edge from p — no orphan, no duplicate"
+        );
+        assert_eq!(
+            (from_p[0].id.as_str(), from_p[0].to_note_id.as_str()),
+            ("e1", "new"),
+            "e1 repointed to the new child"
         );
     }
 
