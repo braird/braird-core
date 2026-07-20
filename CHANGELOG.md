@@ -38,6 +38,12 @@ SUR-956 margins no-op guard so an already-annotated note still records margin en
   host's delete would otherwise take the resurrect path and drop the queued signals tombstone, leaving
   live signal metadata for a dead note. An *absent* local note row is unaffected (a note created on
   another device and not yet synced down still births its signals row with a default `source_prior`).
+  This narrows the orphaned-signals window to the same device; it does not close it fleet-wide. A
+  device that has not yet pulled the note's tombstone still sees a live local row, so a signal it
+  fires there wins on whole-row LWW and leaves the `note_signals` row live for a deleted note — and
+  an absent local row is ambiguous (never-synced-down vs deleted-elsewhere, since a pull skips an
+  incoming tombstone when no local row exists). Retiring those needs a post-pull signals
+  reconciliation pass, which does not exist yet.
 - **`soft_delete_signals_for_note(note_id)` — note_signals tombstone on note delete (SUR-966).** ALWAYS
   stages a whole-shape tombstone even when this device holds no local signals row — the cross-device tail:
   another device may hold a live cloud row this delete must tear down, else orphaned signal metadata

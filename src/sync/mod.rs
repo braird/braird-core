@@ -980,6 +980,13 @@ impl SyncEngine {
         // metadata for a deleted note, the orphaned-row leak this op exists to prevent. An ABSENT
         // note row stays allowed (created on another device, not yet synced down — documented
         // above); only a LOCALLY-DELETED one is the no-op.
+        //
+        // SAME-DEVICE ONLY, deliberately. This does not close the leak fleet-wide, and absent is
+        // AMBIGUOUS — not proven-safe: `pull` skips an incoming tombstone when there is no local
+        // row, so "never synced down" and "deleted on another device" look identical here, and a
+        // device that has not yet pulled a tombstone still holds a LIVE local row whose signal wins
+        // on whole-row LWW. Retiring those needs a post-pull signals reconciliation pass (none
+        // exists); the FFI has no note-existence read-back that would let a host disambiguate.
         if note
             .as_ref()
             .is_some_and(|r| matches!(r.get("deleted"), Some(Value::Bool(true))))
