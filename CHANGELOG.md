@@ -52,7 +52,14 @@ SUR-956 margins no-op guard so an already-annotated note still records margin en
   fires there wins on whole-row LWW and leaves the `note_signals` row live for a deleted note — and
   an absent local row is ambiguous (never-synced-down vs deleted-elsewhere, since a pull skips an
   incoming tombstone when no local row exists). Retiring those needs a post-pull signals
-  reconciliation pass, which does not exist yet.
+  reconciliation pass, which does not exist yet — **SUR-976**.
+  Two paths still reach the unknown-source fallback legitimately, and pin there because nothing
+  re-derives a stored prior: a **visible note with a null `source`** (correct — there is nothing
+  better to derive from; only reachable by pull/import, since `enqueue_note`'s create path defaults
+  source to `manual`), and a **tombstone staged with no local note row**, which must stage regardless
+  and so fabricates the fallback — a value a later resurrect reads verbatim, so a `handwritten` note
+  retired that way comes back pinned at 0.5 rather than 0.9. Both are accepted and pinned by tests;
+  the second is tracked in **SUR-976**.
 - **`soft_delete_signals_for_note(note_id)` — note_signals tombstone on note delete (SUR-966).** ALWAYS
   stages a whole-shape tombstone even when this device holds no local signals row — the cross-device tail:
   another device may hold a live cloud row this delete must tear down, else orphaned signal metadata
