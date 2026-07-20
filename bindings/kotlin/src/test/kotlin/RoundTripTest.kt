@@ -667,14 +667,23 @@ class RoundTripTest {
                 clearNullableFields = emptyList(),
             ))
 
-            // Each deliberate kind stages a genuine write → true.
-            assertTrue(engine.recordNoteSignal("n", NoteSignalKind.RETURN_VISIT))
-            assertTrue(engine.recordNoteSignal("n", NoteSignalKind.ENGAGEMENT))
+            // Exposure goes FIRST, deliberately: ReturnVisit ALSO stamps `exposure_recency_at`, so
+            // any Exposure sequenced after it is inside the throttle window by construction.
             assertTrue(engine.recordNoteSignal("n", NoteSignalKind.EXPOSURE), "first Exposure writes")
             // Repeat Exposure inside the throttle window is a no-op → false (both Booleans marshal).
             assertFalse(
                 engine.recordNoteSignal("n", NoteSignalKind.EXPOSURE),
                 "repeat Exposure within the window returns false",
+            )
+            // The other two deliberate kinds each stage a genuine write → true.
+            assertTrue(engine.recordNoteSignal("n", NoteSignalKind.RETURN_VISIT))
+            assertTrue(engine.recordNoteSignal("n", NoteSignalKind.ENGAGEMENT))
+            // ReturnVisit re-stamped `exposure_recency_at`, so the Exposure that follows it is
+            // throttled — signal ORDER is observable across the FFI, and this is the throttle doing
+            // its job: the reader just returned to the note, so "recently seen" is already true.
+            assertFalse(
+                engine.recordNoteSignal("n", NoteSignalKind.EXPOSURE),
+                "Exposure right after a ReturnVisit is inside the throttle window",
             )
 
             // soft-delete stages a tombstone even here (returns Unit, throws only on error); a repeat is a
