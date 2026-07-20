@@ -975,25 +975,26 @@ impl SyncEngine {
             .get_row("notes", &note_id)
             .map_err(store_err)?
             .and_then(|r| r.get("source").and_then(Value::as_str).map(str::to_string));
-        let write = self.stage_signal_write(&store, &note_id, note_source.as_deref(), now, |s| {
-            match kind {
-                NoteSignalKind::Exposure => {
-                    // Throttle: skip when exposed within the window. Treat an absent/epoch stamp as
-                    // "never exposed" (cold start) so the first real Exposure always writes.
-                    let never_exposed = s.exposure_recency_at <= 0;
-                    if never_exposed
-                        || now.saturating_sub(s.exposure_recency_at) >= SIGNAL_THROTTLE_MS
-                    {
+        let write =
+            self.stage_signal_write(&store, &note_id, note_source.as_deref(), now, |s| {
+                match kind {
+                    NoteSignalKind::Exposure => {
+                        // Throttle: skip when exposed within the window. Treat an absent/epoch stamp as
+                        // "never exposed" (cold start) so the first real Exposure always writes.
+                        let never_exposed = s.exposure_recency_at <= 0;
+                        if never_exposed
+                            || now.saturating_sub(s.exposure_recency_at) >= SIGNAL_THROTTLE_MS
+                        {
+                            s.exposure_recency_at = now;
+                        }
+                    }
+                    NoteSignalKind::Engagement => s.engagement_recency_at = now,
+                    NoteSignalKind::ReturnVisit => {
+                        s.return_visits += 1;
                         s.exposure_recency_at = now;
                     }
                 }
-                NoteSignalKind::Engagement => s.engagement_recency_at = now,
-                NoteSignalKind::ReturnVisit => {
-                    s.return_visits += 1;
-                    s.exposure_recency_at = now;
-                }
-            }
-        })?;
+            })?;
         match write {
             Some(sig) => {
                 store
@@ -1032,9 +1033,8 @@ impl SyncEngine {
             .map_err(store_err)?
             .and_then(|r| r.get("source").and_then(Value::as_str).map(str::to_string));
         let row = existing.unwrap_or_default();
-        let int_or = |field: &str, default: i64| {
-            row.get(field).and_then(Value::as_i64).unwrap_or(default)
-        };
+        let int_or =
+            |field: &str, default: i64| row.get(field).and_then(Value::as_i64).unwrap_or(default);
         let prior = row
             .get("source_prior")
             .and_then(Value::as_f64)
@@ -1635,9 +1635,8 @@ impl SyncEngine {
             .as_ref()
             .is_some_and(|s| !matches!(s.get("deleted"), Some(Value::Bool(true))));
         let row = existing.unwrap_or_default();
-        let int_or = |field: &str, default: i64| {
-            row.get(field).and_then(Value::as_i64).unwrap_or(default)
-        };
+        let int_or =
+            |field: &str, default: i64| row.get(field).and_then(Value::as_i64).unwrap_or(default);
         // Stored columns verbatim, or birth defaults (`freshNoteSignals`): prior from the note's
         // `source`, zeroed counters. `created_at` is preserved (or born now) around the mutation.
         let before = SignalState {
@@ -1666,7 +1665,10 @@ impl SyncEngine {
         sig.insert("return_visits".into(), json!(after.return_visits));
         sig.insert("has_annotation".into(), json!(after.has_annotation));
         sig.insert("stitch_spawns".into(), json!(after.stitch_spawns));
-        sig.insert("exposure_recency_at".into(), json!(after.exposure_recency_at));
+        sig.insert(
+            "exposure_recency_at".into(),
+            json!(after.exposure_recency_at),
+        );
         sig.insert(
             "engagement_recency_at".into(),
             json!(after.engagement_recency_at),
@@ -4348,7 +4350,11 @@ mod tests {
         );
         assert_eq!(after["return_visits"], json!(5), "earned counter preserved");
         assert_eq!(after["stitch_spawns"], json!(2), "earned counter preserved");
-        assert_eq!(after["exposure_recency_at"], json!(111), "exposure untouched");
+        assert_eq!(
+            after["exposure_recency_at"],
+            json!(111),
+            "exposure untouched"
+        );
         assert_eq!(after["created_at"], json!(100), "created_at preserved");
         assert_eq!(
             Store::open(db_path)
@@ -4424,7 +4430,9 @@ mod tests {
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
         let engine = engine_at(db_path);
-        engine.enqueue_note(note_with_source("n", "manual")).unwrap();
+        engine
+            .enqueue_note(note_with_source("n", "manual"))
+            .unwrap();
         engine
             .enqueue_note_signals("n".into(), 0.7, 3, false, 2, 0, 0, 0.0, 50, false)
             .unwrap();
@@ -4469,7 +4477,11 @@ mod tests {
             .unwrap());
 
         let sig = stored_signals(db_path, "n").expect("birth row staged");
-        assert_eq!(sig["source_prior"], json!(0.75), "prior from source `share`");
+        assert_eq!(
+            sig["source_prior"],
+            json!(0.75),
+            "prior from source `share`"
+        );
         assert_eq!(sig["return_visits"], json!(0));
         assert_eq!(sig["has_annotation"], json!(false));
         assert_eq!(sig["stitch_spawns"], json!(0));
@@ -4518,7 +4530,9 @@ mod tests {
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
         let engine = engine_at(db_path);
-        engine.enqueue_note(note_with_source("n", "manual")).unwrap();
+        engine
+            .enqueue_note(note_with_source("n", "manual"))
+            .unwrap();
 
         assert!(engine
             .record_note_signal("n".into(), NoteSignalKind::Exposure)
@@ -4557,7 +4571,9 @@ mod tests {
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
         let engine = engine_at(db_path);
-        engine.enqueue_note(note_with_source("n", "manual")).unwrap();
+        engine
+            .enqueue_note(note_with_source("n", "manual"))
+            .unwrap();
 
         assert!(engine
             .record_note_signal("n".into(), NoteSignalKind::Engagement)
@@ -4591,7 +4607,9 @@ mod tests {
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
         let engine = engine_at(db_path);
-        engine.enqueue_note(note_with_source("n", "manual")).unwrap();
+        engine
+            .enqueue_note(note_with_source("n", "manual"))
+            .unwrap();
 
         engine.soft_delete_signals_for_note("n".into()).unwrap();
         assert_eq!(
@@ -4652,7 +4670,10 @@ mod tests {
             "updated_at",
             "deleted",
         ] {
-            assert!(tomb.contains_key(col), "full-shape tombstone: `{col}` present");
+            assert!(
+                tomb.contains_key(col),
+                "full-shape tombstone: `{col}` present"
+            );
         }
         let (_, table, record_id, payload_json, _) = only_row(db_path);
         assert_eq!(table, "note_signals");
