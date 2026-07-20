@@ -1283,7 +1283,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_recent_note() != 17557.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_record_note_signal() != 57406.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_record_note_signal() != 31578.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 3703.toShort()) {
@@ -2051,9 +2051,12 @@ public interface SyncEngineInterface {
      * callback that lands after the host's delete cannot resurrect the signals tombstone and leak
      * live metadata for a dead note. If `note_id` has no local note row (created on
      * another device, not yet synced down), `source_prior` is born carrying its unknown-source
-     * fallback — the row is otherwise correct. The pull itself does not retro-correct it; the NEXT
-     * signal does, re-deriving the prior from the note's real `source` once it is visible. Only
-     * that unknown-source sentinel heals: a real stored prior is never overwritten (SUR-956).
+     * fallback — the row is otherwise correct. The pull itself does not retro-correct it; the next
+     * signal from a device that can SEE the note does, re-deriving the prior from its real
+     * `source`. Only that unknown-source sentinel heals: a real stored prior is never overwritten
+     * (SUR-956). Best-effort across the fleet, not monotonic — a device that still cannot see the
+     * note does not heal, and pushes its stale sentinel with a newer `updated_at`, reverting a
+     * healed row under whole-row LWW until any note-visible device signals again.
      */
     fun `recordNoteSignal`(`noteId`: kotlin.String, `kind`: NoteSignalKind): kotlin.Boolean
     
@@ -2905,9 +2908,12 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * callback that lands after the host's delete cannot resurrect the signals tombstone and leak
      * live metadata for a dead note. If `note_id` has no local note row (created on
      * another device, not yet synced down), `source_prior` is born carrying its unknown-source
-     * fallback — the row is otherwise correct. The pull itself does not retro-correct it; the NEXT
-     * signal does, re-deriving the prior from the note's real `source` once it is visible. Only
-     * that unknown-source sentinel heals: a real stored prior is never overwritten (SUR-956).
+     * fallback — the row is otherwise correct. The pull itself does not retro-correct it; the next
+     * signal from a device that can SEE the note does, re-deriving the prior from its real
+     * `source`. Only that unknown-source sentinel heals: a real stored prior is never overwritten
+     * (SUR-956). Best-effort across the fleet, not monotonic — a device that still cannot see the
+     * note does not heal, and pushes its stale sentinel with a newer `updated_at`, reverting a
+     * healed row under whole-row LWW until any note-visible device signals again.
      */
     @Throws(SyncException::class)override fun `recordNoteSignal`(`noteId`: kotlin.String, `kind`: NoteSignalKind): kotlin.Boolean {
             return FfiConverterBoolean.lift(

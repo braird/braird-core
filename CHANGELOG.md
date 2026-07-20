@@ -39,10 +39,13 @@ SUR-956 margins no-op guard so an already-annotated note still records margin en
   live signal metadata for a dead note. An *absent* local note row is unaffected (a note created on
   another device and not yet synced down still births its signals row with a default `source_prior`).
   A row born while the note was invisible carries `source_prior`'s unknown-source fallback (0.5), and
-  the **next signal after the note syncs down re-derives it** from the note's real `source` — without
-  that heal, `handwritten` (0.9), `share` (0.75) and `manual` (0.7) notes stay pinned at 0.5 and are
-  under-scored by `compute_importance` forever. Only that sentinel heals: a real stored prior is kept
-  verbatim, preserving SUR-956's "stored prior kept, not re-derived" invariant from v0.9.1.
+  the **next signal from a device that can see the note re-derives it** from the note's real `source`
+  — without that heal, `handwritten` (0.9), `share` (0.75) and `manual` (0.7) notes stay pinned at 0.5
+  and are under-scored by `compute_importance` forever. Only that sentinel heals: a real stored prior
+  is kept verbatim, preserving SUR-956's "stored prior kept, not re-derived" invariant from v0.9.1.
+  The heal is best-effort across a fleet rather than monotonic: a device that still cannot see the
+  note does not heal, and pushes its stale sentinel with a newer `updated_at`, reverting a healed row
+  under whole-row LWW until any note-visible device signals again.
   This narrows the orphaned-signals window to the same device; it does not close it fleet-wide. A
   device that has not yet pulled the note's tombstone still sees a live local row, so a signal it
   fires there wins on whole-row LWW and leaves the `note_signals` row live for a deleted note — and

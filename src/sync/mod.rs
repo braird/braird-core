@@ -964,9 +964,12 @@ impl SyncEngine {
     /// callback that lands after the host's delete cannot resurrect the signals tombstone and leak
     /// live metadata for a dead note. If `note_id` has no local note row (created on
     /// another device, not yet synced down), `source_prior` is born carrying its unknown-source
-    /// fallback — the row is otherwise correct. The pull itself does not retro-correct it; the NEXT
-    /// signal does, re-deriving the prior from the note's real `source` once it is visible. Only
-    /// that unknown-source sentinel heals: a real stored prior is never overwritten (SUR-956).
+    /// fallback — the row is otherwise correct. The pull itself does not retro-correct it; the next
+    /// signal from a device that can SEE the note does, re-deriving the prior from its real
+    /// `source`. Only that unknown-source sentinel heals: a real stored prior is never overwritten
+    /// (SUR-956). Best-effort across the fleet, not monotonic — a device that still cannot see the
+    /// note does not heal, and pushes its stale sentinel with a newer `updated_at`, reverting a
+    /// healed row under whole-row LWW until any note-visible device signals again.
     pub fn record_note_signal(
         &self,
         note_id: String,
@@ -1678,6 +1681,12 @@ impl SyncEngine {
         // about to write, so anything computed into `before` is a change that silently cannot be
         // detected. (The prior heal lived here once and was lost on every throttled Exposure —
         // healed in `before`, equal in `after`, no-op'd, never persisted.)
+        //
+        // NOTE: `importance` is deliberately NOT a `SignalState` field — it is staged below but
+        // rides OUTSIDE change-detection, which is sound only because it is a pure function of
+        // fields that are inside it. A stored `importance` that disagrees with the formula (the
+        // blind `enqueue_note_signals` FFI takes one as an argument) is therefore pinned wrong on a
+        // live row by the same mechanism the prior heal exists to undo.
         let before = SignalState {
             source_prior: stored_prior.unwrap_or(unknown_prior),
             return_visits: int_or("return_visits", 0),
@@ -1697,6 +1706,16 @@ impl SyncEngine {
         // once the note is visible; any OTHER stored prior is kept verbatim, preserving SUR-956's
         // "stored prior kept, not re-derived" invariant (v0.9.1). A genuine `readwise` note heals
         // 0.5 -> 0.5, a no-op, so the sentinel test costs nothing.
+        //
+        // BIRTHS RIDE THIS BRANCH: with no stored row, `before.source_prior` is the 0.5 fiction and
+        // the real prior is derived HERE, not in `before`. That is correct only because `!was_live`
+        // bypasses the no-op below. Do NOT gate this on `was_live` — it would silently birth every
+        // row at 0.5.
+        //
+        // BEST-EFFORT ACROSS THE FLEET, not a guarantee. Only a device that can SEE the note heals;
+        // a blind device's `before` reads its own stale sentinel, does not heal, and pushes 0.5 with
+        // a newer `updated_at` — reverting a healed row under whole-row LWW. Convergent under
+        // continued activity on any note-visible device, but not monotonic.
         // `unknown_prior` is 0.5 — exactly representable, so `==` is safe here.
         if note_source.is_some() && before.source_prior == unknown_prior {
             after.source_prior = source_prior(note_source);
@@ -4844,6 +4863,80 @@ mod tests {
                 .record_note_signal("n".into(), NoteSignalKind::Exposure)
                 .unwrap(),
             "nothing left to heal, throttle window still open — no churn"
+        );
+    }
+
+    #[test]
+    fn record_note_signal_blind_device_reverts_a_healed_prior_and_a_visible_one_re_heals() {
+        // The fleet rule, pinned: the heal is best-effort, NOT monotonic. A device that cannot see
+        // the note reads its own stale sentinel, does not heal, and stages 0.5 with a newer
+        // `updated_at` — which wins whole-row LWW and un-heals the row. Any note-visible device
+        // heals it again on its next signal.
+        //
+        // Single-engine by necessity: a true two-device interleave needs the push/pull network path
+        // (no fixture for that here), so this pins the per-device DECISION each side makes, which is
+        // what determines the LWW outcome — not the convergence itself.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let blind = engine_at(db_path);
+
+        // Blind device: signals row exists at the sentinel, note NOT visible locally.
+        assert!(blind
+            .record_note_signal("n".into(), NoteSignalKind::ReturnVisit)
+            .unwrap());
+        assert_eq!(
+            stored_signals(db_path, "n").unwrap()["source_prior"],
+            json!(0.5)
+        );
+
+        // It keeps staging the sentinel — this is the write that would revert a peer's heal.
+        assert!(blind
+            .record_note_signal("n".into(), NoteSignalKind::Engagement)
+            .unwrap());
+        assert_eq!(
+            stored_signals(db_path, "n").unwrap()["source_prior"],
+            json!(0.5),
+            "a blind device never heals — it pushes the stale sentinel"
+        );
+
+        // The note becomes visible (pulled down); the next signal re-heals.
+        blind.enqueue_note(note_with_source("n", "share")).unwrap();
+        assert!(blind
+            .record_note_signal("n".into(), NoteSignalKind::Engagement)
+            .unwrap());
+        assert_eq!(
+            stored_signals(db_path, "n").unwrap()["source_prior"],
+            json!(0.75),
+            "a note-visible device re-heals it"
+        );
+    }
+
+    #[test]
+    fn record_note_signal_a_genuine_readwise_note_heals_to_the_same_value_without_churn() {
+        // `readwise` derives 0.5, which IS the sentinel — so the heal fires and changes nothing.
+        // Pins the claim that the sentinel test costs nothing: no spurious write, no outbox churn.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_note(note_with_source("n", "readwise"))
+            .unwrap();
+
+        assert!(engine
+            .record_note_signal("n".into(), NoteSignalKind::Exposure)
+            .unwrap());
+        assert_eq!(
+            stored_signals(db_path, "n").unwrap()["source_prior"],
+            json!(0.5)
+        );
+        // Throttled repeat: nothing to heal, nothing to change — a real no-op, not a rewrite.
+        assert!(
+            !engine
+                .record_note_signal("n".into(), NoteSignalKind::Exposure)
+                .unwrap(),
+            "a readwise 0.5 must not re-stage every call"
         );
     }
 
