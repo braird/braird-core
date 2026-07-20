@@ -984,10 +984,16 @@ impl SyncEngine {
         //  - DELETED: a late callback landing after the host's delete would take the resurrect path
         //    (`was_live == false` always stages) and `stage_local_writes` would drop the queued
         //    tombstone — live signal metadata for a dead note.
-        //  - ABSENT: with no note there is no `source`, so the row would be born at the
+        //  - ABSENT: with no note we cannot know its `source`, so the row would be born at the
         //    unknown-source fallback. Nothing re-derives a stored prior (SUR-956's "stored prior
-        //    kept, not re-derived", v0.9.1), so `handwritten` (0.9), `share` (0.75) and `manual`
-        //    (0.7) notes would sit at 0.5 forever, under-scored by `compute_importance`.
+        //    kept, not re-derived", v0.9.1), so a `handwritten` (0.9), `share` (0.75) or `manual`
+        //    (0.7) note would sit at 0.5 forever, under-scored by `compute_importance`.
+        //
+        // The ABSENT arm buys "we never guess a prior we could have known", NOT "the fallback is
+        // unreachable". `notes.source` is nullable, so a perfectly VISIBLE sourceless note derives
+        // 0.5 and pins there — correctly: there is nothing better to derive from, and the PWA
+        // behaves the same. (Locally it cannot happen: `enqueue_note`'s create path defaults source
+        // to "manual". Such a row arrives by PULL or IMPORT, landing verbatim.)
         //
         // Refusing the absent case is what lets the prior stay a plain read. The alternative — birth
         // at a sentinel and heal later — cannot work: a stored 0.5 is genuinely ambiguous (a
@@ -997,7 +1003,7 @@ impl SyncEngine {
         //
         // Same-device only, and deliberately so: it does not close the leak fleet-wide. A device
         // that has not yet pulled a tombstone still holds a LIVE local row whose signal wins on
-        // whole-row LWW. Retiring those needs a post-pull signals reconciliation pass (none exists).
+        // whole-row LWW. Retiring those needs a post-pull signals reconciliation pass — SUR-976.
         let Some(note) = note.filter(|r| !matches!(r.get("deleted"), Some(Value::Bool(true))))
         else {
             return Ok(false);
@@ -1066,6 +1072,20 @@ impl SyncEngine {
         let row = existing.unwrap_or_default();
         let int_or =
             |field: &str, default: i64| row.get(field).and_then(Value::as_i64).unwrap_or(default);
+        // ACCEPTED: with no local signals row AND no local note row, this fabricates the
+        // unknown-source fallback — and that value is not inert. The tombstone IS a local row, so a
+        // later resurrect (`stage_signal_write`'s `!was_live` path) reads this prior VERBATIM;
+        // nothing re-derives it. A `handwritten` note that gets retired here and later arrives live
+        // therefore resurrects pinned at 0.5, under-scored in `compute_importance` and pushed
+        // fleet-wide over whole-row LWW.
+        //
+        // Not fixable by refusing, the way `record_note_signal` refuses: the cross-device contract
+        // REQUIRES staging a tombstone even with no local row (another device may hold a live cloud
+        // row from its own bump), and the flush shape has no room to omit the column. Reaching it is
+        // narrow — the host must retire signals for a note it holds no row for, whereas an ordinary
+        // delete reads the tombstoned note's `source` fine (the lookup above deliberately omits the
+        // `deleted` filter). Tracked as part of SUR-976. Pinned by
+        // `soft_delete_with_no_note_row_seeds_the_fallback_prior_for_a_later_resurrect`.
         let prior = row
             .get("source_prior")
             .and_then(Value::as_f64)
@@ -1673,10 +1693,18 @@ impl SyncEngine {
         //
         // `source_prior` is a PLAIN READ: stored verbatim, or derived at birth from the note's
         // `source`. Nothing re-derives it afterwards — SUR-956's "stored prior kept, not
-        // re-derived" invariant (v0.9.1). That is only safe because both callers refuse a note they
-        // cannot see (`record_note_signal`'s visibility guard, `replace_handwritten_annotations`'
-        // live-parent requirement), so a row can never be born at the unknown-source fallback and
-        // then be stuck there. Do NOT relax either guard without revisiting this line.
+        // re-derived" invariant (v0.9.1). Both callers refuse a note they cannot see
+        // (`record_note_signal`'s visibility guard, `replace_handwritten_annotations`' live-parent
+        // requirement), so a row is never born from a source we could have read but didn't. Do NOT
+        // relax either guard without revisiting this line.
+        //
+        // That is NOT a claim the fallback is unreachable — two paths still reach it legitimately,
+        // and both pin 0.5 permanently because nothing re-derives:
+        //  - a VISIBLE note with a null `source` (the column is nullable) — correct, there is
+        //    nothing better to derive;
+        //  - a tombstone staged by `soft_delete_signals_for_note` when this device holds no local
+        //    note row: it must stage regardless (the cross-device rule), so it fabricates the
+        //    fallback — and that stored value is the seed a later resurrect reads verbatim here.
         //
         // `before` MIRRORS THE STORED ROW, verbatim. Nothing derived belongs here: the no-op check
         // below compares against it to decide whether the persisted row already says what we are
@@ -4748,6 +4776,122 @@ mod tests {
     }
 
     #[test]
+    fn record_note_signal_resumes_after_the_note_is_restored_preserving_prior_and_counters() {
+        // The restore interleave — the path the SUR-966 fix chain kept breaking, and the one the
+        // single-device tests do not reach. Signals are tombstoned alongside a note delete, the note
+        // then comes back LIVE (a pull applying a newer live cloud row from another device writes
+        // over the local tombstone), and the next signal must resume: resurrect the signals row,
+        // keep the stored prior and the earned counters, and flush LIVE rather than the tombstone.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_note(note_with_source("n", "handwritten"))
+            .unwrap();
+        engine
+            .record_note_signal("n".into(), NoteSignalKind::ReturnVisit)
+            .unwrap();
+        engine
+            .record_note_signal("n".into(), NoteSignalKind::ReturnVisit)
+            .unwrap();
+
+        // Host deletes the note and retires its signals row.
+        let mut tomb = Map::new();
+        tomb.insert("id".into(), json!("n"));
+        tomb.insert("deleted".into(), json!(true));
+        tomb.insert("updated_at".into(), json!(epoch_ms()));
+        let store = Store::open(db_path).unwrap();
+        store
+            .stage_local_writes(vec![("notes", "n".into(), tomb)], epoch_ms())
+            .unwrap();
+        engine.soft_delete_signals_for_note("n".into()).unwrap();
+        assert_eq!(
+            stored_signals(db_path, "n").unwrap()["deleted"],
+            json!(true),
+            "signals tombstoned"
+        );
+        // While the note is dead, signals stay refused.
+        assert!(!engine
+            .record_note_signal("n".into(), NoteSignalKind::Engagement)
+            .unwrap());
+
+        // The note is RESTORED live (pull LWW writing a newer live row over the local tombstone).
+        let mut live = Map::new();
+        live.insert("id".into(), json!("n"));
+        live.insert("source".into(), json!("handwritten"));
+        live.insert("deleted".into(), json!(false));
+        live.insert("updated_at".into(), json!(epoch_ms() + 1));
+        store
+            .stage_local_writes(vec![("notes", "n".into(), live)], epoch_ms())
+            .unwrap();
+
+        assert!(
+            engine
+                .record_note_signal("n".into(), NoteSignalKind::Engagement)
+                .unwrap(),
+            "a restored note earns signals again"
+        );
+        let sig = stored_signals(db_path, "n").unwrap();
+        assert_eq!(sig["deleted"], json!(false), "signals row resurrected");
+        assert_eq!(
+            sig["source_prior"],
+            json!(0.9),
+            "stored prior survived the tombstone round-trip"
+        );
+        assert_eq!(
+            sig["return_visits"],
+            json!(2),
+            "earned counters survived the tombstone round-trip"
+        );
+        let payload =
+            collapsed_payload_for(db_path, "note_signals", "n").expect("queued signals row");
+        assert_eq!(
+            payload["deleted"],
+            json!(false),
+            "what flushes is LIVE — the queued tombstone was dropped"
+        );
+    }
+
+    #[test]
+    fn soft_delete_with_no_note_row_seeds_the_fallback_prior_for_a_later_resurrect() {
+        // ACCEPTED BEHAVIOUR, pinned so it is a decision and not a surprise. Retiring signals for a
+        // note this device holds NO row for must still stage a tombstone (the cross-device rule), so
+        // it fabricates the unknown-source fallback. That tombstone is a local row, so a later
+        // resurrect reads the fabricated prior VERBATIM — nothing re-derives it. A `handwritten`
+        // note therefore comes back pinned at 0.5 rather than 0.9.
+        //
+        // Not fixable by refusing (the tombstone is required) and not by re-deriving on resurrect (a
+        // stored 0.5 is ambiguous — that is exactly why the heal was abandoned). Narrow to reach: an
+        // ordinary delete reads the tombstoned note's `source` fine.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        // No local `notes` row at all — retire signals for it anyway.
+        engine.soft_delete_signals_for_note("n".into()).unwrap();
+        assert_eq!(
+            stored_signals(db_path, "n").unwrap()["source_prior"],
+            json!(0.5),
+            "the tombstone fabricates the fallback prior"
+        );
+
+        // The note now arrives as `handwritten`; the resurrect reads the fabricated prior verbatim.
+        engine
+            .enqueue_note(note_with_source("n", "handwritten"))
+            .unwrap();
+        assert!(engine
+            .record_note_signal("n".into(), NoteSignalKind::ReturnVisit)
+            .unwrap());
+        assert_eq!(
+            stored_signals(db_path, "n").unwrap()["source_prior"],
+            json!(0.5),
+            "resurrects at the SEEDED fallback, not the note's real 0.9 — the accepted gap"
+        );
+    }
+
+    #[test]
     fn record_note_signal_keeps_a_real_stored_prior_when_the_note_is_visible() {
         // SUR-956's "stored prior kept, not re-derived" invariant (v0.9.1): a stored prior is kept
         // verbatim even when the visible note's `source` would derive a different number.
@@ -4837,6 +4981,31 @@ mod tests {
             sig["source_prior"],
             json!(0.9),
             "born at the note's real prior, never the fallback"
+        );
+
+        // A VISIBLE note with a NULL `source` still derives the fallback — accepted, not a bug:
+        // `notes.source` is nullable and there is nothing better to derive from. The visibility
+        // guard buys "we never guess a prior we could have known", NOT "0.5 is unreachable".
+        //
+        // Staged directly rather than through `enqueue_note`, because the create path DEFAULTS
+        // source to "manual" (the PWA's create-time default, mod.rs `enqueue_note`). A sourceless
+        // note therefore only reaches the store by PULL or IMPORT, where the row lands verbatim —
+        // which is what this stages.
+        let mut pulled = Map::new();
+        pulled.insert("id".into(), json!("sourceless"));
+        pulled.insert("deleted".into(), json!(false));
+        pulled.insert("updated_at".into(), json!(epoch_ms()));
+        Store::open(db_path)
+            .unwrap()
+            .stage_local_writes(vec![("notes", "sourceless".into(), pulled)], epoch_ms())
+            .unwrap();
+        assert!(engine
+            .record_note_signal("sourceless".into(), NoteSignalKind::ReturnVisit)
+            .unwrap());
+        assert_eq!(
+            stored_signals(db_path, "sourceless").unwrap()["source_prior"],
+            json!(0.5),
+            "a sourceless note legitimately derives the fallback"
         );
         assert_eq!(
             sig["return_visits"],
