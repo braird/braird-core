@@ -48,8 +48,10 @@
 //!    the same state: same-cycle content-dedup merge losers (hence its slot right after pass 4),
 //!    retired margin children, pre-SUR-975 crash strands, and imported orphans. A signals row
 //!    with NO local notes row is deliberately left alone — the pull tombstone-skip makes absent
-//!    ambiguous (never-synced vs deleted-elsewhere), and the row self-resolves once the note
-//!    arrives.
+//!    ambiguous (never-synced vs deleted-elsewhere). It self-resolves once the note arrives — or
+//!    persists as an INERT live row if no tombstone-holding device survives to retire it (the
+//!    tombstone-skip never delivers the note tombstone to a device without the note): accepted —
+//!    it cannot grow (`record_note_signal` refuses an absent note) and no read surface renders it.
 //! 6. **`reconcile_covers`** (SUR-828; `resolveCover` in `surfc/src/lib/coverResolver.js`) —
 //!    a coverless book gets its cover resolved via Open Library (ISBN → a deterministic
 //!    `covers.openlibrary.org` URL by pure construction, no egress; no-ISBN → the Search API for a
@@ -194,66 +196,6 @@ pub async fn reconcile<S: PostgrestSink + CoverEgress>(
         signals_retired,
         covers_resolved,
     })
-}
-
-/// Step 2g (SUR-976) — retire the `note_signals` row of any note whose LOCAL row is tombstoned.
-/// Closes the cross-device half of the orphaned-signals leak that `record_note_signal`'s
-/// visibility guard (same-device, SUR-966) and `enqueue_note`'s atomic delete (same-device,
-/// SUR-975) cannot: under whole-row LWW a not-yet-pulled device's later signal legitimately wins
-/// the cloud row back from the deleting device's tombstone (the server's `t01_lww_guard` accepts
-/// equal-or-newer), and nothing else ever retires it. The same sweep catches every other door —
-/// same-cycle content-dedup merge losers (hence this pass's slot right after it), retired margin
-/// children, pre-SUR-975 crash strands, and imported orphans.
-///
-/// LOCAL-ONLY RULE (founder decision): a signals row whose `notes` row is ABSENT is left alone —
-/// the pull tombstone-skip makes absent genuinely ambiguous ("never synced down" vs "deleted
-/// elsewhere"), and retiring a not-yet-pulled live note's signals would destroy real evidence.
-/// Such rows wait until the note itself arrives (live: row is legitimate; tombstoned: retired
-/// next pass).
-///
-/// Each retirement stages the full-shape tombstone ([`SyncEngine::build_signals_tombstone`] —
-/// counters preserved verbatim, no counter-folding for merge losers, founder decision) through
-/// [`Store::stage_local_write`], so it PROPAGATES via the outbox and the same
-/// `pull_then_flush` that ran this pass converges the cloud row too. Per-row isolated (a
-/// transient failure on one row must not block the rest — the `merge_into_survivor` posture);
-/// idempotent by scan construction (a retired row is no longer live, so a second pass sees
-/// nothing and stages nothing).
-fn reconcile_note_signals(store: &Store) -> Result<usize, String> {
-    let live_signals = store
-        .list_live("note_signals", None, -1, 0)
-        .map_err(|e| e.to_string())?;
-    let now = super::epoch_ms();
-    let mut retired = 0usize;
-    for sig in live_signals {
-        let Some(note_id) = sig.get("note_id").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(note) = store.get_row("notes", note_id).map_err(|e| e.to_string())? else {
-            continue; // absent note — ambiguous, the local-only rule leaves it (see doc above)
-        };
-        if !matches!(note.get("deleted"), Some(Value::Bool(true))) {
-            continue; // live note — its signals row is legitimate evidence
-        }
-        // The tombstoned notes row is in hand, so the (rarely-needed) birth-prior fallback derives
-        // from its real `source` — never the unknown-source 0.5 (the lookup deliberately reads a
-        // dead row's columns, same as an ordinary delete).
-        let note_source = note.get("source").and_then(Value::as_str);
-        match SyncEngine::build_signals_tombstone(store, note_id, note_source, now) {
-            // None can't occur off a `list_live` scan under the engine's held store lock (the row
-            // was live moments ago) — but the guard costs nothing and stays correct if it ever does.
-            Ok(None) => {}
-            Ok(Some(tomb)) => match store.stage_local_write("note_signals", note_id, tomb, now) {
-                Ok(()) => retired += 1,
-                Err(e) => eprintln!(
-                    "reconcile: signals-retire stage for {note_id} failed (non-fatal, retries next pull): {e}"
-                ),
-            },
-            Err(e) => eprintln!(
-                "reconcile: signals-retire build for {note_id} failed (non-fatal, retries next pull): {e}"
-            ),
-        }
-    }
-    Ok(retired)
 }
 
 /// Step 2b — backfill a book referenced by a live note but absent from the local store, by
@@ -880,7 +822,70 @@ fn repoint_memberships(
     Ok(())
 }
 
-/// Step 2e (SUR-828) — resolve Open Library book covers for coverless books (SUR-198 parity for
+/// Step 2f (SUR-976) — retire the `note_signals` row of any note whose LOCAL row is tombstoned.
+/// Closes the cross-device half of the orphaned-signals leak that `record_note_signal`'s
+/// visibility guard (same-device, SUR-966) and `enqueue_note`'s atomic delete (same-device,
+/// SUR-975) cannot: under whole-row LWW a not-yet-pulled device's later signal legitimately wins
+/// the cloud row back from the deleting device's tombstone (the server's `t01_lww_guard` accepts
+/// equal-or-newer), and nothing else ever retires it. The same sweep catches every other door —
+/// same-cycle content-dedup merge losers (hence this pass's slot right after it), retired margin
+/// children, pre-SUR-975 crash strands, and imported orphans.
+///
+/// LOCAL-ONLY RULE (founder decision): a signals row whose `notes` row is ABSENT is left alone —
+/// the pull tombstone-skip makes absent genuinely ambiguous ("never synced down" vs "deleted
+/// elsewhere"), and retiring a not-yet-pulled live note's signals would destroy real evidence.
+/// Such rows wait until the note itself arrives (live: row is legitimate; tombstoned: retired
+/// next pass) — or persist as an INERT live row when no tombstone-holding device survives to
+/// retire them (the tombstone-skip never delivers the note tombstone here): an accepted residual,
+/// harmless because the row cannot grow and nothing renders it.
+///
+/// Each retirement stages the full-shape tombstone ([`SyncEngine::build_signals_tombstone`] —
+/// counters preserved verbatim, no counter-folding for merge losers, founder decision) through
+/// [`Store::stage_local_write`], so it PROPAGATES via the outbox and the same
+/// `pull_then_flush` that ran this pass converges the cloud row too. The WRITE side is per-row
+/// isolated (a build/stage failure on one row is logged and must not block the rest — the
+/// `merge_into_survivor` posture); a scan-level READ failure aborts the pass, which is itself
+/// best-effort and retries next pull. Idempotent by scan construction (a retired row is no
+/// longer live, so a second pass sees nothing and stages nothing).
+fn reconcile_note_signals(store: &Store) -> Result<usize, String> {
+    let live_signals = store
+        .list_live("note_signals", None, -1, 0)
+        .map_err(|e| e.to_string())?;
+    let now = super::epoch_ms();
+    let mut retired = 0usize;
+    for sig in live_signals {
+        let Some(note_id) = sig.get("note_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(note) = store.get_row("notes", note_id).map_err(|e| e.to_string())? else {
+            continue; // absent note — ambiguous, the local-only rule leaves it (see doc above)
+        };
+        if !matches!(note.get("deleted"), Some(Value::Bool(true))) {
+            continue; // live note — its signals row is legitimate evidence
+        }
+        // The tombstoned notes row is in hand, so the (rarely-needed) birth-prior fallback derives
+        // from its real `source` — never the unknown-source 0.5 (the lookup deliberately reads a
+        // dead row's columns, same as an ordinary delete).
+        let note_source = note.get("source").and_then(Value::as_str);
+        match SyncEngine::build_signals_tombstone(store, note_id, note_source, now) {
+            // None can't occur off a `list_live` scan under the engine's held store lock (the row
+            // was live moments ago) — but the guard costs nothing and stays correct if it ever does.
+            Ok(None) => {}
+            Ok(Some(tomb)) => match store.stage_local_write("note_signals", note_id, tomb, now) {
+                Ok(()) => retired += 1,
+                Err(e) => eprintln!(
+                    "reconcile: signals-retire stage for {note_id} failed (non-fatal, retries next pull): {e}"
+                ),
+            },
+            Err(e) => eprintln!(
+                "reconcile: signals-retire build for {note_id} failed (non-fatal, retries next pull): {e}"
+            ),
+        }
+    }
+    Ok(retired)
+}
+
+/// Step 2g (SUR-828) — resolve Open Library book covers for coverless books (SUR-198 parity for
 /// natively-created books, which the PWA only resolves on its own create path). Mirrors the PWA's
 /// `resolveCover` (`surfc/src/lib/coverResolver.js`): a book WITH an ISBN gets a deterministic
 /// `covers.openlibrary.org/b/isbn/<isbn>` URL by pure construction — **no network call**; a book
@@ -3436,6 +3441,30 @@ mod tests {
             );
         }
         assert_eq!(payload["deleted"], json!(true));
+    }
+
+    #[test]
+    fn retirement_stamp_is_monotone_over_a_future_stamped_row() {
+        // The t01_lww_guard silent-cancel hole (sync-reviewer, SUR-976): a pulled foreign row can
+        // carry a stamp AHEAD of this device's clock (skew), and a retirement stamped older would
+        // be silently cancelled server-side while the outbox clears and the local row tombstones —
+        // a retry-immune divergence. The tombstone must therefore be stamped strictly after the
+        // row it retires, regardless of the local clock.
+        let store = Store::open_in_memory().unwrap();
+        let future = 9_999_999_999_999_i64; // far ahead of any test-run wall clock
+        put(&store, "notes", &tombstoned_note("n"));
+        let mut row = signals("n", false);
+        row["updated_at"] = json!(future);
+        put(&store, "note_signals", &row);
+
+        assert_eq!(reconcile_note_signals(&store).unwrap(), 1);
+        let tomb = store.get_row("note_signals", "n").unwrap().unwrap();
+        assert_eq!(tomb["deleted"], json!(true));
+        assert_eq!(
+            tomb["updated_at"],
+            json!(future + 1),
+            "clamped to strictly-after the stored stamp — the server's LWW guard cannot cancel it"
+        );
     }
 
     #[test]

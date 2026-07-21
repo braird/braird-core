@@ -6,7 +6,6 @@
 //! sync-surface interleave test: construct one `SharedCloud`, two [`Device`]s on one shared
 //! `Vault`, and drive `pull_then_flush`/`push::flush` per device in whatever order the scenario
 //! needs.
-#![allow(dead_code)] // each integration-test binary compiles its own copy and uses a subset
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
@@ -35,6 +34,11 @@ pub fn block<F: std::future::Future>(f: F) -> F::Output {
 ///
 /// `RefCell`/`Cell`, not `Mutex`: the harness runs on a single-threaded `block()` executor, the
 /// same justification `sync_736_integration.rs`'s `RecordingSink` uses for its `RefCell` log.
+///
+/// FULL-SHAPE UPSERTS ONLY: `upsert` replaces the whole stored row, and `patch` keeps the trait's
+/// default (loud failure). Real PostgREST updates only the supplied columns on conflict, so a
+/// future test flushing a SPARSE group (e.g. a bare notes tombstone patch) would see columns
+/// erased that the real server preserves — extend the conflict model before testing sparse flows.
 // ponytail: single-tenant — no user_id partitioning; add a per-user submap only if a future test
 // needs cross-account isolation.
 /// One cloud table: rows keyed by the upsert's `on_conflict` value, each carrying the
