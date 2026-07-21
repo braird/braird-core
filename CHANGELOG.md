@@ -6,6 +6,28 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Fixed
+- **`importance` now participates in signal change-detection (SUR-977).** It was computed and
+  staged by `stage_signal_write` but invisible to the `SignalState` no-op compare — sound only
+  while every stored value agreed with the formula, and the blind `enqueue_note_signals` FFI can
+  write one that doesn't. Such a value then sat on a live row forever, feeding ranking: the exact
+  SUR-956/966 `source_prior` bug class one field over. `importance` is now a `SignalState` field
+  with an asymmetric contract — `before` reads the STORED value verbatim (the pre-image invariant),
+  `after` recomputes from the post-mutation fields — so a disagreement is a plain diff and the next
+  signal, even a throttled no-op Exposure, stages the correction (counters and stored prior
+  untouched). Zero churn on consistent rows, and the `importance` compare is EPSILON-tolerant
+  (1e-9, `signals_agree` — `PartialEq` deliberately dropped from `SignalState`):
+  `compute_importance` runs `.exp()`, which has no cross-libm bit-determinism, so an exact compare
+  could ping-pong one-ULP "corrections" between devices on divergent platforms. Import already
+  recomputed on entry (unchanged), and the PWA recomputes on every write, so the blind FFI was the
+  one open door — and it now REJECTS non-finite `source_prior`/`importance` at the trust boundary
+  (`json!` silently launders NaN/±inf to a stored JSON null); a legacy live row already holding a
+  null importance reads as a NaN pre-image, agrees with nothing, and heals on its next signal
+  instead of being shielded by a derived stand-in. One accepted widening, under SUR-737's ratified
+  lossiness: a formerly write-silent throttled signal on a LYING row now pushes a whole corrected
+  row once, which can beat a concurrent earned-counter push — at most once per lying row per
+  device. Internal-only — no FFI surface change, bindings untouched.
+
 ### Added
 - **Post-pull `note_signals` reconciliation — `reconcile_note_signals` (SUR-976).** `note_signals`
   converges by whole-row LWW, so a device that had not yet pulled a note's tombstone could record
