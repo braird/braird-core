@@ -19,9 +19,11 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   a rejected delete-patch (`PatchTargetMissing`) stages neither row. Live writes (`deleted: false`)
   never touch `note_signals`. No FFI signature change — hosts keep their single `enqueue_note`
   delete call and simply stop needing the second one; a legacy second
-  `soft_delete_signals_for_note` call remains a no-op (already-tombstoned guard), which stays
-  exported for the one case `enqueue_note` cannot cover (retiring signals for a note this device
-  holds no row for — the cross-device rule).
+  `soft_delete_signals_for_note` call remains a no-op (already-tombstoned guard), and it stays
+  exported for the cases `enqueue_note` cannot cover: retiring signals for a note with no LIVE
+  local row — absent (the cross-device rule) or already tombstoned (a pre-SUR-975 device's
+  crash-stranded orphan arriving by pull; the delete-patch refuses a dead target, so the
+  standalone call is the repair entrypoint until SUR-976's reconciler).
 - A signals tombstone **born by the full-write delete seeds `source_prior` from the write's own
   `source`** (explicit or the `"manual"` default) — a real prior, not the 0.5 unknown-source
   fallback. The ACCEPTED fallback wart narrows to the standalone no-note-row path (tracked with

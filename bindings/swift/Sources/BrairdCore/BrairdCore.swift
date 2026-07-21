@@ -964,9 +964,13 @@ public protocol SyncEngineProtocol : AnyObject {
      *
      * Since SUR-975 an ordinary note delete no longer needs this call: `enqueue_note` with
      * `deleted: true` stages the same tombstone (built by [`SyncEngine::build_signals_tombstone`])
-     * in the note tombstone's own transaction. This stays exported for the case `enqueue_note`
-     * cannot cover — retiring signals for a note this device holds NO row for (the cross-device
-     * rule) — and as the no-op-safe second half of the legacy two-call sequence.
+     * in the note tombstone's own transaction. This stays exported for the cases `enqueue_note`
+     * cannot cover — retiring signals for a note with no LIVE local row, i.e. ABSENT (the
+     * cross-device rule) or already TOMBSTONED (e.g. a pre-SUR-975 device crashed inside the old
+     * two-call window and pushed a note tombstone with its signals row still live; the delete-
+     * patch path refuses a dead target, so THIS is the host's repair entrypoint until SUR-976's
+     * post-pull reconciler retires such orphans systematically) — and as the no-op-safe second
+     * half of the legacy two-call sequence.
      *
      * Staged through the plain `stage_local_writes` path, which stages a `deleted: true` write
      * unconditionally (no existing-live precondition), so the no-local-row tombstone is never
@@ -1729,9 +1733,13 @@ open func setAccessToken(jwt: String) {try! rustCall() {
      *
      * Since SUR-975 an ordinary note delete no longer needs this call: `enqueue_note` with
      * `deleted: true` stages the same tombstone (built by [`SyncEngine::build_signals_tombstone`])
-     * in the note tombstone's own transaction. This stays exported for the case `enqueue_note`
-     * cannot cover — retiring signals for a note this device holds NO row for (the cross-device
-     * rule) — and as the no-op-safe second half of the legacy two-call sequence.
+     * in the note tombstone's own transaction. This stays exported for the cases `enqueue_note`
+     * cannot cover — retiring signals for a note with no LIVE local row, i.e. ABSENT (the
+     * cross-device rule) or already TOMBSTONED (e.g. a pre-SUR-975 device crashed inside the old
+     * two-call window and pushed a note tombstone with its signals row still live; the delete-
+     * patch path refuses a dead target, so THIS is the host's repair entrypoint until SUR-976's
+     * post-pull reconciler retires such orphans systematically) — and as the no-op-safe second
+     * half of the legacy two-call sequence.
      *
      * Staged through the plain `stage_local_writes` path, which stages a `deleted: true` write
      * unconditionally (no existing-live precondition), so the no-local-row tombstone is never
@@ -5398,7 +5406,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_set_access_token() != 47386) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_soft_delete_signals_for_note() != 25771) {
+    if (uniffi_braird_core_checksum_method_syncengine_soft_delete_signals_for_note() != 21314) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_sync() != 38790) {
