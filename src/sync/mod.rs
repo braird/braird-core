@@ -275,12 +275,13 @@ const SIGNAL_THROTTLE_MS: i64 = 60 * 60 * 1000;
 /// nothing.
 ///
 /// `importance` is INSIDE change-detection (SUR-977) with an asymmetric contract: `before` reads
-/// the STORED value verbatim (the pre-image invariant — nothing derived may enter it), `after` is
+/// the STORED value verbatim (the pre-image invariant — nothing derived may enter it; a LIVE
+/// row's non-numeric stored value reads as NaN so it can never no-op and must heal), `after` is
 /// recomputed from the post-mutation fields, and mutation closures never touch it. So a stored
 /// value that disagrees with the formula for its own row IS a diff, and the next signal — even a
-/// throttled no-op one — stages the correction; a consistent row recomputes to the bit-identical
-/// f64 and still no-ops.
-#[derive(Clone, PartialEq)]
+/// throttled no-op one — stages the correction. Comparison is [`signals_agree`], NOT derived
+/// `PartialEq` — deliberately not derivable, so an exact f64 compare can't sneak back in.
+#[derive(Clone)]
 struct SignalState {
     source_prior: f64,
     return_visits: i64,
@@ -289,6 +290,28 @@ struct SignalState {
     exposure_recency_at: i64,
     engagement_recency_at: i64,
     importance: f64,
+}
+
+/// `importance` disagreements below this stage nothing. `compute_importance` runs `.exp()` — a
+/// system-libm transcendental with NO cross-implementation bit-determinism — so an exact compare
+/// would let two devices on divergent libms (bionic vs Apple vs glibc, or vs the PWA's
+/// `Math.exp`) ping-pong one-ULP "corrections" forever, each a fresh whole-row LWW write
+/// (SUR-977 sync-reviewer). A sub-epsilon lie is harmless to ranking; a real one (the blind-FFI
+/// class) is orders of magnitude larger.
+const IMPORTANCE_EPSILON: f64 = 1e-9;
+
+/// The change-detection compare (SUR-977): exact on every counter/stamp/prior, epsilon-tolerant
+/// on the derived `importance` only. NaN-safe by construction — a NaN `importance` (a live row's
+/// laundered non-numeric stored value) fails the epsilon test against everything, so the row
+/// always stages its heal.
+fn signals_agree(a: &SignalState, b: &SignalState) -> bool {
+    a.source_prior == b.source_prior
+        && a.return_visits == b.return_visits
+        && a.has_annotation == b.has_annotation
+        && a.stitch_spawns == b.stitch_spawns
+        && a.exposure_recency_at == b.exposure_recency_at
+        && a.engagement_recency_at == b.engagement_recency_at
+        && (a.importance - b.importance).abs() <= IMPORTANCE_EPSILON
 }
 
 /// The on-device sync engine. Owns the SQLite [`Store`], the [`PostgrestClient`], the crypto
@@ -1231,6 +1254,11 @@ impl SyncEngine {
     /// CONTRACT (mirror of surfc's `ensureNoteSignals`): hosts must NOT enqueue a fresh "birth" row.
     /// A birth row is local-only lazy-init; pushing one would clobber another device's earned counters
     /// under whole-row LWW. Enqueue only on a genuine behavioural change.
+    ///
+    /// `source_prior` and `importance` must be FINITE (SUR-977): `json!` cannot represent a
+    /// non-finite f64, so NaN/±inf would be silently laundered to a stored JSON null — which a
+    /// later signal must then heal (importance) or derive around (prior). Rejecting at this trust
+    /// boundary keeps the stored row numeric, the same posture the import path already takes.
     #[allow(clippy::too_many_arguments)]
     pub fn enqueue_note_signals(
         &self,
@@ -1245,6 +1273,11 @@ impl SyncEngine {
         created_at: i64,
         deleted: bool,
     ) -> Result<(), SyncError> {
+        if !source_prior.is_finite() || !importance.is_finite() {
+            return Err(SyncError::Store(
+                "source_prior and importance must be finite numbers".into(),
+            ));
+        }
         let now = epoch_ms();
         let mut row = Map::new();
         row.insert("note_id".into(), json!(note_id));
@@ -1695,39 +1728,46 @@ impl SyncEngine {
         // `before` MIRRORS THE STORED ROW, verbatim. Nothing derived belongs here: the no-op check
         // below compares against it to decide whether the persisted row already says what we are
         // about to write, so anything computed into `before` is a change that silently cannot be
-        // detected. (`importance`'s birth default is the one exception in LETTER, not spirit —
-        // with no stored row there is nothing to mirror, `!was_live` always stages, and the value
-        // never reaches a comparison.)
-        let mut before = SignalState {
-            source_prior: row
-                .get("source_prior")
-                .and_then(Value::as_f64)
-                .unwrap_or_else(|| source_prior(note_source)),
-            return_visits: int_or("return_visits", 0),
-            has_annotation: matches!(row.get("has_annotation"), Some(Value::Bool(true))),
-            stitch_spawns: int_or("stitch_spawns", 0),
+        // detected. `importance`'s two fallbacks keep that spirit exactly (SUR-977 sync-reviewer):
+        //  - absent/tombstoned row → birth value; `!was_live` always stages, never compared.
+        //  - LIVE row with a non-numeric stored importance (a pre-guard blind-FFI write laundered
+        //    to JSON null — `json!` cannot represent a non-finite f64) → NaN, which equals
+        //    NOTHING, so the compare below can never no-op and the row heals to the recomputed
+        //    finite value. A derived stand-in here would equal `after` by construction and shield
+        //    the null forever.
+        let stored_source_prior = row
+            .get("source_prior")
+            .and_then(Value::as_f64)
+            .unwrap_or_else(|| source_prior(note_source));
+        let return_visits = int_or("return_visits", 0);
+        let has_annotation = matches!(row.get("has_annotation"), Some(Value::Bool(true)));
+        let stitch_spawns = int_or("stitch_spawns", 0);
+        let stored_importance = row.get("importance").and_then(Value::as_f64);
+        let before = SignalState {
+            source_prior: stored_source_prior,
+            return_visits,
+            has_annotation,
+            stitch_spawns,
             exposure_recency_at: int_or("exposure_recency_at", 0),
             engagement_recency_at: int_or("engagement_recency_at", 0),
-            importance: 0.0, // placeholder — replaced on the next line, see below
-        };
-        before.importance = row
-            .get("importance")
-            .and_then(Value::as_f64)
-            .unwrap_or_else(|| {
+            importance: stored_importance.unwrap_or(if was_live {
+                f64::NAN // force the heal — see above
+            } else {
                 compute_importance(
-                    before.source_prior,
-                    before.return_visits,
-                    before.has_annotation,
-                    before.stitch_spawns,
+                    stored_source_prior,
+                    return_visits,
+                    has_annotation,
+                    stitch_spawns,
                 )
-            });
+            }),
+        };
         let created_at = int_or("created_at", now);
         let mut after = before.clone();
         mutate(&mut after);
         // `importance` is recomputed on the AFTER side only (SUR-977): derived values belong
         // there, never in the pre-image. A stored value disagreeing with the formula for its own
         // row therefore differs from `after` even when the mutation changed nothing — the
-        // correction stages. A consistent row recomputes bit-identically and still no-ops.
+        // correction stages. A consistent row recomputes (near-)identically and still no-ops.
         after.importance = compute_importance(
             after.source_prior,
             after.return_visits,
@@ -1737,7 +1777,13 @@ impl SyncEngine {
         // Change-detection no-op: a LIVE row the mutation left byte-identical stages nothing (an
         // Exposure inside the throttle window, a repeat of an already-set flag). A tombstoned or
         // absent row (`!was_live`) always stages — the resurrect/birth path.
-        if was_live && after == before {
+        //
+        // ACCEPTED (SUR-977, under SUR-737's ratified lossiness): a formerly write-silent
+        // throttled signal on a LYING row now pushes a whole corrected row with a fresh
+        // `updated_at`, which can beat another device's just-pushed earned counter under
+        // whole-row LWW — at most once per lying row per device, then the row is consistent and
+        // the path is write-silent again.
+        if was_live && signals_agree(&after, &before) {
             return Ok(None);
         }
         let mut sig = Map::new();
@@ -5107,6 +5153,105 @@ mod tests {
             stored_signals(db_path, "n").unwrap(),
             before,
             "no updated_at churn once corrected"
+        );
+    }
+
+    #[test]
+    fn enqueue_note_signals_rejects_non_finite_prior_and_importance() {
+        // The trust-boundary guard (SUR-977 sync-reviewer): `json!` launders a non-finite f64 to
+        // JSON null, which would land a null importance/prior on the stored row. Reject instead —
+        // the same posture the import path takes with `finite_number`.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        for (prior, importance) in [(f64::NAN, 0.5), (0.5, f64::NAN), (f64::INFINITY, 0.5)] {
+            let err = engine
+                .enqueue_note_signals("n".into(), prior, 0, false, 0, 0, 0, importance, 1, false)
+                .unwrap_err();
+            assert!(matches!(err, SyncError::Store(_)));
+        }
+        assert!(stored_signals(db_path, "n").is_none(), "nothing staged");
+        assert!(Store::open(db_path)
+            .unwrap()
+            .outbox_items()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_live_rows_null_importance_is_healed_not_shielded() {
+        // A pre-guard/legacy row can hold a JSON-null importance. The pre-image must NOT paper
+        // over it with a derived stand-in (which would equal `after` by construction and shield
+        // the null forever) — it reads NaN, which agrees with nothing, so even the throttled
+        // no-op path stages the heal.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_note(note_with_source("n", "manual"))
+            .unwrap();
+        let now = epoch_ms();
+        Store::open(db_path)
+            .unwrap()
+            .apply_row(
+                "note_signals",
+                json!({
+                    "note_id": "n", "source_prior": 0.7, "return_visits": 2,
+                    "has_annotation": false, "stitch_spawns": 0,
+                    "exposure_recency_at": now, "engagement_recency_at": 0,
+                    "importance": null, "created_at": 1, "updated_at": 1, "deleted": false
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert!(
+            engine
+                .record_note_signal("n".into(), NoteSignalKind::Exposure)
+                .unwrap(),
+            "a throttled Exposure on a null-importance row stages the heal"
+        );
+        assert_eq!(
+            stored_signals(db_path, "n").unwrap()["importance"],
+            json!(compute_importance(0.7, 2, false, 0)),
+            "healed to the formula"
+        );
+    }
+
+    #[test]
+    fn a_sub_epsilon_importance_difference_stages_nothing() {
+        // The epsilon guard (SUR-977 sync-reviewer): `compute_importance` runs `.exp()`, whose
+        // output is libm-specific — a one-ULP cross-platform disagreement must NOT ping-pong
+        // whole-row "corrections" between devices. Sub-epsilon differences are treated as
+        // agreement; only a real lie (orders of magnitude larger) stages.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_note(note_with_source("n", "manual"))
+            .unwrap();
+        let now = epoch_ms();
+        let ulp_off = compute_importance(0.7, 2, false, 0) + 1e-12;
+        engine
+            .enqueue_note_signals("n".into(), 0.7, 2, false, 0, now, 0, ulp_off, 1, false)
+            .unwrap();
+        let before = stored_signals(db_path, "n").unwrap();
+
+        assert!(
+            !engine
+                .record_note_signal("n".into(), NoteSignalKind::Exposure)
+                .unwrap(),
+            "a sub-epsilon disagreement is agreement — the throttled no-op holds"
+        );
+        assert_eq!(
+            stored_signals(db_path, "n").unwrap(),
+            before,
+            "no churn from libm-scale drift"
         );
     }
 

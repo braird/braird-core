@@ -15,10 +15,18 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   with an asymmetric contract — `before` reads the STORED value verbatim (the pre-image invariant),
   `after` recomputes from the post-mutation fields — so a disagreement is a plain diff and the next
   signal, even a throttled no-op Exposure, stages the correction (counters and stored prior
-  untouched). Zero churn on consistent rows: the recompute is bit-identical for agreeing inputs, so
-  every existing no-op still no-ops. Import already recomputed on entry (unchanged), and the PWA
-  recomputes on every write, so the blind FFI was the one open door. Internal-only — no FFI
-  surface change, bindings untouched.
+  untouched). Zero churn on consistent rows, and the `importance` compare is EPSILON-tolerant
+  (1e-9, `signals_agree` — `PartialEq` deliberately dropped from `SignalState`):
+  `compute_importance` runs `.exp()`, which has no cross-libm bit-determinism, so an exact compare
+  could ping-pong one-ULP "corrections" between devices on divergent platforms. Import already
+  recomputed on entry (unchanged), and the PWA recomputes on every write, so the blind FFI was the
+  one open door — and it now REJECTS non-finite `source_prior`/`importance` at the trust boundary
+  (`json!` silently launders NaN/±inf to a stored JSON null); a legacy live row already holding a
+  null importance reads as a NaN pre-image, agrees with nothing, and heals on its next signal
+  instead of being shielded by a derived stand-in. One accepted widening, under SUR-737's ratified
+  lossiness: a formerly write-silent throttled signal on a LYING row now pushes a whole corrected
+  row once, which can beat a concurrent earned-counter push — at most once per lying row per
+  device. Internal-only — no FFI surface change, bindings untouched.
 
 ### Added
 - **Post-pull `note_signals` reconciliation — `reconcile_note_signals` (SUR-976).** `note_signals`
