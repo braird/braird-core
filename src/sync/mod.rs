@@ -2077,23 +2077,33 @@ impl SyncEngine {
                         && is_handwritten(&l.relation_type)
                         && !retiring_ids.contains(l.id.as_str())
                 });
+            // Read the stored parent signals row once — for the skip-create guard AND the stamp clamp.
+            let parent_sig = store
+                .get_row("note_signals", parent_id)
+                .map_err(store_err)?;
             // Skip-create (PWA `refreshAnnotationSignal`): no signals row AND no live edge → nothing
             // to track (an absent row already reads `has_annotation = false`).
-            if !has_live
-                && store
-                    .get_row("note_signals", parent_id)
-                    .map_err(store_err)?
-                    .is_none()
-            {
+            if !has_live && parent_sig.is_none() {
                 continue;
             }
             let parent_source = parent_note
                 .and_then(|r| r.get("source").and_then(Value::as_str).map(str::to_string));
-            if let Some(sig) =
+            if let Some(mut sig) =
                 self.stage_signal_write(store, parent_id, parent_source.as_deref(), now, |s| {
                     s.has_annotation = has_live;
                 })?
             {
+                // MONOTONE over the stored parent signals row (SUR-976, as `build_signals_tombstone`).
+                // `stage_signal_write` stamps `updated_at = now`; a recompute-to-false is a
+                // convergence-required reconcile, not a best-effort behavioural bump, so if this
+                // device's clock trails the pulled parent stamp an unclamped `now` is SILENTLY
+                // cancelled by the server's t01 LWW guard and never retried (the outbox clears) —
+                // leaving the cloud parent at `has_annotation: true`. Clamp strictly above the stored.
+                let stored_updated = parent_sig
+                    .as_ref()
+                    .and_then(|r| r.get("updated_at").and_then(Value::as_i64))
+                    .unwrap_or(0);
+                sig.insert("updated_at".into(), json!(now.max(stored_updated + 1)));
                 writes.push(("note_signals", parent_id.to_string(), sig));
             }
         }
@@ -4317,6 +4327,88 @@ mod tests {
         let e1 = collapsed_payload_for(db_path, "note_links", "e1")
             .expect("NULL-relation edge retired as handwritten");
         assert_eq!(e1["deleted"], json!(true));
+    }
+
+    #[test]
+    fn parent_recompute_stamp_is_clamped_above_a_future_foreign_signal_updated_at() {
+        // Review regression (PR #68): the parent note_signals row was pulled from a faster-clock
+        // device, so its updated_at leads ours. The recompute-to-false must be stamped STRICTLY after
+        // it, or the server's t01 LWW guard silently drops it and the cloud parent stays true.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+        engine
+            .replace_handwritten_annotations("p".into(), vec![margin("c1", "e1", "a margin")])
+            .unwrap();
+        // Simulate a pulled foreign parent-signal stamp far ahead of this device's clock.
+        let future = 9_999_999_999_999i64;
+        {
+            let store = Store::open(db_path).unwrap();
+            let mut sig = store
+                .get_row("note_signals", "p")
+                .unwrap()
+                .expect("parent signal row from replace");
+            sig.insert("updated_at".into(), json!(future));
+            store.apply_row("note_signals", &sig).unwrap();
+        }
+        drain_outbox(db_path);
+
+        engine
+            .enqueue_note(NoteUpsert {
+                deleted: true,
+                ..note_patch("c1")
+            })
+            .unwrap();
+
+        let sig =
+            collapsed_payload_for(db_path, "note_signals", "p").expect("parent recompute queued");
+        assert_eq!(sig["has_annotation"], json!(false));
+        assert_eq!(
+            sig["updated_at"],
+            json!(future + 1),
+            "recompute clamped strictly above the stored foreign stamp"
+        );
+    }
+
+    #[test]
+    fn direct_edge_remove_does_not_recompute_has_annotation_pwa_parity() {
+        // Parity boundary (PR #68 review): a standalone edge remove via enqueue_note_link(deleted:true)
+        // does NOT recompute the parent — matching the PWA, whose deleteNoteLink is unused and unwired
+        // to refreshAnnotationSignal (has_annotation is reconciled only via replace + note-delete).
+        // Locks the boundary so firing the recompute here later is a deliberate, PWA-coordinated call.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+        engine
+            .replace_handwritten_annotations("p".into(), vec![margin("c1", "e1", "a margin")])
+            .unwrap();
+        drain_outbox(db_path);
+
+        // Remove the edge directly; the child note c1 stays live, so no note-delete cascade runs.
+        engine
+            .enqueue_note_link(
+                "e1".into(),
+                "p".into(),
+                "c1".into(),
+                Some("handwritten_annotation".into()),
+                0,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(
+            collapsed_payload_for(db_path, "note_links", "e1").expect("edge tombstone queued")
+                ["deleted"],
+            json!(true)
+        );
+        assert!(
+            collapsed_payload_for(db_path, "note_signals", "p").is_none(),
+            "direct edge remove does not recompute has_annotation (PWA parity — deleteNoteLink unwired)"
+        );
     }
 
     #[test]
