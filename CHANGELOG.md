@@ -6,6 +6,22 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **A margin-child delete now recomputes the parent's `has_annotation` (SUR-959).** `enqueue_note`'s
+  two delete paths (the full-write `deleted: true` arm and the plaintext-free patch arm) now cascade
+  the SUR-956 signal the other direction: in the SAME `stage_local_writes` batch as the note + its
+  `note_signals` tombstone, they retire the deleted note's `handwritten_annotation` edges for which
+  it is the CHILD (full NOT-NULL shape — `note_links` has no sparse-PATCH fallback) and read-merge-
+  stage each affected parent's `has_annotation`, recomputed from its surviving live handwritten
+  edges (importance re-derived, counters preserved, change-detection no-op when unchanged). Without
+  it, deleting the last margin note left the parent's `has_annotation: true` forever, crediting the
+  0.3 annotation weight to importance fleet-wide. Mirrors the PWA `deleteNote` → `refreshAnnotationSignal`
+  (`useNoteActions.js`/`db.js`), including the `!existing && !hasLive` skip-create guard. Scope
+  (founder 2026-07-22): handwritten-only, child-leg — a deleted PARENT's outgoing edges and any
+  non-`handwritten_annotation` edge are the broader note-delete edge cascade (SUR-84 parity), tracked
+  separately. `refresh-annotation-signal` in the native-parity manifest flips from waived to core.
+  Spine (sync); sync-reviewer + crypto-reviewer. No FFI change → no bindings regen.
+
 ## [0.11.0] - 2026-07-22
 
 Twentieth release batch. Minor release: the note_signals hardening arc lands whole —
