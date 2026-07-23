@@ -541,6 +541,10 @@ impl SyncEngine {
                     {
                         writes.push(("note_signals", id.clone(), tomb));
                     }
+                    // SUR-959: retire this note's handwritten child-edges + recompute each affected
+                    // parent's has_annotation, in the SAME batch (reads the still-live edges before
+                    // the note tombstone commits).
+                    writes.extend(self.stage_annotation_cascade_on_delete(&store, &id, now)?);
                     return store.stage_local_writes(writes, now).map_err(store_err);
                 }
                 self.stage_write("notes", &id, row)
@@ -1957,6 +1961,10 @@ impl SyncEngine {
             {
                 extra_writes.push(("note_signals", record_id.to_string(), tomb));
             }
+            // SUR-959: retire this note's handwritten child-edges + recompute each affected parent's
+            // has_annotation, riding the SAME existing-live precondition — a re-delete that fails
+            // the precondition stages neither the note patch nor this cascade.
+            extra_writes.extend(self.stage_annotation_cascade_on_delete(&store, record_id, now)?);
         }
         store
             .stage_local_write_existing_live("notes", record_id, row, extra_writes, now)
@@ -1964,6 +1972,142 @@ impl SyncEngine {
                 StageExistingWriteError::TargetMissing => SyncError::PatchTargetMissing,
                 StageExistingWriteError::Sql(error) => SyncError::Store(error.to_string()),
             })
+    }
+
+    /// SUR-959 — the margins-delete cascade for a note being tombstoned: retire the
+    /// `handwritten_annotation` edges for which this note is the CHILD (`to_note_id`), and recompute
+    /// each affected parent's `has_annotation` from its SURVIVING live handwritten edges. A parent
+    /// that just lost its last margin child drops the 0.3 annotation weight and recomputes
+    /// `importance`, instead of crediting a stale signal fleet-wide. Build-don't-write: returns rows
+    /// the caller appends to its delete batch, so the note + its signals tombstone + these edge
+    /// tombstones + the parent recomputes all commit in ONE transaction (the SUR-975 atomicity,
+    /// extended).
+    ///
+    /// Mirrors the PWA `deleteNote` (`useNoteActions.js` / `db.js`): `softDeleteNoteLinksForNote`'s
+    /// child leg + a `refreshAnnotationSignal` per affected parent — count the parent's live
+    /// `from_note_id == parent` handwritten edges → `has_annotation`, and SKIP creating a row for a
+    /// parent that has neither a signals row nor a surviving edge (`!existing && !hasLive`).
+    ///
+    /// Handwritten-only, child-leg only (founder scope 2026-07-22): a deleted PARENT's outgoing
+    /// edges and any non-`handwritten_annotation` edge belong to the broader note-delete edge
+    /// cascade (SUR-84 parity), tracked separately — this path never retires them.
+    // `(table, id, row)` is the batch shape `stage_local_writes` consumes verbatim (store.rs); the
+    // `Result<Vec<…>>` wrapper is what trips type_complexity, not the tuple the codebase uses raw.
+    #[allow(clippy::type_complexity)]
+    fn stage_annotation_cascade_on_delete(
+        &self,
+        store: &Store,
+        deleted_note_id: &str,
+        now: i64,
+    ) -> Result<Vec<(&'static str, String, Map<String, Value>)>, SyncError> {
+        const HANDWRITTEN: &str = "handwritten_annotation";
+        // An absent `relation_type` defaults to `handwritten_annotation` everywhere else in the
+        // margins code (`enqueue_note_link`, the replace path's reuse check `.is_none_or(...)`) —
+        // treat None the same here, in BOTH the retire filter and the surviving-edge scan, or a
+        // default-handwritten edge with a NULL column is left live and the recompute is skipped.
+        let is_handwritten = |rt: &Option<String>| rt.as_deref().is_none_or(|r| r == HANDWRITTEN);
+        let mut writes: Vec<(&'static str, String, Map<String, Value>)> = Vec::new();
+
+        // Edges where the deleted note is the handwritten CHILD → retire; their parents may recompute.
+        let retiring: Vec<NoteLinkRecord> = read::note_links_for_note(store, deleted_note_id)
+            .map_err(store_err)?
+            .into_iter()
+            .filter(|e| e.to_note_id == deleted_note_id && is_handwritten(&e.relation_type))
+            .collect();
+        if retiring.is_empty() {
+            return Ok(writes);
+        }
+        let retiring_ids: std::collections::HashSet<&str> =
+            retiring.iter().map(|e| e.id.as_str()).collect();
+
+        // Tombstone each retiring edge with the full NOT-NULL shape (SUR-942/SUR-952 — `note_links`
+        // has no sparse-PATCH flush fallback, so a bare `{id, deleted}` would 23502 and wedge the
+        // outbox). `created_at` is the stored edge's, preserved.
+        for edge in &retiring {
+            let mut tomb = Map::new();
+            tomb.insert("id".into(), json!(edge.id));
+            tomb.insert("from_note_id".into(), json!(edge.from_note_id));
+            tomb.insert("to_note_id".into(), json!(edge.to_note_id));
+            tomb.insert(
+                "relation_type".into(),
+                json!(edge
+                    .relation_type
+                    .clone()
+                    .unwrap_or_else(|| HANDWRITTEN.into())),
+            );
+            tomb.insert("created_at".into(), json!(edge.created_at));
+            // MONOTONE over the row it retires (SUR-976, as `build_signals_tombstone`): the server's
+            // `t01_lww_guard` SILENTLY cancels a strictly-older write and the flush clears the outbox
+            // as if it landed — with the edge already locally tombstoned nothing retries, a
+            // retry-immune divergence that leaves the edge live fleet-wide. Reachable when this
+            // device's clock trails a just-pulled foreign edge's stamp.
+            tomb.insert("updated_at".into(), json!(now.max(edge.updated_at + 1)));
+            tomb.insert("deleted".into(), json!(true));
+            writes.push(("note_links", edge.id.clone(), tomb));
+        }
+
+        // Recompute `has_annotation` once per distinct affected parent.
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for edge in &retiring {
+            let parent_id = edge.from_note_id.as_str();
+            if parent_id == deleted_note_id || !seen.insert(parent_id) {
+                continue; // a degenerate p→p self-edge parent IS the note we're deleting; else once
+            }
+            // Only a LIVE parent needs has_annotation tracked. If the parent note is missing or
+            // already tombstoned, its signals must STAY retired: `stage_signal_write` treats a
+            // tombstoned row as a birth/resurrect and would stage `deleted: false`, re-creating live
+            // signal metadata for a dead note. This child-leg-only cascade leaves a deleted parent's
+            // outgoing edge LIVE (SUR-84 scope), so deleting a margin child AFTER its parent still
+            // reaches it here — the PWA never does (its full edge cascade tombstoned that edge with
+            // the parent, so `refreshAnnotationSignal` is never called for a dead parent).
+            let parent_note = store.get_row("notes", parent_id).map_err(store_err)?;
+            let parent_live = parent_note
+                .as_ref()
+                .is_some_and(|r| !matches!(r.get("deleted"), Some(Value::Bool(true))));
+            if !parent_live {
+                continue;
+            }
+            // Any SURVIVING live handwritten edge from this parent? Exclude the ids we're retiring —
+            // they are not committed yet, so `note_links_for_note` still returns them live.
+            let has_live = read::note_links_for_note(store, parent_id)
+                .map_err(store_err)?
+                .iter()
+                .any(|l| {
+                    l.from_note_id == parent_id
+                        && is_handwritten(&l.relation_type)
+                        && !retiring_ids.contains(l.id.as_str())
+                });
+            // Read the stored parent signals row once — for the skip-create guard AND the stamp clamp.
+            let parent_sig = store
+                .get_row("note_signals", parent_id)
+                .map_err(store_err)?;
+            // Skip-create (PWA `refreshAnnotationSignal`): no signals row AND no live edge → nothing
+            // to track (an absent row already reads `has_annotation = false`).
+            if !has_live && parent_sig.is_none() {
+                continue;
+            }
+            let parent_source = parent_note
+                .and_then(|r| r.get("source").and_then(Value::as_str).map(str::to_string));
+            if let Some(mut sig) =
+                self.stage_signal_write(store, parent_id, parent_source.as_deref(), now, |s| {
+                    s.has_annotation = has_live;
+                })?
+            {
+                // MONOTONE over the stored parent signals row (SUR-976, as `build_signals_tombstone`).
+                // `stage_signal_write` stamps `updated_at = now`; a recompute-to-false is a
+                // convergence-required reconcile, not a best-effort behavioural bump, so if this
+                // device's clock trails the pulled parent stamp an unclamped `now` is SILENTLY
+                // cancelled by the server's t01 LWW guard and never retried (the outbox clears) —
+                // leaving the cloud parent at `has_annotation: true`. Clamp strictly above the stored.
+                let stored_updated = parent_sig
+                    .as_ref()
+                    .and_then(|r| r.get("updated_at").and_then(Value::as_i64))
+                    .unwrap_or(0);
+                sig.insert("updated_at".into(), json!(now.max(stored_updated + 1)));
+                writes.push(("note_signals", parent_id.to_string(), sig));
+            }
+        }
+        Ok(writes)
     }
 }
 
@@ -3885,6 +4029,415 @@ mod tests {
         );
         let c1 = collapsed_payload_for(db_path, "notes", "c1").expect("note tombstone queued");
         assert_eq!(c1["deleted"], json!(true)); // sparse is fine for notes (PATCH fallback)
+    }
+
+    // ── SUR-959 — margins-delete recomputes the parent's has_annotation ──────────
+
+    #[test]
+    fn deleting_the_last_margin_child_tombstones_the_edge_and_drops_parent_has_annotation() {
+        // The patch-delete route (plaintext-free `deleted: true`, the host's soft-delete). After a
+        // create→flush, the delete batch stands alone: the child's handwritten edge tombstone must
+        // carry the full NOT-NULL shape, AND the parent — now with no live margin — recomputes
+        // has_annotation to false with importance re-derived. All in ONE batch.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+        engine
+            .replace_handwritten_annotations("p".into(), vec![margin("c1", "e1", "a margin")])
+            .unwrap();
+        drain_outbox(db_path); // creates flushed; the delete batch queues its tombstones ALONE
+
+        engine
+            .enqueue_note(NoteUpsert {
+                deleted: true,
+                ..note_patch("c1")
+            })
+            .unwrap();
+
+        // Edge e1 (p→c1) tombstoned with the full NOT-NULL shape (no sparse-PATCH fallback).
+        let e1 = collapsed_payload_for(db_path, "note_links", "e1").expect("edge tombstone queued");
+        assert_eq!(e1["deleted"], json!(true));
+        for col in [
+            "from_note_id",
+            "to_note_id",
+            "relation_type",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(
+                e1.contains_key(col),
+                "edge tombstone missing `{col}`: {e1:?}"
+            );
+        }
+        assert_eq!(e1["from_note_id"], json!("p"));
+        assert_eq!(e1["to_note_id"], json!("c1"));
+        // Parent p recomputed to has_annotation:false (importance a finite number, re-derived).
+        let sig = collapsed_payload_for(db_path, "note_signals", "p")
+            .expect("parent signal recompute queued");
+        assert_eq!(sig["has_annotation"], json!(false));
+        assert_eq!(sig["deleted"], json!(false));
+        assert!(sig["importance"].as_f64().is_some_and(f64::is_finite));
+        // The child note itself is tombstoned in the same batch.
+        assert_eq!(
+            collapsed_payload_for(db_path, "notes", "c1").expect("child tombstone queued")
+                ["deleted"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn full_write_delete_route_also_recomputes_parent_has_annotation() {
+        // The full-write delete arm (plaintext present, `deleted: true`, SUR-975) must cascade too.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+        engine
+            .replace_handwritten_annotations("p".into(), vec![margin("c1", "e1", "a margin")])
+            .unwrap();
+        drain_outbox(db_path);
+
+        engine
+            .enqueue_note(NoteUpsert {
+                deleted: true,
+                ..note_upsert("c1", "the child text")
+            })
+            .unwrap();
+
+        assert_eq!(
+            collapsed_payload_for(db_path, "note_links", "e1").expect("edge tombstone queued")
+                ["deleted"],
+            json!(true)
+        );
+        assert_eq!(
+            collapsed_payload_for(db_path, "note_signals", "p").expect("parent recompute queued")
+                ["has_annotation"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn deleting_one_of_two_margins_keeps_has_annotation_and_stages_no_signal() {
+        // A surviving live margin means the flag stays true → the change-detection no-op stages NO
+        // note_signals write for the parent (only the deleted child's edge + note tombstones move).
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+        engine
+            .replace_handwritten_annotations(
+                "p".into(),
+                vec![margin("c1", "e1", "first"), margin("c2", "e2", "second")],
+            )
+            .unwrap();
+        drain_outbox(db_path);
+
+        engine
+            .enqueue_note(NoteUpsert {
+                deleted: true,
+                ..note_patch("c1")
+            })
+            .unwrap();
+
+        assert_eq!(
+            collapsed_payload_for(db_path, "note_links", "e1").expect("e1 tombstone queued")
+                ["deleted"],
+            json!(true)
+        );
+        assert!(
+            collapsed_payload_for(db_path, "note_signals", "p").is_none(),
+            "c2 still live → has_annotation unchanged → no signal write"
+        );
+    }
+
+    #[test]
+    fn margin_delete_without_a_parent_signal_row_creates_none() {
+        // Skip-create parity (PWA `refreshAnnotationSignal`: `!existing && !hasLive` → no row). A
+        // LIVE parent that never got a signals row (edge added directly, not via the margins op)
+        // must not birth one on delete.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(note_upsert("p", "the parent")).unwrap();
+        engine.enqueue_note(note_upsert("c", "the child")).unwrap();
+        engine
+            .enqueue_note_link(
+                "e1".into(),
+                "p".into(),
+                "c".into(),
+                Some("handwritten_annotation".into()),
+                0,
+                false,
+            )
+            .unwrap();
+        drain_outbox(db_path);
+
+        engine
+            .enqueue_note(NoteUpsert {
+                deleted: true,
+                ..note_patch("c")
+            })
+            .unwrap();
+
+        assert_eq!(
+            collapsed_payload_for(db_path, "note_links", "e1").expect("edge tombstone queued")
+                ["deleted"],
+            json!(true)
+        );
+        assert!(
+            collapsed_payload_for(db_path, "note_signals", "p").is_none(),
+            "live parent, no prior signal row + no surviving edge → skip-create, not a birthed row"
+        );
+    }
+
+    #[test]
+    fn deleting_a_margin_child_after_its_parent_does_not_resurrect_the_parents_signals() {
+        // Review regression (PR #68): child-leg-only cascade leaves a deleted parent's outgoing edge
+        // LIVE, so deleting the child LATER still reaches the parent recompute. The parent note and
+        // its signals are already tombstoned — the recompute must NOT resurrect them (`deleted:false`)
+        // and re-create live signal metadata for a dead note. Covers BOTH branches: the surviving
+        // edge here (c2/e2 kept live by the child-leg scope) means has_live=true, which the
+        // skip-create guard alone would not catch — only the parent-liveness guard does.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+        engine
+            .replace_handwritten_annotations(
+                "p".into(),
+                vec![margin("c1", "e1", "first"), margin("c2", "e2", "second")],
+            )
+            .unwrap();
+        // Delete the PARENT first: p note + p signals tombstoned; e1/e2 stay live (child-leg scope).
+        engine
+            .enqueue_note(NoteUpsert {
+                deleted: true,
+                ..note_patch("p")
+            })
+            .unwrap();
+        drain_outbox(db_path);
+
+        // Now delete a (still-live) margin child.
+        engine
+            .enqueue_note(NoteUpsert {
+                deleted: true,
+                ..note_patch("c1")
+            })
+            .unwrap();
+
+        // The edge is tombstoned (child-leg), but the deleted parent's signals stay retired.
+        assert_eq!(
+            collapsed_payload_for(db_path, "note_links", "e1").expect("edge tombstone queued")
+                ["deleted"],
+            json!(true)
+        );
+        assert!(
+            collapsed_payload_for(db_path, "note_signals", "p").is_none(),
+            "parent p is deleted — its signals must NOT be resurrected to deleted:false"
+        );
+        // And the local row stays a tombstone (never flipped live).
+        let p_sig = Store::open(db_path)
+            .unwrap()
+            .get_row("note_signals", "p")
+            .unwrap();
+        assert_eq!(
+            p_sig.and_then(|r| r.get("deleted").and_then(Value::as_bool)),
+            Some(true),
+            "parent p's local signals row stays tombstoned"
+        );
+    }
+
+    #[test]
+    fn edge_tombstone_stamp_is_clamped_above_a_future_foreign_updated_at() {
+        // Review regression (PR #68): a margin edge pulled from a device with a faster clock carries
+        // an `updated_at` ahead of ours. The tombstone must be stamped STRICTLY after it, or the
+        // server's t01 LWW guard silently drops the delete and the edge stays live fleet-wide.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+        engine
+            .replace_handwritten_annotations("p".into(), vec![margin("c1", "e1", "a margin")])
+            .unwrap();
+        // Simulate the pulled foreign stamp: overwrite e1's updated_at far into the future.
+        let future = 9_999_999_999_999i64;
+        {
+            let store = Store::open(db_path).unwrap();
+            let mut e1row = store.get_row("note_links", "e1").unwrap().unwrap();
+            e1row.insert("updated_at".into(), json!(future));
+            store.apply_row("note_links", &e1row).unwrap();
+        }
+        drain_outbox(db_path);
+
+        engine
+            .enqueue_note(NoteUpsert {
+                deleted: true,
+                ..note_patch("c1")
+            })
+            .unwrap();
+
+        let e1 = collapsed_payload_for(db_path, "note_links", "e1").expect("edge tombstone queued");
+        assert_eq!(e1["deleted"], json!(true));
+        assert_eq!(
+            e1["updated_at"],
+            json!(future + 1),
+            "edge tombstone clamped strictly above the stored foreign stamp"
+        );
+    }
+
+    #[test]
+    fn margin_edge_with_null_relation_type_is_retired_as_handwritten() {
+        // Review regression (PR #68): an absent relation_type defaults to handwritten_annotation in
+        // the rest of the margins code, so a NULL-relation margin edge whose child is deleted must be
+        // retired (not left live) and count toward the parent recompute.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(note_upsert("p", "the parent")).unwrap();
+        engine.enqueue_note(note_upsert("c", "the child")).unwrap();
+        {
+            let store = Store::open(db_path).unwrap();
+            store
+                .apply_row(
+                    "note_links",
+                    json!({ "id": "e1", "from_note_id": "p", "to_note_id": "c",
+                    "relation_type": null, "created_at": 1, "updated_at": 1, "deleted": false })
+                    .as_object()
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        drain_outbox(db_path);
+
+        engine
+            .enqueue_note(NoteUpsert {
+                deleted: true,
+                ..note_patch("c")
+            })
+            .unwrap();
+
+        let e1 = collapsed_payload_for(db_path, "note_links", "e1")
+            .expect("NULL-relation edge retired as handwritten");
+        assert_eq!(e1["deleted"], json!(true));
+    }
+
+    #[test]
+    fn parent_recompute_stamp_is_clamped_above_a_future_foreign_signal_updated_at() {
+        // Review regression (PR #68): the parent note_signals row was pulled from a faster-clock
+        // device, so its updated_at leads ours. The recompute-to-false must be stamped STRICTLY after
+        // it, or the server's t01 LWW guard silently drops it and the cloud parent stays true.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+        engine
+            .replace_handwritten_annotations("p".into(), vec![margin("c1", "e1", "a margin")])
+            .unwrap();
+        // Simulate a pulled foreign parent-signal stamp far ahead of this device's clock.
+        let future = 9_999_999_999_999i64;
+        {
+            let store = Store::open(db_path).unwrap();
+            let mut sig = store
+                .get_row("note_signals", "p")
+                .unwrap()
+                .expect("parent signal row from replace");
+            sig.insert("updated_at".into(), json!(future));
+            store.apply_row("note_signals", &sig).unwrap();
+        }
+        drain_outbox(db_path);
+
+        engine
+            .enqueue_note(NoteUpsert {
+                deleted: true,
+                ..note_patch("c1")
+            })
+            .unwrap();
+
+        let sig =
+            collapsed_payload_for(db_path, "note_signals", "p").expect("parent recompute queued");
+        assert_eq!(sig["has_annotation"], json!(false));
+        assert_eq!(
+            sig["updated_at"],
+            json!(future + 1),
+            "recompute clamped strictly above the stored foreign stamp"
+        );
+    }
+
+    #[test]
+    fn direct_edge_remove_does_not_recompute_has_annotation_pwa_parity() {
+        // Parity boundary (PR #68 review): a standalone edge remove via enqueue_note_link(deleted:true)
+        // does NOT recompute the parent — matching the PWA, whose deleteNoteLink is unused and unwired
+        // to refreshAnnotationSignal (has_annotation is reconciled only via replace + note-delete).
+        // Locks the boundary so firing the recompute here later is a deliberate, PWA-coordinated call.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+        engine
+            .replace_handwritten_annotations("p".into(), vec![margin("c1", "e1", "a margin")])
+            .unwrap();
+        drain_outbox(db_path);
+
+        // Remove the edge directly; the child note c1 stays live, so no note-delete cascade runs.
+        engine
+            .enqueue_note_link(
+                "e1".into(),
+                "p".into(),
+                "c1".into(),
+                Some("handwritten_annotation".into()),
+                0,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(
+            collapsed_payload_for(db_path, "note_links", "e1").expect("edge tombstone queued")
+                ["deleted"],
+            json!(true)
+        );
+        assert!(
+            collapsed_payload_for(db_path, "note_signals", "p").is_none(),
+            "direct edge remove does not recompute has_annotation (PWA parity — deleteNoteLink unwired)"
+        );
+    }
+
+    #[test]
+    fn deleting_the_parent_leaves_its_outgoing_edge_live_scope_boundary() {
+        // Founder scope 2026-07-22: handwritten-only, CHILD-leg only. Deleting the PARENT retires no
+        // edge here — its outgoing p→c edge is the broader note-delete edge cascade (SUR-84 parity),
+        // tracked separately. This test locks that boundary so a future SUR-84 change is deliberate.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+        engine
+            .replace_handwritten_annotations("p".into(), vec![margin("c1", "e1", "a margin")])
+            .unwrap();
+        drain_outbox(db_path);
+
+        engine
+            .enqueue_note(NoteUpsert {
+                deleted: true,
+                ..note_patch("p")
+            })
+            .unwrap();
+
+        // The parent→child edge is NOT retired by this path (child-leg only).
+        assert!(
+            collapsed_payload_for(db_path, "note_links", "e1").is_none(),
+            "deleting the parent does not tombstone its outgoing edge (SUR-84 scope)"
+        );
     }
 
     #[test]

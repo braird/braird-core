@@ -6,6 +6,34 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **A margin-child delete now recomputes the parent's `has_annotation` (SUR-959).** `enqueue_note`'s
+  two delete paths (the full-write `deleted: true` arm and the plaintext-free patch arm) now cascade
+  the SUR-956 signal the other direction: in the SAME `stage_local_writes` batch as the note + its
+  `note_signals` tombstone, they retire the deleted note's `handwritten_annotation` edges for which
+  it is the CHILD (full NOT-NULL shape — `note_links` has no sparse-PATCH fallback) and read-merge-
+  stage each affected parent's `has_annotation`, recomputed from its surviving live handwritten
+  edges (importance re-derived, counters preserved, change-detection no-op when unchanged). Without
+  it, deleting the last margin note left the parent's `has_annotation: true` forever, crediting the
+  0.3 annotation weight to importance fleet-wide. Mirrors the PWA `deleteNote` → `refreshAnnotationSignal`
+  (`useNoteActions.js`/`db.js`), including the `!existing && !hasLive` skip-create guard, and — because
+  the child-leg scope leaves a deleted parent's outgoing edge live — a **parent-liveness guard** so a
+  child deleted AFTER its parent never resurrects the dead parent's tombstoned signals row (the PWA
+  avoids this structurally: its full edge cascade retires the edge with the parent). The edge
+  tombstone's `updated_at` is clamped strictly above the stored row (SUR-976 monotonicity — else a
+  clock-skewed stamp from a pulled foreign edge lets the server's t01 LWW guard silently drop the
+  delete, leaving the edge live fleet-wide), and an absent `relation_type` is treated as
+  `handwritten_annotation` (the margins-code default) in both the retire filter and the surviving-edge
+  scan. The parent recompute's own `note_signals.updated_at` is likewise clamped strictly above the
+  stored parent row (same t01/SUR-976 reason — a clock-behind device would otherwise leave the cloud
+  parent at `has_annotation: true`). The recompute fires only from the note-delete path (matching where
+  the PWA wires `refreshAnnotationSignal` — `deleteNote` + `replaceHandwrittenAnnotations`); a
+  standalone edge remove (`enqueue_note_link(deleted: true)`) does NOT recompute, faithful to the PWA
+  whose `deleteNoteLink` is unused and unwired to the reconciler. Scope
+  (founder 2026-07-22): handwritten-only, child-leg — a deleted PARENT's outgoing edges and any
+  non-`handwritten_annotation` edge are the broader note-delete edge cascade (SUR-84 parity), tracked
+  separately. `refresh-annotation-signal` in the native-parity manifest flips from waived to core.
+  Spine (sync); sync-reviewer + crypto-reviewer. No FFI change → no bindings regen.
 ### Fixed
 - **`reconcile.rs` `repoint_note_links` now stages the full NOT-NULL shape (SUR-954).** A
   content-dedupe merge (`reconcile_content_dupes` → `merge_into_survivor` → `repoint_note_links`)
