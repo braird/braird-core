@@ -838,14 +838,14 @@ final class RoundTripTests: XCTestCase {
         XCTAssertFalse(registration.corpusChanged)
         XCTAssertEqual(registration.invalidated, 0)
         XCTAssertEqual(registration.pending, 2)
-        XCTAssertEqual(try engine.embedPendingCount(), 2)
+        XCTAssertEqual(try engine.pendingEmbedCount(), 2)
 
         // The drain calls BACK into this Swift embedder with the decrypted plaintext.
         let progress = try engine.embedPending(maxItems: 10)
         XCTAssertEqual(progress.embedded, 2)
-        XCTAssertEqual(progress.remaining, 0)
+        XCTAssertEqual(progress.pending, 0)
         XCTAssertEqual(embedder.documentCalls, 2)
-        XCTAssertEqual(try engine.embedPendingCount(), 0)
+        XCTAssertEqual(try engine.pendingEmbedCount(), 0)
 
         // The scan primitives read the sealed corpus back over the FFI.
         let hits = try engine.semanticSearch(query: "aaaa", limit: 10)
@@ -862,8 +862,8 @@ final class RoundTripTests: XCTestCase {
             func descriptor() -> EmbedderDescriptor {
                 EmbedderDescriptor(modelId: "swift-failing", dims: 8, quantization: "test")
             }
-            func embedDocument(text: String) throws -> [Float] { throw EmbedError.Runtime }
-            func embedQuery(text: String) throws -> [Float] { throw EmbedError.Runtime }
+            func embedDocument(text: String) throws -> [Float] { throw EmbedderError.Runtime }
+            func embedQuery(text: String) throws -> [Float] { throw EmbedderError.Runtime }
         }
         let db = FileManager.default.temporaryDirectory
             .appendingPathComponent("braird-embed-err-\(UUID().uuidString).sqlite")
@@ -876,7 +876,35 @@ final class RoundTripTests: XCTestCase {
         let progress = try engine.embedPending(maxItems: 10)
         XCTAssertEqual(progress.embedded, 0)
         XCTAssertEqual(progress.failed, 1)
-        XCTAssertEqual(progress.remaining, 1, "a failed note stays queued for the next pass")
+        XCTAssertEqual(progress.pending, 1, "a failed note stays queued for the next pass")
+        XCTAssertThrowsError(try engine.semanticSearch(query: "query", limit: 5))
+    }
+
+    /// An UNDECLARED host error (not an EmbedderError) rides UniFFI's unexpected-error
+    /// lane; the From<UnexpectedUniFFICallbackError> impl must degrade it to Runtime —
+    /// counted as failed, never a panic, never the host's message transiting core.
+    func testUndeclaredEmbedderErrorDegradesToFailedNotPanic() throws {
+        struct HostError: Error {}
+        final class UndeclaredThrowingEmbedder: Embedder {
+            func descriptor() -> EmbedderDescriptor {
+                EmbedderDescriptor(modelId: "swift-undeclared", dims: 8, quantization: "test")
+            }
+            func embedDocument(text: String) throws -> [Float] { throw HostError() }
+            func embedQuery(text: String) throws -> [Float] { throw HostError() }
+        }
+        let db = FileManager.default.temporaryDirectory
+            .appendingPathComponent("braird-embed-undeclared-\(UUID().uuidString).sqlite")
+        let engine = try SyncEngine.open(
+            dbPath: db.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
+            vault: Vault.generate())
+        try engine.enqueueNote(draft: plainNote("n1", "some text"))
+        _ = try engine.registerEmbedder(embedder: UndeclaredThrowingEmbedder())
+
+        // Must NOT throw — the pass completes with the item counted failed.
+        let progress = try engine.embedPending(maxItems: 10)
+        XCTAssertEqual(progress.embedded, 0)
+        XCTAssertEqual(progress.failed, 1)
+        XCTAssertEqual(progress.pending, 1)
         XCTAssertThrowsError(try engine.semanticSearch(query: "query", limit: 5))
     }
 }

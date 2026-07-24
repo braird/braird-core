@@ -6,8 +6,9 @@
 //! trait is this repo's **first foreign-implemented trait** (`with_foreign`): Swift/Kotlin
 //! register an implementation on the `SyncEngine`, which drives it from the derived embed
 //! queue (`Store::pending_embeddings`) and seals every vector with the vault key before it
-//! touches disk (`Vault::seal_bytes`, AAD = note id — the `0x02` byte seal). Vectors are
-//! **device-local**: nothing here ever reaches the outbox or the server.
+//! touches disk (`Vault::seal_bytes`, AAD = `emb:{note id}` — the `0x02` byte seal,
+//! domain-separated from enc:v2; see [`embed_aad`]). Vectors are **device-local**: nothing
+//! here ever reaches the outbox or the server.
 //!
 //! This module is the pure half — the contract types and the vector math (corpus key,
 //! normalization, the f32-LE codec, dot/top-k). The pipeline choreography (locks, decrypt,
@@ -21,8 +22,8 @@
 
 use crate::CryptoError;
 
-/// The identity of a host embedder — everything the vector space depends on. Carried in the
-/// corpus key ([`corpus_key`]), so ANY change re-keys the corpus and re-queues every note.
+/// The identity of a host embedder — everything the vector space depends on. Carried in
+/// the corpus key, so ANY change re-keys the corpus and re-queues every note.
 ///
 /// **Prompt-template contract (documented, not enforced):** EmbeddingGemma's query/document
 /// prompt templates and tokenization (BOS(2) + prompt + EOS(1), seq-fixed single-input
@@ -40,12 +41,14 @@ pub struct EmbedderDescriptor {
     pub quantization: String,
 }
 
-/// How a host embed call failed. Deliberately **fieldless**: the error crosses
-/// foreign→Rust, and a host-authored message must never transit into core's error strings
-/// (the same no-host-content rule as `enqueue_note`'s `source_meta_json` handling) — the
-/// host already knows its own error; it threw it, and can log it host-side.
+/// How a host embed call failed — the error the *embedder* throws (`SyncError::Embed` is
+/// its engine-side counterpart, travelling the other direction). Deliberately
+/// **fieldless**: the error crosses foreign→Rust, and a host-authored message must never
+/// transit into core's error strings (the same no-host-content rule as `enqueue_note`'s
+/// `source_meta_json` handling) — the host already knows its own error; it threw it, and
+/// can log it host-side.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
-pub enum EmbedError {
+pub enum EmbedderError {
     /// This embed failed (inference error, transient runtime fault). The pipeline counts it
     /// and moves on to the next note.
     #[error("embedder runtime failure")]
@@ -54,6 +57,20 @@ pub enum EmbedError {
     /// constrained). The pipeline aborts the whole pass — the host re-drains later.
     #[error("embedder unavailable")]
     Unavailable,
+}
+
+/// An UNDECLARED host exception (anything that is not an `EmbedderError` — a stray
+/// `IllegalStateException`, an arbitrary Swift `Error`) arrives on UniFFI's
+/// unexpected-error lane. Without this impl that lane PANICS core with the host's own
+/// message string — both crashing the pass and ferrying host-authored content through
+/// core, the two things the fieldless design forbids. Mapping to
+/// [`EmbedderError::Runtime`] drops the host string in core and keeps the
+/// count-as-failed-and-continue contract (crypto-review finding; pinned by round-trip
+/// tests throwing an undeclared exception on both bindings).
+impl From<uniffi::UnexpectedUniFFICallbackError> for EmbedderError {
+    fn from(_: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        EmbedderError::Runtime
+    }
 }
 
 /// The host-registered embedder (SUR-997 item 1): core calls it with **plaintext** and gets
@@ -78,10 +95,10 @@ pub trait Embedder: Send + Sync {
     /// Embed one note's plaintext for storage (the document prompt template). Must return
     /// exactly `descriptor().dims` values; the output need not be pre-normalized (core
     /// normalizes defensively).
-    fn embed_document(&self, text: String) -> Result<Vec<f32>, EmbedError>;
+    fn embed_document(&self, text: String) -> Result<Vec<f32>, EmbedderError>;
 
     /// Embed a search query (the query prompt template). Same length contract.
-    fn embed_query(&self, text: String) -> Result<Vec<f32>, EmbedError>;
+    fn embed_query(&self, text: String) -> Result<Vec<f32>, EmbedderError>;
 }
 
 /// One semantic-scan result: a live note and its cosine similarity to the probe, in
@@ -93,11 +110,13 @@ pub struct SemanticHit {
 }
 
 /// What one `embed_pending` pass did. `attempted = embedded + skipped + failed`;
-/// `remaining` is the derived queue size after the pass — the host's durable
+/// `pending` is the derived queue size after the pass — the host's durable
 /// rebuild/progress signal (it survives a process restart, unlike a registration-time
-/// flag), and the right driver for any "search index is rebuilding" UI.
+/// flag), and the right driver for any "search index is rebuilding" UI. One word for the
+/// queue size everywhere: this field, `RegisterEmbedderSummary::pending`, and
+/// `pending_embed_count` all name the same number.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct EmbedProgress {
+pub struct EmbedSummary {
     /// Queue items this pass processed (capped by `max_items`).
     pub attempted: u32,
     /// Vectors embedded, sealed, and stored.
@@ -108,7 +127,7 @@ pub struct EmbedProgress {
     /// Embeds that failed (host error, wrong dimension, non-finite output). Still queued.
     pub failed: u32,
     /// The derived queue size after this pass.
-    pub remaining: u32,
+    pub pending: u32,
 }
 
 /// What registering an embedder did. `corpus_changed`/`invalidated` are the *immediate*
@@ -117,7 +136,7 @@ pub struct EmbedProgress {
 /// partially-rebuilt corpus, so `corpus_changed` is correctly `false` while `pending` still
 /// reports the remainder. Drive persistent notification UI off the pending count.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct EmbedderRegistration {
+pub struct RegisterEmbedderSummary {
     /// The registered corpus key differs from (some of) what was stored — stale vectors
     /// were dropped and their notes re-queued.
     pub corpus_changed: bool,
@@ -138,6 +157,17 @@ pub(crate) fn corpus_key(descriptor: &EmbedderDescriptor) -> String {
         "{}|{}|{}|f32le-v1",
         descriptor.model_id, descriptor.dims, descriptor.quantization
     )
+}
+
+/// The AAD a note's vector is sealed under: `emb:{note_id}`. The `emb:` prefix
+/// domain-separates the `0x02` vector seal from `enc:v2` note ciphertext, which uses the
+/// BARE note id as AAD under the same Master Key — without it, neither format header being
+/// authenticated means a stored enc:v2 body repackaged as `[0x02][iv][ct]` (or vice versa)
+/// would cross-authenticate (crypto-review hardening). Free now — no device holds a sealed
+/// vector; after release it would cost a corpus rebuild. The seal primitive and its frozen
+/// `0x02` header are untouched; this is purely the caller's AAD choice.
+pub(crate) fn embed_aad(note_id: &str) -> String {
+    format!("emb:{note_id}")
 }
 
 /// Normalize to unit length, or `None` for a zero/non-finite vector (a NaN/Inf anywhere
@@ -209,6 +239,26 @@ mod tests {
             dims,
             quantization: quantization.into(),
         }
+    }
+
+    #[test]
+    fn an_undeclared_callback_error_degrades_to_runtime_without_the_host_string() {
+        // The unexpected-error lane (crypto-review): an undeclared host exception maps to
+        // fieldless Runtime — never a panic, never the host's message in core.
+        let e = EmbedderError::from(uniffi::UnexpectedUniFFICallbackError {
+            reason: "host secret detail".into(),
+        });
+        assert!(matches!(e, EmbedderError::Runtime));
+        assert!(
+            !e.to_string().contains("secret"),
+            "host content never transits core error strings"
+        );
+    }
+
+    #[test]
+    fn embed_aad_domain_separates_from_the_bare_note_id() {
+        assert_eq!(embed_aad("n1"), "emb:n1");
+        assert_ne!(embed_aad("n1"), "n1", "never the enc:v2 AAD namespace");
     }
 
     #[test]

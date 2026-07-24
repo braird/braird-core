@@ -681,7 +681,7 @@ open func descriptor() -> EmbedderDescriptor {
      * normalizes defensively).
      */
 open func embedDocument(text: String)throws  -> [Float] {
-    return try  FfiConverterSequenceFloat.lift(try rustCallWithError(FfiConverterTypeEmbedError.lift) {
+    return try  FfiConverterSequenceFloat.lift(try rustCallWithError(FfiConverterTypeEmbedderError.lift) {
     uniffi_braird_core_fn_method_embedder_embed_document(self.uniffiClonePointer(),
         FfiConverterString.lower(text),$0
     )
@@ -692,7 +692,7 @@ open func embedDocument(text: String)throws  -> [Float] {
      * Embed a search query (the query prompt template). Same length contract.
      */
 open func embedQuery(text: String)throws  -> [Float] {
-    return try  FfiConverterSequenceFloat.lift(try rustCallWithError(FfiConverterTypeEmbedError.lift) {
+    return try  FfiConverterSequenceFloat.lift(try rustCallWithError(FfiConverterTypeEmbedderError.lift) {
     uniffi_braird_core_fn_method_embedder_embed_query(self.uniffiClonePointer(),
         FfiConverterString.lower(text),$0
     )
@@ -759,7 +759,7 @@ fileprivate struct UniffiCallbackInterfaceEmbedder {
                 callStatus: uniffiCallStatus,
                 makeCall: makeCall,
                 writeReturn: writeReturn,
-                lowerError: FfiConverterTypeEmbedError.lower
+                lowerError: FfiConverterTypeEmbedderError.lower
             )
         },
         embedQuery: { (
@@ -784,7 +784,7 @@ fileprivate struct UniffiCallbackInterfaceEmbedder {
                 callStatus: uniffiCallStatus,
                 makeCall: makeCall,
                 writeReturn: writeReturn,
-                lowerError: FfiConverterTypeEmbedError.lower
+                lowerError: FfiConverterTypeEmbedderError.lower
             )
         },
         uniffiFree: { (uniffiHandle: UInt64) -> () in
@@ -891,27 +891,20 @@ public protocol SyncEngineProtocol : AnyObject {
      * Drain up to `max_items` of the derived embed queue (SUR-997 item 5): per note —
      * read + decrypt in core, hand the PLAINTEXT to the host embedder (the one place note
      * text leaves core other than display DTOs; no lock held across the call), validate
-     * length + normalize, seal with the vault key (AAD = note id), and store — only if the
-     * note's text is still what was embedded ([`Store::upsert_embedding_if_current`];
-     * a note edited/deleted during the ~0.8 s embed re-queues instead).
+     * length + normalize, seal with the vault key (AAD = `emb:{note id}`, domain-separated
+     * from enc:v2), and store — via a write-if-current store check, so a note edited or
+     * deleted during the ~0.8 s embed re-queues instead of storing a stale vector.
      *
      * Hosts own the schedule (WorkManager / BGProcessingTask): call in chunks, stop
      * between calls. One failed embed never halts the pass (counted `failed`, still
-     * queued); [`EmbedError::Unavailable`] aborts the whole pass. A note with empty text
+     * queued); [`EmbedderError::Unavailable`] aborts the whole pass. A note with empty text
      * or undecryptable ciphertext writes a NULL-vector skip marker (mirrors ADR 0005
      * dropping decrypt failures from the lexical index) so the queue actually drains; its
      * next edit re-queues it. Orphan vectors are swept once per pass. Re-registering a
      * different embedder mid-pass is benign: a stale-key row written by the old pass is
      * invisible to the scan and re-embedded via the derived queue.
      */
-    func embedPending(maxItems: UInt32) throws  -> EmbedProgress
-    
-    /**
-     * The derived embed queue's current size — the host's durable rebuild/progress signal
-     * (survives a process restart, unlike [`EmbedderRegistration::corpus_changed`]; drive
-     * any persistent "search index is rebuilding" UI off this). Zero = corpus current.
-     */
-    func embedPendingCount() throws  -> UInt32
+    func embedPending(maxItems: UInt32) throws  -> EmbedSummary
     
     /**
      * Enqueue a book upsert. `updated_at` is stamped in epoch ms at enqueue (never omitted —
@@ -1152,6 +1145,13 @@ public protocol SyncEngineProtocol : AnyObject {
     func notesThisWeek(nowMs: Int64) throws  -> UInt32
     
     /**
+     * The derived embed queue's current size — the host's durable rebuild/progress signal
+     * (survives a process restart, unlike [`RegisterEmbedderSummary::corpus_changed`]; drive
+     * any persistent "search index is rebuilding" UI off this). Zero = corpus current.
+     */
+    func pendingEmbedCount() throws  -> UInt32
+    
+    /**
      * Pull incrementally from Supabase for **all eight synced tables** (SUR-726 —
      * [`synced_table_names`] is the one source of the pull scope). Merges last-write-wins by
      * `updated_at`, applies tombstones without resurrecting soft-deleted rows, **rebases the outbox**
@@ -1219,10 +1219,10 @@ public protocol SyncEngineProtocol : AnyObject {
      * Core refuses a mismatched embedder in three concrete ways rather than a model
      * allowlist: the descriptor is validated here (non-empty `|`-free identity, dims
      * 1..=4096); every embed's returned length is checked against the declared dims; and a
-     * corpus-key change invalidates + re-queues. See [`EmbedderRegistration`] for which
+     * corpus-key change invalidates + re-queues. See [`RegisterEmbedderSummary`] for which
      * returned signal drives which notification UI.
      */
-    func registerEmbedder(embedder: Embedder) throws  -> EmbedderRegistration
+    func registerEmbedder(embedder: Embedder) throws  -> RegisterEmbedderSummary
     
     /**
      * Atomically replace a note's handwritten margins (SUR-952, the SUR-928 "Add the margins"
@@ -1311,7 +1311,7 @@ public protocol SyncEngineProtocol : AnyObject {
      * Semantic search (SUR-997 item 4 → SUR-157): embed the query via the host embedder
      * (its query prompt template), then brute-force cosine top-k over the sealed live
      * corpus, decrypting vectors only in core. Mid-rebuild this returns the already
-     * re-embedded notes — partial, not empty ([`SyncEngine::embed_pending_count`] reports
+     * re-embedded notes — partial, not empty ([`SyncEngine::pending_embed_count`] reports
      * the gap). Empty/whitespace queries return `[]` without an embed (the lexical
      * engine's "no search-everything surprise", and a query embed costs ~0.8 s on CPU).
      */
@@ -1329,7 +1329,7 @@ public protocol SyncEngineProtocol : AnyObject {
      * cheap. The probe note is excluded from its own results. `[]` when the note has no
      * current-key vector yet (not embedded, skip marker, or stale key) — indistinguishable
      * here from "no neighbours", by design: the host's rebuild signal is
-     * [`SyncEngine::embed_pending_count`], not this.
+     * [`SyncEngine::pending_embed_count`], not this.
      */
     func similarNotes(noteId: String, limit: UInt32) throws  -> [SemanticHit]
     
@@ -1509,35 +1509,23 @@ open func counts()throws  -> StoreCounts {
      * Drain up to `max_items` of the derived embed queue (SUR-997 item 5): per note —
      * read + decrypt in core, hand the PLAINTEXT to the host embedder (the one place note
      * text leaves core other than display DTOs; no lock held across the call), validate
-     * length + normalize, seal with the vault key (AAD = note id), and store — only if the
-     * note's text is still what was embedded ([`Store::upsert_embedding_if_current`];
-     * a note edited/deleted during the ~0.8 s embed re-queues instead).
+     * length + normalize, seal with the vault key (AAD = `emb:{note id}`, domain-separated
+     * from enc:v2), and store — via a write-if-current store check, so a note edited or
+     * deleted during the ~0.8 s embed re-queues instead of storing a stale vector.
      *
      * Hosts own the schedule (WorkManager / BGProcessingTask): call in chunks, stop
      * between calls. One failed embed never halts the pass (counted `failed`, still
-     * queued); [`EmbedError::Unavailable`] aborts the whole pass. A note with empty text
+     * queued); [`EmbedderError::Unavailable`] aborts the whole pass. A note with empty text
      * or undecryptable ciphertext writes a NULL-vector skip marker (mirrors ADR 0005
      * dropping decrypt failures from the lexical index) so the queue actually drains; its
      * next edit re-queues it. Orphan vectors are swept once per pass. Re-registering a
      * different embedder mid-pass is benign: a stale-key row written by the old pass is
      * invisible to the scan and re-embedded via the derived queue.
      */
-open func embedPending(maxItems: UInt32)throws  -> EmbedProgress {
-    return try  FfiConverterTypeEmbedProgress.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+open func embedPending(maxItems: UInt32)throws  -> EmbedSummary {
+    return try  FfiConverterTypeEmbedSummary.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_embed_pending(self.uniffiClonePointer(),
         FfiConverterUInt32.lower(maxItems),$0
-    )
-})
-}
-    
-    /**
-     * The derived embed queue's current size — the host's durable rebuild/progress signal
-     * (survives a process restart, unlike [`EmbedderRegistration::corpus_changed`]; drive
-     * any persistent "search index is rebuilding" UI off this). Zero = corpus current.
-     */
-open func embedPendingCount()throws  -> UInt32 {
-    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
-    uniffi_braird_core_fn_method_syncengine_embed_pending_count(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -1961,6 +1949,18 @@ open func notesThisWeek(nowMs: Int64)throws  -> UInt32 {
 }
     
     /**
+     * The derived embed queue's current size — the host's durable rebuild/progress signal
+     * (survives a process restart, unlike [`RegisterEmbedderSummary::corpus_changed`]; drive
+     * any persistent "search index is rebuilding" UI off this). Zero = corpus current.
+     */
+open func pendingEmbedCount()throws  -> UInt32 {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_pending_embed_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * Pull incrementally from Supabase for **all eight synced tables** (SUR-726 —
      * [`synced_table_names`] is the one source of the pull scope). Merges last-write-wins by
      * `updated_at`, applies tombstones without resurrecting soft-deleted rows, **rebases the outbox**
@@ -2047,11 +2047,11 @@ open func recordNoteSignal(noteId: String, kind: NoteSignalKind)throws  -> Bool 
      * Core refuses a mismatched embedder in three concrete ways rather than a model
      * allowlist: the descriptor is validated here (non-empty `|`-free identity, dims
      * 1..=4096); every embed's returned length is checked against the declared dims; and a
-     * corpus-key change invalidates + re-queues. See [`EmbedderRegistration`] for which
+     * corpus-key change invalidates + re-queues. See [`RegisterEmbedderSummary`] for which
      * returned signal drives which notification UI.
      */
-open func registerEmbedder(embedder: Embedder)throws  -> EmbedderRegistration {
-    return try  FfiConverterTypeEmbedderRegistration.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+open func registerEmbedder(embedder: Embedder)throws  -> RegisterEmbedderSummary {
+    return try  FfiConverterTypeRegisterEmbedderSummary.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_register_embedder(self.uniffiClonePointer(),
         FfiConverterTypeEmbedder.lower(embedder),$0
     )
@@ -2159,7 +2159,7 @@ open func search(query: String, limit: UInt32)throws  -> [SearchHit] {
      * Semantic search (SUR-997 item 4 → SUR-157): embed the query via the host embedder
      * (its query prompt template), then brute-force cosine top-k over the sealed live
      * corpus, decrypting vectors only in core. Mid-rebuild this returns the already
-     * re-embedded notes — partial, not empty ([`SyncEngine::embed_pending_count`] reports
+     * re-embedded notes — partial, not empty ([`SyncEngine::pending_embed_count`] reports
      * the gap). Empty/whitespace queries return `[]` without an embed (the lexical
      * engine's "no search-everything surprise", and a query embed costs ~0.8 s on CPU).
      */
@@ -2189,7 +2189,7 @@ open func setAccessToken(jwt: String) {try! rustCall() {
      * cheap. The probe note is excluded from its own results. `[]` when the note has no
      * current-key vector yet (not embedded, skip marker, or stale key) — indistinguishable
      * here from "no neighbours", by design: the host's rebuild signal is
-     * [`SyncEngine::embed_pending_count`], not this.
+     * [`SyncEngine::pending_embed_count`], not this.
      */
 open func similarNotes(noteId: String, limit: UInt32)throws  -> [SemanticHit] {
     return try  FfiConverterSequenceTypeSemanticHit.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
@@ -2380,7 +2380,8 @@ public protocol VaultProtocol : AnyObject {
     
     /**
      * Seal arbitrary bytes (e.g. an embedding vector) at rest: `[0x02][IV][ct]`,
-     * AAD = noteId. Fresh random IV per call.
+     * AAD = the caller's context string (the embedding pipeline passes `emb:{noteId}`,
+     * domain-separated from enc:v2's bare-noteId AAD). Fresh random IV per call.
      */
     func sealBytes(bytes: Data, aad: String)  -> Data
     
@@ -2575,7 +2576,8 @@ open func rewrap(newPrf: Data) -> WrappedBlob {
     
     /**
      * Seal arbitrary bytes (e.g. an embedding vector) at rest: `[0x02][IV][ct]`,
-     * AAD = noteId. Fresh random IV per call.
+     * AAD = the caller's context string (the embedding pipeline passes `emb:{noteId}`,
+     * domain-separated from enc:v2's bare-noteId AAD). Fresh random IV per call.
      */
 open func sealBytes(bytes: Data, aad: String) -> Data {
     return try!  FfiConverterData.lift(try! rustCall() {
@@ -3278,11 +3280,13 @@ public func FfiConverterTypeCustomIdeaRecord_lower(_ value: CustomIdeaRecord) ->
 
 /**
  * What one `embed_pending` pass did. `attempted = embedded + skipped + failed`;
- * `remaining` is the derived queue size after the pass — the host's durable
+ * `pending` is the derived queue size after the pass — the host's durable
  * rebuild/progress signal (it survives a process restart, unlike a registration-time
- * flag), and the right driver for any "search index is rebuilding" UI.
+ * flag), and the right driver for any "search index is rebuilding" UI. One word for the
+ * queue size everywhere: this field, `RegisterEmbedderSummary::pending`, and
+ * `pending_embed_count` all name the same number.
  */
-public struct EmbedProgress {
+public struct EmbedSummary {
     /**
      * Queue items this pass processed (capped by `max_items`).
      */
@@ -3303,7 +3307,7 @@ public struct EmbedProgress {
     /**
      * The derived queue size after this pass.
      */
-    public var remaining: UInt32
+    public var pending: UInt32
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -3323,19 +3327,19 @@ public struct EmbedProgress {
          */failed: UInt32, 
         /**
          * The derived queue size after this pass.
-         */remaining: UInt32) {
+         */pending: UInt32) {
         self.attempted = attempted
         self.embedded = embedded
         self.skipped = skipped
         self.failed = failed
-        self.remaining = remaining
+        self.pending = pending
     }
 }
 
 
 
-extension EmbedProgress: Equatable, Hashable {
-    public static func ==(lhs: EmbedProgress, rhs: EmbedProgress) -> Bool {
+extension EmbedSummary: Equatable, Hashable {
+    public static func ==(lhs: EmbedSummary, rhs: EmbedSummary) -> Bool {
         if lhs.attempted != rhs.attempted {
             return false
         }
@@ -3348,7 +3352,7 @@ extension EmbedProgress: Equatable, Hashable {
         if lhs.failed != rhs.failed {
             return false
         }
-        if lhs.remaining != rhs.remaining {
+        if lhs.pending != rhs.pending {
             return false
         }
         return true
@@ -3359,7 +3363,7 @@ extension EmbedProgress: Equatable, Hashable {
         hasher.combine(embedded)
         hasher.combine(skipped)
         hasher.combine(failed)
-        hasher.combine(remaining)
+        hasher.combine(pending)
     }
 }
 
@@ -3367,24 +3371,24 @@ extension EmbedProgress: Equatable, Hashable {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeEmbedProgress: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EmbedProgress {
+public struct FfiConverterTypeEmbedSummary: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EmbedSummary {
         return
-            try EmbedProgress(
+            try EmbedSummary(
                 attempted: FfiConverterUInt32.read(from: &buf), 
                 embedded: FfiConverterUInt32.read(from: &buf), 
                 skipped: FfiConverterUInt32.read(from: &buf), 
                 failed: FfiConverterUInt32.read(from: &buf), 
-                remaining: FfiConverterUInt32.read(from: &buf)
+                pending: FfiConverterUInt32.read(from: &buf)
         )
     }
 
-    public static func write(_ value: EmbedProgress, into buf: inout [UInt8]) {
+    public static func write(_ value: EmbedSummary, into buf: inout [UInt8]) {
         FfiConverterUInt32.write(value.attempted, into: &buf)
         FfiConverterUInt32.write(value.embedded, into: &buf)
         FfiConverterUInt32.write(value.skipped, into: &buf)
         FfiConverterUInt32.write(value.failed, into: &buf)
-        FfiConverterUInt32.write(value.remaining, into: &buf)
+        FfiConverterUInt32.write(value.pending, into: &buf)
     }
 }
 
@@ -3392,21 +3396,21 @@ public struct FfiConverterTypeEmbedProgress: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeEmbedProgress_lift(_ buf: RustBuffer) throws -> EmbedProgress {
-    return try FfiConverterTypeEmbedProgress.lift(buf)
+public func FfiConverterTypeEmbedSummary_lift(_ buf: RustBuffer) throws -> EmbedSummary {
+    return try FfiConverterTypeEmbedSummary.lift(buf)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeEmbedProgress_lower(_ value: EmbedProgress) -> RustBuffer {
-    return FfiConverterTypeEmbedProgress.lower(value)
+public func FfiConverterTypeEmbedSummary_lower(_ value: EmbedSummary) -> RustBuffer {
+    return FfiConverterTypeEmbedSummary.lower(value)
 }
 
 
 /**
- * The identity of a host embedder — everything the vector space depends on. Carried in the
- * corpus key ([`corpus_key`]), so ANY change re-keys the corpus and re-queues every note.
+ * The identity of a host embedder — everything the vector space depends on. Carried in
+ * the corpus key, so ANY change re-keys the corpus and re-queues every note.
  *
  * **Prompt-template contract (documented, not enforced):** EmbeddingGemma's query/document
  * prompt templates and tokenization (BOS(2) + prompt + EOS(1), seq-fixed single-input
@@ -3505,107 +3509,6 @@ public func FfiConverterTypeEmbedderDescriptor_lift(_ buf: RustBuffer) throws ->
 #endif
 public func FfiConverterTypeEmbedderDescriptor_lower(_ value: EmbedderDescriptor) -> RustBuffer {
     return FfiConverterTypeEmbedderDescriptor.lower(value)
-}
-
-
-/**
- * What registering an embedder did. `corpus_changed`/`invalidated` are the *immediate*
- * "search model updated" signal (a corpus-key change hard-deletes every stale-key vector);
- * `pending` is the durable one — on a relaunch mid-rebuild the key already matches the
- * partially-rebuilt corpus, so `corpus_changed` is correctly `false` while `pending` still
- * reports the remainder. Drive persistent notification UI off the pending count.
- */
-public struct EmbedderRegistration {
-    /**
-     * The registered corpus key differs from (some of) what was stored — stale vectors
-     * were dropped and their notes re-queued.
-     */
-    public var corpusChanged: Bool
-    /**
-     * How many stale-key vectors were dropped.
-     */
-    public var invalidated: UInt32
-    /**
-     * The derived queue size after registration.
-     */
-    public var pending: UInt32
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(
-        /**
-         * The registered corpus key differs from (some of) what was stored — stale vectors
-         * were dropped and their notes re-queued.
-         */corpusChanged: Bool, 
-        /**
-         * How many stale-key vectors were dropped.
-         */invalidated: UInt32, 
-        /**
-         * The derived queue size after registration.
-         */pending: UInt32) {
-        self.corpusChanged = corpusChanged
-        self.invalidated = invalidated
-        self.pending = pending
-    }
-}
-
-
-
-extension EmbedderRegistration: Equatable, Hashable {
-    public static func ==(lhs: EmbedderRegistration, rhs: EmbedderRegistration) -> Bool {
-        if lhs.corpusChanged != rhs.corpusChanged {
-            return false
-        }
-        if lhs.invalidated != rhs.invalidated {
-            return false
-        }
-        if lhs.pending != rhs.pending {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(corpusChanged)
-        hasher.combine(invalidated)
-        hasher.combine(pending)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeEmbedderRegistration: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EmbedderRegistration {
-        return
-            try EmbedderRegistration(
-                corpusChanged: FfiConverterBool.read(from: &buf), 
-                invalidated: FfiConverterUInt32.read(from: &buf), 
-                pending: FfiConverterUInt32.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: EmbedderRegistration, into buf: inout [UInt8]) {
-        FfiConverterBool.write(value.corpusChanged, into: &buf)
-        FfiConverterUInt32.write(value.invalidated, into: &buf)
-        FfiConverterUInt32.write(value.pending, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeEmbedderRegistration_lift(_ buf: RustBuffer) throws -> EmbedderRegistration {
-    return try FfiConverterTypeEmbedderRegistration.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeEmbedderRegistration_lower(_ value: EmbedderRegistration) -> RustBuffer {
-    return FfiConverterTypeEmbedderRegistration.lower(value)
 }
 
 
@@ -4903,6 +4806,107 @@ public func FfiConverterTypeReconcileSummary_lower(_ value: ReconcileSummary) ->
 
 
 /**
+ * What registering an embedder did. `corpus_changed`/`invalidated` are the *immediate*
+ * "search model updated" signal (a corpus-key change hard-deletes every stale-key vector);
+ * `pending` is the durable one — on a relaunch mid-rebuild the key already matches the
+ * partially-rebuilt corpus, so `corpus_changed` is correctly `false` while `pending` still
+ * reports the remainder. Drive persistent notification UI off the pending count.
+ */
+public struct RegisterEmbedderSummary {
+    /**
+     * The registered corpus key differs from (some of) what was stored — stale vectors
+     * were dropped and their notes re-queued.
+     */
+    public var corpusChanged: Bool
+    /**
+     * How many stale-key vectors were dropped.
+     */
+    public var invalidated: UInt32
+    /**
+     * The derived queue size after registration.
+     */
+    public var pending: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The registered corpus key differs from (some of) what was stored — stale vectors
+         * were dropped and their notes re-queued.
+         */corpusChanged: Bool, 
+        /**
+         * How many stale-key vectors were dropped.
+         */invalidated: UInt32, 
+        /**
+         * The derived queue size after registration.
+         */pending: UInt32) {
+        self.corpusChanged = corpusChanged
+        self.invalidated = invalidated
+        self.pending = pending
+    }
+}
+
+
+
+extension RegisterEmbedderSummary: Equatable, Hashable {
+    public static func ==(lhs: RegisterEmbedderSummary, rhs: RegisterEmbedderSummary) -> Bool {
+        if lhs.corpusChanged != rhs.corpusChanged {
+            return false
+        }
+        if lhs.invalidated != rhs.invalidated {
+            return false
+        }
+        if lhs.pending != rhs.pending {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(corpusChanged)
+        hasher.combine(invalidated)
+        hasher.combine(pending)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRegisterEmbedderSummary: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RegisterEmbedderSummary {
+        return
+            try RegisterEmbedderSummary(
+                corpusChanged: FfiConverterBool.read(from: &buf), 
+                invalidated: FfiConverterUInt32.read(from: &buf), 
+                pending: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RegisterEmbedderSummary, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.corpusChanged, into: &buf)
+        FfiConverterUInt32.write(value.invalidated, into: &buf)
+        FfiConverterUInt32.write(value.pending, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRegisterEmbedderSummary_lift(_ buf: RustBuffer) throws -> RegisterEmbedderSummary {
+    return try FfiConverterTypeRegisterEmbedderSummary.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRegisterEmbedderSummary_lower(_ value: RegisterEmbedderSummary) -> RustBuffer {
+    return FfiConverterTypeRegisterEmbedderSummary.lower(value)
+}
+
+
+/**
  * One search result, shaped like the PWA's `runSearch` output: `refId → ref_id`, `type → kind`,
  * plus `title`/`snippet`/`score`. `snippet` is the content (or the title when the doc has no
  * body), matching `hit.content || hit.title`.
@@ -5464,12 +5468,14 @@ extension CryptoError: Foundation.LocalizedError {
 
 
 /**
- * How a host embed call failed. Deliberately **fieldless**: the error crosses
- * foreign→Rust, and a host-authored message must never transit into core's error strings
- * (the same no-host-content rule as `enqueue_note`'s `source_meta_json` handling) — the
- * host already knows its own error; it threw it, and can log it host-side.
+ * How a host embed call failed — the error the *embedder* throws (`SyncError::Embed` is
+ * its engine-side counterpart, travelling the other direction). Deliberately
+ * **fieldless**: the error crosses foreign→Rust, and a host-authored message must never
+ * transit into core's error strings (the same no-host-content rule as `enqueue_note`'s
+ * `source_meta_json` handling) — the host already knows its own error; it threw it, and
+ * can log it host-side.
  */
-public enum EmbedError {
+public enum EmbedderError {
 
     
     
@@ -5489,10 +5495,10 @@ public enum EmbedError {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeEmbedError: FfiConverterRustBuffer {
-    typealias SwiftType = EmbedError
+public struct FfiConverterTypeEmbedderError: FfiConverterRustBuffer {
+    typealias SwiftType = EmbedderError
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EmbedError {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EmbedderError {
         let variant: Int32 = try readInt(&buf)
         switch variant {
 
@@ -5506,7 +5512,7 @@ public struct FfiConverterTypeEmbedError: FfiConverterRustBuffer {
         }
     }
 
-    public static func write(_ value: EmbedError, into buf: inout [UInt8]) {
+    public static func write(_ value: EmbedderError, into buf: inout [UInt8]) {
         switch value {
 
         
@@ -5525,9 +5531,9 @@ public struct FfiConverterTypeEmbedError: FfiConverterRustBuffer {
 }
 
 
-extension EmbedError: Equatable, Hashable {}
+extension EmbedderError: Equatable, Hashable {}
 
-extension EmbedError: Foundation.LocalizedError {
+extension EmbedderError: Foundation.LocalizedError {
     public var errorDescription: String? {
         String(reflecting: self)
     }
@@ -5724,7 +5730,7 @@ public enum SyncError {
     case EmbedderNotRegistered
     /**
      * An embedding operation failed (SUR-997). The message is always core-authored — a
-     * host's own error detail never transits through core ([`EmbedError`] is fieldless).
+     * host's own error detail never transits through core ([`EmbedderError`] is fieldless).
      */
     case Embed(String
     )
@@ -6341,10 +6347,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_embedder_descriptor() != 22797) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_embedder_embed_document() != 45061) {
+    if (uniffi_braird_core_checksum_method_embedder_embed_document() != 56375) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_embedder_embed_query() != 23884) {
+    if (uniffi_braird_core_checksum_method_embedder_embed_query() != 23940) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_collection_ids_for_note() != 41507) {
@@ -6356,10 +6362,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_counts() != 34830) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_embed_pending() != 1718) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_braird_core_checksum_method_syncengine_embed_pending_count() != 7480) {
+    if (uniffi_braird_core_checksum_method_syncengine_embed_pending() != 7184) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 62499) {
@@ -6437,6 +6440,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_notes_this_week() != 50990) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_braird_core_checksum_method_syncengine_pending_embed_count() != 26076) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_braird_core_checksum_method_syncengine_pull() != 8960) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6446,7 +6452,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_record_note_signal() != 34401) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_register_embedder() != 8244) {
+    if (uniffi_braird_core_checksum_method_syncengine_register_embedder() != 9334) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 3703) {
@@ -6455,13 +6461,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_search() != 14411) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_semantic_search() != 24149) {
+    if (uniffi_braird_core_checksum_method_syncengine_semantic_search() != 25564) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_set_access_token() != 47386) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_similar_notes() != 62147) {
+    if (uniffi_braird_core_checksum_method_syncengine_similar_notes() != 52094) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_soft_delete_signals_for_note() != 38804) {
@@ -6497,7 +6503,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_vault_rewrap() != 61446) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_vault_seal_bytes() != 63933) {
+    if (uniffi_braird_core_checksum_method_vault_seal_bytes() != 46732) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_vault_wrap_with_prf() != 28929) {

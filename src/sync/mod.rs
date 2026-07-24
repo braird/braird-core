@@ -33,7 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Map, Value};
 
 use crate::embeddings::{
-    self, EmbedError, EmbedProgress, Embedder, EmbedderRegistration, SemanticHit,
+    self, EmbedSummary, Embedder, EmbedderError, RegisterEmbedderSummary, SemanticHit,
 };
 use crate::search::SearchHit;
 use crate::store::{synced_table_names, StageExistingWriteError, Store};
@@ -66,7 +66,7 @@ pub enum SyncError {
     #[error("no embedder registered")]
     EmbedderNotRegistered,
     /// An embedding operation failed (SUR-997). The message is always core-authored — a
-    /// host's own error detail never transits through core ([`EmbedError`] is fieldless).
+    /// host's own error detail never transits through core ([`EmbedderError`] is fieldless).
     #[error("embed error: {0}")]
     Embed(String),
 }
@@ -2342,7 +2342,7 @@ impl SyncEngine {
             }
             match self
                 .vault
-                .open_bytes(sealed, note_id.clone())
+                .open_bytes(sealed, embeddings::embed_aad(&note_id))
                 .and_then(|bytes| embeddings::from_le_bytes(&bytes, reg.dims))
             {
                 Ok(vector) => hits.push(SemanticHit {
@@ -2373,12 +2373,12 @@ impl SyncEngine {
     /// Core refuses a mismatched embedder in three concrete ways rather than a model
     /// allowlist: the descriptor is validated here (non-empty `|`-free identity, dims
     /// 1..=4096); every embed's returned length is checked against the declared dims; and a
-    /// corpus-key change invalidates + re-queues. See [`EmbedderRegistration`] for which
+    /// corpus-key change invalidates + re-queues. See [`RegisterEmbedderSummary`] for which
     /// returned signal drives which notification UI.
     pub fn register_embedder(
         &self,
         embedder: Arc<dyn Embedder>,
-    ) -> Result<EmbedderRegistration, SyncError> {
+    ) -> Result<RegisterEmbedderSummary, SyncError> {
         // The ONE descriptor() foreign call — before any lock, cached for the registration's
         // lifetime.
         let descriptor = embedder.descriptor();
@@ -2408,7 +2408,7 @@ impl SyncEngine {
         let pending = store
             .pending_embedding_count(&corpus_key)
             .map_err(store_err)?;
-        Ok(EmbedderRegistration {
+        Ok(RegisterEmbedderSummary {
             corpus_changed: invalidated > 0,
             invalidated: invalidated as u32,
             pending: pending.max(0) as u32,
@@ -2416,9 +2416,9 @@ impl SyncEngine {
     }
 
     /// The derived embed queue's current size — the host's durable rebuild/progress signal
-    /// (survives a process restart, unlike [`EmbedderRegistration::corpus_changed`]; drive
+    /// (survives a process restart, unlike [`RegisterEmbedderSummary::corpus_changed`]; drive
     /// any persistent "search index is rebuilding" UI off this). Zero = corpus current.
-    pub fn embed_pending_count(&self) -> Result<u32, SyncError> {
+    pub fn pending_embed_count(&self) -> Result<u32, SyncError> {
         let reg = self.registered_embedder()?;
         let pending = lock!(self.store)
             .pending_embedding_count(&reg.corpus_key)
@@ -2429,19 +2429,19 @@ impl SyncEngine {
     /// Drain up to `max_items` of the derived embed queue (SUR-997 item 5): per note —
     /// read + decrypt in core, hand the PLAINTEXT to the host embedder (the one place note
     /// text leaves core other than display DTOs; no lock held across the call), validate
-    /// length + normalize, seal with the vault key (AAD = note id), and store — only if the
-    /// note's text is still what was embedded ([`Store::upsert_embedding_if_current`];
-    /// a note edited/deleted during the ~0.8 s embed re-queues instead).
+    /// length + normalize, seal with the vault key (AAD = `emb:{note id}`, domain-separated
+    /// from enc:v2), and store — via a write-if-current store check, so a note edited or
+    /// deleted during the ~0.8 s embed re-queues instead of storing a stale vector.
     ///
     /// Hosts own the schedule (WorkManager / BGProcessingTask): call in chunks, stop
     /// between calls. One failed embed never halts the pass (counted `failed`, still
-    /// queued); [`EmbedError::Unavailable`] aborts the whole pass. A note with empty text
+    /// queued); [`EmbedderError::Unavailable`] aborts the whole pass. A note with empty text
     /// or undecryptable ciphertext writes a NULL-vector skip marker (mirrors ADR 0005
     /// dropping decrypt failures from the lexical index) so the queue actually drains; its
     /// next edit re-queues it. Orphan vectors are swept once per pass. Re-registering a
     /// different embedder mid-pass is benign: a stale-key row written by the old pass is
     /// invisible to the scan and re-embedded via the derived queue.
-    pub fn embed_pending(&self, max_items: u32) -> Result<EmbedProgress, SyncError> {
+    pub fn embed_pending(&self, max_items: u32) -> Result<EmbedSummary, SyncError> {
         let reg = self.registered_embedder()?;
         let ids = {
             let store = lock!(self.store);
@@ -2458,7 +2458,7 @@ impl SyncEngine {
                 let store = lock!(self.store);
                 (
                     store.get_row("notes", &id).map_err(store_err)?,
-                    store.note_source_token(&id).map_err(store_err)?,
+                    store.note_content_token(&id).map_err(store_err)?,
                 )
             };
             let (Some(row), Some(token)) = (row, token) else {
@@ -2484,11 +2484,11 @@ impl SyncEngine {
             // The host callback — NO locks held (see the section header).
             let vector = match reg.embedder.embed_document(content) {
                 Ok(v) => v,
-                Err(EmbedError::Runtime) => {
+                Err(EmbedderError::Runtime) => {
                     failed += 1;
                     continue;
                 }
-                Err(EmbedError::Unavailable) => {
+                Err(EmbedderError::Unavailable) => {
                     failed += 1;
                     break 'pass; // the runtime is gone; the host re-drains later
                 }
@@ -2503,7 +2503,7 @@ impl SyncEngine {
             };
             let sealed = self
                 .vault
-                .seal_bytes(embeddings::to_le_bytes(&unit), id.clone());
+                .seal_bytes(embeddings::to_le_bytes(&unit), embeddings::embed_aad(&id));
             let wrote = lock!(self.store)
                 .upsert_embedding_if_current(
                     &id,
@@ -2519,22 +2519,22 @@ impl SyncEngine {
                 skipped += 1; // edited/deleted mid-embed — re-queues with its new token
             }
         }
-        let remaining = lock!(self.store)
+        let pending = lock!(self.store)
             .pending_embedding_count(&reg.corpus_key)
             .map_err(store_err)?;
-        Ok(EmbedProgress {
+        Ok(EmbedSummary {
             attempted,
             embedded,
             skipped,
             failed,
-            remaining: remaining.max(0) as u32,
+            pending: pending.max(0) as u32,
         })
     }
 
     /// Semantic search (SUR-997 item 4 → SUR-157): embed the query via the host embedder
     /// (its query prompt template), then brute-force cosine top-k over the sealed live
     /// corpus, decrypting vectors only in core. Mid-rebuild this returns the already
-    /// re-embedded notes — partial, not empty ([`SyncEngine::embed_pending_count`] reports
+    /// re-embedded notes — partial, not empty ([`SyncEngine::pending_embed_count`] reports
     /// the gap). Empty/whitespace queries return `[]` without an embed (the lexical
     /// engine's "no search-everything surprise", and a query embed costs ~0.8 s on CPU).
     pub fn semantic_search(
@@ -2567,7 +2567,7 @@ impl SyncEngine {
     /// cheap. The probe note is excluded from its own results. `[]` when the note has no
     /// current-key vector yet (not embedded, skip marker, or stale key) — indistinguishable
     /// here from "no neighbours", by design: the host's rebuild signal is
-    /// [`SyncEngine::embed_pending_count`], not this.
+    /// [`SyncEngine::pending_embed_count`], not this.
     pub fn similar_notes(
         &self,
         note_id: String,
@@ -2585,7 +2585,7 @@ impl SyncEngine {
         };
         let probe = match self
             .vault
-            .open_bytes(sealed, note_id.clone())
+            .open_bytes(sealed, embeddings::embed_aad(&note_id))
             .and_then(|bytes| embeddings::from_le_bytes(&bytes, reg.dims))
         {
             Ok(v) => v,
@@ -7082,11 +7082,11 @@ mod tests {
                 quantization: "test".into(),
             }
         }
-        fn embed_document(&self, text: String) -> Result<Vec<f32>, EmbedError> {
+        fn embed_document(&self, text: String) -> Result<Vec<f32>, EmbedderError> {
             self.embed_calls.fetch_add(1, Ordering::SeqCst);
             Ok(histogram(&text))
         }
-        fn embed_query(&self, text: String) -> Result<Vec<f32>, EmbedError> {
+        fn embed_query(&self, text: String) -> Result<Vec<f32>, EmbedderError> {
             Ok(histogram(&text))
         }
     }
@@ -7109,7 +7109,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (engine, _) = embed_engine(&dir, "unregistered");
         assert!(matches!(
-            engine.embed_pending_count().unwrap_err(),
+            engine.pending_embed_count().unwrap_err(),
             SyncError::EmbedderNotRegistered
         ));
         assert!(matches!(
@@ -7133,11 +7133,11 @@ mod tests {
             fn descriptor(&self) -> EmbedderDescriptor {
                 self.0.clone()
             }
-            fn embed_document(&self, _t: String) -> Result<Vec<f32>, EmbedError> {
-                Err(EmbedError::Runtime)
+            fn embed_document(&self, _t: String) -> Result<Vec<f32>, EmbedderError> {
+                Err(EmbedderError::Runtime)
             }
-            fn embed_query(&self, _t: String) -> Result<Vec<f32>, EmbedError> {
-                Err(EmbedError::Runtime)
+            fn embed_query(&self, _t: String) -> Result<Vec<f32>, EmbedderError> {
+                Err(EmbedderError::Runtime)
             }
         }
         let dir = tempfile::tempdir().unwrap();
@@ -7161,7 +7161,7 @@ mod tests {
         }
         // A rejected registration leaves the engine unregistered.
         assert!(matches!(
-            engine.embed_pending_count().unwrap_err(),
+            engine.pending_embed_count().unwrap_err(),
             SyncError::EmbedderNotRegistered
         ));
     }
@@ -7181,11 +7181,11 @@ mod tests {
             (false, 0, 2),
             "first registration: nothing invalidated, both notes pending"
         );
-        assert_eq!(engine.embed_pending_count().unwrap(), 2);
+        assert_eq!(engine.pending_embed_count().unwrap(), 2);
 
         let progress = engine.embed_pending(10).unwrap();
         assert_eq!(
-            (progress.attempted, progress.embedded, progress.remaining),
+            (progress.attempted, progress.embedded, progress.pending),
             (2, 2, 0),
             "both embedded, queue drained"
         );
@@ -7208,7 +7208,7 @@ mod tests {
 
         // A second pass is a no-op — the derived queue self-reports empty.
         let again = engine.embed_pending(10).unwrap();
-        assert_eq!((again.attempted, again.remaining), (0, 0));
+        assert_eq!((again.attempted, again.pending), (0, 0));
         assert_eq!(
             embedder.embed_calls.load(Ordering::SeqCst),
             2,
@@ -7238,14 +7238,26 @@ mod tests {
         assert_eq!(
             engine
                 .vault
-                .open_bytes(sealed.clone(), "n-aaa".into())
+                .open_bytes(sealed.clone(), crate::embeddings::embed_aad("n-aaa"))
                 .unwrap(),
             expected_raw,
-            "the sealed blob opens back to the unit vector under the note-id AAD"
+            "the sealed blob opens back to the unit vector under the emb:-prefixed AAD"
+        );
+        // Domain separation (crypto-review): the BARE note id — enc:v2's AAD under the
+        // same Master Key — must NOT open a vector seal, and neither must another note's.
+        assert!(
+            engine
+                .vault
+                .open_bytes(sealed.clone(), "n-aaa".into())
+                .is_err(),
+            "the bare note-id AAD (the enc:v2 namespace) must fail the open"
         );
         assert!(
-            engine.vault.open_bytes(sealed, "n-bbb".into()).is_err(),
-            "a different note id AAD must fail the open"
+            engine
+                .vault
+                .open_bytes(sealed, crate::embeddings::embed_aad("n-bbb"))
+                .is_err(),
+            "a different note's emb: AAD must fail the open"
         );
     }
 
@@ -7299,7 +7311,7 @@ mod tests {
                 progress.attempted,
                 progress.embedded,
                 progress.skipped,
-                progress.remaining
+                progress.pending
             ),
             (3, 1, 2, 0),
             "markers drain the queue instead of re-attempting forever"
@@ -7330,12 +7342,12 @@ mod tests {
             .register_embedder(HistogramEmbedder::new("fake-model"))
             .unwrap();
         engine.embed_pending(10).unwrap();
-        assert_eq!(engine.embed_pending_count().unwrap(), 0);
+        assert_eq!(engine.pending_embed_count().unwrap(), 0);
 
         // An edit recomputes content_tag → the token moves → the note re-queues; after the
         // re-embed the search follows the NEW text.
         engine.enqueue_note(note_upsert("n1", "cccc")).unwrap();
-        assert_eq!(engine.embed_pending_count().unwrap(), 1);
+        assert_eq!(engine.pending_embed_count().unwrap(), 1);
         engine.embed_pending(10).unwrap();
         let hits = engine.semantic_search("cccc".into(), 10).unwrap();
         assert_eq!(hits[0].note_id, "n1");
@@ -7401,7 +7413,7 @@ mod tests {
         // returns immediately; the pending count reports the durable gap (this is the
         // restart-safe notification signal, not corpus_changed).
         engine.embed_pending(1).unwrap();
-        assert_eq!(engine.embed_pending_count().unwrap(), 1);
+        assert_eq!(engine.pending_embed_count().unwrap(), 1);
         let visible = engine.semantic_search("bbbb".into(), 10).unwrap();
         assert_eq!(visible.len(), 1, "re-embedded note returns mid-rebuild");
         // And a FRESH registration at the new key mid-rebuild reports corpus_changed:false
@@ -7431,16 +7443,16 @@ mod tests {
                     quantization: "test".into(),
                 }
             }
-            fn embed_document(&self, text: String) -> Result<Vec<f32>, EmbedError> {
+            fn embed_document(&self, text: String) -> Result<Vec<f32>, EmbedderError> {
                 if text.contains("poison") {
-                    Err(EmbedError::Runtime)
+                    Err(EmbedderError::Runtime)
                 } else if text.contains("gone") {
-                    Err(EmbedError::Unavailable)
+                    Err(EmbedderError::Unavailable)
                 } else {
                     Ok(histogram(&text))
                 }
             }
-            fn embed_query(&self, text: String) -> Result<Vec<f32>, EmbedError> {
+            fn embed_query(&self, text: String) -> Result<Vec<f32>, EmbedderError> {
                 Ok(histogram(&text))
             }
         }
@@ -7465,13 +7477,13 @@ mod tests {
                 progress.attempted,
                 progress.embedded,
                 progress.failed,
-                progress.remaining
+                progress.pending
             ),
             (3, 1, 2, 2),
             "Runtime failure skips one; Unavailable aborts; both stay queued"
         );
         // The failures remain in the derived queue for the next pass — no marker written.
-        assert_eq!(engine.embed_pending_count().unwrap(), 2);
+        assert_eq!(engine.pending_embed_count().unwrap(), 2);
     }
 
     #[test]
@@ -7485,14 +7497,14 @@ mod tests {
                     quantization: "test".into(),
                 }
             }
-            fn embed_document(&self, text: String) -> Result<Vec<f32>, EmbedError> {
+            fn embed_document(&self, text: String) -> Result<Vec<f32>, EmbedderError> {
                 Ok(if text.contains("short") {
                     vec![1.0; DIMS as usize - 1] // violates the declared dims
                 } else {
                     vec![0.0; DIMS as usize] // zero vector — unusable
                 })
             }
-            fn embed_query(&self, _t: String) -> Result<Vec<f32>, EmbedError> {
+            fn embed_query(&self, _t: String) -> Result<Vec<f32>, EmbedderError> {
                 Ok(vec![1.0; DIMS as usize - 1])
             }
         }
@@ -7517,6 +7529,63 @@ mod tests {
     }
 
     #[test]
+    fn a_tampered_sealed_blob_self_heals_out_of_the_scan_and_requeues() {
+        // The GCM auth-failure leg (crypto-review NIT): a tampered / bit-rotted blob must
+        // never surface a hit, never wedge — it hard-deletes, the note re-queues via the
+        // derived queue, and the next pass restores it.
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, db_path) = embed_engine(&dir, "tamper");
+        engine.enqueue_note(note_upsert("n1", "aaaa")).unwrap();
+        engine
+            .register_embedder(HistogramEmbedder::new("fake-model"))
+            .unwrap();
+        engine.embed_pending(10).unwrap();
+        assert_eq!(engine.pending_embed_count().unwrap(), 0);
+
+        // Flip one ciphertext byte in the stored blob.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let mut blob: Vec<u8> = conn
+                .query_row(
+                    "SELECT encrypted_vector FROM embeddings WHERE note_id = 'n1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let last = blob.len() - 1;
+            blob[last] ^= 0x01;
+            conn.execute(
+                "UPDATE embeddings SET encrypted_vector = ?1 WHERE note_id = 'n1'",
+                rusqlite::params![blob],
+            )
+            .unwrap();
+        }
+
+        assert!(
+            engine
+                .semantic_search("aaaa".into(), 10)
+                .unwrap()
+                .is_empty(),
+            "a blob that fails its auth tag never surfaces"
+        );
+        assert!(
+            Store::open(&db_path)
+                .unwrap()
+                .embedding_row("n1")
+                .unwrap()
+                .is_none(),
+            "the corrupt row is hard-deleted (self-heal)"
+        );
+        assert_eq!(engine.pending_embed_count().unwrap(), 1, "note re-queued");
+        engine.embed_pending(10).unwrap();
+        assert_eq!(
+            engine.semantic_search("aaaa".into(), 10).unwrap()[0].note_id,
+            "n1",
+            "the next pass restores the vector"
+        );
+    }
+
+    #[test]
     fn an_embedder_may_reenter_the_engine_mid_embed() {
         // The lock-discipline pin: NO engine mutex is held across a host embed call, so an
         // embedder that calls back into the engine (progress reads are the natural case)
@@ -7534,13 +7603,13 @@ mod tests {
                     quantization: "test".into(),
                 }
             }
-            fn embed_document(&self, text: String) -> Result<Vec<f32>, EmbedError> {
+            fn embed_document(&self, text: String) -> Result<Vec<f32>, EmbedderError> {
                 let engine = self.engine.lock().unwrap().clone().unwrap();
-                let pending = engine.embed_pending_count().unwrap(); // ← the reentrant call
+                let pending = engine.pending_embed_count().unwrap(); // ← the reentrant call
                 self.observed_pending.store(pending, Ordering::SeqCst);
                 Ok(histogram(&text))
             }
-            fn embed_query(&self, text: String) -> Result<Vec<f32>, EmbedError> {
+            fn embed_query(&self, text: String) -> Result<Vec<f32>, EmbedderError> {
                 Ok(histogram(&text))
             }
         }

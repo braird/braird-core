@@ -375,7 +375,7 @@ const LOCAL_ONLY_DDL: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS embeddings (\
         note_id TEXT PRIMARY KEY, \
         model_version TEXT, \
-        source_token TEXT, \
+        content_token TEXT, \
         encrypted_vector BLOB, \
         updated_at INTEGER, \
         deleted INTEGER);",
@@ -458,9 +458,9 @@ impl Store {
             self.conn.execute_batch(ddl)?;
         }
         // SUR-997 — the same additive migration for the local-only `embeddings` table:
-        // `source_token` postdates the original DDL, and every store created before it
+        // `content_token` postdates the original DDL, and every store created before it
         // (the table has existed, writer-less, since SUR-723) needs the ALTER on open.
-        self.ensure_columns("embeddings", &[("source_token", "TEXT")])?;
+        self.ensure_columns("embeddings", &[("content_token", "TEXT")])?;
         Ok(())
     }
 
@@ -1035,14 +1035,14 @@ impl Store {
     /// A note's embedding staleness token: `content_tag` (the HMAC of its normalized
     /// plaintext — free change detection, no decrypt) with an `u:{updated_at}` fallback for
     /// the rare tagless row. `None` when the note is absent or tombstoned. One SQL
-    /// definition ([`source_token_sql`]) shared with the pending derivation, so the queue
+    /// definition ([`content_token_sql`]) shared with the pending derivation, so the queue
     /// and the write-time revalidation can't drift.
-    pub(crate) fn note_source_token(&self, note_id: &str) -> rusqlite::Result<Option<String>> {
+    pub(crate) fn note_content_token(&self, note_id: &str) -> rusqlite::Result<Option<String>> {
         self.conn
             .query_row(
                 &format!(
                     "SELECT {} FROM notes WHERE id = ?1 AND deleted = 0",
-                    source_token_sql("notes")
+                    content_token_sql("notes")
                 ),
                 [note_id],
                 |row| row.get(0),
@@ -1051,7 +1051,7 @@ impl Store {
     }
 
     /// Upsert a note's sealed vector (or a NULL skip marker) — but ONLY if the note is still
-    /// live and its source token still equals `source_token` (the value read before the host
+    /// live and its source token still equals `content_token` (the value read before the host
     /// embed ran). Returns whether the write happened. The embed pipeline releases the store
     /// lock across the host callback (~0.8 s on CPU), so the note can be edited, deleted, or
     /// pulled over in that window; a stale vector written anyway would carry a CURRENT token
@@ -1061,18 +1061,18 @@ impl Store {
         &self,
         note_id: &str,
         corpus_key: &str,
-        source_token: &str,
+        content_token: &str,
         sealed: Option<&[u8]>,
         updated_at: i64,
     ) -> rusqlite::Result<bool> {
-        if self.note_source_token(note_id)?.as_deref() != Some(source_token) {
+        if self.note_content_token(note_id)?.as_deref() != Some(content_token) {
             return Ok(false);
         }
         self.conn.execute(
             "INSERT OR REPLACE INTO embeddings \
-             (note_id, model_version, source_token, encrypted_vector, updated_at, deleted) \
+             (note_id, model_version, content_token, encrypted_vector, updated_at, deleted) \
              VALUES (?1, ?2, ?3, ?4, ?5, 0)",
-            rusqlite::params![note_id, corpus_key, source_token, sealed, updated_at],
+            rusqlite::params![note_id, corpus_key, content_token, sealed, updated_at],
         )?;
         Ok(true)
     }
@@ -1112,21 +1112,16 @@ impl Store {
 
     /// The derived embed queue: live notes whose vector is missing, keyed to a different
     /// corpus, or embedded from different text (token mismatch — see
-    /// [`Store::note_source_token`]). Newest-first (recent notes become searchable first),
-    /// `limit < 0` = no limit. `IS NOT` keeps a NULL stored key/token from wedging a row
-    /// out of the queue forever (`<>` against NULL is never true in SQL).
+    /// [`Store::note_content_token`]). Newest-first (recent notes become searchable first),
+    /// `limit < 0` = no limit.
     pub(crate) fn pending_embeddings(
         &self,
         corpus_key: &str,
         limit: i64,
     ) -> rusqlite::Result<Vec<String>> {
         let sql = format!(
-            "SELECT n.id FROM notes n LEFT JOIN embeddings e ON e.note_id = n.id \
-             WHERE n.deleted = 0 AND (e.note_id IS NULL \
-               OR e.model_version IS NOT ?1 \
-               OR e.source_token IS NOT {token}) \
-             ORDER BY n.created_at DESC, n.id DESC LIMIT ?2",
-            token = source_token_sql("n"),
+            "{} ORDER BY n.created_at DESC, n.id DESC LIMIT ?2",
+            pending_embeddings_sql("n.id"),
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params![corpus_key, limit], |row| row.get(0))?;
@@ -1135,16 +1130,12 @@ impl Store {
 
     /// How many notes the derived queue currently holds — the host's durable
     /// rebuild/progress signal (survives a process restart, unlike a registration-time
-    /// flag). Same WHERE as [`Store::pending_embeddings`].
+    /// flag). Same derivation as [`Store::pending_embeddings`], by construction.
     pub(crate) fn pending_embedding_count(&self, corpus_key: &str) -> rusqlite::Result<i64> {
-        let sql = format!(
-            "SELECT count(*) FROM notes n LEFT JOIN embeddings e ON e.note_id = n.id \
-             WHERE n.deleted = 0 AND (e.note_id IS NULL \
-               OR e.model_version IS NOT ?1 \
-               OR e.source_token IS NOT {token})",
-            token = source_token_sql("n"),
-        );
-        self.conn.query_row(&sql, [corpus_key], |row| row.get(0))
+        self.conn
+            .query_row(&pending_embeddings_sql("count(*)"), [corpus_key], |row| {
+                row.get(0)
+            })
     }
 
     /// The scannable corpus: `(note_id, sealed vector)` for every current-key, non-marker
@@ -1199,7 +1190,7 @@ impl Store {
     ) -> rusqlite::Result<Option<(Option<String>, Option<String>, Option<Vec<u8>>)>> {
         self.conn
             .query_row(
-                "SELECT model_version, source_token, encrypted_vector \
+                "SELECT model_version, content_token, encrypted_vector \
                  FROM embeddings WHERE note_id = ?1",
                 [note_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -1224,8 +1215,22 @@ fn sync_cursor_key(table: &str) -> String {
 /// the pending count, and the write-time revalidation — so the three can't drift. The inner
 /// `COALESCE(updated_at, 0)` keeps a junk NULL-`updated_at` row from producing a NULL token
 /// (`'u:' || NULL` is NULL) that could never match anything.
-fn source_token_sql(alias: &str) -> String {
+fn content_token_sql(alias: &str) -> String {
     format!("COALESCE({alias}.content_tag, 'u:' || COALESCE({alias}.updated_at, 0))")
+}
+
+/// The derived embed queue's one query body, parameterized on the SELECT expression — the
+/// list (`n.id`) and the count (`count(*)`) share it verbatim, so the two can't drift.
+/// `?1` = the corpus key. `IS NOT` (null-safe) keeps a NULL stored key/token from wedging a
+/// row out of the queue forever (`<>` against NULL is never true in SQL).
+fn pending_embeddings_sql(select: &str) -> String {
+    format!(
+        "SELECT {select} FROM notes n LEFT JOIN embeddings e ON e.note_id = n.id \
+         WHERE n.deleted = 0 AND (e.note_id IS NULL \
+           OR e.model_version IS NOT ?1 \
+           OR e.content_token IS NOT {token})",
+        token = content_token_sql("n"),
+    )
 }
 
 #[cfg(test)]
@@ -1944,8 +1949,8 @@ mod tests {
     }
 
     #[test]
-    fn init_schema_alters_a_pre_source_token_embeddings_table() {
-        // A store created before `source_token` existed (the table has been in
+    fn init_schema_alters_a_pre_content_token_embeddings_table() {
+        // A store created before `content_token` existed (the table has been in
         // LOCAL_ONLY_DDL, writer-less, since SUR-723): hand-create the old shape, then run
         // the normal open path — `ensure_columns` must add the missing column, idempotently.
         let conn = Connection::open_in_memory().unwrap();
@@ -1958,8 +1963,9 @@ mod tests {
 
         let cols = store.table_columns("embeddings").unwrap();
         assert!(
-            cols.iter().any(|(n, a)| n == "source_token" && a == "TEXT"),
-            "ALTER must add source_token TEXT"
+            cols.iter()
+                .any(|(n, a)| n == "content_token" && a == "TEXT"),
+            "ALTER must add content_token TEXT"
         );
         // Idempotent, and a fresh store agrees on the column SET (order may differ — ALTER appends).
         store.init_schema().unwrap();
@@ -2020,7 +2026,7 @@ mod tests {
 
         // The tagless fallback token really is u:{updated_at}: embedding under it drains it.
         assert_eq!(
-            store.note_source_token("tagless").unwrap().as_deref(),
+            store.note_content_token("tagless").unwrap().as_deref(),
             Some("u:6")
         );
         store
@@ -2051,7 +2057,7 @@ mod tests {
         );
         assert_eq!(sealed, Some(vec![9]));
 
-        // A tombstoned target writes nothing (note_source_token excludes deleted rows).
+        // A tombstoned target writes nothing (note_content_token excludes deleted rows).
         store
             .apply_row(
                 "notes",
@@ -2130,7 +2136,7 @@ mod tests {
         store
             .conn
             .execute(
-                "INSERT INTO embeddings (note_id, model_version, source_token, encrypted_vector, updated_at, deleted) \
+                "INSERT INTO embeddings (note_id, model_version, content_token, encrypted_vector, updated_at, deleted) \
                  VALUES ('ghost', ?1, 't', x'01', 0, 0), ('junk', NULL, NULL, x'02', 0, 0)",
                 [KEY],
             )

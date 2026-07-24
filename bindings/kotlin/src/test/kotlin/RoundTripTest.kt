@@ -14,7 +14,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import uniffi.braird_core.BookUpsert
 import uniffi.braird_core.CryptoException
-import uniffi.braird_core.EmbedException
+import uniffi.braird_core.EmbedderException
 import uniffi.braird_core.Embedder
 import uniffi.braird_core.EmbedderDescriptor
 import uniffi.braird_core.ImportCounts
@@ -810,14 +810,14 @@ class RoundTripTest {
         assertFalse(registration.corpusChanged)
         assertEquals(0u, registration.invalidated)
         assertEquals(2u, registration.pending)
-        assertEquals(2u, engine.embedPendingCount())
+        assertEquals(2u, engine.pendingEmbedCount())
 
         // The drain calls BACK into this Kotlin embedder with the decrypted plaintext.
         val progress = engine.embedPending(10u)
         assertEquals(2u, progress.embedded)
-        assertEquals(0u, progress.remaining)
+        assertEquals(0u, progress.pending)
         assertEquals(2, embedder.documentCalls.get())
-        assertEquals(0u, engine.embedPendingCount())
+        assertEquals(0u, engine.pendingEmbedCount())
 
         // The scan primitives read the sealed corpus back over the FFI.
         val hits = engine.semanticSearch("aaaa", 10u)
@@ -827,7 +827,7 @@ class RoundTripTest {
         assertTrue(similar.none { it.noteId == "n-aaa" }, "probe excluded from its own results")
     }
 
-    /** A Kotlin EmbedException must lower cleanly into core's failure accounting — the
+    /** A Kotlin EmbedderException must lower cleanly into core's failure accounting — the
      * error leg of the reverse call direction. */
     @Test
     fun embedderThrownExceptionLowersIntoFailureCounts() {
@@ -838,14 +838,46 @@ class RoundTripTest {
         engine.registerEmbedder(object : Embedder {
             override fun descriptor() =
                 EmbedderDescriptor(modelId = "kt-failing", dims = 8u, quantization = "test")
-            override fun embedDocument(text: String): List<Float> = throw EmbedException.Runtime()
-            override fun embedQuery(text: String): List<Float> = throw EmbedException.Runtime()
+            override fun embedDocument(text: String): List<Float> = throw EmbedderException.Runtime()
+            override fun embedQuery(text: String): List<Float> = throw EmbedderException.Runtime()
         })
 
         val progress = engine.embedPending(10u)
         assertEquals(0u, progress.embedded)
         assertEquals(1u, progress.failed)
-        assertEquals(1u, progress.remaining, "a failed note stays queued for the next pass")
+        assertEquals(1u, progress.pending, "a failed note stays queued for the next pass")
         assertThrows(SyncException::class.java) { engine.semanticSearch("query", 5u) }
+    }
+
+    /** An UNDECLARED host exception (not an EmbedderException) rides UniFFI's
+     * unexpected-error lane; the From<UnexpectedUniFFICallbackError> impl must degrade it
+     * to Runtime — counted as failed, never a panic, and never the host's message
+     * transiting core (crypto-review finding). */
+    @Test
+    fun undeclaredEmbedderExceptionDegradesToFailedNotPanic() {
+        val db = File.createTempFile("braird-embed-undeclared", ".sqlite").apply { deleteOnExit() }
+        val engine = SyncEngine.open(db.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
+        engine.enqueueNote(plainNote("n1", "some text"))
+
+        engine.registerEmbedder(object : Embedder {
+            override fun descriptor() =
+                EmbedderDescriptor(modelId = "kt-undeclared", dims = 8u, quantization = "test")
+            override fun embedDocument(text: String): List<Float> =
+                throw IllegalStateException("host-secret-detail")
+            override fun embedQuery(text: String): List<Float> =
+                throw IllegalStateException("host-secret-detail")
+        })
+
+        // Must NOT throw — the pass completes with the item counted failed.
+        val progress = engine.embedPending(10u)
+        assertEquals(0u, progress.embedded)
+        assertEquals(1u, progress.failed)
+        assertEquals(1u, progress.pending)
+        // The engine-side error for a query embed is core-authored, never the host string.
+        val thrown = assertThrows(SyncException::class.java) { engine.semanticSearch("query", 5u) }
+        assertFalse(
+            (thrown.message ?: "").contains("host-secret-detail"),
+            "host content must never transit core error strings",
+        )
     }
 }
