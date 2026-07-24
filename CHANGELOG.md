@@ -6,6 +6,34 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **Host-embedder FFI contract, sealed vector store, corpus versioning, and the semantic scan
+  primitive (SUR-997, ADR 0006)** — the platform-neutral core leg of the SUR-529/SUR-986 native
+  embedding lane, and the repo's **first foreign-implemented trait**. Hosts register an
+  `Embedder` (`#[uniffi::export(with_foreign)]`: `descriptor()` + `embed_document`/`embed_query`,
+  one argument each — the SUR-843 arm64 caution applied to the reverse call direction) on the
+  `SyncEngine`; core owns *what* gets embedded and *when*, the host owns the runtime (LiteRT /
+  Core ML). Five new engine methods: `register_embedder` (descriptor validation; a corpus-key
+  change hard-deletes stale vectors and re-queues — the model-upgrade path, reported via
+  `EmbedderRegistration`), `embed_pending_count` (the durable, restart-safe rebuild signal),
+  `embed_pending(max_items)` (host-scheduled chunked drain), and the two scan primitives
+  `semantic_search(query, limit)` (SUR-157) and `similar_notes(note_id, limit)`
+  (SUR-647/SUR-996) — brute-force cosine top-k, no ANN (SUR-529: interactive past ~100k docs).
+  Posture (the ADR 0006 headline): vectors are the core's **first persistent
+  derived-from-plaintext artifact** — sealed with the vault key at rest (`0x02` seal, AAD = note
+  id, f32-LE inside), opened only in core, device-local by construction (never the outbox, never
+  snapshot export), hard-deleted with their note via a single `apply_row` choke-point hook plus
+  an orphan sweep. The (re)embed queue is **derived, not staged**: one metadata JOIN on
+  `(corpus key, content_tag-or-updated_at token)` — no decrypt to decide staleness, no
+  invalidation hooks in enqueue/pull/reconcile, self-healing after any write path. Empty-text and
+  undecryptable notes write NULL-vector skip markers so the queue drains; an edit moves the token
+  and re-queues. No engine mutex is ever held across a host embed call (reentrancy-pinned).
+  Store side: `embeddings.source_token` column (added via `ensure_columns`, the SUR-1005 ALTER
+  machinery extracted and extended to local-only tables) + the sealed-vector CRUD. New
+  `SyncError::EmbedderNotRegistered` / `SyncError::Embed`; `EmbedError` is deliberately fieldless
+  (host-authored messages never transit core error strings). Ships no model asset, no scheduler,
+  no UI — SUR-998/SUR-999 consume via pin bump.
+
 ## [0.12.0] - 2026-07-23
 
 Twenty-second release batch. Minor release: SUR-916 Option 1 part B — core consumes the
