@@ -15,6 +15,11 @@
 # committed-binding generation here (DRY); the `bindings-drift` CI job runs this into a temp
 # dir and `git diff --exit-code`s it against the committed tree.
 #
+# The Kotlin output is then HARDENED by scripts/patch-kotlin-bindings.mjs (SUR-1014: the
+# stock shims let java.lang.Error escape the JNA callback with the call status unwritten).
+# The committed bytes are generated+patched — still never hand-edited; the patcher is part
+# of this canonical emission and hard-fails if a UniFFI bump reshapes the generated text.
+#
 # Usage:  scripts/gen-bindings.sh [debug|release]   (default: debug — faster; the generated
 #         binding text is identical either way, it derives from metadata, not codegen).
 set -euo pipefail
@@ -51,6 +56,11 @@ cargo run --quiet --bin uniffi-bindgen -- generate \
   --library "$LIB" --language kotlin --no-format --out-dir "$GEN"
 cargo run --quiet --bin uniffi-bindgen -- generate \
   --library "$LIB" --language swift  --no-format --out-dir "$GEN"
+
+# Harden the Kotlin callback shims before the bytes become the committed canonical form
+# (SUR-1014). Pure string transforms on the pristine --no-format output — deterministic;
+# hard-fails on any anchor drift so a uniffi bump forces a deliberate revisit.
+node scripts/patch-kotlin-bindings.mjs "${GEN}/uniffi/${NAME}/${NAME}.kt"
 
 # Copy into the committed binding paths. UniFFI writes Kotlin under uniffi/<crate>/<name>.kt
 # and Swift flat as <name>.swift (renamed to BrairdCore.swift for the SwiftPM target). The
