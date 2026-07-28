@@ -7,6 +7,7 @@ import java.util.Base64
 import java.util.concurrent.atomic.AtomicInteger
 import org.json.JSONArray
 import org.json.JSONObject
+import org.junit.jupiter.api.Assertions.assertDoesNotThrow
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertThrows
@@ -17,6 +18,12 @@ import uniffi.braird_core.CryptoException
 import uniffi.braird_core.EmbedderException
 import uniffi.braird_core.Embedder
 import uniffi.braird_core.EmbedderDescriptor
+import uniffi.braird_core.FfiConverterString
+import uniffi.braird_core.FfiConverterTypeEmbedder
+import uniffi.braird_core.RustBuffer
+import uniffi.braird_core.UNIFFI_CALL_UNEXPECTED_ERROR
+import uniffi.braird_core.UniffiRustCallStatus
+import uniffi.braird_core.uniffiCallbackInterfaceEmbedder
 import uniffi.braird_core.ImportCounts
 import uniffi.braird_core.ImportSummary
 import uniffi.braird_core.NoteSignalKind
@@ -879,5 +886,103 @@ class RoundTripTest {
             (thrown.message ?: "").contains("host-secret-detail"),
             "host content must never transit core error strings",
         )
+    }
+
+    // ── SUR-1014: throwables the generated shim must not let escape the JNA callback ──
+    // A java.lang.Error (OOM, UnsatisfiedLinkError — both ordinary conditions for an
+    // on-device ML host) or a pre-guard handle-map miss used to unwind out of the
+    // callback with UniffiRustCallStatus never written; a zeroed status reads as
+    // UNIFFI_CALL_SUCCESS, so core proceeded on a callback that produced no return value.
+
+    /** A host java.lang.Error from embedDocument must ride the unexpected-error lane into
+     * core's EmbedderError::Runtime — counted failed, never a JVM escape or a corrupt success.
+     * NOTE this asserts the end-to-end degradation, not the shim fix itself: on the stock
+     * shim the Error escapes, but Rust happens to recover by failing to lift the unwritten
+     * return, so the counts land the same. vtableThrownErrorWritesUnexpectedErrorStatus is
+     * the test that goes red without the fix. */
+    @Test
+    fun embedderThrownErrorDegradesToFailedNotJvmEscape() {
+        val db = File.createTempFile("braird-embed-error", ".sqlite").apply { deleteOnExit() }
+        val engine = SyncEngine.open(db.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
+        engine.enqueueNote(plainNote("n1", "some text"))
+
+        engine.registerEmbedder(object : Embedder {
+            override fun descriptor() =
+                EmbedderDescriptor(modelId = "kt-oom", dims = 8u, quantization = "test")
+            // Constructed Error, not real memory pressure — the class is what matters.
+            override fun embedDocument(text: String): List<Float> =
+                throw OutOfMemoryError("host-secret-detail")
+            override fun embedQuery(text: String): List<Float> =
+                throw OutOfMemoryError("host-secret-detail")
+        })
+
+        // Must NOT throw and must NOT report success — the item is counted failed.
+        val progress = engine.embedPending(10u)
+        assertEquals(0u, progress.embedded)
+        assertEquals(1u, progress.failed)
+        assertEquals(1u, progress.pending)
+        val thrown = assertThrows(SyncException::class.java) { engine.semanticSearch("query", 5u) }
+        assertFalse(
+            (thrown.message ?: "").contains("host-secret-detail"),
+            "host content must never transit core error strings",
+        )
+    }
+
+    /** THE shim pin: drive the vtable directly with a VALID handle whose methods throw a
+     * java.lang.Error. On the stock shim (`catch(e: kotlin.Exception)`) the Error escapes the
+     * JNA callback — this test throws and goes red — leaving the status zeroed, i.e. read as
+     * success. Both shim variants are covered: descriptor (no-error) and embedDocument
+     * (declared-error). Only the throwable's class name may reach the status buffer.
+     * UnsatisfiedLinkError, not OutOfMemoryError: JUnit rethrows OOM as unrecoverable, so an
+     * escape would be reported ABORTED (green-ish) instead of failing — a silent guard. Both
+     * are java.lang.Error and take the identical path through the widened catch. */
+    @Test
+    fun vtableThrownErrorWritesUnexpectedErrorStatus() {
+        val embedder = object : Embedder {
+            override fun descriptor(): EmbedderDescriptor = throw UnsatisfiedLinkError("host-secret-detail")
+            override fun embedDocument(text: String): List<Float> = throw UnsatisfiedLinkError("host-secret-detail")
+            override fun embedQuery(text: String): List<Float> = throw UnsatisfiedLinkError("host-secret-detail")
+        }
+        val handle = FfiConverterTypeEmbedder.handleMap.insert(embedder)
+        try {
+            // No-error shim (uniffiTraitInterfaceCall).
+            val descStatus = UniffiRustCallStatus()
+            assertDoesNotThrow {
+                uniffiCallbackInterfaceEmbedder.`descriptor`.callback(handle, RustBuffer(), descStatus)
+            }
+            assertEquals(UNIFFI_CALL_UNEXPECTED_ERROR, descStatus.code, "an Error must not read as success")
+            assertEquals("java.lang.UnsatisfiedLinkError", FfiConverterString.lift(descStatus.error_buf))
+
+            // Declared-error shim. The argument buffer is consumed by the lift inside the guard.
+            val docStatus = UniffiRustCallStatus()
+            val text = FfiConverterString.lower("some text")
+            assertDoesNotThrow {
+                uniffiCallbackInterfaceEmbedder.`embedDocument`.callback(handle, text, RustBuffer(), docStatus)
+            }
+            assertEquals(UNIFFI_CALL_UNEXPECTED_ERROR, docStatus.code, "an Error must not read as success")
+            assertEquals("java.lang.UnsatisfiedLinkError", FfiConverterString.lift(docStatus.error_buf))
+        } finally {
+            FfiConverterTypeEmbedder.handleMap.remove(handle)
+        }
+    }
+
+    /** A stale/invalid handle used to throw InternalException BEFORE the shim's guard,
+     * escaping the callback with the status still zeroed (= UNIFFI_CALL_SUCCESS). Drive the
+     * generated vtable entry directly (test source set is a friend module) to pin that the
+     * lookup now fails INSIDE the guard and writes UNEXPECTED_ERROR. */
+    @Test
+    fun vtableHandleMapMissWritesUnexpectedErrorStatus() {
+        val status = UniffiRustCallStatus()
+        // No manual free of `text`: the guard lifts the argument BEFORE the handle lookup, so
+        // the buffer (decrypted plaintext in production) is consumed even on the miss lane —
+        // freeing it here again would corrupt the heap.
+        val text = FfiConverterString.lower("x")
+        assertDoesNotThrow {
+            uniffiCallbackInterfaceEmbedder.`embedDocument`.callback(Long.MIN_VALUE, text, RustBuffer(), status)
+        }
+        assertEquals(UNIFFI_CALL_UNEXPECTED_ERROR, status.code, "a handle miss must not read as success")
+        val reason = FfiConverterString.lift(status.error_buf) // frees error_buf
+        assertTrue(reason.contains("InternalException"), "reason should carry the throwable class: $reason")
+        assertFalse(reason.contains("Invalid handle"), "only the class name may cross — no message content: $reason")
     }
 }

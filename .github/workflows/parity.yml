@@ -12,10 +12,10 @@ name: Parity
 on:
   push:
     branches: [main]
-    paths: ['Cargo.toml', 'Cargo.lock', 'build.rs', 'src/**', 'tests/**', 'vendored/**', '**/*.udl']
+    paths: ['Cargo.toml', 'Cargo.lock', 'build.rs', 'src/**', 'tests/**', 'vendored/**', '**/*.udl', 'scripts/gen-bindings.sh', 'scripts/patch-kotlin-bindings.mjs']
   pull_request:
     branches: [main]
-    paths: ['Cargo.toml', 'Cargo.lock', 'build.rs', 'src/**', 'tests/**', 'vendored/**', '**/*.udl']
+    paths: ['Cargo.toml', 'Cargo.lock', 'build.rs', 'src/**', 'tests/**', 'vendored/**', '**/*.udl', 'scripts/gen-bindings.sh', 'scripts/patch-kotlin-bindings.mjs']
   workflow_dispatch:
 
 jobs:
@@ -125,6 +125,9 @@ jobs:
   # bindings/** would fire the macOS `ios-crosscompile` smoke (10× billing) on every
   # binding-regen PR for no coverage gain (a hand-edit to committed bindings with no src change
   # isn't a supported workflow — CLAUDE.md forbids hand-editing them).
+  # SUR-1014: gen-bindings.sh + patch-kotlin-bindings.mjs ARE in the filter — they co-author
+  # the committed bytes, so an edit to either must rerun this drift check (accepting the rare
+  # macOS-billed run on script-touching PRs).
   bindings-drift:
     name: FFI bindings up to date
     runs-on: ubuntu-latest

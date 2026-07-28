@@ -6,6 +6,38 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Fixed
+- **A host `java.lang.Error` could escape the Kotlin callback boundary with the call status
+  unwritten (SUR-1014).** UniFFI 0.28's generated foreign-trait shims catch only
+  `kotlin.Exception`, and each vtable entry looked its callback handle up *before* entering that
+  guard. So an `OutOfMemoryError`, an `UnsatisfiedLinkError` (both ordinary conditions for an
+  on-device ML embedder — SUR-998 loads a large model into a memory-tight process, and LiteRT
+  fails to link on unsupported devices), or a stale-handle `InternalException` unwound straight
+  out of the JNA callback with `UniffiRustCallStatus` **never written** — and a zeroed status
+  reads as `UNIFFI_CALL_SUCCESS`, so core continued past a callback that produced no return
+  value, mid-`embed_pending` with the vault unlocked. On today's `Embedder` methods that
+  stopped short of a silent wrong answer by luck rather than design: the return types are
+  length-prefixed, so Rust failed to lift the unwritten buffer and degraded to a counted
+  failure. A `Unit`-returning callback method would have been a full silent success, and the
+  throwable also landed on JNA's default handler, printing the host's stack trace to logcat.
+  The whole point of the SUR-997 contract is that a host failure becomes a declared, fieldless
+  `EmbedderError`; the `From<UnexpectedUniFFICallbackError>` safety net only covers what the
+  shim actually catches. Both shims now catch `kotlin.Throwable`; the handle lookup moved
+  inside the guard, below the argument lifts, so a miss can no longer strand a decrypted
+  plaintext buffer; and the status code is written *before* the error buffer so a throwing
+  `lower()` (the real-OOM case) still leaves an error status rather than a success. The
+  unexpected lane now lowers only the throwable's **class name**, not `e.toString()` — no
+  host-authored message content transits core, tightening the property SUR-997's crypto review
+  set. Kotlin only: Swift's `catch` is already total, and its traps are uncatchable in any
+  formulation. Bindings are generated, so the fix lives in `scripts/patch-kotlin-bindings.mjs`,
+  invoked by `scripts/gen-bindings.sh` before the output becomes the committed form — the
+  committed bytes are generated+patched and `bindings-drift` reproduces them exactly. Every
+  transform is exact-anchor and occurrence-counted: a future UniFFI bump that reshapes the
+  generated text hard-fails the script (and the drift job) rather than silently no-opping.
+  Upstream UniFFI's own `Throwable` fix is still unreleased, lowers a host stack trace, and does
+  not move the handle lookup at all. No FFI signature changes — current hosts pin-bump with no
+  code changes, and the hardened shim arrives with the bindings.
+
 ## [0.13.1] - 2026-07-24
 
 Twenty-fourth release batch. Patch release, two fixes merged since v0.13.0 — **hosts should

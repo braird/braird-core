@@ -315,9 +315,15 @@ internal inline fun<T> uniffiTraitInterfaceCall(
 ) {
     try {
         writeReturn(makeCall())
-    } catch(e: kotlin.Exception) {
+    } catch(e: kotlin.Throwable) {
+        // SUR-1014 (patched post-generation): Throwable, not Exception — a java.lang.Error must not
+        // escape the JNA callback with the status left UNIFFI_CALL_SUCCESS. Code before
+        // buffer so a throwing lower() (real OOM) still leaves an error status; only the
+        // throwable's class name crosses — never host-authored message content.
         callStatus.code = UNIFFI_CALL_UNEXPECTED_ERROR
-        callStatus.error_buf = FfiConverterString.lower(e.toString())
+        try {
+            callStatus.error_buf = FfiConverterString.lower(e.javaClass.name)
+        } catch(_: kotlin.Throwable) {}
     }
 }
 
@@ -329,13 +335,21 @@ internal inline fun<T, reified E: Throwable> uniffiTraitInterfaceCallWithError(
 ) {
     try {
         writeReturn(makeCall())
-    } catch(e: kotlin.Exception) {
+    } catch(e: kotlin.Throwable) {
+        // SUR-1014 (patched post-generation): see uniffiTraitInterfaceCall above. The declared lane
+        // sets UNIFFI_CALL_UNEXPECTED_ERROR first and promotes to UNIFFI_CALL_ERROR only
+        // after lowerError succeeds, so a throwing lowerError degrades to the unexpected
+        // lane instead of escaping.
+        callStatus.code = UNIFFI_CALL_UNEXPECTED_ERROR
         if (e is E) {
-            callStatus.code = UNIFFI_CALL_ERROR
-            callStatus.error_buf = lowerError(e)
+            try {
+                callStatus.error_buf = lowerError(e)
+                callStatus.code = UNIFFI_CALL_ERROR
+            } catch(_: kotlin.Throwable) {}
         } else {
-            callStatus.code = UNIFFI_CALL_UNEXPECTED_ERROR
-            callStatus.error_buf = FfiConverterString.lower(e.toString())
+            try {
+                callStatus.error_buf = FfiConverterString.lower(e.javaClass.name)
+            } catch(_: kotlin.Throwable) {}
         }
     }
 }
@@ -2113,9 +2127,8 @@ public abstract class FfiConverterCallbackInterface<CallbackInterface: Any>: Ffi
 internal object uniffiCallbackInterfaceEmbedder {
     internal object `descriptor`: UniffiCallbackInterfaceEmbedderMethod0 {
         override fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
-            val uniffiObj = FfiConverterTypeEmbedder.handleMap.get(uniffiHandle)
             val makeCall = { ->
-                uniffiObj.`descriptor`(
+                FfiConverterTypeEmbedder.handleMap.get(uniffiHandle).`descriptor`(
                 )
             }
             val writeReturn = { value: EmbedderDescriptor -> uniffiOutReturn.setValue(FfiConverterTypeEmbedderDescriptor.lower(value)) }
@@ -2124,10 +2137,10 @@ internal object uniffiCallbackInterfaceEmbedder {
     }
     internal object `embedDocument`: UniffiCallbackInterfaceEmbedderMethod1 {
         override fun callback(`uniffiHandle`: Long,`text`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
-            val uniffiObj = FfiConverterTypeEmbedder.handleMap.get(uniffiHandle)
             val makeCall = { ->
-                uniffiObj.`embedDocument`(
-                    FfiConverterString.lift(`text`),
+                val uniffiArg1 = FfiConverterString.lift(`text`)
+                FfiConverterTypeEmbedder.handleMap.get(uniffiHandle).`embedDocument`(
+                    uniffiArg1,
                 )
             }
             val writeReturn = { value: List<kotlin.Float> -> uniffiOutReturn.setValue(FfiConverterSequenceFloat.lower(value)) }
@@ -2141,10 +2154,10 @@ internal object uniffiCallbackInterfaceEmbedder {
     }
     internal object `embedQuery`: UniffiCallbackInterfaceEmbedderMethod2 {
         override fun callback(`uniffiHandle`: Long,`text`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
-            val uniffiObj = FfiConverterTypeEmbedder.handleMap.get(uniffiHandle)
             val makeCall = { ->
-                uniffiObj.`embedQuery`(
-                    FfiConverterString.lift(`text`),
+                val uniffiArg1 = FfiConverterString.lift(`text`)
+                FfiConverterTypeEmbedder.handleMap.get(uniffiHandle).`embedQuery`(
+                    uniffiArg1,
                 )
             }
             val writeReturn = { value: List<kotlin.Float> -> uniffiOutReturn.setValue(FfiConverterSequenceFloat.lower(value)) }
