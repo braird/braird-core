@@ -62,6 +62,12 @@ of the embed pipeline. Fusion is therefore core work: the same discipline, one l
    and `NoSemanticMatch` over-fires), too low admits noise that RRF then damps to a low rank
    anyway. The related band is also the smaller sample. Both point the same way, so the floor
    is not pushed toward the recall edge.
+   *nothing here matched by meaning* instead of padding the list. The initial value (0.35) is
+   **provisional**: EmbeddingGemma is prompt-conditioned and Matryoshka-truncated, both of
+   which compress the cosine band, so the release gate re-derives the value from measured
+   related/unrelated query distributions on the SUR-998 device corpus before the release
+   ships (the constant sits behind the release-skew rule — a wrong value costs a patch
+   release + pin bumps, so it is tuned before the first cut, not after).
 4. **One FFI call, degrade-to-status, never degrade-to-error.** `ranked_search(query, limit)
    → RankedSearchPage { hits, semantic_status, pending_embed_count }`. The lexical half
    always answers; every legitimate semantic absence is a nameable `SemanticStatus`

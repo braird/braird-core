@@ -21,6 +21,10 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   `(0.3245, 0.3818]` admits zero nonsense hits while keeping every real one; 0.35 is that
   interval's midpoint, the max-margin choice. The number is bound to the embedder descriptor
   — any model, quantization, or Matryoshka-width change invalidates it along with the corpus. The semantic half degrades to a nameable `SemanticStatus`
+  equal-ranked single-list one. A cosine relevance floor (`SEMANTIC_FLOOR = 0.35`,
+  provisional pending the device-corpus tuning pass at the release gate) defines "no good
+  semantic match" so surfaces can say *nothing here matched by meaning* instead of padding
+  with the least-bad vector. The semantic half degrades to a nameable `SemanticStatus`
   (`EmbedderNotRegistered` / `EmbedderFailed` / `NoSemanticMatch`) on a lexical-only page
   rather than erroring — only store failures are errors — and `pending_embed_count` reports
   the backfill gap so a mid-rebuild page is honest about partial coverage (truthfully even

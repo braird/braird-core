@@ -70,6 +70,10 @@ pub(crate) const RRF_K: f64 = 60.0;
 /// lexical half for exactly that kind of query. Re-run the harness on any descriptor change:
 /// a new model, new quantization, or a different Matryoshka width re-keys the corpus AND
 /// invalidates this number.
+/// TUNE(SUR-1019 step 8a): provisional pending the device pass against the real
+/// EmbeddingGemma corpus — the model is prompt-conditioned and Matryoshka-truncated to
+/// 256-dim, both of which compress the cosine band, so the release gate re-derives this
+/// value from measured related/unrelated query distributions before v0.14.0 ships.
 pub(crate) const SEMANTIC_FLOOR: f64 = 0.35;
 
 /// One fused search result. The shape of [`SearchHit`] (same `kind`/`ref_id`/`title`/
