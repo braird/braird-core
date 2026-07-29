@@ -6,6 +6,25 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **The release now fails on documentation that contradicts it (`scripts/check-stale-release-markers.mjs`).**
+  Cutting v0.14.0 exposed a gap with no owner: `release.yml` verifies the tag, the crate version and
+  the CHANGELOG *section heading*, but nothing reads the prose beneath them. Merging a PR onto a
+  squash-merged base re-inserted stale text into `src/fusion.rs`, ADR 0007 **and** the CHANGELOG, so
+  all three simultaneously recorded a measured constant and instructed maintainers to re-derive that
+  value before the very release shipping it — a release telling its reader to redo the work it
+  contains. Every existing gate passed. The new check runs in `validate`, once, before any build
+  lane spends a minute, and fails on deferral annotations: a `TUNE` marker, a still-provisional
+  label, a defer-until-release phrase, and its version-specific form naming the release being cut
+  (the script carries the exact literals). It scans a 3-line window with whitespace collapsed,
+  because prose wraps — the real ADR 0007 marker straddled a line break, which a line-by-line grep
+  walks straight past. Deliberately narrow: `TODO`/`FIXME` are ordinary and are not checked, since a
+  gate that fires on things people reasonably ship is a gate people learn to bypass. `--self-check`
+  proves the detector actually fires (wrapped case included, plus the false positive where a legit
+  word merely contains a pattern) and runs in CI ahead of the scan itself, so a silently-broken
+  guard cannot pass as "no markers found". Note the scan covers `src/`, `docs/adr/` and the
+  changelog but not `scripts/`, which is what lets the checker hold the literals it hunts for.
+
 ## [0.14.0] - 2026-07-29
 
 Twenty-fifth release batch. Minor release: the SUR-157 query path lands in core as

@@ -81,6 +81,25 @@ jobs:
         id: commit
         run: echo "sha=$(git rev-parse --verify HEAD^{commit})" >> "$GITHUB_OUTPUT"
 
+      # Fail-closed on documentation that contradicts the release. The version/CHANGELOG checks in
+      # the build lanes verify the section HEADING and the crate version; nothing reads the prose
+      # beneath them. At the v0.14.0 cut a merge re-inserted stale text into src/fusion.rs, ADR
+      # 0007 and the CHANGELOG, so all three told maintainers to "re-derive this value ... before
+      # v0.14.0 ships" while sitting directly beneath the completed measurement — and no gate
+      # objected. Runs here, once, before any build lane spends a minute.
+      # Same Node the rest of this workflow pins, so a release gate never depends on whatever
+      # version the runner image happens to ship this month.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.15.0'
+
+      - name: No stale deferral markers for this release
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          node scripts/check-stale-release-markers.mjs --self-check
+          node scripts/check-stale-release-markers.mjs "$VERSION"
+
   # Android AAR (arm64-v8a + x86_64, 16 KB-aligned) + self-contained desktop JVM jar. Uploads both
   # as a workflow artifact for `publish` to attach — this leg never touches the release itself.
   build-android:
