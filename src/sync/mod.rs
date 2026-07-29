@@ -36,7 +36,8 @@ use serde_json::{json, Map, Value};
 use crate::embeddings::{
     self, EmbedSummary, Embedder, EmbedderError, RegisterEmbedderSummary, SemanticHit,
 };
-use crate::search::SearchHit;
+use crate::fusion::{self, RankedHit, RankedSearchPage, SemanticStatus};
+use crate::search::{SearchDoc, SearchDocKind, SearchHit};
 use crate::store::{synced_table_names, StageExistingWriteError, Store};
 use crate::vault::Vault;
 use export_import::import::{compute_importance, source_prior};
@@ -2407,6 +2408,52 @@ impl SyncEngine {
         }
         Ok(embeddings::top_k(hits, limit as usize))
     }
+
+    /// The derived embed queue's size for `reg`'s corpus key, clamped to `u32` — the
+    /// number [`SyncEngine::pending_embed_count`] reports, read under its own short lock.
+    fn pending_for(&self, reg: &RegisteredEmbedder) -> Result<u32, SyncError> {
+        let pending = lock!(self.store)
+            .pending_embedding_count(&reg.corpus_key)
+            .map_err(store_err)?;
+        Ok(pending.max(0) as u32)
+    }
+
+    /// The semantic leg of [`SyncEngine::ranked_search`] — everything that may legitimately
+    /// be absent or fail WITHOUT failing the page. Returns the above-floor scan hits (full
+    /// ranking, empty on any degrade), the nameable status, and the pending-embed count
+    /// (the partial-corpus honesty signal; `0` when nothing is registered, since without a
+    /// corpus key there is no queue to measure). Only store failures are `Err`.
+    fn ranked_semantic_leg(
+        &self,
+        query: &str,
+    ) -> Result<(Vec<SemanticHit>, SemanticStatus, u32), SyncError> {
+        let Ok(reg) = self.registered_embedder() else {
+            return Ok((vec![], SemanticStatus::EmbedderNotRegistered, 0));
+        };
+        // The host callback — NO locks held (see the section header). A host error, a
+        // wrong-dimension vector, and a zero/non-finite vector all degrade the same way:
+        // the embedder failed the query, the lexical page still stands.
+        let probe = match reg.embedder.embed_query(query.to_string()) {
+            Ok(v) if v.len() == reg.dims as usize => embeddings::normalize(v),
+            _ => None,
+        };
+        let Some(probe) = probe else {
+            return Ok((
+                vec![],
+                SemanticStatus::EmbedderFailed,
+                self.pending_for(&reg)?,
+            ));
+        };
+        let hits = fusion::above_floor(self.scan_corpus(&reg, &probe, u32::MAX, None)?);
+        let status = if hits.is_empty() {
+            SemanticStatus::NoSemanticMatch
+        } else {
+            SemanticStatus::Fused
+        };
+        // Pending is read AFTER the scan so notes its corrupt-vector self-heal just
+        // re-queued are counted, not silently missing from the honesty signal.
+        Ok((hits, status, self.pending_for(&reg)?))
+    }
 }
 
 #[uniffi::export]
@@ -2700,6 +2747,89 @@ impl SyncEngine {
         };
         self.scan_corpus(&reg, &probe, limit, Some(&note_id))
     }
+
+    /// Hybrid ranked search (SUR-1019, ADR 0007 — the SUR-157 query path): ONE ranked
+    /// answer over the lexical engine (ADR 0005; notes + ideas) and the sealed-vector
+    /// cosine scan (ADR 0006; notes), fused by reciprocal rank IN CORE so the two native
+    /// surfaces cannot drift on ranking. Ranking policy — the RRF constant and the
+    /// relevance floor that defines "no good semantic match" — is core's, not host config.
+    ///
+    /// The lexical half always answers. The semantic half degrades to a nameable
+    /// [`SemanticStatus`] on a lexical-only page (no embedder, embed failure, nothing
+    /// above the floor) rather than erroring — only store failures are `Err`. Mid-rebuild
+    /// the scan covers the re-embedded notes only;
+    /// [`RankedSearchPage::pending_embed_count`] reports the gap so a surface can say
+    /// "still indexing" instead of under-returning.
+    ///
+    /// Empty/whitespace queries and `limit == 0` return an empty page without an embed
+    /// call (the lexical engine's "no search-everything surprise" — a query embed costs
+    /// ~0.8 s on CPU) — but the page's status and pending count are still the cheap truth
+    /// (registration check + queue count), because hosts initialize search-screen state
+    /// from exactly this call: an unregistered embedder still shows its download
+    /// affordance, a mid-backfill corpus still shows "indexing N". Cost of a real call ≈
+    /// `search()` (full corpus decrypt, in memory only) + one host `embed_query` + the
+    /// full-corpus vector scan — the accepted ADR 0005/0006 per-call posture at
+    /// personal-archive scale.
+    pub fn ranked_search(&self, query: String, limit: u32) -> Result<RankedSearchPage, SyncError> {
+        if query.trim().is_empty() || limit == 0 {
+            let (semantic_status, pending_embed_count) = match self.registered_embedder() {
+                Ok(reg) => (SemanticStatus::Fused, self.pending_for(&reg)?),
+                Err(_) => (SemanticStatus::EmbedderNotRegistered, 0),
+            };
+            return Ok(RankedSearchPage {
+                hits: vec![],
+                semantic_status,
+                pending_embed_count,
+            });
+        }
+        // Semantic leg FIRST, so no note plaintext is live in core while the ~0.8 s
+        // foreign embed call runs (the section header's at-most-one-note posture; the
+        // query string is the host's own) — and the lexical corpus below is the fresher
+        // of the two snapshots at delivery time.
+        let (semantic, status, pending_embed_count) = self.ranked_semantic_leg(&query)?;
+        // Lexical leg: corpus built under the store lock (no foreign call runs inside
+        // it); the engine ranks its FULL corpus (untruncated) — fusion needs whole
+        // rankings.
+        let docs = {
+            let store = lock!(self.store);
+            read::build_search_docs(&store, &self.vault).map_err(store_err)?
+        };
+        let lexical = crate::search::search(&docs, &query, usize::MAX);
+        // Fuse the untruncated rankings, hydrate display fields from the already-decrypted
+        // corpus (same snippet rule as `SearchHit`), truncate LAST — so a semantic-only
+        // hit whose note was deleted or went empty/undecryptable between the two snapshot
+        // reads (absent from the docs, with nothing displayable) is dropped without
+        // leaving the page short.
+        let by_key: HashMap<(SearchDocKind, &str), &SearchDoc> = docs
+            .iter()
+            .map(|d| ((d.kind, d.ref_id.as_str()), d))
+            .collect();
+        let hits = fusion::fuse(&lexical, &semantic)
+            .into_iter()
+            .filter_map(|f| {
+                let doc = by_key.get(&(f.kind, f.ref_id.as_str()))?;
+                Some(RankedHit {
+                    kind: f.kind,
+                    ref_id: doc.ref_id.clone(),
+                    title: doc.title.clone(),
+                    snippet: if doc.content.is_empty() {
+                        doc.title.clone()
+                    } else {
+                        doc.content.clone()
+                    },
+                    score: f.score,
+                    matched_lexical: f.matched_lexical,
+                    matched_semantic: f.matched_semantic,
+                })
+            })
+            .take(limit as usize)
+            .collect();
+        Ok(RankedSearchPage {
+            hits,
+            semantic_status: status,
+            pending_embed_count,
+        })
+    }
 }
 
 /// Epoch milliseconds — the PWA `Date.now()` unit the cloud data is stamped in. `SystemTime`
@@ -2805,10 +2935,9 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].ref_id, "n1");
 
-        // …yet the marker never reaches the SQLite file — only enc:v2 ciphertext is at rest.
-        let bytes = std::fs::read(db_path).unwrap();
-        let leaked = bytes.windows(marker.len()).any(|w| w == marker.as_bytes());
-        assert!(!leaked, "plaintext note text must never be written to disk");
+        // …yet the marker never reaches disk — only enc:v2 ciphertext is at rest
+        // (a directory sweep, so a future WAL sidecar can't blind the pin).
+        assert_no_marker_on_disk(dir.path(), marker);
     }
 
     #[test]
@@ -7968,5 +8097,334 @@ mod tests {
             1,
             "the reentrant read ran mid-pass (n1 still pending while being embedded)"
         );
+    }
+
+    // ── SUR-1019: hybrid ranked search ───────────────────────────────────────
+
+    /// Exact-cosine control for floor/fusion tests: every known text (document or query)
+    /// maps to a fixed unit vector; unknown text gets the last basis axis. Lets a test
+    /// place a query at ANY chosen cosine to a note, independent of the texts' bytes —
+    /// which [`HistogramEmbedder`] (text-derived) cannot.
+    struct FixedVecEmbedder {
+        map: HashMap<String, Vec<f32>>,
+    }
+    fn basis(axis: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; DIMS as usize];
+        v[axis] = 1.0;
+        v
+    }
+    impl FixedVecEmbedder {
+        fn new(entries: &[(&str, Vec<f32>)]) -> Arc<Self> {
+            Arc::new(Self {
+                map: entries
+                    .iter()
+                    .map(|(text, v)| (text.to_string(), v.clone()))
+                    .collect(),
+            })
+        }
+    }
+    impl Embedder for FixedVecEmbedder {
+        fn descriptor(&self) -> EmbedderDescriptor {
+            EmbedderDescriptor {
+                model_id: "fixed".into(),
+                dims: DIMS,
+                quantization: "test".into(),
+            }
+        }
+        fn embed_document(&self, text: String) -> Result<Vec<f32>, EmbedderError> {
+            Ok(self
+                .map
+                .get(&text)
+                .cloned()
+                .unwrap_or_else(|| basis(DIMS as usize - 1)))
+        }
+        fn embed_query(&self, text: String) -> Result<Vec<f32>, EmbedderError> {
+            self.embed_document(text)
+        }
+    }
+
+    #[test]
+    fn ranked_search_fuses_both_engines_and_flags_the_match_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "ranked-fuse");
+        // Disjoint byte sets: orthogonal histogram vectors AND no lexical cross-match.
+        engine.enqueue_note(note_upsert("n-aaa", "aaaa")).unwrap();
+        engine.enqueue_note(note_upsert("n-bbb", "bbbb")).unwrap();
+        engine
+            .register_embedder(HistogramEmbedder::new("fake-model"))
+            .unwrap();
+        engine.embed_pending(10).unwrap();
+
+        let page = engine.ranked_search("aaaa".into(), 10).unwrap();
+        assert_eq!(page.semantic_status, SemanticStatus::Fused);
+        assert_eq!(page.pending_embed_count, 0);
+        assert_eq!(page.hits.len(), 1, "the orthogonal note never surfaces");
+        let hit = &page.hits[0];
+        assert_eq!(hit.ref_id, "n-aaa");
+        assert_eq!(hit.kind, SearchDocKind::Note);
+        assert_eq!(hit.snippet, "aaaa", "hydrated from the decrypted corpus");
+        assert!(hit.matched_lexical && hit.matched_semantic);
+        // Both engines rank it #1 → the fused RRF score is exactly 2/(k+1).
+        assert!((hit.score - 2.0 / (crate::fusion::RRF_K + 1.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn ranked_search_includes_ideas_through_their_lexical_rank() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "ranked-idea");
+        engine
+            .enqueue_note(note_upsert("n1", "stoic calm under pressure"))
+            .unwrap();
+        engine
+            .enqueue_custom_idea("i1".into(), "Stoicism".into(), None, 0, false)
+            .unwrap();
+        engine
+            .register_embedder(HistogramEmbedder::new("fake-model"))
+            .unwrap();
+        engine.embed_pending(10).unwrap();
+
+        let page = engine.ranked_search("stoic".into(), 10).unwrap();
+        let idea = page
+            .hits
+            .iter()
+            .find(|h| h.ref_id == "i1")
+            .expect("the idea participates in the fused ranking");
+        assert_eq!(idea.kind, SearchDocKind::Idea);
+        assert!(idea.matched_lexical);
+        assert!(
+            !idea.matched_semantic,
+            "ideas are never in the vector corpus"
+        );
+        assert_eq!(idea.title, "Stoicism");
+        assert_eq!(
+            idea.snippet, "Stoicism",
+            "empty description → title snippet"
+        );
+        assert!(page.hits.iter().any(|h| h.ref_id == "n1"));
+    }
+
+    #[test]
+    fn nothing_above_the_floor_reports_no_semantic_match_with_lexical_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "ranked-floor");
+        let text = "the unexamined life is not worth living";
+        engine.enqueue_note(note_upsert("n1", text)).unwrap();
+        // The document sits on axis 0; the query on axis 1 → cosine 0.0 < the floor.
+        engine
+            .register_embedder(FixedVecEmbedder::new(&[
+                (text, basis(0)),
+                ("unexamined", basis(1)),
+            ]))
+            .unwrap();
+        engine.embed_pending(10).unwrap();
+
+        let page = engine.ranked_search("unexamined".into(), 10).unwrap();
+        assert_eq!(page.semantic_status, SemanticStatus::NoSemanticMatch);
+        assert_eq!(page.hits.len(), 1, "the lexical half still answers");
+        assert_eq!(page.hits[0].ref_id, "n1");
+        assert!(page.hits[0].matched_lexical && !page.hits[0].matched_semantic);
+    }
+
+    #[test]
+    fn no_embedder_degrades_to_a_lexical_only_page_not_an_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "ranked-unregistered");
+        engine
+            .enqueue_note(note_upsert("n1", "the unexamined life"))
+            .unwrap();
+        // Where `semantic_search` errors (pinned above), `ranked_search` names the outcome.
+        let page = engine.ranked_search("unexamined".into(), 10).unwrap();
+        assert_eq!(page.semantic_status, SemanticStatus::EmbedderNotRegistered);
+        assert_eq!(
+            page.pending_embed_count, 0,
+            "no corpus key → no queue to measure"
+        );
+        assert_eq!(page.hits.len(), 1);
+        assert!(!page.hits[0].matched_semantic);
+    }
+
+    #[test]
+    fn a_failing_query_embed_degrades_to_a_lexical_only_page() {
+        struct FailsQueries;
+        impl Embedder for FailsQueries {
+            fn descriptor(&self) -> EmbedderDescriptor {
+                EmbedderDescriptor {
+                    model_id: "fails-queries".into(),
+                    dims: DIMS,
+                    quantization: "test".into(),
+                }
+            }
+            fn embed_document(&self, text: String) -> Result<Vec<f32>, EmbedderError> {
+                Ok(histogram(&text))
+            }
+            fn embed_query(&self, _t: String) -> Result<Vec<f32>, EmbedderError> {
+                Err(EmbedderError::Runtime)
+            }
+        }
+        struct WrongDimsQueries;
+        impl Embedder for WrongDimsQueries {
+            fn descriptor(&self) -> EmbedderDescriptor {
+                EmbedderDescriptor {
+                    model_id: "wrong-dims-queries".into(),
+                    dims: DIMS,
+                    quantization: "test".into(),
+                }
+            }
+            fn embed_document(&self, text: String) -> Result<Vec<f32>, EmbedderError> {
+                Ok(histogram(&text))
+            }
+            fn embed_query(&self, _t: String) -> Result<Vec<f32>, EmbedderError> {
+                Ok(vec![1.0; DIMS as usize + 1]) // violates the dims contract
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for (name, embedder) in [
+            ("throws", Arc::new(FailsQueries) as Arc<dyn Embedder>),
+            ("wrong-dims", Arc::new(WrongDimsQueries)),
+        ] {
+            let (engine, _) = embed_engine(&dir, &format!("ranked-degrade-{name}"));
+            engine
+                .enqueue_note(note_upsert("n1", "the unexamined life"))
+                .unwrap();
+            engine.register_embedder(embedder).unwrap();
+            engine.embed_pending(10).unwrap();
+            let page = engine.ranked_search("unexamined".into(), 10).unwrap();
+            assert_eq!(
+                page.semantic_status,
+                SemanticStatus::EmbedderFailed,
+                "{name}"
+            );
+            assert_eq!(page.hits.len(), 1, "{name}: the lexical half still answers");
+            // Where `semantic_search` would return Err(Embed) — the page never does.
+        }
+    }
+
+    #[test]
+    fn pending_embed_count_reports_the_backfill_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "ranked-pending");
+        engine.enqueue_note(note_upsert("n-aaa", "aaaa")).unwrap();
+        engine.enqueue_note(note_upsert("n-bbb", "bbbb")).unwrap();
+        engine
+            .register_embedder(HistogramEmbedder::new("fake-model"))
+            .unwrap();
+        engine.embed_pending(1).unwrap(); // drain HALF the queue
+
+        let page = engine.ranked_search("aaaa".into(), 10).unwrap();
+        assert_eq!(
+            page.pending_embed_count, 1,
+            "the partial-corpus honesty signal mid-backfill"
+        );
+    }
+
+    #[test]
+    fn a_semantic_only_hit_is_hydrated_from_the_decrypted_corpus() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "ranked-semantic-only");
+        let text = "wholly unrelated words";
+        engine.enqueue_note(note_upsert("n1", text)).unwrap();
+        // The query shares no token with the note (no lexical hit) but maps to the same
+        // axis (cosine 1.0 — well above the floor).
+        engine
+            .register_embedder(FixedVecEmbedder::new(&[
+                (text, basis(0)),
+                ("meaning probe", basis(0)),
+            ]))
+            .unwrap();
+        engine.embed_pending(10).unwrap();
+
+        let page = engine.ranked_search("meaning probe".into(), 10).unwrap();
+        assert_eq!(page.semantic_status, SemanticStatus::Fused);
+        assert_eq!(page.hits.len(), 1);
+        let hit = &page.hits[0];
+        assert_eq!(hit.ref_id, "n1");
+        assert!(!hit.matched_lexical && hit.matched_semantic);
+        assert_eq!(
+            hit.snippet, text,
+            "display fields come from the decrypted corpus, not the vector store"
+        );
+    }
+
+    #[test]
+    fn empty_query_or_zero_limit_returns_an_empty_page_without_an_embed() {
+        struct PanicsOnQuery;
+        impl Embedder for PanicsOnQuery {
+            fn descriptor(&self) -> EmbedderDescriptor {
+                EmbedderDescriptor {
+                    model_id: "panics-on-query".into(),
+                    dims: DIMS,
+                    quantization: "test".into(),
+                }
+            }
+            fn embed_document(&self, text: String) -> Result<Vec<f32>, EmbedderError> {
+                Ok(histogram(&text))
+            }
+            fn embed_query(&self, _t: String) -> Result<Vec<f32>, EmbedderError> {
+                panic!("a guarded query must never reach the embedder");
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "ranked-guards");
+        engine.enqueue_note(note_upsert("n1", "aaaa")).unwrap();
+
+        // Guard pages stay truthful (persona finding): before registration the guard
+        // says so — hosts initialize search screens from an empty-query call.
+        let page = engine.ranked_search("".into(), 10).unwrap();
+        assert_eq!(page.semantic_status, SemanticStatus::EmbedderNotRegistered);
+
+        engine.register_embedder(Arc::new(PanicsOnQuery)).unwrap();
+        // …and mid-backfill the guard still reports the real queue size (n1 unembedded).
+        let page = engine.ranked_search("".into(), 10).unwrap();
+        assert_eq!(page.pending_embed_count, 1);
+
+        engine.embed_pending(10).unwrap();
+        for page in [
+            engine.ranked_search("   ".into(), 10).unwrap(),
+            engine.ranked_search("aaaa".into(), 0).unwrap(),
+        ] {
+            assert!(page.hits.is_empty());
+            assert_eq!(page.semantic_status, SemanticStatus::Fused);
+            assert_eq!(page.pending_embed_count, 0);
+        }
+    }
+
+    #[test]
+    fn ranked_search_writes_no_plaintext_note_text_to_disk() {
+        // The SUR-744 AC #4 pin, extended over the hybrid path: the fused page decrypts
+        // for the lexical corpus AND opens sealed vectors — none of it may reach disk.
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, db_path) = embed_engine(&dir, "ranked-no-plaintext");
+        let marker = "plaintextmarkerzzz";
+        engine
+            .enqueue_note(note_upsert("n1", &format!("a note about {marker}")))
+            .unwrap();
+        engine
+            .register_embedder(HistogramEmbedder::new("fake-model"))
+            .unwrap();
+        engine.embed_pending(10).unwrap();
+
+        let page = engine.ranked_search(marker.into(), 10).unwrap();
+        assert_eq!(page.hits.len(), 1);
+        assert_eq!(page.hits[0].ref_id, "n1");
+
+        assert_no_marker_on_disk(dir.path(), marker);
+        let _ = db_path; // the sweep covers the db file and any future sidecar
+    }
+
+    /// Sweep EVERY file under `dir` for `marker` — not just the main db file — so the
+    /// plaintext pin doesn't go silently blind if the store ever gains WAL/`-shm`
+    /// sidecars or auxiliary files (crypto-review finding, SUR-1019).
+    fn assert_no_marker_on_disk(dir: &std::path::Path, marker: &str) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if !path.is_file() {
+                continue;
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(
+                !bytes.windows(marker.len()).any(|w| w == marker.as_bytes()),
+                "plaintext note text must never be written to disk (found in {path:?})"
+            );
+        }
     }
 }

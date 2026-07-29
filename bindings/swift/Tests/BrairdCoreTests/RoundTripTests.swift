@@ -855,6 +855,48 @@ final class RoundTripTests: XCTestCase {
         XCTAssertFalse(similar.contains { $0.noteId == "n-aaa" }, "probe excluded")
     }
 
+    /// SUR-1019: the hybrid ranked-search surface — the fused page, the status enum, the
+    /// matched flags, and the pending count all lift across the FFI; the degrade leg
+    /// (no embedder) returns a nameable status where semanticSearch throws.
+    func testRankedSearchOverFfi() throws {
+        let db = FileManager.default.temporaryDirectory
+            .appendingPathComponent("braird-ranked-\(UUID().uuidString).sqlite")
+        let engine = try SyncEngine.open(
+            dbPath: db.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
+            vault: Vault.generate())
+        try engine.enqueueNote(draft: plainNote("n-aaa", "aaaa"))
+        try engine.enqueueNote(draft: plainNote("n-bbb", "bbbb"))
+        try engine.enqueueCustomIdea(
+            id: "i1", name: "aaaa", description: "the aaaa idea", createdAt: 5, deleted: false)
+
+        // Before registration: a lexical-only page with a nameable status, not a throw.
+        let unregistered = try engine.rankedSearch(query: "aaaa", limit: 10)
+        XCTAssertEqual(unregistered.semanticStatus, .embedderNotRegistered)
+        XCTAssertEqual(unregistered.pendingEmbedCount, 0)
+        XCTAssertTrue(unregistered.hits.contains { $0.refId == "n-aaa" && !$0.matchedSemantic })
+
+        _ = try engine.registerEmbedder(embedder: HistogramEmbedder())
+        _ = try engine.embedPending(maxItems: 10)
+
+        // The fused page: the note matched by both engines, the idea by lexical rank alone.
+        let page = try engine.rankedSearch(query: "aaaa", limit: 10)
+        XCTAssertEqual(page.semanticStatus, .fused)
+        XCTAssertEqual(page.pendingEmbedCount, 0)
+        let note = try XCTUnwrap(page.hits.first { $0.refId == "n-aaa" })
+        XCTAssertEqual(note.kind, .note)
+        XCTAssertTrue(note.matchedLexical && note.matchedSemantic)
+        XCTAssertEqual(note.snippet, "aaaa")
+        let idea = try XCTUnwrap(page.hits.first { $0.refId == "i1" })
+        XCTAssertEqual(idea.kind, .idea)
+        XCTAssertTrue(idea.matchedLexical)
+        XCTAssertFalse(idea.matchedSemantic, "ideas are never in the vector corpus")
+        XCTAssertFalse(page.hits.contains { $0.refId == "n-bbb" }, "orthogonal + lexically unrelated")
+
+        // The guards: empty query / zero limit are empty pages, never an embed call.
+        XCTAssertTrue(try engine.rankedSearch(query: "   ", limit: 10).hits.isEmpty)
+        XCTAssertTrue(try engine.rankedSearch(query: "aaaa", limit: 0).hits.isEmpty)
+    }
+
     /// A Swift-thrown EmbedError must lower cleanly into core's failure accounting — the
     /// error leg of the reverse call direction.
     func testEmbedderThrownErrorLowersIntoFailureCounts() throws {

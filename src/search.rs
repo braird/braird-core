@@ -35,7 +35,7 @@
 /// but a closed enum gives Swift/Kotlin an exhaustive switch instead of a stringly-typed field.
 /// Scope is notes + custom-ideas only (SUR-744 decision 1); books aren't indexed by the PWA and
 /// lenses/collections have no v1 read surface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, uniffi::Enum)]
 pub enum SearchDocKind {
     Note,
     Idea,

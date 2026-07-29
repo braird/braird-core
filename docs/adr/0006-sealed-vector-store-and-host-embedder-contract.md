@@ -128,7 +128,9 @@ Two very different undo costs live in this record — future work must not confu
   dependency.
 - Downstream consumers get two primitives: `semantic_search(query, limit)` (SUR-157) and
   `similar_notes(note_id, limit)` (SUR-647/SUR-996) — both returning `(note_id, score)` pairs — `score` IS the cosine in `[-1, 1]`, a different range from the lexical `SearchHit.score` (BM25-ish relevance): blend knowingly, never sum naively;
-  ranking policy, thresholds, and blending stay consumer-side.
+  ranking policy, thresholds, and blending stay consumer-side. *(Superseded by ADR 0007,
+  SUR-1019: ranking policy, the relevance threshold, and blending now live in core behind
+  `ranked_search`; the two primitives above remain, and their scores remain incomparable.)*
 - No parity gate exists for this surface (nothing to be parity *with*); the fallback gate is the
   Rust test suite plus hand-written Kotlin/Swift round-trip tests with a fake embedder — the only
   exercise of the Rust→foreign call direction until the SUR-998 device pass.

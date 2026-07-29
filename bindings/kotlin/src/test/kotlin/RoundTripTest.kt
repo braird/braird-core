@@ -29,6 +29,7 @@ import uniffi.braird_core.ImportSummary
 import uniffi.braird_core.NoteSignalKind
 import uniffi.braird_core.NoteUpsert
 import uniffi.braird_core.SearchDocKind
+import uniffi.braird_core.SemanticStatus
 import uniffi.braird_core.SyncEngine
 import uniffi.braird_core.SyncException
 import uniffi.braird_core.Vault
@@ -832,6 +833,48 @@ class RoundTripTest {
         assertTrue(hits.first().score > 0.999, "identical text → cosine ~1")
         val similar = engine.similarNotes("n-aaa", 10u)
         assertTrue(similar.none { it.noteId == "n-aaa" }, "probe excluded from its own results")
+    }
+
+    /** SUR-1019: the hybrid ranked-search surface — the fused page, the status enum, the
+     * matched flags, and the pending count all lift across the FFI; the degrade leg
+     * (no embedder) returns a nameable status where semanticSearch throws. */
+    @Test
+    fun rankedSearchOverFfi() {
+        val db = File.createTempFile("braird-ranked", ".sqlite").apply { deleteOnExit() }
+        val engine = SyncEngine.open(db.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
+        engine.enqueueNote(plainNote("n-aaa", "aaaa"))
+        engine.enqueueNote(plainNote("n-bbb", "bbbb"))
+        engine.enqueueCustomIdea(
+            id = "i1", name = "aaaa", description = "the aaaa idea",
+            createdAt = 5L, deleted = false,
+        )
+
+        // Before registration: a lexical-only page with a nameable status, not an exception.
+        val unregistered = engine.rankedSearch("aaaa", 10u)
+        assertEquals(SemanticStatus.EMBEDDER_NOT_REGISTERED, unregistered.semanticStatus)
+        assertEquals(0u, unregistered.pendingEmbedCount)
+        assertTrue(unregistered.hits.any { it.refId == "n-aaa" && !it.matchedSemantic })
+
+        engine.registerEmbedder(HistogramEmbedder())
+        engine.embedPending(10u)
+
+        // The fused page: the note matched by both engines, the idea by lexical rank alone.
+        val page = engine.rankedSearch("aaaa", 10u)
+        assertEquals(SemanticStatus.FUSED, page.semanticStatus)
+        assertEquals(0u, page.pendingEmbedCount)
+        val note = page.hits.first { it.refId == "n-aaa" }
+        assertEquals(SearchDocKind.NOTE, note.kind)
+        assertTrue(note.matchedLexical && note.matchedSemantic)
+        assertEquals("aaaa", note.snippet)
+        val idea = page.hits.first { it.refId == "i1" }
+        assertEquals(SearchDocKind.IDEA, idea.kind)
+        assertTrue(idea.matchedLexical)
+        assertFalse(idea.matchedSemantic, "ideas are never in the vector corpus")
+        assertTrue(page.hits.none { it.refId == "n-bbb" }, "orthogonal + lexically unrelated")
+
+        // The guards: empty query / zero limit are empty pages, never an embed call.
+        assertTrue(engine.rankedSearch("   ", 10u).hits.isEmpty())
+        assertTrue(engine.rankedSearch("aaaa", 0u).hits.isEmpty())
     }
 
     /** A Kotlin EmbedderException must lower cleanly into core's failure accounting — the

@@ -112,9 +112,9 @@ pub struct SemanticHit {
 /// What one `embed_pending` pass did. `attempted = embedded + skipped + failed`;
 /// `pending` is the derived queue size after the pass — the host's durable
 /// rebuild/progress signal (it survives a process restart, unlike a registration-time
-/// flag), and the right driver for any "search index is rebuilding" UI. One word for the
-/// queue size everywhere: this field, `RegisterEmbedderSummary::pending`, and
-/// `pending_embed_count` all name the same number.
+/// flag), and the right driver for any "search index is rebuilding" UI. One number, four
+/// names: this field, `RegisterEmbedderSummary::pending`, `pending_embed_count`, and
+/// `RankedSearchPage::pending_embed_count` (SUR-1019) all report the same queue size.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct EmbedSummary {
     /// Queue items this pass processed (capped by `max_items`).

@@ -886,6 +886,8 @@ internal open class UniffiVTableCallbackInterfaceEmbedder(
 
 
 
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -985,6 +987,8 @@ internal interface UniffiLib : Library {
     fun uniffi_braird_core_fn_method_syncengine_pending_embed_count(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Int
     fun uniffi_braird_core_fn_method_syncengine_pull(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_ranked_search(`ptr`: Pointer,`query`: RustBuffer.ByValue,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_recent_note(`ptr`: Pointer,`nowMs`: Long,`seed`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1224,6 +1228,8 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_pull(
     ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_ranked_search(
+    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_recent_note(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_record_note_signal(
@@ -1396,6 +1402,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_pull() != 8960.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_ranked_search() != 46931.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_recent_note() != 17557.toShort()) {
@@ -2643,6 +2652,32 @@ public interface SyncEngineInterface {
     fun `pull`(): PullSummary
     
     /**
+     * Hybrid ranked search (SUR-1019, ADR 0007 — the SUR-157 query path): ONE ranked
+     * answer over the lexical engine (ADR 0005; notes + ideas) and the sealed-vector
+     * cosine scan (ADR 0006; notes), fused by reciprocal rank IN CORE so the two native
+     * surfaces cannot drift on ranking. Ranking policy — the RRF constant and the
+     * relevance floor that defines "no good semantic match" — is core's, not host config.
+     *
+     * The lexical half always answers. The semantic half degrades to a nameable
+     * [`SemanticStatus`] on a lexical-only page (no embedder, embed failure, nothing
+     * above the floor) rather than erroring — only store failures are `Err`. Mid-rebuild
+     * the scan covers the re-embedded notes only;
+     * [`RankedSearchPage::pending_embed_count`] reports the gap so a surface can say
+     * "still indexing" instead of under-returning.
+     *
+     * Empty/whitespace queries and `limit == 0` return an empty page without an embed
+     * call (the lexical engine's "no search-everything surprise" — a query embed costs
+     * ~0.8 s on CPU) — but the page's status and pending count are still the cheap truth
+     * (registration check + queue count), because hosts initialize search-screen state
+     * from exactly this call: an unregistered embedder still shows its download
+     * affordance, a mid-backfill corpus still shows "indexing N". Cost of a real call ≈
+     * `search()` (full corpus decrypt, in memory only) + one host `embed_query` + the
+     * full-corpus vector scan — the accepted ADR 0005/0006 per-call posture at
+     * personal-archive scale.
+     */
+    fun `rankedSearch`(`query`: kotlin.String, `limit`: kotlin.UInt): RankedSearchPage
+    
+    /**
      * Home "Recently surfaced" card (SUR-806) — a pseudo-random note from that same "this week"
      * set, decrypted in core, or `None` when nothing is fresh. `seed` is the host's random draw
      * (the pick is deterministic in it, and the host re-rolls it to re-surface); `now_ms` is the
@@ -3598,6 +3633,43 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_pull(
         it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Hybrid ranked search (SUR-1019, ADR 0007 — the SUR-157 query path): ONE ranked
+     * answer over the lexical engine (ADR 0005; notes + ideas) and the sealed-vector
+     * cosine scan (ADR 0006; notes), fused by reciprocal rank IN CORE so the two native
+     * surfaces cannot drift on ranking. Ranking policy — the RRF constant and the
+     * relevance floor that defines "no good semantic match" — is core's, not host config.
+     *
+     * The lexical half always answers. The semantic half degrades to a nameable
+     * [`SemanticStatus`] on a lexical-only page (no embedder, embed failure, nothing
+     * above the floor) rather than erroring — only store failures are `Err`. Mid-rebuild
+     * the scan covers the re-embedded notes only;
+     * [`RankedSearchPage::pending_embed_count`] reports the gap so a surface can say
+     * "still indexing" instead of under-returning.
+     *
+     * Empty/whitespace queries and `limit == 0` return an empty page without an embed
+     * call (the lexical engine's "no search-everything surprise" — a query embed costs
+     * ~0.8 s on CPU) — but the page's status and pending count are still the cheap truth
+     * (registration check + queue count), because hosts initialize search-screen state
+     * from exactly this call: an unregistered embedder still shows its download
+     * affordance, a mid-backfill corpus still shows "indexing N". Cost of a real call ≈
+     * `search()` (full corpus decrypt, in memory only) + one host `embed_query` + the
+     * full-corpus vector scan — the accepted ADR 0005/0006 per-call posture at
+     * personal-archive scale.
+     */
+    @Throws(SyncException::class)override fun `rankedSearch`(`query`: kotlin.String, `limit`: kotlin.UInt): RankedSearchPage {
+            return FfiConverterTypeRankedSearchPage.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_ranked_search(
+        it, FfiConverterString.lower(`query`),FfiConverterUInt.lower(`limit`),_status)
 }
     }
     )
@@ -4815,9 +4887,9 @@ public object FfiConverterTypeCustomIdeaRecord: FfiConverterRustBuffer<CustomIde
  * What one `embed_pending` pass did. `attempted = embedded + skipped + failed`;
  * `pending` is the derived queue size after the pass — the host's durable
  * rebuild/progress signal (it survives a process restart, unlike a registration-time
- * flag), and the right driver for any "search index is rebuilding" UI. One word for the
- * queue size everywhere: this field, `RegisterEmbedderSummary::pending`, and
- * `pending_embed_count` all name the same number.
+ * flag), and the right driver for any "search index is rebuilding" UI. One number, four
+ * names: this field, `RegisterEmbedderSummary::pending`, `pending_embed_count`, and
+ * `RankedSearchPage::pending_embed_count` (SUR-1019) all report the same queue size.
  */
 data class EmbedSummary (
     /**
@@ -5549,6 +5621,114 @@ public object FfiConverterTypePullSummary: FfiConverterRustBuffer<PullSummary> {
 
 
 /**
+ * One fused search result. The shape of [`SearchHit`] (same `kind`/`ref_id`/`title`/
+ * `snippet` display fields, hydrated from the same decrypted corpus) plus the fusion
+ * verdict: `score` is the reciprocal-rank-fusion (RRF) score — the per-engine raw scores are
+ * deliberately NOT exposed, because they are incomparable across engines (ADR 0006) and
+ * any host arithmetic over them would rebuild the drift this API removes. The two
+ * `matched_*` flags say which engine(s) surfaced the hit (for a "matched by meaning"
+ * badge); ideas are never in the vector corpus, so an Idea hit always has
+ * `matched_semantic == false`.
+ */
+data class RankedHit (
+    var `kind`: SearchDocKind, 
+    var `refId`: kotlin.String, 
+    var `title`: kotlin.String, 
+    var `snippet`: kotlin.String, 
+    var `score`: kotlin.Double, 
+    var `matchedLexical`: kotlin.Boolean, 
+    var `matchedSemantic`: kotlin.Boolean
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeRankedHit: FfiConverterRustBuffer<RankedHit> {
+    override fun read(buf: ByteBuffer): RankedHit {
+        return RankedHit(
+            FfiConverterTypeSearchDocKind.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterDouble.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: RankedHit) = (
+            FfiConverterTypeSearchDocKind.allocationSize(value.`kind`) +
+            FfiConverterString.allocationSize(value.`refId`) +
+            FfiConverterString.allocationSize(value.`title`) +
+            FfiConverterString.allocationSize(value.`snippet`) +
+            FfiConverterDouble.allocationSize(value.`score`) +
+            FfiConverterBoolean.allocationSize(value.`matchedLexical`) +
+            FfiConverterBoolean.allocationSize(value.`matchedSemantic`)
+    )
+
+    override fun write(value: RankedHit, buf: ByteBuffer) {
+            FfiConverterTypeSearchDocKind.write(value.`kind`, buf)
+            FfiConverterString.write(value.`refId`, buf)
+            FfiConverterString.write(value.`title`, buf)
+            FfiConverterString.write(value.`snippet`, buf)
+            FfiConverterDouble.write(value.`score`, buf)
+            FfiConverterBoolean.write(value.`matchedLexical`, buf)
+            FfiConverterBoolean.write(value.`matchedSemantic`, buf)
+    }
+}
+
+
+
+/**
+ * One `ranked_search` answer: the fused hits, how the semantic half fared, and the
+ * partial-corpus honesty signal — `pending_embed_count` is the derived embed queue's
+ * size (the same number [`SyncEngine::pending_embed_count`] reports, and truthful even
+ * on the empty-query guard page; `0` when no embedder is registered, where that method
+ * would error), so a surface can say "still indexing N notes" instead of quietly
+ * under-returning (SUR-1019 item 5).
+ *
+ * [`SyncEngine::pending_embed_count`]: crate::sync::SyncEngine::pending_embed_count
+ */
+data class RankedSearchPage (
+    var `hits`: List<RankedHit>, 
+    var `semanticStatus`: SemanticStatus, 
+    var `pendingEmbedCount`: kotlin.UInt
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeRankedSearchPage: FfiConverterRustBuffer<RankedSearchPage> {
+    override fun read(buf: ByteBuffer): RankedSearchPage {
+        return RankedSearchPage(
+            FfiConverterSequenceTypeRankedHit.read(buf),
+            FfiConverterTypeSemanticStatus.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: RankedSearchPage) = (
+            FfiConverterSequenceTypeRankedHit.allocationSize(value.`hits`) +
+            FfiConverterTypeSemanticStatus.allocationSize(value.`semanticStatus`) +
+            FfiConverterUInt.allocationSize(value.`pendingEmbedCount`)
+    )
+
+    override fun write(value: RankedSearchPage, buf: ByteBuffer) {
+            FfiConverterSequenceTypeRankedHit.write(value.`hits`, buf)
+            FfiConverterTypeSemanticStatus.write(value.`semanticStatus`, buf)
+            FfiConverterUInt.write(value.`pendingEmbedCount`, buf)
+    }
+}
+
+
+
+/**
  * The result of the post-pull reconciliation pass across the FFI (SUR-820): books backfilled by
  * id (a note's `book_id` referenced a book absent locally), notes rehomed to a known
  * offline-merge survivor vs. detached locally-only when no survivor is known, custom ideas
@@ -6166,6 +6346,65 @@ public object FfiConverterTypeSearchDocKind: FfiConverterRustBuffer<SearchDocKin
     override fun allocationSize(value: SearchDocKind) = 4UL
 
     override fun write(value: SearchDocKind, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * What the semantic half of a [`SyncEngine::ranked_search`] call did — a first-class,
+ * nameable outcome (SUR-1019 item 4), NOT an error: the lexical half always runs, so a
+ * page is always returned and this enum says how to read it. Only store failures error.
+ *
+ * [`SyncEngine::ranked_search`]: crate::sync::SyncEngine::ranked_search
+ */
+
+enum class SemanticStatus {
+    
+    /**
+     * The scan ran and at least one hit cleared the relevance floor — the ranking is
+     * genuinely hybrid. Also the neutral status of an empty-query / `limit == 0` page
+     * (with an embedder registered): nothing was scanned and nothing was excluded, so
+     * there is no absence to name — drive "matched by meaning" badges off individual
+     * hits' `matched_semantic`, not off this variant alone.
+     */
+    FUSED,
+    /**
+     * The scan ran but nothing cleared the floor: *nothing here matched by meaning*.
+     * Distinguish "the corpus is still backfilling" via
+     * [`RankedSearchPage::pending_embed_count`].
+     */
+    NO_SEMANTIC_MATCH,
+    /**
+     * No embedder is registered (model not downloaded / feature off) — lexical-only page.
+     */
+    EMBEDDER_NOT_REGISTERED,
+    /**
+     * The registered embedder failed the query embed (host error, wrong dimension,
+     * degenerate vector) — lexical-only page. Often transient (the next call retries),
+     * though a wrong-dimension embedder fails identically every call.
+     */
+    EMBEDDER_FAILED;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSemanticStatus: FfiConverterRustBuffer<SemanticStatus> {
+    override fun read(buf: ByteBuffer) = try {
+        SemanticStatus.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: SemanticStatus) = 4UL
+
+    override fun write(value: SemanticStatus, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
@@ -6801,6 +7040,34 @@ public object FfiConverterSequenceTypeNoteRecord: FfiConverterRustBuffer<List<No
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeNoteRecord.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeRankedHit: FfiConverterRustBuffer<List<RankedHit>> {
+    override fun read(buf: ByteBuffer): List<RankedHit> {
+        val len = buf.getInt()
+        return List<RankedHit>(len) {
+            FfiConverterTypeRankedHit.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<RankedHit>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeRankedHit.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<RankedHit>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeRankedHit.write(it, buf)
         }
     }
 }

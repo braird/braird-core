@@ -1183,6 +1183,32 @@ public protocol SyncEngineProtocol : AnyObject {
     func pull() throws  -> PullSummary
     
     /**
+     * Hybrid ranked search (SUR-1019, ADR 0007 — the SUR-157 query path): ONE ranked
+     * answer over the lexical engine (ADR 0005; notes + ideas) and the sealed-vector
+     * cosine scan (ADR 0006; notes), fused by reciprocal rank IN CORE so the two native
+     * surfaces cannot drift on ranking. Ranking policy — the RRF constant and the
+     * relevance floor that defines "no good semantic match" — is core's, not host config.
+     *
+     * The lexical half always answers. The semantic half degrades to a nameable
+     * [`SemanticStatus`] on a lexical-only page (no embedder, embed failure, nothing
+     * above the floor) rather than erroring — only store failures are `Err`. Mid-rebuild
+     * the scan covers the re-embedded notes only;
+     * [`RankedSearchPage::pending_embed_count`] reports the gap so a surface can say
+     * "still indexing" instead of under-returning.
+     *
+     * Empty/whitespace queries and `limit == 0` return an empty page without an embed
+     * call (the lexical engine's "no search-everything surprise" — a query embed costs
+     * ~0.8 s on CPU) — but the page's status and pending count are still the cheap truth
+     * (registration check + queue count), because hosts initialize search-screen state
+     * from exactly this call: an unregistered embedder still shows its download
+     * affordance, a mid-backfill corpus still shows "indexing N". Cost of a real call ≈
+     * `search()` (full corpus decrypt, in memory only) + one host `embed_query` + the
+     * full-corpus vector scan — the accepted ADR 0005/0006 per-call posture at
+     * personal-archive scale.
+     */
+    func rankedSearch(query: String, limit: UInt32) throws  -> RankedSearchPage
+    
+    /**
      * Home "Recently surfaced" card (SUR-806) — a pseudo-random note from that same "this week"
      * set, decrypted in core, or `None` when nothing is fresh. `seed` is the host's random draw
      * (the pick is deterministic in it, and the host re-rolls it to re-surface); `now_ms` is the
@@ -2004,6 +2030,39 @@ open func pendingEmbedCount()throws  -> UInt32 {
 open func pull()throws  -> PullSummary {
     return try  FfiConverterTypePullSummary.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_pull(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Hybrid ranked search (SUR-1019, ADR 0007 — the SUR-157 query path): ONE ranked
+     * answer over the lexical engine (ADR 0005; notes + ideas) and the sealed-vector
+     * cosine scan (ADR 0006; notes), fused by reciprocal rank IN CORE so the two native
+     * surfaces cannot drift on ranking. Ranking policy — the RRF constant and the
+     * relevance floor that defines "no good semantic match" — is core's, not host config.
+     *
+     * The lexical half always answers. The semantic half degrades to a nameable
+     * [`SemanticStatus`] on a lexical-only page (no embedder, embed failure, nothing
+     * above the floor) rather than erroring — only store failures are `Err`. Mid-rebuild
+     * the scan covers the re-embedded notes only;
+     * [`RankedSearchPage::pending_embed_count`] reports the gap so a surface can say
+     * "still indexing" instead of under-returning.
+     *
+     * Empty/whitespace queries and `limit == 0` return an empty page without an embed
+     * call (the lexical engine's "no search-everything surprise" — a query embed costs
+     * ~0.8 s on CPU) — but the page's status and pending count are still the cheap truth
+     * (registration check + queue count), because hosts initialize search-screen state
+     * from exactly this call: an unregistered embedder still shows its download
+     * affordance, a mid-backfill corpus still shows "indexing N". Cost of a real call ≈
+     * `search()` (full corpus decrypt, in memory only) + one host `embed_query` + the
+     * full-corpus vector scan — the accepted ADR 0005/0006 per-call posture at
+     * personal-archive scale.
+     */
+open func rankedSearch(query: String, limit: UInt32)throws  -> RankedSearchPage {
+    return try  FfiConverterTypeRankedSearchPage.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_ranked_search(self.uniffiClonePointer(),
+        FfiConverterString.lower(query),
+        FfiConverterUInt32.lower(limit),$0
     )
 })
 }
@@ -3306,9 +3365,9 @@ public func FfiConverterTypeCustomIdeaRecord_lower(_ value: CustomIdeaRecord) ->
  * What one `embed_pending` pass did. `attempted = embedded + skipped + failed`;
  * `pending` is the derived queue size after the pass — the host's durable
  * rebuild/progress signal (it survives a process restart, unlike a registration-time
- * flag), and the right driver for any "search index is rebuilding" UI. One word for the
- * queue size everywhere: this field, `RegisterEmbedderSummary::pending`, and
- * `pending_embed_count` all name the same number.
+ * flag), and the right driver for any "search index is rebuilding" UI. One number, four
+ * names: this field, `RegisterEmbedderSummary::pending`, `pending_embed_count`, and
+ * `RankedSearchPage::pending_embed_count` (SUR-1019) all report the same queue size.
  */
 public struct EmbedSummary {
     /**
@@ -4710,6 +4769,206 @@ public func FfiConverterTypePullSummary_lower(_ value: PullSummary) -> RustBuffe
 
 
 /**
+ * One fused search result. The shape of [`SearchHit`] (same `kind`/`ref_id`/`title`/
+ * `snippet` display fields, hydrated from the same decrypted corpus) plus the fusion
+ * verdict: `score` is the reciprocal-rank-fusion (RRF) score — the per-engine raw scores are
+ * deliberately NOT exposed, because they are incomparable across engines (ADR 0006) and
+ * any host arithmetic over them would rebuild the drift this API removes. The two
+ * `matched_*` flags say which engine(s) surfaced the hit (for a "matched by meaning"
+ * badge); ideas are never in the vector corpus, so an Idea hit always has
+ * `matched_semantic == false`.
+ */
+public struct RankedHit {
+    public var kind: SearchDocKind
+    public var refId: String
+    public var title: String
+    public var snippet: String
+    public var score: Double
+    public var matchedLexical: Bool
+    public var matchedSemantic: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(kind: SearchDocKind, refId: String, title: String, snippet: String, score: Double, matchedLexical: Bool, matchedSemantic: Bool) {
+        self.kind = kind
+        self.refId = refId
+        self.title = title
+        self.snippet = snippet
+        self.score = score
+        self.matchedLexical = matchedLexical
+        self.matchedSemantic = matchedSemantic
+    }
+}
+
+
+
+extension RankedHit: Equatable, Hashable {
+    public static func ==(lhs: RankedHit, rhs: RankedHit) -> Bool {
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.refId != rhs.refId {
+            return false
+        }
+        if lhs.title != rhs.title {
+            return false
+        }
+        if lhs.snippet != rhs.snippet {
+            return false
+        }
+        if lhs.score != rhs.score {
+            return false
+        }
+        if lhs.matchedLexical != rhs.matchedLexical {
+            return false
+        }
+        if lhs.matchedSemantic != rhs.matchedSemantic {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(kind)
+        hasher.combine(refId)
+        hasher.combine(title)
+        hasher.combine(snippet)
+        hasher.combine(score)
+        hasher.combine(matchedLexical)
+        hasher.combine(matchedSemantic)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRankedHit: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RankedHit {
+        return
+            try RankedHit(
+                kind: FfiConverterTypeSearchDocKind.read(from: &buf), 
+                refId: FfiConverterString.read(from: &buf), 
+                title: FfiConverterString.read(from: &buf), 
+                snippet: FfiConverterString.read(from: &buf), 
+                score: FfiConverterDouble.read(from: &buf), 
+                matchedLexical: FfiConverterBool.read(from: &buf), 
+                matchedSemantic: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RankedHit, into buf: inout [UInt8]) {
+        FfiConverterTypeSearchDocKind.write(value.kind, into: &buf)
+        FfiConverterString.write(value.refId, into: &buf)
+        FfiConverterString.write(value.title, into: &buf)
+        FfiConverterString.write(value.snippet, into: &buf)
+        FfiConverterDouble.write(value.score, into: &buf)
+        FfiConverterBool.write(value.matchedLexical, into: &buf)
+        FfiConverterBool.write(value.matchedSemantic, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRankedHit_lift(_ buf: RustBuffer) throws -> RankedHit {
+    return try FfiConverterTypeRankedHit.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRankedHit_lower(_ value: RankedHit) -> RustBuffer {
+    return FfiConverterTypeRankedHit.lower(value)
+}
+
+
+/**
+ * One `ranked_search` answer: the fused hits, how the semantic half fared, and the
+ * partial-corpus honesty signal — `pending_embed_count` is the derived embed queue's
+ * size (the same number [`SyncEngine::pending_embed_count`] reports, and truthful even
+ * on the empty-query guard page; `0` when no embedder is registered, where that method
+ * would error), so a surface can say "still indexing N notes" instead of quietly
+ * under-returning (SUR-1019 item 5).
+ *
+ * [`SyncEngine::pending_embed_count`]: crate::sync::SyncEngine::pending_embed_count
+ */
+public struct RankedSearchPage {
+    public var hits: [RankedHit]
+    public var semanticStatus: SemanticStatus
+    public var pendingEmbedCount: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(hits: [RankedHit], semanticStatus: SemanticStatus, pendingEmbedCount: UInt32) {
+        self.hits = hits
+        self.semanticStatus = semanticStatus
+        self.pendingEmbedCount = pendingEmbedCount
+    }
+}
+
+
+
+extension RankedSearchPage: Equatable, Hashable {
+    public static func ==(lhs: RankedSearchPage, rhs: RankedSearchPage) -> Bool {
+        if lhs.hits != rhs.hits {
+            return false
+        }
+        if lhs.semanticStatus != rhs.semanticStatus {
+            return false
+        }
+        if lhs.pendingEmbedCount != rhs.pendingEmbedCount {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(hits)
+        hasher.combine(semanticStatus)
+        hasher.combine(pendingEmbedCount)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRankedSearchPage: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RankedSearchPage {
+        return
+            try RankedSearchPage(
+                hits: FfiConverterSequenceTypeRankedHit.read(from: &buf), 
+                semanticStatus: FfiConverterTypeSemanticStatus.read(from: &buf), 
+                pendingEmbedCount: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RankedSearchPage, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeRankedHit.write(value.hits, into: &buf)
+        FfiConverterTypeSemanticStatus.write(value.semanticStatus, into: &buf)
+        FfiConverterUInt32.write(value.pendingEmbedCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRankedSearchPage_lift(_ buf: RustBuffer) throws -> RankedSearchPage {
+    return try FfiConverterTypeRankedSearchPage.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRankedSearchPage_lower(_ value: RankedSearchPage) -> RustBuffer {
+    return FfiConverterTypeRankedSearchPage.lower(value)
+}
+
+
+/**
  * The result of the post-pull reconciliation pass across the FFI (SUR-820): books backfilled by
  * id (a note's `book_id` referenced a book absent locally), notes rehomed to a known
  * offline-merge survivor vs. detached locally-only when no survivor is known, custom ideas
@@ -5730,6 +5989,111 @@ extension SearchDocKind: Equatable, Hashable {}
 
 
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * What the semantic half of a [`SyncEngine::ranked_search`] call did — a first-class,
+ * nameable outcome (SUR-1019 item 4), NOT an error: the lexical half always runs, so a
+ * page is always returned and this enum says how to read it. Only store failures error.
+ *
+ * [`SyncEngine::ranked_search`]: crate::sync::SyncEngine::ranked_search
+ */
+
+public enum SemanticStatus {
+    
+    /**
+     * The scan ran and at least one hit cleared the relevance floor — the ranking is
+     * genuinely hybrid. Also the neutral status of an empty-query / `limit == 0` page
+     * (with an embedder registered): nothing was scanned and nothing was excluded, so
+     * there is no absence to name — drive "matched by meaning" badges off individual
+     * hits' `matched_semantic`, not off this variant alone.
+     */
+    case fused
+    /**
+     * The scan ran but nothing cleared the floor: *nothing here matched by meaning*.
+     * Distinguish "the corpus is still backfilling" via
+     * [`RankedSearchPage::pending_embed_count`].
+     */
+    case noSemanticMatch
+    /**
+     * No embedder is registered (model not downloaded / feature off) — lexical-only page.
+     */
+    case embedderNotRegistered
+    /**
+     * The registered embedder failed the query embed (host error, wrong dimension,
+     * degenerate vector) — lexical-only page. Often transient (the next call retries),
+     * though a wrong-dimension embedder fails identically every call.
+     */
+    case embedderFailed
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSemanticStatus: FfiConverterRustBuffer {
+    typealias SwiftType = SemanticStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SemanticStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .fused
+        
+        case 2: return .noSemanticMatch
+        
+        case 3: return .embedderNotRegistered
+        
+        case 4: return .embedderFailed
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SemanticStatus, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .fused:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .noSemanticMatch:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .embedderNotRegistered:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .embedderFailed:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSemanticStatus_lift(_ buf: RustBuffer) throws -> SemanticStatus {
+    return try FfiConverterTypeSemanticStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSemanticStatus_lower(_ value: SemanticStatus) -> RustBuffer {
+    return FfiConverterTypeSemanticStatus.lower(value)
+}
+
+
+
+extension SemanticStatus: Equatable, Hashable {}
+
+
+
 
 /**
  * Errors that cross the FFI from the sync engine. Coarse like [`crate::CryptoError`]: enough
@@ -6243,6 +6607,31 @@ fileprivate struct FfiConverterSequenceTypeNoteRecord: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeRankedHit: FfiConverterRustBuffer {
+    typealias SwiftType = [RankedHit]
+
+    public static func write(_ value: [RankedHit], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeRankedHit.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [RankedHit] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [RankedHit]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeRankedHit.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeSearchHit: FfiConverterRustBuffer {
     typealias SwiftType = [SearchHit]
 
@@ -6472,6 +6861,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_pull() != 8960) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_ranked_search() != 46931) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_recent_note() != 17557) {
