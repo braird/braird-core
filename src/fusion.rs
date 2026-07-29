@@ -40,10 +40,36 @@ pub(crate) const RRF_K: f64 = 60.0;
 /// The cosine floor that defines "no good semantic match" (inclusive: a hit AT the floor
 /// survives). Scan hits below it are discarded before fusion.
 ///
-/// TUNE(SUR-1019 step 8a): provisional pending the device pass against the real
-/// EmbeddingGemma corpus — the model is prompt-conditioned and Matryoshka-truncated to
-/// 256-dim, both of which compress the cosine band, so the release gate re-derives this
-/// value from measured related/unrelated query distributions before v0.14.0 ships.
+/// **Measured, not guessed** (SUR-1019 step 8a, 2026-07-29). Derived on a Galaxy S25U
+/// (SM-S938B) running the real EmbeddingGemma-300M-qat-seq256 through LiteRT — the value is
+/// a property of THAT model's geometry (prompt-conditioned, Matryoshka-truncated to 256
+/// dims), so it is only meaningful against that descriptor. 432 labeled query×document
+/// cosines over an 18-note calibration corpus:
+///
+/// | band                                   |   n |  p50   |  max   |
+/// |----------------------------------------|-----|--------|--------|
+/// | related (paraphrase, low word overlap) |  18 | 0.5347 | 0.7273 |
+/// | tangential (same subject, other idea)  |  36 | 0.3901 | 0.5618 |
+/// | unrelated (different subject)          | 270 | 0.3024 | 0.5243 |
+/// | nonsense (absent from the corpus)      | 108 | 0.1367 | 0.3245 |
+///
+/// The decisive band is `nonsense` — the floor exists so a search for something the archive
+/// does not contain reports [`SemanticStatus::NoSemanticMatch`] rather than the least-bad
+/// vector. Its ceiling (0.3245) and the lowest related score (0.3818) leave a clean interval
+/// of `(0.3245, 0.3818]`, every value of which admits **zero** nonsense hits and keeps
+/// **all** related ones. 0.35 is essentially its midpoint (0.3532): +0.0255 of headroom above
+/// the noise ceiling, 0.0318 of slack below the weakest true match — the max-margin choice,
+/// so drift in either direction has to be substantial before it changes a verdict.
+///
+/// Known limits of the calibration, so nobody over-trusts it: the related band is only 18
+/// samples, so its low tail is the weakly characterised side (hence not pushing the floor
+/// higher, where recall is the expensive failure); the corpus is aphoristic 1–3 sentence
+/// highlights, the commonplace-book shape, not long-form notes; and queries are natural
+/// language, which the model's query template expects — a terse keyword query may score
+/// lower and fall below the floor, which is safe here only because RRF still returns the
+/// lexical half for exactly that kind of query. Re-run the harness on any descriptor change:
+/// a new model, new quantization, or a different Matryoshka width re-keys the corpus AND
+/// invalidates this number.
 pub(crate) const SEMANTIC_FLOOR: f64 = 0.35;
 
 /// One fused search result. The shape of [`SearchHit`] (same `kind`/`ref_id`/`title`/

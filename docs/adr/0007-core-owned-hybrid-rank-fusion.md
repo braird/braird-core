@@ -40,12 +40,28 @@ of the embed pipeline. Fusion is therefore core work: the same discipline, one l
    always returns the least-bad vectors, and at personal-archive scale least-bad is routinely
    noise. Scan hits below `fusion::SEMANTIC_FLOOR` (cosine, inclusive) never enter fusion;
    when none survive, the result names the outcome (`NoSemanticMatch`) so surfaces can say
-   *nothing here matched by meaning* instead of padding the list. The initial value (0.35) is
-   **provisional**: EmbeddingGemma is prompt-conditioned and Matryoshka-truncated, both of
-   which compress the cosine band, so the release gate re-derives the value from measured
-   related/unrelated query distributions on the SUR-998 device corpus before the release
-   ships (the constant sits behind the release-skew rule — a wrong value costs a patch
-   release + pin bumps, so it is tuned before the first cut, not after).
+   *nothing here matched by meaning* instead of padding the list.
+
+   **The value is measured, not chosen** (step 8a, 2026-07-29, before the release cut — the
+   constant sits behind release-skew, so a wrong value costs a patch release plus both host
+   pin bumps). Method: 432 labeled query×document cosines over an 18-note calibration corpus,
+   embedded on a Galaxy S25U through the real EmbeddingGemma-300M-qat-seq256 / LiteRT
+   pipeline, in four bands — *related* (paraphrase with deliberately low word overlap, the
+   case only semantic search can serve), *tangential*, *unrelated*, and *nonsense* (plausible
+   searches for content the archive does not hold). The nonsense band is the decisive one: it
+   is precisely what the floor exists to reject, and it is the best-sampled (n=108). Its
+   ceiling is 0.3245; the lowest related score is 0.3818. Every value in `(0.3245, 0.3818]`
+   therefore admits zero nonsense hits while keeping every related one, and **0.35 is
+   effectively that interval's midpoint** (0.3532) — chosen for maximum margin on both sides
+   rather than for the number itself. The pre-measurement placeholder happened to be 0.35;
+   the calibration confirmed it rather than moved it, which is worth recording so a future
+   reader does not mistake a measured value for an unexamined default.
+
+   Where the floor is deliberately biased: within the clean interval the cost of the two
+   errors is asymmetric — too high silently guts recall (semantic search stops contributing
+   and `NoSemanticMatch` over-fires), too low admits noise that RRF then damps to a low rank
+   anyway. The related band is also the smaller sample. Both point the same way, so the floor
+   is not pushed toward the recall edge.
 4. **One FFI call, degrade-to-status, never degrade-to-error.** `ranked_search(query, limit)
    → RankedSearchPage { hits, semantic_status, pending_embed_count }`. The lexical half
    always answers; every legitimate semantic absence is a nameable `SemanticStatus`
@@ -103,6 +119,12 @@ of the embed pipeline. Fusion is therefore core work: the same discipline, one l
   Kotlin/Swift round-trip suites exercising the new surface with fake embedders.
 - The floor constant is a quality knob with release-cadence latency. Accepted: better one
   honest constant tuned on device data than a host-configurable knob that forks ranking.
+- **The floor is bound to the embedder descriptor, not to Braird.** It was measured against
+  `embeddinggemma-300m-qat-seq256` at 256 dims; a model, quantization, or Matryoshka-width
+  change re-keys the corpus (ADR 0006) and invalidates this number in the same breath. The
+  calibration harness that produced it is `FloorCalibrationOnDeviceTest` on the Android side
+  (the only place the real runtime exists) — re-run it on any descriptor change rather than
+  carrying 0.35 forward on faith.
 - Cost per call ≈ `search()` + one query embed + the full vector scan, all per-call and
   in-memory — the accepted ADR 0005/0006 posture at personal-archive scale; the ponytail
   caching path recorded in ADR 0005 remains the upgrade if profiling ever demands it.
