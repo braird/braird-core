@@ -6,6 +6,25 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-07-29
+
+Twenty-fifth release batch. Minor release: the SUR-157 query path lands in core as
+`ranked_search` (SUR-1019), plus the SUR-1014 callback-shim fix merged since v0.13.1 —
+**hosts pin-bump to pick up both**. The new API is additive, so an existing host compiles
+unchanged and adopts it when its surface is ready (SUR-1020 Android / SUR-1021 iOS).
+
+The substance is that hybrid *ranking* now lives in core rather than in each host. Lexical
+relevance and cosine similarity have no shared unit, so any blend of them is a policy
+decision; two independent host implementations of that policy would drift, and the symptom —
+"results feel different on my phone" — is unfalsifiable from a bug report. Reciprocal rank
+fusion consumes ranks instead of scores, which removes the calibration question entirely, and
+the one number that genuinely had to be measured (the relevance floor separating a real
+semantic match from the least-bad vector) was derived on device against the real
+EmbeddingGemma pipeline rather than guessed. Everything the floor rests on is recorded in
+ADR 0007 and in the constant's own doc, including the limits of the calibration and the fact
+that it is bound to the embedder descriptor — a model change invalidates it along with the
+corpus.
+
 ### Added
 - **Hybrid ranked search: `ranked_search(query, limit)` fuses the lexical engine and the
   sealed-vector cosine scan into one core-owned ranking (SUR-1019, ADR 0007 — the core leg
@@ -20,11 +39,8 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   at 0.3245 and the weakest genuine paraphrase match at 0.3818, so every value in
   `(0.3245, 0.3818]` admits zero nonsense hits while keeping every real one; 0.35 is that
   interval's midpoint, the max-margin choice. The number is bound to the embedder descriptor
-  — any model, quantization, or Matryoshka-width change invalidates it along with the corpus. The semantic half degrades to a nameable `SemanticStatus`
-  equal-ranked single-list one. A cosine relevance floor (`SEMANTIC_FLOOR = 0.35`,
-  provisional pending the device-corpus tuning pass at the release gate) defines "no good
-  semantic match" so surfaces can say *nothing here matched by meaning* instead of padding
-  with the least-bad vector. The semantic half degrades to a nameable `SemanticStatus`
+  — any model, quantization, or Matryoshka-width change invalidates it along with the corpus.
+  The semantic half degrades to a nameable `SemanticStatus`
   (`EmbedderNotRegistered` / `EmbedderFailed` / `NoSemanticMatch`) on a lexical-only page
   rather than erroring — only store failures are errors — and `pending_embed_count` reports
   the backfill gap so a mid-rebuild page is honest about partial coverage (truthfully even
