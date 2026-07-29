@@ -6,6 +6,28 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **Hybrid ranked search: `ranked_search(query, limit)` fuses the lexical engine and the
+  sealed-vector cosine scan into one core-owned ranking (SUR-1019, ADR 0007 — the core leg
+  of SUR-157).** Reciprocal rank fusion (`k = 60`) over both engines' full rankings, so the
+  two incomparable score scales (unbounded lexical relevance vs. cosine in `[-1, 1]`) are
+  never arithmetically mixed, and a document surfacing in both lists outranks an
+  equal-ranked single-list one. A cosine relevance floor (`SEMANTIC_FLOOR = 0.35`,
+  provisional pending the device-corpus tuning pass at the release gate) defines "no good
+  semantic match" so surfaces can say *nothing here matched by meaning* instead of padding
+  with the least-bad vector. The semantic half degrades to a nameable `SemanticStatus`
+  (`EmbedderNotRegistered` / `EmbedderFailed` / `NoSemanticMatch`) on a lexical-only page
+  rather than erroring — only store failures are errors — and `pending_embeds` reports the
+  backfill gap so a mid-rebuild page is honest about partial coverage. Ideas participate
+  through their lexical rank (they are never in the vector corpus; `matched_semantic` is
+  always false for them). Ranking policy — the RRF constant and the floor — is core's, not
+  host config: platform-local ranking tweaks are the drift class the SUR-998 lane spent a
+  week engineering out, and this API keeps them impossible. Amends ADR 0006's
+  "ranking stays consumer-side" consequence (see ADR 0007). No new at-rest artifact, no new
+  plaintext exposure: the fused page hydrates from the same per-call decrypted corpus the
+  lexical engine already builds, and a test pins that the hybrid path writes no plaintext
+  to disk.
+
 ### Fixed
 - **A host `java.lang.Error` could escape the Kotlin callback boundary with the call status
   unwritten (SUR-1014).** UniFFI 0.28's generated foreign-trait shims catch only

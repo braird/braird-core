@@ -43,6 +43,13 @@ pub mod search;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod embeddings;
 
+// Hybrid lexical + semantic rank fusion (SUR-1019, ADR 0007) — RRF over `search` ×
+// `embeddings`, with the relevance floor that defines "no semantic match". Native-only
+// like both engines it fuses. Its DTOs (`RankedSearchPage`/`RankedHit`/`SemanticStatus`)
+// are UniFFI types consumed by `SyncEngine::ranked_search`.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod fusion;
+
 pub use vault::Vault;
 
 uniffi::setup_scaffolding!();
