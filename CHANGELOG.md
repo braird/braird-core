@@ -17,8 +17,9 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   semantic match" so surfaces can say *nothing here matched by meaning* instead of padding
   with the least-bad vector. The semantic half degrades to a nameable `SemanticStatus`
   (`EmbedderNotRegistered` / `EmbedderFailed` / `NoSemanticMatch`) on a lexical-only page
-  rather than erroring — only store failures are errors — and `pending_embeds` reports the
-  backfill gap so a mid-rebuild page is honest about partial coverage. Ideas participate
+  rather than erroring — only store failures are errors — and `pending_embed_count` reports
+  the backfill gap so a mid-rebuild page is honest about partial coverage (truthfully even
+  on the empty-query guard page, which hosts initialize search screens from). Ideas participate
   through their lexical rank (they are never in the vector corpus; `matched_semantic` is
   always false for them). Ranking policy — the RRF constant and the floor — is core's, not
   host config: platform-local ranking tweaks are the drift class the SUR-998 lane spent a

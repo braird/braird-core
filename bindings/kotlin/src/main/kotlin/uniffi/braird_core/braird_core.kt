@@ -1404,7 +1404,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_pull() != 8960.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_ranked_search() != 43961.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_ranked_search() != 46931.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_recent_note() != 17557.toShort()) {
@@ -2661,14 +2661,19 @@ public interface SyncEngineInterface {
      * The lexical half always answers. The semantic half degrades to a nameable
      * [`SemanticStatus`] on a lexical-only page (no embedder, embed failure, nothing
      * above the floor) rather than erroring — only store failures are `Err`. Mid-rebuild
-     * the scan covers the re-embedded notes only; [`RankedSearchPage::pending_embeds`]
-     * reports the gap so a surface can say "still indexing" instead of under-returning.
+     * the scan covers the re-embedded notes only;
+     * [`RankedSearchPage::pending_embed_count`] reports the gap so a surface can say
+     * "still indexing" instead of under-returning.
      *
-     * Empty/whitespace queries and `limit == 0` return an empty `Fused` page without an
-     * embed call (the lexical engine's "no search-everything surprise" — a query embed
-     * costs ~0.8 s on CPU). Cost per call ≈ `search()` (full corpus decrypt, in memory
-     * only) + one host `embed_query` + the full-corpus vector scan — the accepted ADR
-     * 0005/0006 per-call posture at personal-archive scale.
+     * Empty/whitespace queries and `limit == 0` return an empty page without an embed
+     * call (the lexical engine's "no search-everything surprise" — a query embed costs
+     * ~0.8 s on CPU) — but the page's status and pending count are still the cheap truth
+     * (registration check + queue count), because hosts initialize search-screen state
+     * from exactly this call: an unregistered embedder still shows its download
+     * affordance, a mid-backfill corpus still shows "indexing N". Cost of a real call ≈
+     * `search()` (full corpus decrypt, in memory only) + one host `embed_query` + the
+     * full-corpus vector scan — the accepted ADR 0005/0006 per-call posture at
+     * personal-archive scale.
      */
     fun `rankedSearch`(`query`: kotlin.String, `limit`: kotlin.UInt): RankedSearchPage
     
@@ -3645,14 +3650,19 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * The lexical half always answers. The semantic half degrades to a nameable
      * [`SemanticStatus`] on a lexical-only page (no embedder, embed failure, nothing
      * above the floor) rather than erroring — only store failures are `Err`. Mid-rebuild
-     * the scan covers the re-embedded notes only; [`RankedSearchPage::pending_embeds`]
-     * reports the gap so a surface can say "still indexing" instead of under-returning.
+     * the scan covers the re-embedded notes only;
+     * [`RankedSearchPage::pending_embed_count`] reports the gap so a surface can say
+     * "still indexing" instead of under-returning.
      *
-     * Empty/whitespace queries and `limit == 0` return an empty `Fused` page without an
-     * embed call (the lexical engine's "no search-everything surprise" — a query embed
-     * costs ~0.8 s on CPU). Cost per call ≈ `search()` (full corpus decrypt, in memory
-     * only) + one host `embed_query` + the full-corpus vector scan — the accepted ADR
-     * 0005/0006 per-call posture at personal-archive scale.
+     * Empty/whitespace queries and `limit == 0` return an empty page without an embed
+     * call (the lexical engine's "no search-everything surprise" — a query embed costs
+     * ~0.8 s on CPU) — but the page's status and pending count are still the cheap truth
+     * (registration check + queue count), because hosts initialize search-screen state
+     * from exactly this call: an unregistered embedder still shows its download
+     * affordance, a mid-backfill corpus still shows "indexing N". Cost of a real call ≈
+     * `search()` (full corpus decrypt, in memory only) + one host `embed_query` + the
+     * full-corpus vector scan — the accepted ADR 0005/0006 per-call posture at
+     * personal-archive scale.
      */
     @Throws(SyncException::class)override fun `rankedSearch`(`query`: kotlin.String, `limit`: kotlin.UInt): RankedSearchPage {
             return FfiConverterTypeRankedSearchPage.lift(
@@ -4877,9 +4887,9 @@ public object FfiConverterTypeCustomIdeaRecord: FfiConverterRustBuffer<CustomIde
  * What one `embed_pending` pass did. `attempted = embedded + skipped + failed`;
  * `pending` is the derived queue size after the pass — the host's durable
  * rebuild/progress signal (it survives a process restart, unlike a registration-time
- * flag), and the right driver for any "search index is rebuilding" UI. One word for the
- * queue size everywhere: this field, `RegisterEmbedderSummary::pending`, and
- * `pending_embed_count` all name the same number.
+ * flag), and the right driver for any "search index is rebuilding" UI. One number, four
+ * names: this field, `RegisterEmbedderSummary::pending`, `pending_embed_count`, and
+ * `RankedSearchPage::pending_embed_count` (SUR-1019) all report the same queue size.
  */
 data class EmbedSummary (
     /**
@@ -5613,7 +5623,7 @@ public object FfiConverterTypePullSummary: FfiConverterRustBuffer<PullSummary> {
 /**
  * One fused search result. The shape of [`SearchHit`] (same `kind`/`ref_id`/`title`/
  * `snippet` display fields, hydrated from the same decrypted corpus) plus the fusion
- * verdict: `score` is the RRF-fused rank score — the per-engine raw scores are
+ * verdict: `score` is the reciprocal-rank-fusion (RRF) score — the per-engine raw scores are
  * deliberately NOT exposed, because they are incomparable across engines (ADR 0006) and
  * any host arithmetic over them would rebuild the drift this API removes. The two
  * `matched_*` flags say which engine(s) surfaced the hit (for a "matched by meaning"
@@ -5674,15 +5684,18 @@ public object FfiConverterTypeRankedHit: FfiConverterRustBuffer<RankedHit> {
 
 /**
  * One `ranked_search` answer: the fused hits, how the semantic half fared, and the
- * partial-corpus honesty signal — `pending_embeds` is the derived embed queue's size
- * (the same number `pending_embed_count` reports; `0` when no embedder is registered),
- * so a surface can say "still indexing N notes" instead of quietly under-returning
- * (SUR-1019 item 5).
+ * partial-corpus honesty signal — `pending_embed_count` is the derived embed queue's
+ * size (the same number [`SyncEngine::pending_embed_count`] reports, and truthful even
+ * on the empty-query guard page; `0` when no embedder is registered, where that method
+ * would error), so a surface can say "still indexing N notes" instead of quietly
+ * under-returning (SUR-1019 item 5).
+ *
+ * [`SyncEngine::pending_embed_count`]: crate::sync::SyncEngine::pending_embed_count
  */
 data class RankedSearchPage (
     var `hits`: List<RankedHit>, 
-    var `semantic`: SemanticStatus, 
-    var `pendingEmbeds`: kotlin.UInt
+    var `semanticStatus`: SemanticStatus, 
+    var `pendingEmbedCount`: kotlin.UInt
 ) {
     
     companion object
@@ -5702,14 +5715,14 @@ public object FfiConverterTypeRankedSearchPage: FfiConverterRustBuffer<RankedSea
 
     override fun allocationSize(value: RankedSearchPage) = (
             FfiConverterSequenceTypeRankedHit.allocationSize(value.`hits`) +
-            FfiConverterTypeSemanticStatus.allocationSize(value.`semantic`) +
-            FfiConverterUInt.allocationSize(value.`pendingEmbeds`)
+            FfiConverterTypeSemanticStatus.allocationSize(value.`semanticStatus`) +
+            FfiConverterUInt.allocationSize(value.`pendingEmbedCount`)
     )
 
     override fun write(value: RankedSearchPage, buf: ByteBuffer) {
             FfiConverterSequenceTypeRankedHit.write(value.`hits`, buf)
-            FfiConverterTypeSemanticStatus.write(value.`semantic`, buf)
-            FfiConverterUInt.write(value.`pendingEmbeds`, buf)
+            FfiConverterTypeSemanticStatus.write(value.`semanticStatus`, buf)
+            FfiConverterUInt.write(value.`pendingEmbedCount`, buf)
     }
 }
 
@@ -6353,12 +6366,16 @@ enum class SemanticStatus {
     
     /**
      * The scan ran and at least one hit cleared the relevance floor — the ranking is
-     * genuinely hybrid.
+     * genuinely hybrid. Also the neutral status of an empty-query / `limit == 0` page
+     * (with an embedder registered): nothing was scanned and nothing was excluded, so
+     * there is no absence to name — drive "matched by meaning" badges off individual
+     * hits' `matched_semantic`, not off this variant alone.
      */
     FUSED,
     /**
      * The scan ran but nothing cleared the floor: *nothing here matched by meaning*.
-     * Distinguish "the corpus is still backfilling" via [`RankedSearchPage::pending_embeds`].
+     * Distinguish "the corpus is still backfilling" via
+     * [`RankedSearchPage::pending_embed_count`].
      */
     NO_SEMANTIC_MATCH,
     /**
@@ -6367,7 +6384,8 @@ enum class SemanticStatus {
     EMBEDDER_NOT_REGISTERED,
     /**
      * The registered embedder failed the query embed (host error, wrong dimension,
-     * degenerate vector) — lexical-only page. Transient by nature; the next call retries.
+     * degenerate vector) — lexical-only page. Often transient (the next call retries),
+     * though a wrong-dimension embedder fails identically every call.
      */
     EMBEDDER_FAILED;
     companion object

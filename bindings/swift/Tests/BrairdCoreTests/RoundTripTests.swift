@@ -871,8 +871,8 @@ final class RoundTripTests: XCTestCase {
 
         // Before registration: a lexical-only page with a nameable status, not a throw.
         let unregistered = try engine.rankedSearch(query: "aaaa", limit: 10)
-        XCTAssertEqual(unregistered.semantic, .embedderNotRegistered)
-        XCTAssertEqual(unregistered.pendingEmbeds, 0)
+        XCTAssertEqual(unregistered.semanticStatus, .embedderNotRegistered)
+        XCTAssertEqual(unregistered.pendingEmbedCount, 0)
         XCTAssertTrue(unregistered.hits.contains { $0.refId == "n-aaa" && !$0.matchedSemantic })
 
         _ = try engine.registerEmbedder(embedder: HistogramEmbedder())
@@ -880,8 +880,8 @@ final class RoundTripTests: XCTestCase {
 
         // The fused page: the note matched by both engines, the idea by lexical rank alone.
         let page = try engine.rankedSearch(query: "aaaa", limit: 10)
-        XCTAssertEqual(page.semantic, .fused)
-        XCTAssertEqual(page.pendingEmbeds, 0)
+        XCTAssertEqual(page.semanticStatus, .fused)
+        XCTAssertEqual(page.pendingEmbedCount, 0)
         let note = try XCTUnwrap(page.hits.first { $0.refId == "n-aaa" })
         XCTAssertEqual(note.kind, .note)
         XCTAssertTrue(note.matchedLexical && note.matchedSemantic)

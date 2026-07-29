@@ -48,7 +48,7 @@ pub(crate) const SEMANTIC_FLOOR: f64 = 0.35;
 
 /// One fused search result. The shape of [`SearchHit`] (same `kind`/`ref_id`/`title`/
 /// `snippet` display fields, hydrated from the same decrypted corpus) plus the fusion
-/// verdict: `score` is the RRF-fused rank score — the per-engine raw scores are
+/// verdict: `score` is the reciprocal-rank-fusion (RRF) score — the per-engine raw scores are
 /// deliberately NOT exposed, because they are incomparable across engines (ADR 0006) and
 /// any host arithmetic over them would rebuild the drift this API removes. The two
 /// `matched_*` flags say which engine(s) surfaced the hit (for a "matched by meaning"
@@ -73,28 +73,36 @@ pub struct RankedHit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum SemanticStatus {
     /// The scan ran and at least one hit cleared the relevance floor — the ranking is
-    /// genuinely hybrid.
+    /// genuinely hybrid. Also the neutral status of an empty-query / `limit == 0` page
+    /// (with an embedder registered): nothing was scanned and nothing was excluded, so
+    /// there is no absence to name — drive "matched by meaning" badges off individual
+    /// hits' `matched_semantic`, not off this variant alone.
     Fused,
     /// The scan ran but nothing cleared the floor: *nothing here matched by meaning*.
-    /// Distinguish "the corpus is still backfilling" via [`RankedSearchPage::pending_embeds`].
+    /// Distinguish "the corpus is still backfilling" via
+    /// [`RankedSearchPage::pending_embed_count`].
     NoSemanticMatch,
     /// No embedder is registered (model not downloaded / feature off) — lexical-only page.
     EmbedderNotRegistered,
     /// The registered embedder failed the query embed (host error, wrong dimension,
-    /// degenerate vector) — lexical-only page. Transient by nature; the next call retries.
+    /// degenerate vector) — lexical-only page. Often transient (the next call retries),
+    /// though a wrong-dimension embedder fails identically every call.
     EmbedderFailed,
 }
 
 /// One `ranked_search` answer: the fused hits, how the semantic half fared, and the
-/// partial-corpus honesty signal — `pending_embeds` is the derived embed queue's size
-/// (the same number `pending_embed_count` reports; `0` when no embedder is registered),
-/// so a surface can say "still indexing N notes" instead of quietly under-returning
-/// (SUR-1019 item 5).
+/// partial-corpus honesty signal — `pending_embed_count` is the derived embed queue's
+/// size (the same number [`SyncEngine::pending_embed_count`] reports, and truthful even
+/// on the empty-query guard page; `0` when no embedder is registered, where that method
+/// would error), so a surface can say "still indexing N notes" instead of quietly
+/// under-returning (SUR-1019 item 5).
+///
+/// [`SyncEngine::pending_embed_count`]: crate::sync::SyncEngine::pending_embed_count
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct RankedSearchPage {
     pub hits: Vec<RankedHit>,
-    pub semantic: SemanticStatus,
-    pub pending_embeds: u32,
+    pub semantic_status: SemanticStatus,
+    pub pending_embed_count: u32,
 }
 
 /// A fused ranking entry before hydration — fusion works on identities + ranks only;
@@ -125,33 +133,33 @@ pub(crate) fn above_floor(mut hits: Vec<SemanticHit>) -> Vec<SemanticHit> {
 /// both lists sums both contributions — that agreement bonus is RRF's whole mechanism.
 pub(crate) fn fuse(lexical: &[SearchHit], semantic: &[SemanticHit]) -> Vec<Fused> {
     let rrf = |rank0: usize| 1.0 / (RRF_K + (rank0 + 1) as f64);
-
-    let mut fused: Vec<Fused> = Vec::with_capacity(lexical.len() + semantic.len());
-    let mut index: HashMap<(SearchDocKind, String), usize> = HashMap::new();
-    let mut entry = |fused: &mut Vec<Fused>, kind: SearchDocKind, ref_id: &str| -> usize {
-        *index.entry((kind, ref_id.to_string())).or_insert_with(|| {
-            fused.push(Fused {
-                kind,
-                ref_id: ref_id.to_string(),
-                score: 0.0,
-                matched_lexical: false,
-                matched_semantic: false,
-            });
-            fused.len() - 1
-        })
+    let blank = |kind: SearchDocKind, ref_id: &str| Fused {
+        kind,
+        ref_id: ref_id.to_string(),
+        score: 0.0,
+        matched_lexical: false,
+        matched_semantic: false,
     };
 
+    let mut by_key: HashMap<(SearchDocKind, String), Fused> = HashMap::new();
     for (rank0, hit) in lexical.iter().enumerate() {
-        let i = entry(&mut fused, hit.kind, &hit.ref_id);
-        fused[i].score += rrf(rank0);
-        fused[i].matched_lexical = true;
+        let e = by_key
+            .entry((hit.kind, hit.ref_id.clone()))
+            .or_insert_with(|| blank(hit.kind, &hit.ref_id));
+        e.score += rrf(rank0);
+        e.matched_lexical = true;
     }
     for (rank0, hit) in semantic.iter().enumerate() {
-        let i = entry(&mut fused, SearchDocKind::Note, &hit.note_id);
-        fused[i].score += rrf(rank0);
-        fused[i].matched_semantic = true;
+        let e = by_key
+            .entry((SearchDocKind::Note, hit.note_id.clone()))
+            .or_insert_with(|| blank(SearchDocKind::Note, &hit.note_id));
+        e.score += rrf(rank0);
+        e.matched_semantic = true;
     }
 
+    // The sort's total order (no two entries share (kind, ref_id)) makes the map's
+    // iteration order irrelevant — fixed inputs, fixed output.
+    let mut fused: Vec<Fused> = by_key.into_values().collect();
     fused.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)

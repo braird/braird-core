@@ -851,8 +851,8 @@ class RoundTripTest {
 
         // Before registration: a lexical-only page with a nameable status, not an exception.
         val unregistered = engine.rankedSearch("aaaa", 10u)
-        assertEquals(SemanticStatus.EMBEDDER_NOT_REGISTERED, unregistered.semantic)
-        assertEquals(0u, unregistered.pendingEmbeds)
+        assertEquals(SemanticStatus.EMBEDDER_NOT_REGISTERED, unregistered.semanticStatus)
+        assertEquals(0u, unregistered.pendingEmbedCount)
         assertTrue(unregistered.hits.any { it.refId == "n-aaa" && !it.matchedSemantic })
 
         engine.registerEmbedder(HistogramEmbedder())
@@ -860,8 +860,8 @@ class RoundTripTest {
 
         // The fused page: the note matched by both engines, the idea by lexical rank alone.
         val page = engine.rankedSearch("aaaa", 10u)
-        assertEquals(SemanticStatus.FUSED, page.semantic)
-        assertEquals(0u, page.pendingEmbeds)
+        assertEquals(SemanticStatus.FUSED, page.semanticStatus)
+        assertEquals(0u, page.pendingEmbedCount)
         val note = page.hits.first { it.refId == "n-aaa" }
         assertEquals(SearchDocKind.NOTE, note.kind)
         assertTrue(note.matchedLexical && note.matchedSemantic)

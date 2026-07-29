@@ -47,14 +47,21 @@ of the embed pipeline. Fusion is therefore core work: the same discipline, one l
    ships (the constant sits behind the release-skew rule — a wrong value costs a patch
    release + pin bumps, so it is tuned before the first cut, not after).
 4. **One FFI call, degrade-to-status, never degrade-to-error.** `ranked_search(query, limit)
-   → RankedSearchPage { hits, semantic, pending_embeds }`. The lexical half always answers;
-   every legitimate semantic absence is a nameable `SemanticStatus` (`EmbedderNotRegistered`,
-   `EmbedderFailed`, `NoSemanticMatch`) on a lexical-only page — an unfused page is a search
-   *outcome*, not a failure. Only store failures error. `pending_embeds` (the derived-queue
-   size, the same number `pending_embed_count` reports) is the partial-corpus honesty signal:
-   mid-backfill a surface says "still indexing N notes" instead of quietly under-returning.
-   Per-engine raw scores are deliberately NOT in the result — host arithmetic over them is
-   the drift vector; hosts get the fused score plus `matched_lexical`/`matched_semantic`.
+   → RankedSearchPage { hits, semantic_status, pending_embed_count }`. The lexical half
+   always answers; every legitimate semantic absence is a nameable `SemanticStatus`
+   (`EmbedderNotRegistered`, `EmbedderFailed`, `NoSemanticMatch`) on a lexical-only page —
+   an unfused page is a search *outcome*, not a failure. Only store failures error.
+   `pending_embed_count` (the derived-queue size, the same number the
+   `pending_embed_count()` method reports — except `0` where that method would error on an
+   unregistered embedder) is the partial-corpus honesty signal: mid-backfill a surface says
+   "still indexing N notes" instead of quietly under-returning. Degenerate queries
+   (empty/whitespace, `limit == 0`) return an empty page without the ~0.8 s embed call, but
+   the status and pending count are still computed truthfully — hosts initialize
+   search-screen state from exactly that call, so the guard must not fake "hybrid ready,
+   nothing indexing" (`Fused` doubles as the guard's neutral status only when an embedder
+   is registered; its docstring names the vacuous case). Per-engine raw scores are
+   deliberately NOT in the result — host arithmetic over them is the drift vector; hosts
+   get the fused score plus `matched_lexical`/`matched_semantic`.
 5. **Choreography follows the established seams.** The lexical corpus builds under the store
    lock; the lock drops before the ONE foreign `embed_query` call (ADR 0006 lock
    discipline); the scan opens sealed vectors in core only; hydration reuses the
@@ -84,6 +91,12 @@ of the embed pipeline. Fusion is therefore core work: the same discipline, one l
 - Ranking policy is core-owned and version-pinned: a ranking change is a core release, seen
   by both platforms at their pin bump, never a platform-local tweak. ADR 0006's
   "consumer-side" consequence is superseded accordingly.
+- **Reversibility is split.** The exported result shape (`RankedSearchPage` /
+  `RankedHit` / `SemanticStatus`) is the same expensive-door class as ADR 0006's trait
+  surface: reshaping or extending it after v0.14.0 is a breaking, coordinated iOS+Android
+  change. The constants and fusion internals *behind* the shape (RRF's k, the floor, even
+  swapping RRF for a weighted scheme) are the cheap half — a core release + pin bump with
+  no host code change.
 - The Rust fusion unit tests on fixed rankings ARE the cross-platform ranking contract
   (deterministic: total order with `ref_id`/kind tiebreaks). No parity oracle exists or can
   exist (GATING §5, as with ADR 0006); the fallback gate is those fixtures plus the
