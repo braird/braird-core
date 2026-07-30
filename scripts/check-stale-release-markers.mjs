@@ -41,54 +41,25 @@ import { join } from 'node:path';
 const STATIC_MARKERS = [
   { pattern: 'TUNE(', why: 'a TUNE(...) deferral marker', caseSensitive: true },
   { pattern: 'provisional pending', why: 'a value still labelled provisional' },
-  { pattern: 'before the release ships', why: 'work deferred to release time', needsCue: true },
+  { pattern: 'before the release ships', why: 'work deferred to release time' },
 ];
 
-/**
- * Language that makes a temporal phrase an INSTRUCTION rather than a description.
- *
- * "before the release ships" is not evidence of anything on its own: *"CI verifies the checksums
- * before the release ships"* describes finished behaviour, and *"the migration is complete before
- * v0.15.0 ships"* is ordinary release documentation. Firing on those would fail every subsequent
- * release over correct prose — the precise way a gate earns a permanent bypass. So markers flagged
- * `needsCue` require one of these nearby.
- *
- * Checked against the real incident before being trusted: the stale ADR/CHANGELOG text was "the
- * release gate **re-derives** this value … before v0.14.0 ships", which carries a cue, and the other
- * two markers there (`TUNE(`, `provisional pending`) are unambiguous and need no cue at all. So the
- * requirement costs nothing on the case this gate was built for — verified by replaying commit
- * 212ac21, not by assertion.
- */
-const DEFERRAL_CUE =
-  /\b(must|should|needs? to|re-?deriv\w*|re-?run|re-?tune|re-?measure|remember to|don'?t forget|outstanding|unfinished|not yet|pending|provisional|deferred|to ?do|tune)\b/i;
-
-/**
- * The sentence of `text` containing offset `index`.
- *
- * A cue only makes a temporal phrase a deferral when it governs the SAME sentence. Tested against
- * the whole 3-line window, an adjacent sentence's `must` convicts its neighbour: "This component
- * must remain backwards compatible. CI verifies checksums before the release ships." — the second
- * sentence is the exact completed-behaviour form the negative corpus exists to allow.
- *
- * Boundaries are `[.!?]` followed by whitespace (or end), NOT bare dots — a version literal like
- * `9.9.9` sits mid-phrase and must never split the sentence out from under its own cue.
- */
-const sentenceAround = (text, index) => {
-  const boundary = /[.!?](?=\s|$)/g;
-  let start = 0;
-  let m;
-  while ((m = boundary.exec(text))) {
-    if (m.index < index) start = m.index + 1;
-    else return text.slice(start, m.index + 1);
-  }
-  return text.slice(start);
-};
+// The temporal markers fire UNCONDITIONALLY, descriptive prose included. An earlier revision
+// required an imperative/pending "cue" word nearby, so that "CI verifies the checksums before the
+// release ships" would pass as a statement of finished behaviour — but imperative English is an
+// open class ("Remove this compatibility shim before v9.9.9 ships" carries no cue any list would
+// think to name), so the allowlist silently failed OPEN on every verb it didn't know, and each
+// review round found another. A release gate carries the opposite duty: fail CLOSED and make the
+// operator decide. A false positive is visible and costs a one-line `stale-marker-allow`; a false
+// negative ships self-contradicting docs with no trace. The cue machinery, its sentence splitter,
+// and their corpus rows were deleted rather than extended.
 
 /**
  * Escape hatch for the residual: a line carrying this token, or the line directly above it, is
- * exempt — the `eslint-disable-next-line` contract. Needed because the cue heuristic cannot be
- * perfect and a release must never be blocked by prose no one can legally rewrite (a quoted spec, a
- * historical note in a live document). An exemption is visible in review, which a silent miss is not.
+ * exempt — the `eslint-disable-next-line` contract. This is what lets the markers fail closed:
+ * descriptive prose that legitimately uses a temporal phrase, a quoted spec, or a historical note
+ * in a live document keeps a one-line exemption instead of blocking the release. An exemption is
+ * visible in review, which a silent miss is not.
  */
 const ALLOW_TOKEN = 'stale-marker-allow';
 
@@ -144,7 +115,9 @@ const normalizeInline = (s) =>
     // No separate autolink rule: `<https://…>` is already consumed by the inline-HTML rule below,
     // since `h` satisfies its `[a-zA-Z]`. Mutation-tested as redundant rather than assumed.
     .replace(/<\/?[a-zA-Z][^>]*>/g, ' ') // inline HTML (<sub>, <b>, <code>…) and autolinks
-    .replace(/&[a-zA-Z]+;|&#\d+;/g, ' ') // entities, incl. &nbsp;
+    // Character references in all three forms — named (`&nbsp;`, digits allowed after the first
+    // letter: `&frac12;`), decimal (`&#32;`), and hex with either case marker (`&#x20;`, `&#X20;`).
+    .replace(/&(?:[a-zA-Z][a-zA-Z0-9]*|#\d+|#[xX][0-9a-fA-F]+);/g, ' ')
     .replace(/[|[\]]/g, ' ') // table pipes + any leftover brackets
     .replace(/[`*_~]/g, ''); // emphasis / code / strikethrough delimiters
 
@@ -269,9 +242,6 @@ export function findMarkers(text, version) {
       // covering here — normalizeInline already turned those into spaces.
       source: `before \\(?v?${escapeRe(version)}\\)? ships`,
       why: `work deferred until v${version}, which is the release being cut`,
-      // Same ambiguity as the prose temporal marker: "the migration is complete before v0.15.0
-      // ships" is a statement of fact, not a deferral.
-      needsCue: true,
     });
   }
   // Scan a 3-line sliding window with whitespace collapsed, not line by line. Prose here wraps at
@@ -304,14 +274,10 @@ export function findMarkers(text, version) {
       window += seg;
     });
     for (const m of compiled) {
-      // EVERY occurrence is examined, not just the first. A line can describe finished behaviour
-      // and then defer work in its next sentence — and when two occurrences share a line, no other
-      // window ever separates them, so skipping past the first would be a permanent miss.
+      // EVERY occurrence is examined. With the cue heuristic gone this is belt-and-braces (the
+      // exemption and the dedupe are both line-scoped), but running the global regex to exhaustion
+      // is also what resets it between windows.
       for (let hit; (hit = m.re.exec(window)); ) {
-        // An ambiguous temporal phrase needs imperative/pending language in ITS OWN sentence, or
-        // ordinary documentation describing finished behaviour would block every release — and a
-        // cue in a neighbouring sentence proves nothing about this one.
-        if (m.needsCue && !DEFERRAL_CUE.test(sentenceAround(window, hit.index))) continue;
         // The line this occurrence STARTS on — the last recorded segment offset at or before it.
         let at = i;
         for (let k = starts.length - 1; k >= 0; k--) {
@@ -321,7 +287,7 @@ export function findMarkers(text, version) {
           }
         }
         // Explicit exemption on the hit's own line or the one above it (eslint-disable-next-line
-        // semantics), so an author can keep prose the cue heuristic misjudges.
+        // semantics), so an author can keep descriptive prose the unconditional markers misjudge.
         if (rawLines[at].includes(ALLOW_TOKEN) || (at > 0 && rawLines[at - 1].includes(ALLOW_TOKEN))) continue;
         // Dedupe on the resolved line, so overlapping windows report a marker exactly once.
         const key = `${m.pattern}@${at}`;
@@ -376,7 +342,10 @@ function selfCheck() {
     ['re-derive it before <code>v9.9.9</code> ships', true],                   // inline HTML
     ['re-derive it before <b>v9.9.9</b> ships', true],
     ['| step | re-derive it before v9.9.9 ships |', true],                     // table row
-    ['re-derive it before&nbsp;v9.9.9 ships', true],                           // HTML entity
+    ['re-derive it before&nbsp;v9.9.9 ships', true],                           // named entity
+    ['re-derive it before&#32;v9.9.9 ships', true],                            // decimal char reference
+    ['re-derive it before&#x20;v9.9.9 ships', true],                           // hex char reference
+    ['re-derive it before&#X20;v9.9.9 ships', true],                           // ...with uppercase X
     ['re-derive it before <https://x.invalid> v9.9.9 ships', true],            // autolink between words
     ['re-run it before the release <!-- editor note --> ships', true],          // HTML comment
     [`re-run it before the release <!-- a note
@@ -392,24 +361,16 @@ spanning lines --> ships`, true],                                               
     ['> re-derive before the release\n> ships now', true],
     ['- re-derive before the release\n  ships now', true],
     ['# re-run it before the release\n# ships', true],
-    // -- ordinary release DOCUMENTATION describing finished behaviour: a temporal phrase alone
-    //    is not evidence, and firing on these would block every release over correct prose --
-    ['CI verifies the checksums before the release ships', false],
-    ['The migration is complete before v9.9.9 ships.', false],
-    ['Every artifact is SHA-256 pinned before the release ships.', false],
-    // -- a cue governs only its OWN sentence: a neighbour's `must` proves nothing about this one --
-    [`This component must remain backwards compatible.
-CI verifies checksums before the release ships.`, false],
-    ['The floor is pending re-measurement. CI verifies checksums before v9.9.9 ships.', false],
-    ['The floor is measured. You must re-tune it before v9.9.9 ships.', true], // cue IN the sentence still trips
-    // -- ...but the same phrase WITH imperative/pending language is a real deferral --
+    // -- the markers fail CLOSED: descriptive prose fires too, and keeps a stale-marker-allow if
+    //    it is legitimate. The cue heuristic that tried to pass these automatically failed OPEN on
+    //    any imperative verb outside its list — an open class no allowlist closes --
+    ['CI verifies the checksums before the release ships', true],
+    ['The migration is complete before v9.9.9 ships.', true],
+    ['Remove this compatibility shim before v9.9.9 ships.', true],  // imperative with no listed cue word
     ['re-derive this value before v9.9.9 ships', true],
     ['you must bump the pin before the release ships', true],
     ['this is still outstanding before v9.9.9 ships', true],
     ['the release gate re-derives this before v9.9.9 ships', true],   // the real incident's shape
-    // -- two occurrences on ONE line, only the second a real deferral: no other window can ever
-    //    separate them, so stopping at the first (cueless) occurrence would be a permanent miss --
-    ['CI verifies checksums before v9.9.9 ships. You must re-derive the value before v9.9.9 ships.', true],
     // -- explicit exemption, on the line and the line above (eslint-disable-next-line semantics) --
     ['re-derive this before v9.9.9 ships <!-- stale-marker-allow -->', false],
     // Template literals so a real newline needs no escaping — these are multi-line by nature.
