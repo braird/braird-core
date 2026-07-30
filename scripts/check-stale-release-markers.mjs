@@ -80,7 +80,7 @@ const stripLinePrefix = (line) => line.replace(/^\s*(\/\/\/|\/\/!|\/\/|\/\*+|\*+
  */
 const normalizeInline = (s) =>
   s
-    .replace(/<!--.*?-->/g, ' ') // single-line HTML comments (the allow-token's own carrier)
+    .replace(/<!--[\s\S]*?-->/g, ' ') // HTML comments (including multiline) -> separation
     .replace(/\[\^[^\]]*\]/g, ' ') // footnote refs, before the link rules claim the brackets
     .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1') // images + inline links -> visible label
     .replace(/\[([^\]]*)\]\[[^\]]*\]/g, '$1') // reference links -> visible label
