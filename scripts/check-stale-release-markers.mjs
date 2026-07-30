@@ -149,11 +149,17 @@ function sourceFiles(root) {
 function maskReleasedChangelogSections(text, version) {
   const lines = text.split('\n');
   let active = true; // the file preamble, before any section heading
-  let fenced = false;
+  let fence = null; // the opening delimiter of the fence we are inside, if any
   return lines
     .map((line) => {
-      if (/^\s*(?:```|~~~)/.test(line)) fenced = !fenced;
-      const heading = !fenced && /^##\s+\[([^\]]+)\]/.exec(line);
+      // A fence closes only on AT LEAST the opener's length in the same character — CommonMark's
+      // rule, and what lets a ```` block quote a ``` snippet without the state desyncing.
+      const f = /^\s*(`{3,}|~{3,})/.exec(line);
+      if (f) {
+        if (!fence) fence = f[1];
+        else if (f[1][0] === fence[0] && f[1].length >= fence.length) fence = null;
+      }
+      const heading = !fence && /^##\s+\[([^\]]+)\]/.exec(line);
       if (heading) {
         const label = heading[1].trim().toLowerCase();
         active = label === 'unreleased' || (!!version && label === version.toLowerCase());
@@ -287,6 +293,12 @@ function selfCheck() {
     ['must re-derive before the release\n```\nships are signed\n```', false], // fence bounds
     ['```rust\n/// TUNE(SUR-1019): provisional pending x\n```', true], // ...but its contents scan
     ['| before the release | ships are signed |', false], // adjacent table cells
+    // ACCEPTED OVER-MATCH, recorded as a decision: `*` cannot be a block boundary because it is
+    // also the block-comment continuation prefix, where JOINING is what catches a wrapped marker
+    // (the `/* … * ships */` positive above) — splitting on `*` would trade that incident-class
+    // miss for this contrived false positive. House bullets are `-`; if a real `*`-bullet false
+    // positive ever occurs, the remedy is a one-line stale-marker-allow.
+    ['* re-derive before the release\n* ships now', true],
     // -- ordinary code and prose that must never trip --
     ['fn tune(x: f64) -> f64 { x }', false],
     ['let y = self.tune(0.5);', false],
@@ -358,7 +370,7 @@ function selfCheck() {
   // mask the rest of the section and fail open.
   const changelog = [
     '# Changelog', '', '## [Unreleased]', '',
-    '```', '## [0.0.1] - a quoted example, not a section', '```', '',
+    '````', '```', '## [0.0.1] - a quoted example, not a section', '```', '````', '',
     'UNRELEASED', '',
     '## [9.9.9] - 2026-01-01', '', 'CUTTING', '',
     '## [9.9.8] - 2025-12-01', '', 'SHIPPED', '',
