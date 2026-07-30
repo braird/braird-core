@@ -16,16 +16,21 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   contains. Every existing gate passed. The new check runs in `validate`, once, before any build
   lane spends a minute, and fails on deferral annotations: a `TUNE` marker, a still-provisional
   label, a defer-until-release phrase, and its version-specific form naming the release being cut
-  (the script carries the exact literals). It scans a 3-line window with whitespace collapsed,
-  because prose wraps — the real ADR 0007 marker straddled a line break, which a line-by-line grep
-  walks straight past. Case handling differs by marker kind, and the split is deliberate: **prose**
-  markers match case-insensitively, since a marker opening a sentence is capitalized by ordinary
-  writing and a lowercase substring scan would miss the common case while reporting success; the
-  **annotation** marker stays case-sensitive, because its uppercase form is its syntax and matching
-  it loosely would turn an ordinary Rust `fn tune(..)` into a hit and fail every release until the
-  function was renamed. Word boundaries are necessary but not sufficient there — they stop
-  `fortune(`/`attune(`, not an exact lowercase call. Both properties are pinned by `--self-check`:
-  breaking either direction fails it. Deliberately narrow: `TODO`/`FIXME` are ordinary and are not checked, since a
+  (the script carries the exact literals). Matching a marker in real prose turned out to be the
+  whole difficulty, because a marker hides behind ordinary formatting: it wraps across a line break
+  and the continuation line carries its own `///`, `//!`, `>` or `*` prefix; it opens a sentence and
+  so is capitalized; and the version inside it is written as inline code or bold, which is this
+  repo's own house style in the changelog. Each of those defeats a plain substring scan while the
+  gate reports success. So the window of three lines is **normalized** before matching — leading
+  comment, quote and bullet prefixes stripped, Markdown emphasis and code decoration removed,
+  whitespace collapsed — and the version accepts an optional `v`. Case handling then splits by
+  marker kind: **prose** markers match case-insensitively; the **annotation** marker stays
+  case-sensitive, because its uppercase form is its syntax and matching it loosely would turn an
+  ordinary Rust `fn tune(..)` into a hit and fail every release until the function was renamed
+  (word boundaries stop `fortune(`/`attune(` but not an exact lowercase call). `--self-check` is an
+  **evasion corpus** of 35 cases covering every one of those shapes plus the code and prose that
+  must *not* trip, and each of the six behaviours above is pinned: mutate any one and the self-check
+  fails. Deliberately narrow: `TODO`/`FIXME` are ordinary and are not checked, since a
   gate that fires on things people reasonably ship is a gate people learn to bypass. `--self-check`
   proves the detector actually fires (wrapped case included, plus the false positive where a legit
   word merely contains a pattern) and runs in CI ahead of the scan itself, so a silently-broken

@@ -47,6 +47,38 @@ const STATIC_MARKERS = [
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /**
+ * Strip a line's leading comment / quote / list decoration, replacing it with a space.
+ *
+ * Without this, ANY wrapped marker inside a Rust doc comment escapes: joining
+ * `/// … before the release` + `/// ships …` yields "before the release /// ships", which matches
+ * nothing. Doc comments wrap at ~100 cols throughout this crate, so that was the likeliest real
+ * evasion of the lot. Same for Markdown blockquotes, headings, bullets, and block-comment `*`
+ * continuations.
+ *
+ * Ordered-list prefixes (`1.`) are deliberately NOT stripped: a line opening with `0.15.0` would
+ * lose its `0.` and stop matching the version marker — trading one evasion for another.
+ */
+const stripLinePrefix = (line) => line.replace(/^\s*(\/\/\/|\/\/!|\/\/|\/\*+|\*+\/|\*|#+|>+|[-+])\s*/, ' ');
+
+/**
+ * Remove Markdown emphasis and code decoration.
+ *
+ * The repo's own CHANGELOG formats versions as inline code, so `` before `v0.15.0` ships `` is the
+ * house style rather than a contrivance — and it matched nothing. This also repairs a subtler bug:
+ * `_` is a word character, so `_provisional pending_` defeated the leading `\b` anchor even though
+ * the phrase was intact.
+ *
+ * Safe against false positives because it only ever DELETES characters and never inserts a space:
+ * an identifier like `collection_memberships` collapses to `collectionmemberships`, which matches no
+ * marker, and `before_the_release_ships` collapses to one word rather than becoming the phrase.
+ */
+const stripDecoration = (s) => s.replace(/[`*_~]/g, '');
+
+/** A window of lines reduced to comparable prose: prefixes gone, decoration gone, spaces collapsed. */
+const normalize = (lines) =>
+  stripDecoration(lines.map(stripLinePrefix).join(' ')).replace(/\s+/g, ' ');
+
+/**
  * Compile a marker literal to a matcher. Two properties, both load-bearing:
  *
  * - **Case-insensitive unless the marker says otherwise.** A prose marker at the start of a
@@ -57,8 +89,8 @@ const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
  *   `fortune(` or `attune(`. Note this is necessary but NOT sufficient on its own — it does nothing
  *   about an exact `tune(`, which is why case sensitivity carries that weight.
  */
-const toMatcher = (pattern, caseSensitive = false) =>
-  new RegExp((/^\w/.test(pattern) ? '\\b' : '') + escapeRe(pattern), caseSensitive ? '' : 'i');
+const toMatcher = (pattern, caseSensitive = false, source = null) =>
+  new RegExp((/^\w/.test(pattern) ? '\\b' : '') + (source ?? escapeRe(pattern)), caseSensitive ? '' : 'i');
 
 /** Files that ARE the release record or ship inside it. */
 function sourceFiles(root) {
@@ -84,6 +116,9 @@ export function findMarkers(text, version) {
     // substring of `memberships`/`relationships`, which appear 150+ times in legitimate prose.
     markers.push({
       pattern: `before v${version} ships`,
+      // `v?` because the version is written both ways in this repo's prose. Decoration around it
+      // (`` `v0.15.0` ``, `**v0.15.0**`) is already gone by the time this matches — see normalize().
+      source: `before v?${escapeRe(version)} ships`,
       why: `work deferred until v${version}, which is the release being cut`,
     });
   }
@@ -96,18 +131,20 @@ export function findMarkers(text, version) {
   const hits = [];
   const compiled = markers.map((m) => ({
     ...m,
-    re: toMatcher(m.pattern, m.caseSensitive),
+    re: toMatcher(m.pattern, m.caseSensitive, m.source),
     firstWordRe: toMatcher(m.pattern.split(' ')[0], m.caseSensitive),
   }));
   for (let i = 0; i < lines.length; i++) {
-    const window = lines.slice(i, i + 3).join(' ').replace(/\s+/g, ' ');
+    const window = normalize(lines.slice(i, i + 3));
     for (const m of compiled) {
       if (!m.re.test(window)) continue;
       // Report the line the marker actually STARTS on, not the window's first line — a release
       // gate that points at the wrong line costs whoever is debugging it more than it saves.
+      // Matched against the NORMALIZED line, or a decorated/`///`-prefixed first line would fail
+      // the attribution search and the hit would be blamed on the window's opening line instead.
       let at = i;
       for (let j = i; j < Math.min(i + 3, lines.length); j++) {
-        if (m.firstWordRe.test(lines[j])) {
+        if (m.firstWordRe.test(normalize([lines[j]]))) {
           at = j;
           break;
         }
@@ -125,33 +162,51 @@ export function findMarkers(text, version) {
 function selfCheck() {
   // The negative leg: prove the detector actually fires, so a silently-broken guard cannot pass as
   // "no markers found". Every marker gets a case, plus one that must NOT trip.
+  // The EVASION CORPUS. Every case here is a way a real deferral marker could hide from a naive
+  // matcher, and most of these classes were found by review rather than by me — so this list, not
+  // the fixes above, is the durable answer. Add a row here FIRST whenever a new evasion is imagined;
+  // it runs in CI ahead of the scan, so the corpus can never silently stop being checked.
   const cases = [
+    // -- plain --
     ['/// TUNE(SUR-1019 step 8a): provisional', true],
     ['the value is provisional pending the device pass', true],
     ['re-derive this before v9.9.9 ships', true],
-    // Wrapped across a line break — the real ADR 0007 shape, which a line-by-line scan misses.
-    ['distributions on the device corpus before the release\n   ships (the constant sits', true],
-    // Sentence-start capitalization — how prose is ORDINARILY written, and what a literal
-    // lowercase `includes` walked straight past until this was fixed.
+    ['before   the   release   ships', true],                            // whitespace noise
+    // -- capitalization: prose opens sentences with a capital --
     ['Provisional pending the device pass against the real model.', true],
     ['Before v9.9.9 ships, re-run the device pass.', true],
     ['PROVISIONAL PENDING the device pass', true],
-    // …without letting case-insensitivity widen the ANNOTATION marker onto ordinary Rust. Every
-    // `.rs` file is scanned, so a hit here would fail every release until the function was renamed.
-    // The first two are why `TUNE(` stays case-sensitive: a word boundary alone does not save them,
-    // because a space or a `.` before `tune` IS a boundary.
+    // -- Markdown decoration: this repo's own CHANGELOG writes versions as inline code --
+    ['re-derive it before `v9.9.9` ships', true],
+    ['re-derive it before **v9.9.9** ships', true],
+    ['re-derive it before *v9.9.9* ships', true],
+    ['re-derive it before ***v9.9.9*** ships', true],
+    ['re-derive it before 9.9.9 ships', true],                           // version without the v
+    ['deferred until before **the release** ships', true],               // emphasis INSIDE a phrase
+    ['the value is _provisional pending_ the device pass', true],        // underscore also broke \b
+    ['the value is `provisional pending` the device pass', true],
+    // -- wrapped across a line break, carrying the continuation line's own prefix --
+    ['distributions on the device corpus before the release\n   ships (the constant sits', true],
+    ['/// re-derive the value before the release\n/// ships and then stop', true],
+    ['//! re-derive the value before the release\n//! ships and then stop', true],
+    ['// re-derive the value before the release\n// ships and then stop', true],
+    ['/* re-derive before the release\n * ships */', true],
+    ['> re-derive before the release\n> ships now', true],
+    ['- re-derive before the release\n  ships now', true],
+    ['# before the release\n# ships', true],
+    // -- must NOT trip: ordinary code, and prose that merely contains a marker substring --
     ['fn tune(x: f64) -> f64 { x }', false],
     ['let y = self.tune(0.5);', false],
     ['let seed = fortune(rng);', false],
     ['fn attune(&self) -> f64 { 0.0 }', false],
-    // The accepted miss, pinned so it is a decision rather than a surprise: a lowercase spelling of
-    // the annotation is NOT caught by the annotation marker (see STATIC_MARKERS). Real deferrals
-    // carry prose alongside, which is caught in any casing — the line below that.
+    ['`collection_memberships` converge to ONE row', false],
+    ['relationships between notes are row-per-edge', false],
+    ['the release ships an additive API', false],
+    ['let before_the_release_ships = true;', false],  // stripping decoration must not forge a phrase
+    ['ranking policy is core-owned and version-pinned', false],
+    // -- the accepted miss, pinned as a decision: a lowercase annotation is not the convention --
     ['/// Tune(SUR-1019): still outstanding', false],
     ['/// Tune(SUR-1019): provisional pending the device pass', true],
-    ['`collection_memberships` converge to ONE row', false], // contains "ships"
-    ['relationships between notes are row-per-edge', false], // contains "ships" too
-    ['ranking policy is core-owned and version-pinned', false],
   ];
   let ok = true;
   for (const [text, shouldTrip] of cases) {
