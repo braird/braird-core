@@ -24,9 +24,9 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   gate reports success. So the window of three lines is **normalized** before matching — leading
   comment, quote and bullet prefixes stripped, Markdown emphasis and code decoration removed,
   whitespace collapsed, **and Markdown inline syntax reduced to its visible text** (link and image
-  labels extracted, reference links resolved, inline formatting tags deleted while separator tags
-  and autolinks become spaces, numeric character references decoded, named ones and table pipes
-  neutralised) — because the decoration that matters sits *between* the words — or inside them: a version
+  labels extracted, reference links resolved, inline formatting tags deleted while cell and block
+  boundaries stay boundaries and soft breaks become spaces, character references decoded) —
+  because the decoration that matters sits *between* the words — or inside them: a version
   inside a link keeps the sentence looking intact while putting brackets and a URL in the middle,
   and this repo's own files carry 19 reference links, 3 inline links and 104 table rows. The version
   accepts an optional `v` and tolerates wrapping parens. Case handling then splits by

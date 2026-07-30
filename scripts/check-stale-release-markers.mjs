@@ -142,14 +142,18 @@ const reduceLinks = (s) => {
       }
     }
     while (s[i] === ' ' || s[i] === '\t') i++;
+    // Optional quoted title in any of its three forms. Backslash-escaped delimiters inside it
+    // (`"title \" draft"`) are text, so the closing delimiter is found by walking escapes.
+    const closeTitle = (close) => {
+      for (let k = i + 1; k < s.length; k++) {
+        if (s[k] === '\\') k++;
+        else if (s[k] === close) return k + 1;
+      }
+      return s.length;
+    };
     const q = s[i];
-    if (q === '"' || q === "'") {
-      const end = s.indexOf(q, i + 1);
-      i = end === -1 ? s.length : end + 1;
-    } else if (q === '(') {
-      const end = s.indexOf(')', i + 1);
-      i = end === -1 ? s.length : end + 1;
-    }
+    if (q === '"' || q === "'") i = closeTitle(q);
+    else if (q === '(') i = closeTitle(')');
     while (s[i] === ' ' || s[i] === '\t') i++;
     if (s[i] === ')') {
       out += s.slice(last, m.index) + m[1];
@@ -166,15 +170,17 @@ const normalizeInline = (s) =>
   // Footnote refs go first, before the link rules claim the brackets.
   reduceLinks(s.replace(/\[\^[^\]]*\]/g, ' '))
     .replace(/\[([^\]]*)\]\[[^\]]*\]/g, '$1') // reference links -> visible label
-    // The split between the next two rules is what the RENDERED text demands. Inline FORMATTING
+    // The split between the next three rules is what the RENDERED text demands. Inline FORMATTING
     // tags contribute no whitespace — `be<em>fore</em>` reads "before", so a space would split the
-    // word and hide the marker; they are deleted outright. Everything else — block and void
-    // elements, autolinks, unknown tags — becomes a space, because those DO render as separation
-    // and deleting them would forge joined-up text out of adjacent table cells (`<td>TUNE</td>
-    // <td>(x)</td>` must not become `TUNE(x)`). A `<br>` mid-phrase thus joins with a space, the
-    // same semantics the paragraph join gives a hard line wrap. No separate autolink rule:
-    // `<https://…>` is consumed by the generic rule, mutation-tested as redundant rather than assumed.
-    .replace(/<\/?(?:em|strong|b|i|code|span|sub|sup|u|s|small|abbr|mark|kbd|a)(?:\s[^>]*)?\s*\/?>/gi, '')
+    // word and hide the marker; they are deleted outright. CELL AND BLOCK boundary tags render
+    // their contents APART — a space would join `<td>before the release</td><td>ships…` into a
+    // phrase no reader sees — so they become a literal pipe, the same boundary a Markdown table
+    // writes. Everything else — `<br>`, autolinks, unknown tags — becomes a space: a `<br>`
+    // mid-phrase is a soft wrap, the same semantics the paragraph join gives a hard line break.
+    // No separate autolink rule: `<https://…>` is consumed by the generic rule, mutation-tested
+    // as redundant rather than assumed.
+    .replace(/<\/?(?:em|strong|b|i|code|span|sub|sup|u|s|small|abbr|mark|kbd|a|cite|q|dfn|var|samp|time|data|ins|del|tt|big|bdi|bdo|wbr|ruby|rt|rp)(?:\s[^>]*)?\s*\/?>/gi, '')
+    .replace(/<\/?(?:td|th|tr|table|thead|tbody|tfoot|caption|li|ul|ol|dl|dt|dd|p|div|section|article|aside|figure|blockquote|hr|h[1-6])(?:\s[^>]*)?\s*\/?>/gi, ' | ')
     .replace(/<\/?[a-zA-Z][^>]*>/g, ' ')
     // Numeric character references DECODE to their character: `bef&#x6f;re` renders as "before",
     // so blanking to a space would split the word and hide the marker. Decimal and hex (either
@@ -190,7 +196,10 @@ const normalizeInline = (s) =>
     .replace(/&(period|lpar|rpar|comma|colon|semi|ndash|mdash);/g,
       (_, n) => ({ period: '.', lpar: '(', rpar: ')', comma: ',', colon: ':', semi: ';', ndash: '–', mdash: '—' }[n]))
     .replace(/&[a-zA-Z][a-zA-Z0-9]*;/g, ' ')
-    .replace(/[|[\]]/g, ' ') // table pipes + any leftover brackets
+    // Table pipes are deliberately KEPT: a pipe is a cell boundary in a table and a visible
+    // character in prose — either way it separates, and turning it into a space would join
+    // `| before the release | ships … |` into a phrase no reader sees.
+    .replace(/[[\]]/g, ' ') // any leftover brackets
     .replace(/[`*_~]/g, ''); // emphasis / code / strikethrough delimiters
 
 // Emphasis stripping only ever DELETES (never inserts a space), so it cannot forge a phrase out of
@@ -469,6 +478,7 @@ function selfCheck() {
     // A quoted TITLE may contain unmatched parens — title text is not destination structure.
     ['Remove this before [v9.9.9](https://example.invalid "title (draft") ships', true],
     ["Remove this before [v9.9.9](https://example.invalid 'title (draft') ships", true],
+    ['before [v9.9.9](https://example.invalid "title \\" draft") ships, re-derive it', true], // escaped quote in title
     ['re-derive it before [v9.9.9][rel] ships', true],                         // reference link
     ['re-derive it before ![v9.9.9](img.png) ships', true],                    // image syntax
     ['re-derive it before [v9.9.9] ships', true],                              // bare brackets
@@ -575,6 +585,10 @@ re-derive this before v9.9.9 ships`, false],
     ['the release ships an additive API', false],
     ['let before_the_release_ships = true;', false],  // stripping decoration must not forge a phrase
     ['<td>TUNE</td><td>(x)</td>', false],             // adjacent cells render apart; deleting tags must not join them
+    ['<td>before the release</td><td>ships are signed</td>', false],  // a SPACE would forge the phrase across cells
+    ['| before the release | ships are signed |', false],             // same forge via table pipes
+    ['| step | re-derive it before v9.9.9 ships | done |', true],     // ...but a phrase INSIDE one cell still trips
+    ['re-derive before the release<br>ships now', true],              // <br> is a soft wrap, like a hard line break
     ['ranking policy is core-owned and version-pinned', false],
     // -- the accepted miss, pinned as a decision: a lowercase annotation is not the convention --
     ['/// Tune(SUR-1019): still outstanding', false],
