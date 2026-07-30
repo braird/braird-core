@@ -111,12 +111,13 @@ const stripLinePrefix = (line) => line.replace(/^\s*(\/\/\/|\/\/!|\/\/|\/\*+|\*+
  * brackets, the form anyone actually writes, ARE handled.
  */
 /**
- * Replace every inline link and image with its visible label, walking the destination with a real
- * parenthesis counter. CommonMark allows a plain destination's parens to balance to ANY depth and
- * an angle-bracketed destination (`(<https://a_(b>)`) to hold arbitrary text up to `>` — a
- * fixed-depth regex is an evasion exactly one level deeper, the same lesson the fixed-size window
- * taught. An unclosed construct is left untouched: the later bracket rules space it apart, which
- * can only miss, never forge.
+ * Replace every inline link and image with its visible label, parsing the CommonMark construct
+ * for real: an angle-bracketed destination runs to its `>`; a plain destination runs to
+ * whitespace or the closing paren with nested parens counted to ANY depth (a fixed-depth regex is
+ * an evasion exactly one level deeper — the fixed-size window's lesson); then an OPTIONAL quoted
+ * title, whose parens are text rather than structure (`"title (draft"` is a legal title that must
+ * not derail the depth count). An unclosed construct is left untouched: the later bracket rules
+ * space it apart, which can only miss, never forge.
  */
 const reduceLinks = (s) => {
   const re = /!?\[([^\]]*)\]\(/g;
@@ -128,17 +129,32 @@ const reduceLinks = (s) => {
     if (s[i] === '<') {
       const gt = s.indexOf('>', i);
       i = gt === -1 ? s.length : gt + 1;
+    } else {
+      let depth = 0;
+      while (i < s.length) {
+        const c = s[i];
+        if (c === '(') depth++;
+        else if (c === ')') {
+          if (depth === 0) break;
+          depth--;
+        } else if (c === ' ' || c === '\t') break;
+        i++;
+      }
     }
-    let depth = 1;
-    while (i < s.length && depth > 0) {
-      if (s[i] === '(') depth++;
-      else if (s[i] === ')') depth--;
-      i++;
+    while (s[i] === ' ' || s[i] === '\t') i++;
+    const q = s[i];
+    if (q === '"' || q === "'") {
+      const end = s.indexOf(q, i + 1);
+      i = end === -1 ? s.length : end + 1;
+    } else if (q === '(') {
+      const end = s.indexOf(')', i + 1);
+      i = end === -1 ? s.length : end + 1;
     }
-    if (depth === 0) {
+    while (s[i] === ' ' || s[i] === '\t') i++;
+    if (s[i] === ')') {
       out += s.slice(last, m.index) + m[1];
-      last = i;
-      re.lastIndex = i;
+      last = i + 1;
+      re.lastIndex = i + 1;
     }
   }
   return out + s.slice(last);
@@ -450,6 +466,9 @@ function selfCheck() {
     // CommonMark balances destination parens to ANY depth — two levels, so a single-level
     // matcher (the previous implementation) pins as insufficient.
     ['re-derive it before [the release](https://x.invalid/a_(b_(c))_d) ships', true],
+    // A quoted TITLE may contain unmatched parens — title text is not destination structure.
+    ['Remove this before [v9.9.9](https://example.invalid "title (draft") ships', true],
+    ["Remove this before [v9.9.9](https://example.invalid 'title (draft') ships", true],
     ['re-derive it before [v9.9.9][rel] ships', true],                         // reference link
     ['re-derive it before ![v9.9.9](img.png) ships', true],                    // image syntax
     ['re-derive it before [v9.9.9] ships', true],                              // bare brackets
