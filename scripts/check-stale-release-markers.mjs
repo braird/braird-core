@@ -248,12 +248,11 @@ export function findMarkers(text, version) {
     // substring of `memberships`/`relationships`, which appear 150+ times in legitimate prose.
     markers.push({
       pattern: `before v${version} ships`,
-      // `v?` because the version is written both ways in this repo's prose. Decoration around it
-      // (`` `v0.15.0` ``, `**v0.15.0**`) is already gone by the time this matches — see normalize().
-      // `v?` because the repo writes it both ways, and optional parens because those survive
-      // normalization on purpose (the annotation marker needs its own `(`). Brackets do not need
-      // covering here — normalizeInline already turned those into spaces.
-      source: `before \\(?v?${escapeRe(version)}\\)? ships`,
+      // The number may be written bare (`0.15.0`), `v`-prefixed, or as a noun phrase
+      // (`version 0.15.0`) — all three appear in ordinary maintainer prose. Optional parens
+      // because those survive normalization on purpose (the annotation marker needs its own `(`);
+      // decoration and brackets are already gone by the time this matches — see normalize().
+      source: `before \\(?(?:version )?v?${escapeRe(version)}\\)? ships`,
       why: `work deferred until v${version}, which is the release being cut`,
     });
   }
@@ -294,6 +293,14 @@ export function findMarkers(text, version) {
     let window = '';
     for (const j of idx) {
       const seg = segsAll[j];
+      // A raw-blank line is a paragraph break: the reader sees separated prose, so the window
+      // carries a hard boundary no phrase can match across. Without it, "before the release" at
+      // the end of one paragraph and "ships …" opening the next would join into a marker.
+      if (seg === '' && rawLines[j].trim() === '') {
+        if (window) window += ' ¶';
+        starts.push(window.length);
+        continue;
+      }
       if (seg && window) window += ' ';
       starts.push(window.length);
       window += seg;
@@ -348,6 +355,7 @@ function selfCheck() {
     ['re-derive it before *v9.9.9* ships', true],
     ['re-derive it before ***v9.9.9*** ships', true],
     ['re-derive it before 9.9.9 ships', true],                           // version without the v
+    ['Remove this shim before version 9.9.9 ships.', true],              // version as a noun phrase
     ['deferred until before **the release** ships', true],               // emphasis INSIDE a phrase
     ['the value is _provisional pending_ the device pass', true],        // underscore also broke \b
     ['the value is `provisional pending` the device pass', true],
@@ -385,11 +393,16 @@ spanning lines --> ships`, true],                                               
 /// detail line one
 /// detail line two
 /// --> ships and then stop`, true],
-    // ...but a real paragraph break is the reader's separation and must keep separating.
+    // ...but a real paragraph break is the reader's separation and must keep separating —
+    // including a SINGLE blank line, the ordinary Markdown paragraph form, whose halves would
+    // otherwise share one window and join.
     [`must re-derive before the release
 
 
 ships now`, false],
+    [`before the release
+
+ships in this channel are signed`, false],
     ['re-run it before the release[^1] ships', true],                           // footnote INSIDE the phrase
     ['the value is [provisional pending](x) the device pass', true],            // linked prose marker
     // -- wrapped across a line break, carrying the continuation line's own prefix --
