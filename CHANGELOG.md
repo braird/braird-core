@@ -9,56 +9,22 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 ### Added
 - **The release now fails on documentation that contradicts it (`scripts/check-stale-release-markers.mjs`).**
   Cutting v0.14.0 exposed a gap with no owner: `release.yml` verifies the tag, the crate version and
-  the CHANGELOG *section heading*, but nothing reads the prose beneath them. Merging a PR onto a
-  squash-merged base re-inserted stale text into `src/fusion.rs`, ADR 0007 **and** the CHANGELOG, so
-  all three simultaneously recorded a measured constant and instructed maintainers to re-derive that
-  value before the very release shipping it — a release telling its reader to redo the work it
-  contains. Every existing gate passed. The new check runs in `validate`, once, before any build
-  lane spends a minute, and fails on deferral annotations: a `TUNE` marker, a still-provisional
-  label, a defer-until-release phrase, and its version-specific form naming the release being cut
-  (the script carries the exact literals). Matching a marker in real prose turned out to be the
-  whole difficulty, because a marker hides behind ordinary formatting: it wraps across a line break
-  and the continuation line carries its own `///`, `//!`, `>` or `*` prefix; it opens a sentence and
-  so is capitalized; and the version inside it is written as inline code or bold, which is this
-  repo's own house style in the changelog. Each of those defeats a plain substring scan while the
-  gate reports success. So the window of three lines is **normalized** before matching — leading
-  comment, quote and bullet prefixes stripped, Markdown emphasis and code decoration removed,
-  whitespace collapsed, **and Markdown inline syntax reduced to its visible text** (link and image
-  labels extracted, reference links resolved, inline formatting tags deleted while cell and block
-  boundaries stay boundaries and soft breaks become spaces, character references decoded) —
-  because the decoration that matters sits *between* the words — or inside them: a version
-  inside a link keeps the sentence looking intact while putting brackets and a URL in the middle,
-  and this repo's own files carry 19 reference links, 3 inline links and 104 table rows. The version
-  accepts an optional `v` and tolerates wrapping parens. Case handling then splits by
-  marker kind: **prose** markers match case-insensitively; the **annotation** marker stays
-  case-sensitive, because its uppercase form is its syntax and matching it loosely would turn an
-  ordinary Rust `fn tune(..)` into a hit and fail every release until the function was renamed
-  (word boundaries stop `fortune(`/`attune(` but not an exact lowercase call). `--self-check` is an
-  **evasion corpus** covering every one of those shapes plus the code and prose that must *not* trip.
-  Scope is every `.md` in the repo root and under `docs/` — `docs/pinning.md` above all, since it is
-  the consumer-facing release/packaging contract named in GATING.md's release row — **excluding**
-  `docs/plans`, `docs/learnings` and `docs/superpowers`, which are historical records where a past
-  deferral is correct and rewriting it to appease a gate would be the wrong repair. **The changelog
-  gets the same treatment section by section:** only `[Unreleased]` and the section being cut are
-  scanned, because a shipped entry is immutable — an entry that accurately recorded a
-  then-provisional value would otherwise block every future release, clearable only by editing
-  release history. The line this all rests on is *immutable records are out, living documents are
-  in*: shipped changelog sections, plans and learnings are immutable; ADRs are living (amended with
-  supersede notes, and the incident was partly in one), so they stay fully in scope. The temporal
-  markers fire **unconditionally** — an early revision waved through "descriptive" uses of the
-  phrases by requiring an imperative or pending cue word nearby, but imperative English is an open
-  class, so that allowlist failed open on any verb it didn't know and was deleted. Descriptive
-  prose that legitimately carries a marker phrase instead keeps a one-line `stale-marker-allow`
-  comment (on the marker's line or the line above), visible in review where a silent miss is not —
-  this entry needs none, because it is worded to describe the markers without spelling one out.
-  Every behaviour is mutation-pinned — including which files are scanned, via a
-  throwaway tree in `--self-check` — and the whole thing is replayed against the commit that caused
-  the incident, which it still catches in full. Deliberately narrow: `TODO`/`FIXME` are ordinary and are not checked, since a
-  gate that fires on things people reasonably ship is a gate people learn to bypass. `--self-check`
-  proves the detector actually fires (wrapped case included, plus the false positive where a legit
-  word merely contains a pattern) and runs in CI ahead of the scan itself, so a silently-broken
-  guard cannot pass as "no markers found". Note the scan covers `src/`, `docs/adr/` and the
-  changelog but not `scripts/`, which is what lets the checker hold the literals it hunts for.
+  the CHANGELOG *section heading*, but nothing reads the prose beneath them, so a bad merge shipped
+  three files that each recorded a measured constant while instructing maintainers to re-derive it
+  before the very release containing it. The new check runs once in `validate` and fails on a small
+  set of literal deferral markers, matched the way maintainers honestly write them: wrapped across
+  `///` doc-comment lines, sentence-capitalized, decorated in house style (inline code, bold, plain
+  links, tables). Its threat model is **accidental staleness, not adversarial concealment** — a
+  marker hidden behind exotic Markdown is out of scope by design (anyone hiding from the gate can
+  simply not write the marker), and the accepted misses are pinned as explicit `--self-check` rows
+  so that boundary is executable. Scope: `src/**.rs` plus release-facing Markdown, excluding
+  historical records (`docs/plans`, `docs/learnings`, `docs/superpowers`), with the changelog
+  scanned only in `[Unreleased]` and the section being cut — shipped entries are immutable history.
+  Markers fail closed (descriptive prose trips too); a legitimate use keeps a one-line
+  `stale-marker-allow` exemption, visible in review where a silent miss is not. `--self-check` runs
+  in CI ahead of the scan, every behaviour is mutation-pinned, and the checker is replayed against
+  the incident commit, which it catches in full. `TODO`/`FIXME` are deliberately not checked: a
+  gate that fires on things people reasonably ship is a gate people learn to bypass.
 
 ## [0.14.0] - 2026-07-29
 
