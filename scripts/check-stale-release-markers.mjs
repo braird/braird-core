@@ -112,12 +112,25 @@ const normalizeInline = (s) =>
     // `[^)]*` stops at the destination's own `)` and leaves debris inside the phrase.
     .replace(/!?\[([^\]]*)\]\((?:<[^>]*>)?(?:[^()]|\([^()]*\))*\)/g, '$1')
     .replace(/\[([^\]]*)\]\[[^\]]*\]/g, '$1') // reference links -> visible label
-    // No separate autolink rule: `<https://…>` is already consumed by the inline-HTML rule below,
-    // since `h` satisfies its `[a-zA-Z]`. Mutation-tested as redundant rather than assumed.
-    .replace(/<\/?[a-zA-Z][^>]*>/g, ' ') // inline HTML (<sub>, <b>, <code>…) and autolinks
-    // Character references in all three forms — named (`&nbsp;`, digits allowed after the first
-    // letter: `&frac12;`), decimal (`&#32;`), and hex with either case marker (`&#x20;`, `&#X20;`).
-    .replace(/&(?:[a-zA-Z][a-zA-Z0-9]*|#\d+|#[xX][0-9a-fA-F]+);/g, ' ')
+    // The split between the next two rules is what the RENDERED text demands. Inline FORMATTING
+    // tags contribute no whitespace — `be<em>fore</em>` reads "before", so a space would split the
+    // word and hide the marker; they are deleted outright. Everything else — block and void
+    // elements, autolinks, unknown tags — becomes a space, because those DO render as separation
+    // and deleting them would forge joined-up text out of adjacent table cells (`<td>TUNE</td>
+    // <td>(x)</td>` must not become `TUNE(x)`). A `<br>` mid-phrase thus joins with a space, the
+    // same semantics the 3-line window gives a hard line wrap. No separate autolink rule:
+    // `<https://…>` is consumed by the generic rule, mutation-tested as redundant rather than assumed.
+    .replace(/<\/?(?:em|strong|b|i|code|span|sub|sup|u|s|small|abbr|mark|kbd|a)(?:\s[^>]*)?\s*\/?>/gi, '')
+    .replace(/<\/?[a-zA-Z][^>]*>/g, ' ')
+    // Numeric character references DECODE to their character: `bef&#x6f;re` renders as "before",
+    // so blanking to a space would split the word and hide the marker. Decimal and hex (either
+    // case marker) are both decoded; out-of-range codepoints blank rather than throw. NAMED
+    // references still blank to a space — HTML names none of the bare ASCII letters, so a named
+    // reference can separate words but never spell one (accepted residue: ligature oddities like
+    // `&fjlig;` render letter PAIRS, none of which occur inside any marker word).
+    .replace(/&#(\d+);/g, (_, d) => (+d <= 0x10ffff ? String.fromCodePoint(+d) : ' '))
+    .replace(/&#[xX]([0-9a-fA-F]+);/g, (_, h) => (parseInt(h, 16) <= 0x10ffff ? String.fromCodePoint(parseInt(h, 16)) : ' '))
+    .replace(/&[a-zA-Z][a-zA-Z0-9]*;/g, ' ')
     .replace(/[|[\]]/g, ' ') // table pipes + any leftover brackets
     .replace(/[`*_~]/g, ''); // emphasis / code / strikethrough delimiters
 
@@ -346,6 +359,10 @@ function selfCheck() {
     ['re-derive it before&#32;v9.9.9 ships', true],                            // decimal char reference
     ['re-derive it before&#x20;v9.9.9 ships', true],                           // hex char reference
     ['re-derive it before&#X20;v9.9.9 ships', true],                           // ...with uppercase X
+    // -- decoration INSIDE a word, not just between words: the rendered text is the marker --
+    ['re-derive it be<em>fore</em> v9.9.9 ships', true],                       // formatting tag mid-word
+    ['re-derive it bef&#x6f;re v9.9.9 ships', true],                           // hex reference spells a letter
+    ['re-derive it bef&#111;re v9.9.9 ships', true],                           // decimal reference spells a letter
     ['re-derive it before <https://x.invalid> v9.9.9 ships', true],            // autolink between words
     ['re-run it before the release <!-- editor note --> ships', true],          // HTML comment
     [`re-run it before the release <!-- a note
@@ -400,6 +417,7 @@ re-derive this before v9.9.9 ships`, false],
     ['relationships between notes are row-per-edge', false],
     ['the release ships an additive API', false],
     ['let before_the_release_ships = true;', false],  // stripping decoration must not forge a phrase
+    ['<td>TUNE</td><td>(x)</td>', false],             // adjacent cells render apart; deleting tags must not join them
     ['ranking policy is core-owned and version-pinned', false],
     // -- the accepted miss, pinned as a decision: a lowercase annotation is not the convention --
     ['/// Tune(SUR-1019): still outstanding', false],
