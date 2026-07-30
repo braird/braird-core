@@ -61,22 +61,46 @@ const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const stripLinePrefix = (line) => line.replace(/^\s*(\/\/\/|\/\/!|\/\/|\/\*+|\*+\/|\*|#+|>+|[-+])\s*/, ' ');
 
 /**
- * Remove Markdown emphasis and code decoration.
+ * Reduce Markdown inline syntax to the text a reader actually sees.
  *
- * The repo's own CHANGELOG formats versions as inline code, so `` before `v0.15.0` ships `` is the
- * house style rather than a contrivance — and it matched nothing. This also repairs a subtler bug:
- * `_` is a word character, so `_provisional pending_` defeated the leading `\b` anchor even though
- * the phrase was intact.
+ * Deleting emphasis characters is not enough, because the interesting decoration is *structural*.
+ * A version inside a link — `before [v0.15.0](https://…) ships` — keeps the phrase visually intact
+ * while putting brackets and a whole URL between the version and `ships`. Surveying the scanned
+ * files, this repo's own conventions include **19 reference links, 3 inline links, 104 table rows
+ * and 2 HTML entities**, so these are house style rather than hypotheticals.
  *
- * Safe against false positives because it only ever DELETES characters and never inserts a space:
- * an identifier like `collection_memberships` collapses to `collectionmemberships`, which matches no
- * marker, and `before_the_release_ships` collapses to one word rather than becoming the phrase.
+ * Order is load-bearing: link *labels* must be extracted before leftover brackets become spaces,
+ * or `[v0.15.0](url)` degrades to `v0.15.0 url` instead of `v0.15.0`.
+ *
+ * Parentheses are deliberately NOT touched — the annotation marker `TUNE(` needs its `(`, so the
+ * version matcher tolerates wrapping parens itself rather than having them stripped here.
+ *
+ * ACCEPTED MISS: backslash-escaped punctuation inside a marker (`before \[v0.15.0\] ships`) is not
+ * unescaped, so that one shape evades. There are zero backslash-escaped delimiters in any scanned
+ * file, and the rule for it could not be pinned by a corpus case — an unpinnable rule is an
+ * unverified claim, which by this checker's own standard is worse than a documented gap. Unescaped
+ * brackets, the form anyone actually writes, ARE handled.
  */
-const stripDecoration = (s) => s.replace(/[`*_~]/g, '');
+const normalizeInline = (s) =>
+  s
+    .replace(/<!--[\s\S]*?-->/g, ' ') // HTML comments
+    .replace(/\[\^[^\]]*\]/g, ' ') // footnote refs, before the link rules claim the brackets
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1') // images + inline links -> visible label
+    .replace(/\[([^\]]*)\]\[[^\]]*\]/g, '$1') // reference links -> visible label
+    // No separate autolink rule: `<https://…>` is already consumed by the inline-HTML rule below,
+    // since `h` satisfies its `[a-zA-Z]`. Mutation-tested as redundant rather than assumed.
+    .replace(/<\/?[a-zA-Z][^>]*>/g, ' ') // inline HTML (<sub>, <b>, <code>…) and autolinks
+    .replace(/&[a-zA-Z]+;|&#\d+;/g, ' ') // entities, incl. &nbsp;
+    .replace(/[|[\]]/g, ' ') // table pipes + any leftover brackets
+    .replace(/[`*_~]/g, ''); // emphasis / code / strikethrough delimiters
+
+// Emphasis stripping only ever DELETES (never inserts a space), so it cannot forge a phrase out of
+// an identifier: `collection_memberships` collapses to one word, and `before_the_release_ships`
+// stays one word rather than becoming the marker. Both are pinned negatives in the corpus.
 
 /** A window of lines reduced to comparable prose: prefixes gone, decoration gone, spaces collapsed. */
 const normalize = (lines) =>
-  stripDecoration(lines.map(stripLinePrefix).join(' ')).replace(/\s+/g, ' ');
+  normalizeInline(lines.map(stripLinePrefix).join(' ')).replace(/\s+/g, ' ');
 
 /**
  * Compile a marker literal to a matcher. Two properties, both load-bearing:
@@ -118,7 +142,10 @@ export function findMarkers(text, version) {
       pattern: `before v${version} ships`,
       // `v?` because the version is written both ways in this repo's prose. Decoration around it
       // (`` `v0.15.0` ``, `**v0.15.0**`) is already gone by the time this matches — see normalize().
-      source: `before v?${escapeRe(version)} ships`,
+      // `v?` because the repo writes it both ways, and optional parens because those survive
+      // normalization on purpose (the annotation marker needs its own `(`). Brackets do not need
+      // covering here — normalizeInline already turned those into spaces.
+      source: `before \\(?v?${escapeRe(version)}\\)? ships`,
       why: `work deferred until v${version}, which is the release being cut`,
     });
   }
@@ -185,6 +212,20 @@ function selfCheck() {
     ['deferred until before **the release** ships', true],               // emphasis INSIDE a phrase
     ['the value is _provisional pending_ the device pass', true],        // underscore also broke \b
     ['the value is `provisional pending` the device pass', true],
+    // -- Markdown STRUCTURE, not just emphasis: the decoration sits BETWEEN the words --
+    ['re-derive it before [v9.9.9](https://example.invalid) ships', true],     // inline link
+    ['re-derive it before [v9.9.9][rel] ships', true],                         // reference link
+    ['re-derive it before ![v9.9.9](img.png) ships', true],                    // image syntax
+    ['re-derive it before [v9.9.9] ships', true],                              // bare brackets
+    ['re-derive it before (v9.9.9) ships', true],                              // wrapping parens
+    ['re-derive it before <code>v9.9.9</code> ships', true],                   // inline HTML
+    ['re-derive it before <b>v9.9.9</b> ships', true],
+    ['| step | re-derive it before v9.9.9 ships |', true],                     // table row
+    ['re-derive it before&nbsp;v9.9.9 ships', true],                           // HTML entity
+    ['re-derive it before <https://x.invalid> v9.9.9 ships', true],            // autolink between words
+    ['before the release <!-- editor note --> ships', true],                    // HTML comment
+    ['before the release[^1] ships', true],                                     // footnote INSIDE the phrase
+    ['the value is [provisional pending](x) the device pass', true],            // linked prose marker
     // -- wrapped across a line break, carrying the continuation line's own prefix --
     ['distributions on the device corpus before the release\n   ships (the constant sits', true],
     ['/// re-derive the value before the release\n/// ships and then stop', true],

@@ -23,7 +23,12 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   repo's own house style in the changelog. Each of those defeats a plain substring scan while the
   gate reports success. So the window of three lines is **normalized** before matching — leading
   comment, quote and bullet prefixes stripped, Markdown emphasis and code decoration removed,
-  whitespace collapsed — and the version accepts an optional `v`. Case handling then splits by
+  whitespace collapsed, **and Markdown inline syntax reduced to its visible text** (link and image
+  labels extracted, reference links resolved, inline HTML and autolinks dropped, entities and table
+  pipes neutralised) — because the decoration that matters sits *between* the words: a version
+  inside a link keeps the sentence looking intact while putting brackets and a URL in the middle,
+  and this repo's own files carry 19 reference links, 3 inline links and 104 table rows. The version
+  accepts an optional `v` and tolerates wrapping parens. Case handling then splits by
   marker kind: **prose** markers match case-insensitively; the **annotation** marker stays
   case-sensitive, because its uppercase form is its syntax and matching it loosely would turn an
   ordinary Rust `fn tune(..)` into a hit and fail every release until the function was renamed
