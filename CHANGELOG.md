@@ -16,9 +16,12 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   contains. Every existing gate passed. The new check runs in `validate`, once, before any build
   lane spends a minute, and fails on deferral annotations: a `TUNE` marker, a still-provisional
   label, a defer-until-release phrase, and its version-specific form naming the release being cut
-  (the script carries the exact literals). It scans a 3-line window with whitespace collapsed,
-  because prose wraps — the real ADR 0007 marker straddled a line break, which a line-by-line grep
-  walks straight past. Deliberately narrow: `TODO`/`FIXME` are ordinary and are not checked, since a
+  (the script carries the exact literals). It scans a 3-line window with whitespace collapsed and
+  matches case-insensitively with word-boundary anchoring — because prose wraps *and* capitalizes:
+  the real ADR 0007 marker straddled a line break, and a marker opening a sentence is capitalized by
+  ordinary writing, so a literal lowercase substring scan misses the common case entirely while
+  reporting success. The boundary anchor keeps case-insensitivity from widening the `TUNE` marker
+  into ordinary identifiers that merely contain it. Deliberately narrow: `TODO`/`FIXME` are ordinary and are not checked, since a
   gate that fires on things people reasonably ship is a gate people learn to bypass. `--self-check`
   proves the detector actually fires (wrapped case included, plus the false positive where a legit
   word merely contains a pattern) and runs in CI ahead of the scan itself, so a silently-broken

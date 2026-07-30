@@ -25,6 +25,22 @@ const STATIC_MARKERS = [
   { pattern: 'before the release ships', why: 'work deferred to release time' },
 ];
 
+/** Escape a literal so it can be embedded in a RegExp — the version's dots especially. */
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * Compile a marker literal to a matcher. Two properties, both load-bearing:
+ *
+ * - **Case-insensitive.** A marker at the start of a sentence is capitalized by ordinary prose
+ *   ("Before v0.15.0 ships, re-run the device pass"), which a literal lowercase `includes` walks
+ *   straight past. That is the common case, not an edge case, so a case-sensitive gate is barely a
+ *   gate at all.
+ * - **Word-boundary anchored** when the literal starts with a word character, so case-insensitive
+ *   matching cannot turn `TUNE(` into a hit on `fortune(` or `attune(`.
+ */
+const toMatcher = (pattern) =>
+  new RegExp((/^\w/.test(pattern) ? '\\b' : '') + escapeRe(pattern), 'i');
+
 /** Files that ARE the release record or ship inside it. */
 function sourceFiles(root) {
   const out = [];
@@ -59,16 +75,20 @@ export function findMarkers(text, version) {
   const lines = text.split('\n');
   const seen = new Set();
   const hits = [];
+  const compiled = markers.map((m) => ({
+    ...m,
+    re: toMatcher(m.pattern),
+    firstWordRe: toMatcher(m.pattern.split(' ')[0]),
+  }));
   for (let i = 0; i < lines.length; i++) {
     const window = lines.slice(i, i + 3).join(' ').replace(/\s+/g, ' ');
-    for (const m of markers) {
-      if (!window.includes(m.pattern)) continue;
+    for (const m of compiled) {
+      if (!m.re.test(window)) continue;
       // Report the line the marker actually STARTS on, not the window's first line — a release
       // gate that points at the wrong line costs whoever is debugging it more than it saves.
-      const firstWord = m.pattern.split(' ')[0];
       let at = i;
       for (let j = i; j < Math.min(i + 3, lines.length); j++) {
-        if (lines[j].includes(firstWord)) {
+        if (m.firstWordRe.test(lines[j])) {
           at = j;
           break;
         }
@@ -92,6 +112,16 @@ function selfCheck() {
     ['re-derive this before v9.9.9 ships', true],
     // Wrapped across a line break — the real ADR 0007 shape, which a line-by-line scan misses.
     ['distributions on the device corpus before the release\n   ships (the constant sits', true],
+    // Sentence-start capitalization — how prose is ORDINARILY written, and what a literal
+    // lowercase `includes` walked straight past until this was fixed.
+    ['Provisional pending the device pass against the real model.', true],
+    ['Before v9.9.9 ships, re-run the device pass.', true],
+    ['/// Tune(SUR-1019): still outstanding', true],
+    ['PROVISIONAL PENDING the device pass', true],
+    // …without letting case-insensitivity widen `TUNE(` into ordinary identifiers. Both of these
+    // contain "tune(" as a substring and must NOT trip the gate.
+    ['let seed = fortune(rng);', false],
+    ['fn attune(&self) -> f64 { 0.0 }', false],
     ['`collection_memberships` converge to ONE row', false], // contains "ships"
     ['relationships between notes are row-per-edge', false], // contains "ships" too
     ['ranking policy is core-owned and version-pinned', false],
