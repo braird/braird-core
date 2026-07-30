@@ -40,7 +40,15 @@ import { join } from 'node:path';
 // its own, in any casing.
 const STATIC_MARKERS = [
   { pattern: 'TUNE(', why: 'a TUNE(...) deferral marker', caseSensitive: true },
-  { pattern: 'provisional pending', why: 'a value still labelled provisional' },
+  {
+    pattern: 'provisional pending',
+    // A short bridge of punctuation/whitespace is the same deferral: "provisional, pending the
+    // device pass" and "provisional — pending" read identically to the bare pair. A sentence
+    // boundary does NOT bridge (`.` is absent from the class): "The API is provisional. Pending
+    // items…" is two unrelated statements and must not join.
+    source: 'provisional[\\s,;:\\u2013\\u2014-]{1,3}pending',
+    why: 'a value still labelled provisional',
+  },
   { pattern: 'before the release ships', why: 'work deferred to release time' },
 ];
 
@@ -248,11 +256,12 @@ export function findMarkers(text, version) {
     // substring of `memberships`/`relationships`, which appear 150+ times in legitimate prose.
     markers.push({
       pattern: `before v${version} ships`,
-      // The number may be written bare (`0.15.0`), `v`-prefixed, or as a noun phrase
-      // (`version 0.15.0`) — all three appear in ordinary maintainer prose. Optional parens
-      // because those survive normalization on purpose (the annotation marker needs its own `(`);
-      // decoration and brackets are already gone by the time this matches — see normalize().
-      source: `before \\(?(?:version )?v?${escapeRe(version)}\\)? ships`,
+      // The number may be written bare (`0.15.0`), `v`-prefixed, or as a noun phrase on either
+      // side (`version 0.15.0`, `the 0.15.0 release`) — all of which appear in ordinary
+      // maintainer prose. Optional parens because those survive normalization on purpose (the
+      // annotation marker needs its own `(`); decoration and brackets are already gone by the
+      // time this matches — see normalize().
+      source: `before (?:the )?\\(?(?:version )?v?${escapeRe(version)}\\)?(?: release)? ships`,
       why: `work deferred until v${version}, which is the release being cut`,
     });
   }
@@ -356,6 +365,12 @@ function selfCheck() {
     ['re-derive it before ***v9.9.9*** ships', true],
     ['re-derive it before 9.9.9 ships', true],                           // version without the v
     ['Remove this shim before version 9.9.9 ships.', true],              // version as a noun phrase
+    ['Remove this shim before the v9.9.9 release ships.', true],         // "release" after the version
+    ['drop the fallback before the 9.9.9 release ships', true],          // ...and bare-number form
+    // -- punctuation bridges the provisional pair; a sentence boundary must not --
+    ['This threshold is provisional, pending the real-device pass.', true],
+    ['the floor is provisional — pending the S25U pass', true],
+    ['The API is provisional. Pending items are tracked in Linear.', false],
     ['deferred until before **the release** ships', true],               // emphasis INSIDE a phrase
     ['the value is _provisional pending_ the device pass', true],        // underscore also broke \b
     ['the value is `provisional pending` the device pass', true],
