@@ -43,13 +43,14 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   then-provisional value would otherwise block every future release, clearable only by editing
   release history. The line this all rests on is *immutable records are out, living documents are
   in*: shipped changelog sections, plans and learnings are immutable; ADRs are living (amended with
-  supersede notes, and the incident was partly in one), so they stay fully in scope. Because
-  broadening scope multiplies false positives, the two ambiguous temporal phrases now require
-  <!-- stale-marker-allow: this entry quotes both marker phrases as examples -->
-  imperative or pending language nearby: *"CI verifies the checksums before the release ships"*
-  describes finished behaviour and must never block a release, while *"re-derive this before v0.15.0
-  ships"* must. A `stale-marker-allow` comment on a line or the line above exempts it, for prose the
-  heuristic misjudges. Every behaviour is mutation-pinned — including which files are scanned, via a
+  supersede notes, and the incident was partly in one), so they stay fully in scope. The temporal
+  markers fire **unconditionally** — an early revision waved through "descriptive" uses of the
+  phrases by requiring an imperative or pending cue word nearby, but imperative English is an open
+  class, so that allowlist failed open on any verb it didn't know and was deleted. Descriptive
+  prose that legitimately carries a marker phrase instead keeps a one-line `stale-marker-allow`
+  comment (on the marker's line or the line above), visible in review where a silent miss is not —
+  this entry needs none, because it is worded to describe the markers without spelling one out.
+  Every behaviour is mutation-pinned — including which files are scanned, via a
   throwaway tree in `--self-check` — and the whole thing is replayed against the commit that caused
   the incident, which it still catches in full. Deliberately narrow: `TODO`/`FIXME` are ordinary and are not checked, since a
   gate that fires on things people reasonably ship is a gate people learn to bypass. `--self-check`
