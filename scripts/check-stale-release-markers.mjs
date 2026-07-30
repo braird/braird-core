@@ -132,7 +132,8 @@ const stripLinePrefix = (line) => line.replace(/^\s*(\/\/\/|\/\/!|\/\/|\/\*+|\*+
  */
 const normalizeInline = (s) =>
   s
-    .replace(/<!--[\s\S]*?-->/g, ' ') // HTML comments
+    // No HTML-comment rule here: comments can span lines, so findMarkers blanks them on the whole
+    // text before any per-line work — a rule at this level was mutation-tested as redundant.
     .replace(/\[\^[^\]]*\]/g, ' ') // footnote refs, before the link rules claim the brackets
     // Images + inline links -> visible label. The destination may be angle-bracketed
     // (`(<https://a_(b)>)`, CommonMark's escape for awkward URLs) or a plain URL with one level of
@@ -165,9 +166,12 @@ const normalize = (lines) =>
  * - **Word-boundary anchored** when the literal starts with a word character, so `TUNE(` cannot hit
  *   `fortune(` or `attune(`. Note this is necessary but NOT sufficient on its own — it does nothing
  *   about an exact `tune(`, which is why case sensitivity carries that weight.
+ *
+ * Always global: the scan must see EVERY occurrence in a window, not the first. The statefulness a
+ * `g` regex carries is safe here because every exec loop runs to exhaustion, which resets it.
  */
 const toMatcher = (pattern, caseSensitive = false, source = null) =>
-  new RegExp((/^\w/.test(pattern) ? '\\b' : '') + (source ?? escapeRe(pattern)), caseSensitive ? '' : 'i');
+  new RegExp((/^\w/.test(pattern) ? '\\b' : '') + (source ?? escapeRe(pattern)), caseSensitive ? 'g' : 'gi');
 
 /**
  * Directories whose Markdown is a HISTORICAL record and must NOT be scanned.
@@ -274,42 +278,57 @@ export function findMarkers(text, version) {
   // ~100 cols, so a marker routinely straddles a line break — the real ADR 0007 case was "before
   // the release\n   ships", which every single-line check walks straight past. Hits are deduped by
   // (line, pattern) so a marker sitting inside three overlapping windows is reported once.
-  const lines = text.split('\n');
+  //
+  // HTML comments are blanked up front with newlines kept, so a comment can never shield part of a
+  // phrase — including one spanning a line break, which the per-line normalization below cannot
+  // see. Matching runs on the blanked copy; the RAW lines keep serving the allow-token check (the
+  // token itself lives inside a comment) and the reported excerpt, and identical line counts keep
+  // the two aligned.
+  const rawLines = text.split('\n');
+  const lines = text.replace(/<!--[\s\S]*?-->/g, (c) => c.replace(/[^\n]/g, ' ')).split('\n');
   const seen = new Set();
   const hits = [];
-  const compiled = markers.map((m) => ({
-    ...m,
-    re: toMatcher(m.pattern, m.caseSensitive, m.source),
-    firstWordRe: toMatcher(m.pattern.split(' ')[0], m.caseSensitive),
-  }));
+  const compiled = markers.map((m) => ({ ...m, re: toMatcher(m.pattern, m.caseSensitive, m.source) }));
   for (let i = 0; i < lines.length; i++) {
-    const window = normalize(lines.slice(i, i + 3));
+    // Each line is normalized SEPARATELY and joined with its start offset recorded, so a match
+    // index maps straight back to the source line. The previous attribution — searching lines for
+    // the marker's first word — blamed the nearest earlier line containing an ordinary word like
+    // "before", which both misreported the line and pointed the allow-token check above the wrong
+    // one, turning an explicitly exempted marker into a release blocker.
+    const segs = lines.slice(i, i + 3).map((l) => normalize([l]).trim());
+    const starts = [];
+    let window = '';
+    segs.forEach((seg, k) => {
+      if (seg && window) window += ' ';
+      starts.push(window.length);
+      window += seg;
+    });
     for (const m of compiled) {
-      const matched = m.re.exec(window);
-      if (!matched) continue;
-      // An ambiguous temporal phrase needs imperative/pending language in ITS OWN sentence, or
-      // ordinary documentation describing finished behaviour would block every release — and a cue
-      // in a neighbouring sentence proves nothing about this one.
-      if (m.needsCue && !DEFERRAL_CUE.test(sentenceAround(window, matched.index))) continue;
-      // Report the line the marker actually STARTS on, not the window's first line — a release
-      // gate that points at the wrong line costs whoever is debugging it more than it saves.
-      // Matched against the NORMALIZED line, or a decorated/`///`-prefixed first line would fail
-      // the attribution search and the hit would be blamed on the window's opening line instead.
-      let at = i;
-      for (let j = i; j < Math.min(i + 3, lines.length); j++) {
-        if (m.firstWordRe.test(normalize([lines[j]]))) {
-          at = j;
-          break;
+      // EVERY occurrence is examined, not just the first. A line can describe finished behaviour
+      // and then defer work in its next sentence — and when two occurrences share a line, no other
+      // window ever separates them, so skipping past the first would be a permanent miss.
+      for (let hit; (hit = m.re.exec(window)); ) {
+        // An ambiguous temporal phrase needs imperative/pending language in ITS OWN sentence, or
+        // ordinary documentation describing finished behaviour would block every release — and a
+        // cue in a neighbouring sentence proves nothing about this one.
+        if (m.needsCue && !DEFERRAL_CUE.test(sentenceAround(window, hit.index))) continue;
+        // The line this occurrence STARTS on — the last recorded segment offset at or before it.
+        let at = i;
+        for (let k = starts.length - 1; k >= 0; k--) {
+          if (hit.index >= starts[k]) {
+            at = i + k;
+            break;
+          }
         }
+        // Explicit exemption on the hit's own line or the one above it (eslint-disable-next-line
+        // semantics), so an author can keep prose the cue heuristic misjudges.
+        if (rawLines[at].includes(ALLOW_TOKEN) || (at > 0 && rawLines[at - 1].includes(ALLOW_TOKEN))) continue;
+        // Dedupe on the resolved line, so overlapping windows report a marker exactly once.
+        const key = `${m.pattern}@${at}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        hits.push({ line: at + 1, why: m.why, excerpt: rawLines[at].trim().slice(0, 120) });
       }
-      // Explicit exemption on the hit's own line or the one above it (eslint-disable-next-line
-      // semantics), so an author can keep prose the cue heuristic misjudges.
-      if (lines[at].includes(ALLOW_TOKEN) || (at > 0 && lines[at - 1].includes(ALLOW_TOKEN))) continue;
-      // Dedupe on the resolved line, so overlapping windows report a marker exactly once.
-      const key = `${m.pattern}@${at}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      hits.push({ line: at + 1, why: m.why, excerpt: lines[at].trim().slice(0, 120) });
     }
   }
   return hits;
@@ -360,6 +379,8 @@ function selfCheck() {
     ['re-derive it before&nbsp;v9.9.9 ships', true],                           // HTML entity
     ['re-derive it before <https://x.invalid> v9.9.9 ships', true],            // autolink between words
     ['re-run it before the release <!-- editor note --> ships', true],          // HTML comment
+    [`re-run it before the release <!-- a note
+spanning lines --> ships`, true],                                               // comment straddling a line break
     ['re-run it before the release[^1] ships', true],                           // footnote INSIDE the phrase
     ['the value is [provisional pending](x) the device pass', true],            // linked prose marker
     // -- wrapped across a line break, carrying the continuation line's own prefix --
@@ -386,6 +407,9 @@ CI verifies checksums before the release ships.`, false],
     ['you must bump the pin before the release ships', true],
     ['this is still outstanding before v9.9.9 ships', true],
     ['the release gate re-derives this before v9.9.9 ships', true],   // the real incident's shape
+    // -- two occurrences on ONE line, only the second a real deferral: no other window can ever
+    //    separate them, so stopping at the first (cueless) occurrence would be a permanent miss --
+    ['CI verifies checksums before v9.9.9 ships. You must re-derive the value before v9.9.9 ships.', true],
     // -- explicit exemption, on the line and the line above (eslint-disable-next-line semantics) --
     ['re-derive this before v9.9.9 ships <!-- stale-marker-allow -->', false],
     // Template literals so a real newline needs no escaping — these are multi-line by nature.
@@ -394,6 +418,18 @@ re-derive this before v9.9.9 ships`, false],
     [`<!-- stale-marker-allow -->
 filler line, so the exemption is two lines above
 re-derive this before v9.9.9 ships`, true], // an exemption must not leak down the file
+    // An earlier line containing an ordinary word from the marker ("before") must not steal the
+    // attribution — the exemption belongs to the line the marker actually starts on.
+    [`A sentence before anything.
+<!-- stale-marker-allow -->
+re-derive this before v9.9.9 ships`, false],
+    // A multi-line comment above an exemption: blanking must preserve LINE COUNT, or every
+    // raw-line lookup below the comment (allow token, excerpt) shifts onto the wrong line.
+    [`<!-- an editor
+note spanning
+three lines -->
+<!-- stale-marker-allow -->
+re-derive this before v9.9.9 ships`, false],
     // -- must NOT trip: ordinary code, and prose that merely contains a marker substring --
     ['fn tune(x: f64) -> f64 { x }', false],
     ['let y = self.tune(0.5);', false],
