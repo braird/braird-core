@@ -152,8 +152,16 @@ const reduceLinks = (s) => {
       }
     };
     if (s[i] === '<') {
-      const gt = s.indexOf('>', i);
-      i = gt === -1 ? s.length : gt + 1;
+      // Escapes are text here too (`<https://a\>draft>`), the same ruling as the plain
+      // destination and the title. CommonMark forbids a newline inside `<…>`, so one aborts.
+      for (i += 1; i < s.length; i++) {
+        const c = s[i];
+        if (c === '\\') i++;
+        else if (c === '>') {
+          i++;
+          break;
+        } else if (c === '\n') break;
+      }
     } else {
       let depth = 0;
       while (i < s.length) {
@@ -518,6 +526,7 @@ function selfCheck() {
     ["Remove this before [v9.9.9](https://example.invalid 'title (draft') ships", true],
     ['before [v9.9.9](https://example.invalid "title \\" draft") ships, re-derive it', true], // escaped quote in title
     ['before [v9.9.9](https://example.invalid/a\\)draft) ships, re-derive it', true],         // escaped paren in destination
+    ['before [v9.9.9](<https://example.invalid/a\\>draft>) ships, re-derive it', true],       // escaped > in angle destination
     // -- a link may break across a SOFT line (title on the next line, prefix and all), but
     //    never across a blank line: no link spans a paragraph --
     [`re-derive before [v9.9.9](https://example.invalid
