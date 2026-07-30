@@ -63,6 +63,28 @@ const DEFERRAL_CUE =
   /\b(must|should|needs? to|re-?deriv\w*|re-?run|re-?tune|re-?measure|remember to|don'?t forget|outstanding|unfinished|not yet|pending|provisional|deferred|to ?do|tune)\b/i;
 
 /**
+ * The sentence of `text` containing offset `index`.
+ *
+ * A cue only makes a temporal phrase a deferral when it governs the SAME sentence. Tested against
+ * the whole 3-line window, an adjacent sentence's `must` convicts its neighbour: "This component
+ * must remain backwards compatible. CI verifies checksums before the release ships." — the second
+ * sentence is the exact completed-behaviour form the negative corpus exists to allow.
+ *
+ * Boundaries are `[.!?]` followed by whitespace (or end), NOT bare dots — a version literal like
+ * `9.9.9` sits mid-phrase and must never split the sentence out from under its own cue.
+ */
+const sentenceAround = (text, index) => {
+  const boundary = /[.!?](?=\s|$)/g;
+  let start = 0;
+  let m;
+  while ((m = boundary.exec(text))) {
+    if (m.index < index) start = m.index + 1;
+    else return text.slice(start, m.index + 1);
+  }
+  return text.slice(start);
+};
+
+/**
  * Escape hatch for the residual: a line carrying this token, or the line directly above it, is
  * exempt — the `eslint-disable-next-line` contract. Needed because the cue heuristic cannot be
  * perfect and a release must never be blocked by prose no one can legally rewrite (a quoted spec, a
@@ -112,7 +134,11 @@ const normalizeInline = (s) =>
   s
     .replace(/<!--[\s\S]*?-->/g, ' ') // HTML comments
     .replace(/\[\^[^\]]*\]/g, ' ') // footnote refs, before the link rules claim the brackets
-    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1') // images + inline links -> visible label
+    // Images + inline links -> visible label. The destination may be angle-bracketed
+    // (`(<https://a_(b)>)`, CommonMark's escape for awkward URLs) or a plain URL with one level of
+    // balanced parens (`https://en.wikipedia.org/wiki/A_(b)`) — both are valid forms where a naive
+    // `[^)]*` stops at the destination's own `)` and leaves debris inside the phrase.
+    .replace(/!?\[([^\]]*)\]\((?:<[^>]*>)?(?:[^()]|\([^()]*\))*\)/g, '$1')
     .replace(/\[([^\]]*)\]\[[^\]]*\]/g, '$1') // reference links -> visible label
     // No separate autolink rule: `<https://…>` is already consumed by the inline-HTML rule below,
     // since `h` satisfies its `[a-zA-Z]`. Mutation-tested as redundant rather than assumed.
@@ -259,10 +285,12 @@ export function findMarkers(text, version) {
   for (let i = 0; i < lines.length; i++) {
     const window = normalize(lines.slice(i, i + 3));
     for (const m of compiled) {
-      if (!m.re.test(window)) continue;
-      // An ambiguous temporal phrase needs imperative/pending language in the same window, or
-      // ordinary documentation describing finished behaviour would block every release.
-      if (m.needsCue && !DEFERRAL_CUE.test(window)) continue;
+      const matched = m.re.exec(window);
+      if (!matched) continue;
+      // An ambiguous temporal phrase needs imperative/pending language in ITS OWN sentence, or
+      // ordinary documentation describing finished behaviour would block every release — and a cue
+      // in a neighbouring sentence proves nothing about this one.
+      if (m.needsCue && !DEFERRAL_CUE.test(sentenceAround(window, matched.index))) continue;
       // Report the line the marker actually STARTS on, not the window's first line — a release
       // gate that points at the wrong line costs whoever is debugging it more than it saves.
       // Matched against the NORMALIZED line, or a decorated/`///`-prefixed first line would fail
@@ -315,6 +343,13 @@ function selfCheck() {
     ['the value is `provisional pending` the device pass', true],
     // -- Markdown STRUCTURE, not just emphasis: the decoration sits BETWEEN the words --
     ['re-derive it before [v9.9.9](https://example.invalid) ships', true],     // inline link
+    // Angle-bracketed destination — CommonMark's escape for URLs the plain form can't hold, so the
+    // pinning case uses what only it allows: an UNBALANCED paren (a balanced one is already covered
+    // by the plain-destination rule and would pin nothing).
+    ['re-derive it before [v9.9.9](<https://example.invalid/a_(b>) ships', true],
+    // Balanced parens in a plain destination (the Wikipedia-URL shape). Pinned via the prose marker:
+    // the version marker's own `\)?` tolerance would absorb the debris and mask a regression.
+    ['re-derive it before [the release](https://x.invalid/wiki/A_(b)) ships', true],
     ['re-derive it before [v9.9.9][rel] ships', true],                         // reference link
     ['re-derive it before ![v9.9.9](img.png) ships', true],                    // image syntax
     ['re-derive it before [v9.9.9] ships', true],                              // bare brackets
@@ -341,6 +376,11 @@ function selfCheck() {
     ['CI verifies the checksums before the release ships', false],
     ['The migration is complete before v9.9.9 ships.', false],
     ['Every artifact is SHA-256 pinned before the release ships.', false],
+    // -- a cue governs only its OWN sentence: a neighbour's `must` proves nothing about this one --
+    [`This component must remain backwards compatible.
+CI verifies checksums before the release ships.`, false],
+    ['The floor is pending re-measurement. CI verifies checksums before v9.9.9 ships.', false],
+    ['The floor is measured. You must re-tune it before v9.9.9 ships.', true], // cue IN the sentence still trips
     // -- ...but the same phrase WITH imperative/pending language is a real deferral --
     ['re-derive this value before v9.9.9 ships', true],
     ['you must bump the pin before the release ships', true],
