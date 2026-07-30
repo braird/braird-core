@@ -18,9 +18,27 @@
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-/** Markers that always mean "not finished yet", wherever they appear. */
+// Markers that always mean "not finished yet", wherever they appear.
+//
+// `caseSensitive` separates two different kinds of marker, and the distinction is load-bearing:
+//
+//   - `TUNE(` is an ANNOTATION, uppercase by convention like TODO(/FIXME(. Its case IS its syntax,
+//     so it is matched case-sensitively. Matching it case-insensitively would turn an ordinary Rust
+//     `fn tune(..)` or `self.tune(..)` into a hit — every `.rs` file is scanned — and fail every
+//     release until the function was renamed. A word boundary does not help: it protects `attune(`
+//     and `fortune(`, where a word character precedes, but an exact `tune(` is preceded by a space
+//     or a `.` and matches cleanly. Blocking releases on legitimate code is how a gate earns a
+//     bypass, which costs more than the miss below.
+//   - The rest are PROSE, where a sentence-opening capital is ordinary writing, so they match
+//     case-insensitively.
+//
+// Accepted miss, stated so nobody "fixes" it back: a deferral annotation written `Tune(` or `tune(`
+// is not caught by the annotation marker. That is a non-conventional spelling of a convention, and
+// the prose markers overlap it in practice — the real SUR-1019 text was
+// "TUNE(SUR-1019 step 8a): provisional pending the device pass", which the prose marker catches on
+// its own, in any casing.
 const STATIC_MARKERS = [
-  { pattern: 'TUNE(', why: 'a TUNE(...) deferral marker' },
+  { pattern: 'TUNE(', why: 'a TUNE(...) deferral marker', caseSensitive: true },
   { pattern: 'provisional pending', why: 'a value still labelled provisional' },
   { pattern: 'before the release ships', why: 'work deferred to release time' },
 ];
@@ -31,15 +49,16 @@ const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 /**
  * Compile a marker literal to a matcher. Two properties, both load-bearing:
  *
- * - **Case-insensitive.** A marker at the start of a sentence is capitalized by ordinary prose
- *   ("Before v0.15.0 ships, re-run the device pass"), which a literal lowercase `includes` walks
- *   straight past. That is the common case, not an edge case, so a case-sensitive gate is barely a
- *   gate at all.
- * - **Word-boundary anchored** when the literal starts with a word character, so case-insensitive
- *   matching cannot turn `TUNE(` into a hit on `fortune(` or `attune(`.
+ * - **Case-insensitive unless the marker says otherwise.** A prose marker at the start of a
+ *   sentence is capitalized by ordinary writing ("Before v0.15.0 ships, re-run the device pass"),
+ *   which a literal lowercase `includes` walks straight past — the common case, not an edge case.
+ *   Annotation markers opt out via `caseSensitive` (see [`STATIC_MARKERS`]).
+ * - **Word-boundary anchored** when the literal starts with a word character, so `TUNE(` cannot hit
+ *   `fortune(` or `attune(`. Note this is necessary but NOT sufficient on its own — it does nothing
+ *   about an exact `tune(`, which is why case sensitivity carries that weight.
  */
-const toMatcher = (pattern) =>
-  new RegExp((/^\w/.test(pattern) ? '\\b' : '') + escapeRe(pattern), 'i');
+const toMatcher = (pattern, caseSensitive = false) =>
+  new RegExp((/^\w/.test(pattern) ? '\\b' : '') + escapeRe(pattern), caseSensitive ? '' : 'i');
 
 /** Files that ARE the release record or ship inside it. */
 function sourceFiles(root) {
@@ -77,8 +96,8 @@ export function findMarkers(text, version) {
   const hits = [];
   const compiled = markers.map((m) => ({
     ...m,
-    re: toMatcher(m.pattern),
-    firstWordRe: toMatcher(m.pattern.split(' ')[0]),
+    re: toMatcher(m.pattern, m.caseSensitive),
+    firstWordRe: toMatcher(m.pattern.split(' ')[0], m.caseSensitive),
   }));
   for (let i = 0; i < lines.length; i++) {
     const window = lines.slice(i, i + 3).join(' ').replace(/\s+/g, ' ');
@@ -116,12 +135,20 @@ function selfCheck() {
     // lowercase `includes` walked straight past until this was fixed.
     ['Provisional pending the device pass against the real model.', true],
     ['Before v9.9.9 ships, re-run the device pass.', true],
-    ['/// Tune(SUR-1019): still outstanding', true],
     ['PROVISIONAL PENDING the device pass', true],
-    // …without letting case-insensitivity widen `TUNE(` into ordinary identifiers. Both of these
-    // contain "tune(" as a substring and must NOT trip the gate.
+    // …without letting case-insensitivity widen the ANNOTATION marker onto ordinary Rust. Every
+    // `.rs` file is scanned, so a hit here would fail every release until the function was renamed.
+    // The first two are why `TUNE(` stays case-sensitive: a word boundary alone does not save them,
+    // because a space or a `.` before `tune` IS a boundary.
+    ['fn tune(x: f64) -> f64 { x }', false],
+    ['let y = self.tune(0.5);', false],
     ['let seed = fortune(rng);', false],
     ['fn attune(&self) -> f64 { 0.0 }', false],
+    // The accepted miss, pinned so it is a decision rather than a surprise: a lowercase spelling of
+    // the annotation is NOT caught by the annotation marker (see STATIC_MARKERS). Real deferrals
+    // carry prose alongside, which is caught in any casing — the line below that.
+    ['/// Tune(SUR-1019): still outstanding', false],
+    ['/// Tune(SUR-1019): provisional pending the device pass', true],
     ['`collection_memberships` converge to ONE row', false], // contains "ships"
     ['relationships between notes are row-per-edge', false], // contains "ships" too
     ['ranking policy is core-owned and version-pinned', false],
