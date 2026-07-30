@@ -272,30 +272,42 @@ export function findMarkers(text, version) {
   const seen = new Set();
   const hits = [];
   const compiled = markers.map((m) => ({ ...m, re: toMatcher(m.pattern, m.caseSensitive, m.source) }));
-  for (let i = 0; i < lines.length; i++) {
-    // Each line is normalized SEPARATELY and joined with its start offset recorded, so a match
-    // index maps straight back to the source line. The previous attribution — searching lines for
-    // the marker's first word — blamed the nearest earlier line containing an ordinary word like
-    // "before", which both misreported the line and pointed the allow-token check above the wrong
-    // one, turning an explicitly exempted marker into a release blocker.
-    const segs = lines.slice(i, i + 3).map((l) => normalize([l]).trim());
+  // Each line is normalized SEPARATELY and joined with its start offset recorded, so a match
+  // index maps straight back to the source line. The previous attribution — searching lines for
+  // the marker's first word — blamed the nearest earlier line containing an ordinary word like
+  // "before", which both misreported the line and pointed the allow-token check above the wrong
+  // one, turning an explicitly exempted marker into a release blocker.
+  const segsAll = lines.map((l) => normalize([l]).trim());
+  // The window slides over CONTENT-BEARING lines, not physical ones. A line swallowed whole by a
+  // comment carries no rendered text, so it is dropped from the sequence — otherwise a comment
+  // spanning four physical lines pushes the phrase's two halves out of every 3-line window and the
+  // marker escapes. A line that is blank in the RAW text stays: a real paragraph break separates
+  // prose for the reader, and windows must keep respecting that.
+  const scannable = [];
+  for (let j = 0; j < lines.length; j++) {
+    if (segsAll[j] === '' && rawLines[j].trim() !== '') continue;
+    scannable.push(j);
+  }
+  for (let p = 0; p < scannable.length; p++) {
+    const idx = scannable.slice(p, p + 3);
     const starts = [];
     let window = '';
-    segs.forEach((seg, k) => {
+    for (const j of idx) {
+      const seg = segsAll[j];
       if (seg && window) window += ' ';
       starts.push(window.length);
       window += seg;
-    });
+    }
     for (const m of compiled) {
       // EVERY occurrence is examined. With the cue heuristic gone this is belt-and-braces (the
       // exemption and the dedupe are both line-scoped), but running the global regex to exhaustion
       // is also what resets it between windows.
       for (let hit; (hit = m.re.exec(window)); ) {
         // The line this occurrence STARTS on — the last recorded segment offset at or before it.
-        let at = i;
+        let at = idx[0];
         for (let k = starts.length - 1; k >= 0; k--) {
           if (hit.index >= starts[k]) {
-            at = i + k;
+            at = idx[k];
             break;
           }
         }
@@ -367,6 +379,17 @@ function selfCheck() {
     ['re-run it before the release <!-- editor note --> ships', true],          // HTML comment
     [`re-run it before the release <!-- a note
 spanning lines --> ships`, true],                                               // comment straddling a line break
+    // A comment swallowing WHOLE lines must not push the phrase's halves out of window range —
+    // this is a rendered phrase split across five physical lines, prefixes and all.
+    [`/// re-derive before the release <!-- editor
+/// detail line one
+/// detail line two
+/// --> ships and then stop`, true],
+    // ...but a real paragraph break is the reader's separation and must keep separating.
+    [`must re-derive before the release
+
+
+ships now`, false],
     ['re-run it before the release[^1] ships', true],                           // footnote INSIDE the phrase
     ['the value is [provisional pending](x) the device pass', true],            // linked prose marker
     // -- wrapped across a line break, carrying the continuation line's own prefix --
