@@ -149,20 +149,26 @@ function sourceFiles(root) {
  */
 function maskReleasedChangelogSections(text, version) {
   const lines = text.split('\n');
+  // Structure detection (fences, headings) runs on a comment-blanked PROBE: an example heading
+  // or fence inside an HTML editor comment is invisible prose, not a section boundary. The
+  // returned lines stay original — the allow-token's carrier is itself a comment and must
+  // survive into the scan.
+  const detect = text.replace(/<!--[\s\S]*?-->/g, (c) => c.replace(/[^\n]/g, ' ')).split('\n');
   let active = true; // the file preamble, before any section heading
   let fence = null; // the opening delimiter of the fence we are inside, if any
   return lines
-    .map((line) => {
+    .map((line, i) => {
+      const probe = detect[i];
       // A fence closes only on AT LEAST the opener's length in the same character, followed by
       // nothing but whitespace — CommonMark's rules, and what lets a ```` block quote a ```
       // snippet (or a visible ```rust line) without the state desyncing. An OPENER may carry an
       // info string; a closer may not.
-      const f = /^\s*(`{3,}|~{3,})(.*)$/.exec(line);
+      const f = /^\s*(`{3,}|~{3,})(.*)$/.exec(probe);
       if (f) {
         if (!fence) fence = f[1];
         else if (f[1][0] === fence[0] && f[1].length >= fence.length && f[2].trim() === '') fence = null;
       }
-      const heading = !fence && /^##\s+\[([^\]]+)\]/.exec(line);
+      const heading = !fence && /^##\s+\[([^\]]+)\]/.exec(probe);
       if (heading) {
         const label = heading[1].trim().toLowerCase();
         active = label === 'unreleased' || (!!version && label === version.toLowerCase());
@@ -337,6 +343,12 @@ function selfCheck() {
     ['let before_the_release_ships = true;', false], // deleting emphasis must not forge a phrase
     ['The API is provisional. Pending items are tracked in Linear.', false], // sentence boundary
     ['<td>TUNE</td><td>(x)</td>', false], // tags become separation, never adjacency
+    // ACCEPTED OVER-MATCH, recorded as a decision: adjacent HTML cells whose spaced tags happen
+    // to bridge a multi-word phrase. No scanned file contains an HTML table (the repo's 104
+    // tables are Markdown, whose pipes are kept as boundaries), and preventing it means
+    // reintroducing the block/inline tag taxonomy the 45b4516 reset deleted. If it ever occurs,
+    // the remedy is a one-line stale-marker-allow.
+    ['<td>before the release</td><td>ships are signed</td>', true],
     // -- explicit exemption (eslint-disable-next-line semantics) --
     ['re-derive this before v9.9.9 ships <!-- stale-marker-allow -->', false],
     ['<!-- stale-marker-allow -->\nre-derive this before v9.9.9 ships', false],
@@ -403,6 +415,7 @@ function selfCheck() {
   const changelog = [
     '# Changelog', '', '## [Unreleased]', '',
     '````', '```', '## [0.0.1] - a quoted example, not a section', '```', '````rust', '````', '',
+    '<!-- an editor note quoting a heading:', '## [0.0.2] - a commented example, not a section', '-->', '',
     'UNRELEASED', '',
     '## [9.9.9] - 2026-01-01', '', 'CUTTING', '',
     '## [9.9.8] - 2025-12-01', '', 'SHIPPED', '',
