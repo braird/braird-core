@@ -37,7 +37,13 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   Scope is every `.md` in the repo root and under `docs/` — `docs/pinning.md` above all, since it is
   the consumer-facing release/packaging contract named in GATING.md's release row — **excluding**
   `docs/plans`, `docs/learnings` and `docs/superpowers`, which are historical records where a past
-  deferral is correct and rewriting it to appease a gate would be the wrong repair. Because
+  deferral is correct and rewriting it to appease a gate would be the wrong repair. **The changelog
+  gets the same treatment section by section:** only `[Unreleased]` and the section being cut are
+  scanned, because a shipped entry is immutable — an entry that accurately recorded a
+  then-provisional value would otherwise block every future release, clearable only by editing
+  release history. The line this all rests on is *immutable records are out, living documents are
+  in*: shipped changelog sections, plans and learnings are immutable; ADRs are living (amended with
+  supersede notes, and the incident was partly in one), so they stay fully in scope. Because
   broadening scope multiplies false positives, the two ambiguous temporal phrases now require
   <!-- stale-marker-allow: this entry quotes both marker phrases as examples -->
   imperative or pending language nearby: *"CI verifies the checksums before the release ships"*

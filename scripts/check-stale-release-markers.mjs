@@ -167,7 +167,14 @@ function sourceFiles(root) {
   const out = [];
   const rel = (p) => p.slice(root.length + 1).replace(/\\/g, '/');
   const walk = (dir, mdOnly) => {
-    for (const name of readdirSync(dir)) {
+    // A missing tree is not this gate's business, the same tolerance the CHANGELOG read already has.
+    let entries;
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const name of entries) {
       const p = join(dir, name);
       if (statSync(p).isDirectory()) {
         if (!HISTORICAL.includes(rel(p))) walk(p, mdOnly);
@@ -182,6 +189,39 @@ function sourceFiles(root) {
     if (name.endsWith('.md') && statSync(join(root, name)).isFile()) out.push(join(root, name));
   }
   return out;
+}
+
+/**
+ * Blank every changelog line outside `[Unreleased]` and the section being cut.
+ *
+ * A shipped release entry is an IMMUTABLE historical record — the same argument that keeps
+ * `docs/plans` and `docs/learnings` out of scope, and this file is the most historical one in the
+ * repo: 26 released sections, ~1500 lines. An entry that accurately recorded a then-provisional
+ * value ("the threshold was provisional pending field results") would otherwise block every future
+ * release, and the only way to clear it would be editing shipped release history — which is exactly
+ * the wrong repair. Scoping this checker to what the release actually asserts is the fix.
+ *
+ * The distinction the whole scan now rests on: **immutable records are out, living documents are
+ * in.** Released changelog sections, plans and learnings are immutable. ADRs are living — they get
+ * amended with supersede notes rather than frozen (ADR 0006 was amended, not left stale), and the
+ * incident this gate exists for was partly IN an ADR — so they stay fully in scope.
+ *
+ * Lines are blanked rather than removed so reported line numbers stay true and a 3-line window can
+ * never straddle a section boundary.
+ */
+function maskReleasedChangelogSections(text, version) {
+  const lines = text.split('\n');
+  let active = true; // the file preamble, before any section heading
+  return lines
+    .map((line) => {
+      const heading = /^##\s+\[([^\]]+)\]/.exec(line);
+      if (heading) {
+        const label = heading[1].trim().toLowerCase();
+        active = label === 'unreleased' || (!!version && label === version.toLowerCase());
+      }
+      return active ? line : '';
+    })
+    .join('\n');
 }
 
 /** Every marker hit in `text`, as {line, why, excerpt}. `version` may be undefined. */
@@ -370,29 +410,81 @@ re-derive this before v9.9.9 ships`, true], // an exemption must not leak down t
     rmSync(tmp, { recursive: true, force: true });
   }
 
+  // The changelog's SHIPPED sections are immutable history: an entry that accurately recorded a
+  // then-provisional value must never block a future release, because the only way to clear it
+  // would be rewriting a released entry. Only `[Unreleased]` and the section being cut are asserted
+  // by this release, so only those are scanned — pinned here because a string corpus cannot express
+  // "which section was this line in".
+  const changelog = [
+    '# Changelog', '', '## [Unreleased]', '', 'UNRELEASED', '',
+    '## [9.9.9] - 2026-01-01', '', 'CUTTING', '',
+    '## [9.9.8] - 2025-12-01', '', 'SHIPPED', '',
+  ].join('\n');
+  const stale = 'the threshold was provisional pending field results';
+  const sectionCases = [
+    ['SHIPPED', false, 'a shipped section is immutable history'],
+    ['UNRELEASED', true, '[Unreleased] is asserted by this release'],
+    ['CUTTING', true, 'the section being cut is asserted by this release'],
+  ];
+  // Driven through scanRepo() on a real temp tree, NOT by calling the masking function directly —
+  // otherwise this proves the unit works while a deleted call site would still pass.
+  for (const [slot, shouldTrip, why] of sectionCases) {
+    const dir = mkdtempSync(join(tmpdir(), 'stale-marker-changelog-'));
+    try {
+      mkdirSync(join(dir, 'src'), { recursive: true });
+      writeFileSync(join(dir, 'src', 'lib.rs'), '// nothing\n');
+      writeFileSync(join(dir, 'CHANGELOG.md'), changelog.replace(slot, stale));
+      const tripped = scanRepo(dir, '9.9.9').length > 0;
+      if (tripped !== shouldTrip) {
+        console.error(`self-check FAILED: ${slot} — ${why} (expected trip=${shouldTrip})`);
+        ok = false;
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
   console.log(ok ? 'check-stale-release-markers: self-check OK' : 'self-check FAILED');
   process.exit(ok ? 0 : 1);
+}
+
+/**
+ * Scan a repository root and return every hit as `{file, line, why, excerpt}`.
+ *
+ * A function rather than top-level code so `--self-check` can exercise the REAL path against a
+ * throwaway tree. Testing `maskReleasedChangelogSections` directly proved the unit worked while
+ * saying nothing about whether it was wired in — deleting its call site left the self-check green.
+ * That unit-passes-integration-unwired gap is the one this file keeps rediscovering, so the scan is
+ * now callable and the wiring is pinned.
+ */
+export function scanRepo(root, version) {
+  const hits = [];
+  for (const file of sourceFiles(root)) {
+    let text;
+    try {
+      text = readFileSync(file, 'utf8');
+    } catch {
+      continue; // an optional path (CHANGELOG in a partial checkout) is not this gate's business
+    }
+    // The changelog is scanned only where the release makes an assertion: `[Unreleased]` and the
+    // section being cut. Its shipped sections are immutable history, like `docs/plans`.
+    if (file.endsWith('CHANGELOG.md')) text = maskReleasedChangelogSections(text, version);
+    for (const hit of findMarkers(text, version)) {
+      hits.push({ ...hit, file: file.slice(root.length + 1).replace(/\\/g, '/') });
+    }
+  }
+  return hits;
 }
 
 const arg = process.argv[2];
 if (arg === '--self-check') selfCheck();
 
 const version = arg && arg !== '--self-check' ? arg.replace(/^v/, '') : undefined;
-const root = process.cwd();
-let failed = 0;
-for (const file of sourceFiles(root)) {
-  let text;
-  try {
-    text = readFileSync(file, 'utf8');
-  } catch {
-    continue; // an optional path (CHANGELOG in a partial checkout) is not this gate's business
-  }
-  for (const hit of findMarkers(text, version)) {
-    const rel = file.slice(root.length + 1).replace(/\\/g, '/');
-    console.error(`::error file=${rel},line=${hit.line}::${hit.why} — ${hit.excerpt}`);
-    failed++;
-  }
+const found = scanRepo(process.cwd(), version);
+for (const hit of found) {
+  console.error(`::error file=${hit.file},line=${hit.line}::${hit.why} — ${hit.excerpt}`);
 }
+const failed = found.length;
 
 if (failed > 0) {
   console.error(
