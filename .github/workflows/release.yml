@@ -71,6 +71,17 @@ jobs:
           echo "tag=$TAG_RAW" >> "$GITHUB_OUTPUT"
           echo "version=${TAG_RAW#v}" >> "$GITHUB_OUTPUT"
 
+      # The marker checker is stashed from THIS workflow's revision before the workspace becomes
+      # the tag under test, then run against that tree from outside it. Two reasons: a
+      # workflow_dispatch against a tag that predates the checker must not break the documented
+      # existing-tag recovery path with MODULE_NOT_FOUND, and the tree being judged is not the
+      # place to load the judge from — a tag cannot bring its own neutered copy.
+      - name: Stash the marker checker from the workflow revision
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: cp scripts/check-stale-release-markers.mjs "$RUNNER_TEMP"/
+
       - name: Check out validated tag without persisting credentials
         uses: actions/checkout@v4
         with:
@@ -97,8 +108,8 @@ jobs:
         env:
           VERSION: ${{ steps.v.outputs.version }}
         run: |
-          node scripts/check-stale-release-markers.mjs --self-check
-          node scripts/check-stale-release-markers.mjs "$VERSION"
+          node "$RUNNER_TEMP/check-stale-release-markers.mjs" --self-check
+          node "$RUNNER_TEMP/check-stale-release-markers.mjs" "$VERSION"
 
   # Android AAR (arm64-v8a + x86_64, 16 KB-aligned) + self-contained desktop JVM jar. Uploads both
   # as a workflow artifact for `publish` to attach — this leg never touches the release itself.
