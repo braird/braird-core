@@ -33,9 +33,19 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   case-sensitive, because its uppercase form is its syntax and matching it loosely would turn an
   ordinary Rust `fn tune(..)` into a hit and fail every release until the function was renamed
   (word boundaries stop `fortune(`/`attune(` but not an exact lowercase call). `--self-check` is an
-  **evasion corpus** of 35 cases covering every one of those shapes plus the code and prose that
-  must *not* trip, and each of the six behaviours above is pinned: mutate any one and the self-check
-  fails. Deliberately narrow: `TODO`/`FIXME` are ordinary and are not checked, since a
+  **evasion corpus** covering every one of those shapes plus the code and prose that must *not* trip.
+  Scope is every `.md` in the repo root and under `docs/` — `docs/pinning.md` above all, since it is
+  the consumer-facing release/packaging contract named in GATING.md's release row — **excluding**
+  `docs/plans`, `docs/learnings` and `docs/superpowers`, which are historical records where a past
+  deferral is correct and rewriting it to appease a gate would be the wrong repair. Because
+  broadening scope multiplies false positives, the two ambiguous temporal phrases now require
+  <!-- stale-marker-allow: this entry quotes both marker phrases as examples -->
+  imperative or pending language nearby: *"CI verifies the checksums before the release ships"*
+  describes finished behaviour and must never block a release, while *"re-derive this before v0.15.0
+  ships"* must. A `stale-marker-allow` comment on a line or the line above exempts it, for prose the
+  heuristic misjudges. Every behaviour is mutation-pinned — including which files are scanned, via a
+  throwaway tree in `--self-check` — and the whole thing is replayed against the commit that caused
+  the incident, which it still catches in full. Deliberately narrow: `TODO`/`FIXME` are ordinary and are not checked, since a
   gate that fires on things people reasonably ship is a gate people learn to bypass. `--self-check`
   proves the detector actually fires (wrapped case included, plus the false positive where a legit
   word merely contains a pattern) and runs in CI ahead of the scan itself, so a silently-broken

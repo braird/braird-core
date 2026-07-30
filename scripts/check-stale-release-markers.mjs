@@ -15,7 +15,8 @@
 // Usage:  node scripts/check-stale-release-markers.mjs [<version>]
 //         node scripts/check-stale-release-markers.mjs --self-check
 
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 // Markers that always mean "not finished yet", wherever they appear.
@@ -40,8 +41,34 @@ import { join } from 'node:path';
 const STATIC_MARKERS = [
   { pattern: 'TUNE(', why: 'a TUNE(...) deferral marker', caseSensitive: true },
   { pattern: 'provisional pending', why: 'a value still labelled provisional' },
-  { pattern: 'before the release ships', why: 'work deferred to release time' },
+  { pattern: 'before the release ships', why: 'work deferred to release time', needsCue: true },
 ];
+
+/**
+ * Language that makes a temporal phrase an INSTRUCTION rather than a description.
+ *
+ * "before the release ships" is not evidence of anything on its own: *"CI verifies the checksums
+ * before the release ships"* describes finished behaviour, and *"the migration is complete before
+ * v0.15.0 ships"* is ordinary release documentation. Firing on those would fail every subsequent
+ * release over correct prose — the precise way a gate earns a permanent bypass. So markers flagged
+ * `needsCue` require one of these nearby.
+ *
+ * Checked against the real incident before being trusted: the stale ADR/CHANGELOG text was "the
+ * release gate **re-derives** this value … before v0.14.0 ships", which carries a cue, and the other
+ * two markers there (`TUNE(`, `provisional pending`) are unambiguous and need no cue at all. So the
+ * requirement costs nothing on the case this gate was built for — verified by replaying commit
+ * 212ac21, not by assertion.
+ */
+const DEFERRAL_CUE =
+  /\b(must|should|needs? to|re-?deriv\w*|re-?run|re-?tune|re-?measure|remember to|don'?t forget|outstanding|unfinished|not yet|pending|provisional|deferred|to ?do|tune)\b/i;
+
+/**
+ * Escape hatch for the residual: a line carrying this token, or the line directly above it, is
+ * exempt — the `eslint-disable-next-line` contract. Needed because the cue heuristic cannot be
+ * perfect and a release must never be blocked by prose no one can legally rewrite (a quoted spec, a
+ * historical note in a live document). An exemption is visible in review, which a silent miss is not.
+ */
+const ALLOW_TOKEN = 'stale-marker-allow';
 
 /** Escape a literal so it can be embedded in a RegExp — the version's dots especially. */
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -116,19 +143,44 @@ const normalize = (lines) =>
 const toMatcher = (pattern, caseSensitive = false, source = null) =>
   new RegExp((/^\w/.test(pattern) ? '\\b' : '') + (source ?? escapeRe(pattern)), caseSensitive ? '' : 'i');
 
-/** Files that ARE the release record or ship inside it. */
+/**
+ * Directories whose Markdown is a HISTORICAL record and must NOT be scanned.
+ *
+ * A plan or a learning legitimately says "before v0.12.0 ships, do X" — that was true when it was
+ * written, and rewriting history to appease a release gate would be the wrong repair. Scanning them
+ * would guarantee false positives by design.
+ */
+const HISTORICAL = ['docs/plans', 'docs/learnings', 'docs/superpowers'];
+
+/**
+ * Files that ARE the release record, or that a consumer reads as part of it.
+ *
+ * Scans every `.md` in the repo root and under `docs/` except the historical trees, rather than an
+ * allowlist of individual documents. Enumerating paths one at a time is exactly how four scripts
+ * drifted out of GATING.md coverage in this same PR; an exclude-list means a NEW release-facing doc
+ * is covered by default, and a new historical tree announces itself as a false positive instead of
+ * hiding as a silent gap. `docs/pinning.md` matters most here — it is the consumer-facing
+ * release/packaging contract, named in GATING.md's release row, so a deferral there contradicts the
+ * release in precisely the way this gate exists to prevent.
+ */
 function sourceFiles(root) {
   const out = [];
-  const walk = (dir) => {
+  const rel = (p) => p.slice(root.length + 1).replace(/\\/g, '/');
+  const walk = (dir, mdOnly) => {
     for (const name of readdirSync(dir)) {
       const p = join(dir, name);
-      if (statSync(p).isDirectory()) walk(p);
-      else if (name.endsWith('.rs') || name.endsWith('.md')) out.push(p);
+      if (statSync(p).isDirectory()) {
+        if (!HISTORICAL.includes(rel(p))) walk(p, mdOnly);
+      } else if (name.endsWith('.rs') || name.endsWith('.md')) {
+        if (!mdOnly || name.endsWith('.md')) out.push(p);
+      }
     }
   };
-  walk(join(root, 'src'));
-  walk(join(root, 'docs', 'adr'));
-  out.push(join(root, 'CHANGELOG.md'));
+  walk(join(root, 'src'), false);
+  walk(join(root, 'docs'), true);
+  for (const name of readdirSync(root)) {
+    if (name.endsWith('.md') && statSync(join(root, name)).isFile()) out.push(join(root, name));
+  }
   return out;
 }
 
@@ -147,6 +199,9 @@ export function findMarkers(text, version) {
       // covering here — normalizeInline already turned those into spaces.
       source: `before \\(?v?${escapeRe(version)}\\)? ships`,
       why: `work deferred until v${version}, which is the release being cut`,
+      // Same ambiguity as the prose temporal marker: "the migration is complete before v0.15.0
+      // ships" is a statement of fact, not a deferral.
+      needsCue: true,
     });
   }
   // Scan a 3-line sliding window with whitespace collapsed, not line by line. Prose here wraps at
@@ -165,6 +220,9 @@ export function findMarkers(text, version) {
     const window = normalize(lines.slice(i, i + 3));
     for (const m of compiled) {
       if (!m.re.test(window)) continue;
+      // An ambiguous temporal phrase needs imperative/pending language in the same window, or
+      // ordinary documentation describing finished behaviour would block every release.
+      if (m.needsCue && !DEFERRAL_CUE.test(window)) continue;
       // Report the line the marker actually STARTS on, not the window's first line — a release
       // gate that points at the wrong line costs whoever is debugging it more than it saves.
       // Matched against the NORMALIZED line, or a decorated/`///`-prefixed first line would fail
@@ -176,6 +234,9 @@ export function findMarkers(text, version) {
           break;
         }
       }
+      // Explicit exemption on the hit's own line or the one above it (eslint-disable-next-line
+      // semantics), so an author can keep prose the cue heuristic misjudges.
+      if (lines[at].includes(ALLOW_TOKEN) || (at > 0 && lines[at - 1].includes(ALLOW_TOKEN))) continue;
       // Dedupe on the resolved line, so overlapping windows report a marker exactly once.
       const key = `${m.pattern}@${at}`;
       if (seen.has(key)) continue;
@@ -198,7 +259,7 @@ function selfCheck() {
     ['/// TUNE(SUR-1019 step 8a): provisional', true],
     ['the value is provisional pending the device pass', true],
     ['re-derive this before v9.9.9 ships', true],
-    ['before   the   release   ships', true],                            // whitespace noise
+    ['re-derive it before   the   release   ships', true],               // whitespace noise
     // -- capitalization: prose opens sentences with a capital --
     ['Provisional pending the device pass against the real model.', true],
     ['Before v9.9.9 ships, re-run the device pass.', true],
@@ -223,18 +284,36 @@ function selfCheck() {
     ['| step | re-derive it before v9.9.9 ships |', true],                     // table row
     ['re-derive it before&nbsp;v9.9.9 ships', true],                           // HTML entity
     ['re-derive it before <https://x.invalid> v9.9.9 ships', true],            // autolink between words
-    ['before the release <!-- editor note --> ships', true],                    // HTML comment
-    ['before the release[^1] ships', true],                                     // footnote INSIDE the phrase
+    ['re-run it before the release <!-- editor note --> ships', true],          // HTML comment
+    ['re-run it before the release[^1] ships', true],                           // footnote INSIDE the phrase
     ['the value is [provisional pending](x) the device pass', true],            // linked prose marker
     // -- wrapped across a line break, carrying the continuation line's own prefix --
-    ['distributions on the device corpus before the release\n   ships (the constant sits', true],
+    ['must re-derive from distributions before the release\n   ships (the constant sits', true],
     ['/// re-derive the value before the release\n/// ships and then stop', true],
     ['//! re-derive the value before the release\n//! ships and then stop', true],
     ['// re-derive the value before the release\n// ships and then stop', true],
     ['/* re-derive before the release\n * ships */', true],
     ['> re-derive before the release\n> ships now', true],
     ['- re-derive before the release\n  ships now', true],
-    ['# before the release\n# ships', true],
+    ['# re-run it before the release\n# ships', true],
+    // -- ordinary release DOCUMENTATION describing finished behaviour: a temporal phrase alone
+    //    is not evidence, and firing on these would block every release over correct prose --
+    ['CI verifies the checksums before the release ships', false],
+    ['The migration is complete before v9.9.9 ships.', false],
+    ['Every artifact is SHA-256 pinned before the release ships.', false],
+    // -- ...but the same phrase WITH imperative/pending language is a real deferral --
+    ['re-derive this value before v9.9.9 ships', true],
+    ['you must bump the pin before the release ships', true],
+    ['this is still outstanding before v9.9.9 ships', true],
+    ['the release gate re-derives this before v9.9.9 ships', true],   // the real incident's shape
+    // -- explicit exemption, on the line and the line above (eslint-disable-next-line semantics) --
+    ['re-derive this before v9.9.9 ships <!-- stale-marker-allow -->', false],
+    // Template literals so a real newline needs no escaping — these are multi-line by nature.
+    [`<!-- stale-marker-allow -->
+re-derive this before v9.9.9 ships`, false],
+    [`<!-- stale-marker-allow -->
+filler line, so the exemption is two lines above
+re-derive this before v9.9.9 ships`, true], // an exemption must not leak down the file
     // -- must NOT trip: ordinary code, and prose that merely contains a marker substring --
     ['fn tune(x: f64) -> f64 { x }', false],
     ['let y = self.tune(0.5);', false],
@@ -257,6 +336,40 @@ function selfCheck() {
       ok = false;
     }
   }
+  // WHICH FILES get scanned is filesystem logic, so the string corpus above cannot reach it — and
+  // an unpinned behaviour is an unverified claim. Build a throwaway tree instead and assert the two
+  // properties that matter: release-facing docs are IN, historical trees are OUT. Without the second
+  // one, every plan document that legitimately recorded a past deferral would block releases.
+  const tmp = mkdtempSync(join(tmpdir(), 'stale-marker-selfcheck-'));
+  try {
+    for (const d of ['src', 'docs/adr', 'docs/plans', 'docs/learnings', 'docs/superpowers']) {
+      mkdirSync(join(tmp, ...d.split('/')), { recursive: true });
+    }
+    for (const f of ['README.md', 'CHANGELOG.md', 'docs/pinning.md', 'docs/snapshots.md',
+      'docs/adr/0001-x.md', 'src/lib.rs', 'docs/plans/old.md', 'docs/learnings/old.md',
+      'docs/superpowers/old.md']) {
+      writeFileSync(join(tmp, ...f.split('/')), '# placeholder\n');
+    }
+    const scanned = sourceFiles(tmp).map((p) => p.slice(tmp.length + 1).split('\\').join('/'));
+    const mustInclude = ['README.md', 'CHANGELOG.md', 'docs/pinning.md', 'docs/snapshots.md',
+      'docs/adr/0001-x.md', 'src/lib.rs'];
+    const mustExclude = ['docs/plans/old.md', 'docs/learnings/old.md', 'docs/superpowers/old.md'];
+    for (const f of mustInclude) {
+      if (!scanned.includes(f)) {
+        console.error(`self-check FAILED: ${f} must be scanned (it is release-facing)`);
+        ok = false;
+      }
+    }
+    for (const f of mustExclude) {
+      if (scanned.includes(f)) {
+        console.error(`self-check FAILED: ${f} must NOT be scanned (historical record)`);
+        ok = false;
+      }
+    }
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+
   console.log(ok ? 'check-stale-release-markers: self-check OK' : 'self-check FAILED');
   process.exit(ok ? 0 : 1);
 }
