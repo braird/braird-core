@@ -159,11 +159,12 @@ function maskReleasedChangelogSections(text, version) {
   return lines
     .map((line, i) => {
       const probe = detect[i];
-      // A fence closes only on AT LEAST the opener's length in the same character, followed by
-      // nothing but whitespace — CommonMark's rules, and what lets a ```` block quote a ```
-      // snippet (or a visible ```rust line) without the state desyncing. An OPENER may carry an
-      // info string; a closer may not.
-      const f = /^\s*(`{3,}|~{3,})(.*)$/.exec(probe);
+      // A fence delimiter takes AT MOST three leading spaces (four is indented code content),
+      // closes only on AT LEAST the opener's length in the same character, and a closer carries
+      // nothing but whitespace after the run — CommonMark's rules, and what lets a ```` block
+      // quote a ``` snippet, a visible ```rust line, or an indented backtick run without the
+      // state desyncing. An OPENER may carry an info string; a closer may not.
+      const f = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(probe);
       if (f) {
         if (!fence) fence = f[1];
         else if (f[1][0] === fence[0] && f[1].length >= fence.length && f[2].trim() === '') fence = null;
@@ -414,7 +415,7 @@ function selfCheck() {
   // mask the rest of the section and fail open.
   const changelog = [
     '# Changelog', '', '## [Unreleased]', '',
-    '````', '```', '## [0.0.1] - a quoted example, not a section', '```', '````rust', '````', '',
+    '````', '```', '## [0.0.1] - a quoted example, not a section', '```', '````rust', '    ````', '````', '',
     '<!-- an editor note quoting a heading:', '## [0.0.2] - a commented example, not a section', '-->', '',
     'UNRELEASED', '',
     '## [9.9.9] - 2026-01-01', '', 'CUTTING', '',
