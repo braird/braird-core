@@ -6,6 +6,26 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **The release now fails on documentation that contradicts it (`scripts/check-stale-release-markers.mjs`).**
+  Cutting v0.14.0 exposed a gap with no owner: `release.yml` verifies the tag, the crate version and
+  the CHANGELOG *section heading*, but nothing reads the prose beneath them, so a bad merge shipped
+  three files that each recorded a measured constant while instructing maintainers to re-derive it
+  before the very release containing it. The new check runs once in `validate` and fails on a small
+  set of literal deferral markers, matched the way maintainers honestly write them: wrapped across
+  `///` doc-comment lines, sentence-capitalized, decorated in house style (inline code, bold, plain
+  links, tables). Its threat model is **accidental staleness, not adversarial concealment** — a
+  marker hidden behind exotic Markdown is out of scope by design (anyone hiding from the gate can
+  simply not write the marker), and the accepted misses are pinned as explicit `--self-check` rows
+  so that boundary is executable. Scope: `src/**.rs` plus release-facing Markdown, excluding
+  historical records (`docs/plans`, `docs/learnings`, `docs/superpowers`), with the changelog
+  scanned only in `[Unreleased]` and the section being cut — shipped entries are immutable history.
+  Markers fail closed (descriptive prose trips too); a legitimate use keeps a one-line
+  `stale-marker-allow` exemption, visible in review where a silent miss is not. `--self-check` runs
+  in CI ahead of the scan, every behaviour is mutation-pinned, and the checker is replayed against
+  the incident commit, which it catches in full. `TODO`/`FIXME` are deliberately not checked: a
+  gate that fires on things people reasonably ship is a gate people learn to bypass.
+
 ## [0.14.0] - 2026-07-29
 
 Twenty-fifth release batch. Minor release: the SUR-157 query path lands in core as
