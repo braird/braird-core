@@ -114,18 +114,43 @@ const stripLinePrefix = (line) => line.replace(/^\s*(\/\/\/|\/\/!|\/\/|\/\*+|\*+
  * Replace every inline link and image with its visible label, parsing the CommonMark construct
  * for real: an angle-bracketed destination runs to its `>`; a plain destination runs to
  * whitespace or the closing paren with nested parens counted to ANY depth (a fixed-depth regex is
- * an evasion exactly one level deeper — the fixed-size window's lesson); then an OPTIONAL quoted
- * title, whose parens are text rather than structure (`"title (draft"` is a legal title that must
- * not derail the depth count). An unclosed construct is left untouched: the later bracket rules
- * space it apart, which can only miss, never forge.
+ * an evasion exactly one level deeper — the fixed-size window's lesson) and backslash escapes
+ * walked (`a\)draft` does not close the link); then an OPTIONAL quoted title, whose parens are
+ * text rather than structure and whose escapes are walked the same way. An unclosed construct is
+ * left untouched: the later bracket rules space it apart, which can only miss, never forge.
+ *
+ * Operates on the WHOLE text, line-preservingly, because a link may legally break across a soft
+ * line — `[v9.9.9](https://…\n "title")` renders only the label. Each whitespace gap may cross
+ * ONE newline, with the continuation line's comment prefix skipped, since rustdoc strips it
+ * before parsing Markdown. The consumed span is blanked with newlines kept, label first, so line
+ * numbers and the raw-line bookkeeping downstream stay true — the same contract as HTML-comment
+ * blanking. That newline preservation is also why no paragraph guard is needed here: a construct
+ * that ran across a blank line still leaves the blank line in place, and the run builder splits
+ * the paragraphs regardless.
  */
 const reduceLinks = (s) => {
-  const re = /!?\[([^\]]*)\]\(/g;
+  const skipPrefix = (k) => {
+    const m = /^[ \t]*(?:\/{2,3}!?|\*+|>+)?[ \t]*/.exec(s.slice(k, k + 24));
+    return k + m[0].length;
+  };
+  const re = /!?\[([^\]\n]*)\]\(/g;
   let out = '';
   let last = 0;
   let m;
   while ((m = re.exec(s))) {
     let i = re.lastIndex;
+    const skipWs = () => {
+      let crossed = false;
+      for (;;) {
+        while (s[i] === ' ' || s[i] === '\t') i++;
+        if (s[i] === '\n' && !crossed) {
+          crossed = true;
+          i = skipPrefix(i + 1);
+          continue;
+        }
+        return;
+      }
+    };
     if (s[i] === '<') {
       const gt = s.indexOf('>', i);
       i = gt === -1 ? s.length : gt + 1;
@@ -133,30 +158,39 @@ const reduceLinks = (s) => {
       let depth = 0;
       while (i < s.length) {
         const c = s[i];
+        if (c === '\\') {
+          i += 2;
+          continue;
+        }
         if (c === '(') depth++;
         else if (c === ')') {
           if (depth === 0) break;
           depth--;
-        } else if (c === ' ' || c === '\t') break;
+        } else if (c === ' ' || c === '\t' || c === '\n') break;
         i++;
       }
     }
-    while (s[i] === ' ' || s[i] === '\t') i++;
-    // Optional quoted title in any of its three forms. Backslash-escaped delimiters inside it
-    // (`"title \" draft"`) are text, so the closing delimiter is found by walking escapes.
+    skipWs();
     const closeTitle = (close) => {
       for (let k = i + 1; k < s.length; k++) {
-        if (s[k] === '\\') k++;
-        else if (s[k] === close) return k + 1;
+        const c = s[k];
+        if (c === '\\') k++;
+        else if (c === close) return k + 1;
+        // A title may wrap across a soft line (prefix skipped). No blank-line guard is needed:
+        // even if a title ran across a paragraph break, the blanked span KEEPS the blank line and
+        // the run builder splits there — mutation-tested as redundant, hence absent.
+        else if (c === '\n') k = skipPrefix(k + 1) - 1;
       }
       return s.length;
     };
     const q = s[i];
     if (q === '"' || q === "'") i = closeTitle(q);
     else if (q === '(') i = closeTitle(')');
-    while (s[i] === ' ' || s[i] === '\t') i++;
+    skipWs();
     if (s[i] === ')') {
-      out += s.slice(last, m.index) + m[1];
+      const span = s.slice(m.index, i + 1);
+      const blanked = span.replace(/[^\n]/g, ' ');
+      out += s.slice(last, m.index) + m[1] + blanked.slice(m[1].length);
       last = i + 1;
       re.lastIndex = i + 1;
     }
@@ -165,10 +199,10 @@ const reduceLinks = (s) => {
 };
 
 const normalizeInline = (s) =>
-  // No HTML-comment rule here: comments can span lines, so findMarkers blanks them on the whole
-  // text before any per-line work — a rule at this level was mutation-tested as redundant.
-  // Footnote refs go first, before the link rules claim the brackets.
-  reduceLinks(s.replace(/\[\^[^\]]*\]/g, ' '))
+  // No HTML-comment or inline-link rule here: both constructs can span lines, so findMarkers
+  // handles them on the whole text (line-preservingly) before any per-line work.
+  s
+    .replace(/\[\^[^\]]*\]/g, ' ') // footnote refs, before the reference-link rule claims the brackets
     .replace(/\[([^\]]*)\]\[[^\]]*\]/g, '$1') // reference links -> visible label
     // The split between the next three rules is what the RENDERED text demands. Inline FORMATTING
     // tags contribute no whitespace — `be<em>fore</em>` reads "before", so a space would split the
@@ -335,7 +369,11 @@ export function findMarkers(text, version) {
   // token itself lives inside a comment) and the reported excerpt, and identical line counts keep
   // the two aligned.
   const rawLines = text.split('\n');
-  const lines = text.replace(/<!--[\s\S]*?-->/g, (c) => c.replace(/[^\n]/g, ' ')).split('\n');
+  // Comments first (a commented-out `](` must not confuse the link parser), links second — both
+  // whole-text and line-preserving.
+  const lines = reduceLinks(
+    text.replace(/<!--[\s\S]*?-->/g, (c) => c.replace(/[^\n]/g, ' ')),
+  ).split('\n');
   const seen = new Set();
   const hits = [];
   const compiled = markers.map((m) => ({ ...m, re: toMatcher(m.pattern, m.caseSensitive, m.source) }));
@@ -479,6 +517,16 @@ function selfCheck() {
     ['Remove this before [v9.9.9](https://example.invalid "title (draft") ships', true],
     ["Remove this before [v9.9.9](https://example.invalid 'title (draft') ships", true],
     ['before [v9.9.9](https://example.invalid "title \\" draft") ships, re-derive it', true], // escaped quote in title
+    ['before [v9.9.9](https://example.invalid/a\\)draft) ships, re-derive it', true],         // escaped paren in destination
+    // -- a link may break across a SOFT line (title on the next line, prefix and all), but
+    //    never across a blank line: no link spans a paragraph --
+    [`re-derive before [v9.9.9](https://example.invalid
+ "title") ships`, true],
+    [`/// re-derive before [v9.9.9](https://example.invalid
+/// "title") ships`, true],
+    [`before [v9.9.9](https://example.invalid "ti
+
+tle") ships, re-derive it`, false],
     ['re-derive it before [v9.9.9][rel] ships', true],                         // reference link
     ['re-derive it before ![v9.9.9](img.png) ships', true],                    // image syntax
     ['re-derive it before [v9.9.9] ships', true],                              // bare brackets
