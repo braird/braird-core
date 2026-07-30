@@ -322,9 +322,7 @@ export function findMarkers(text, version) {
     run = [];
   };
   for (let j = 0; j < lines.length; j++) {
-    if (rawLines[j].trim() === '') {
-      flush();
-    } else if (segsAll[j] !== '') {
+    if (segsAll[j] !== '') {
       if (isHeading(rawLines[j])) {
         flush();
         runs.push([j]);
@@ -332,6 +330,13 @@ export function findMarkers(text, version) {
       }
       if (startsBlock(j)) flush();
       run.push(j);
+    } else if (stripLinePrefix(rawLines[j]).trim() === '') {
+      // A paragraph break, in either spelling: a blank line, or a PREFIX-ONLY line (`///`,
+      // `//!`, `>`) — the rustdoc/blockquote form whose raw text is non-blank but renders
+      // nothing. Both close the run. The one remaining way to reach seg === '' is a line
+      // swallowed by an HTML comment, whose raw text HAD content — that line is skipped with the
+      // run left open, so a long comment never splits the phrase around it.
+      flush();
     }
   }
   flush();
@@ -447,6 +452,9 @@ spanning lines --> ships`, true],                                               
     ['## Notes on before the release\nships an additive API', false],
     ['re-derive before the release\n> ships now', false],
     ['/// re-derive before the release\n/// - ships now', false],   // bullet inside a doc comment
+    // -- a PREFIX-ONLY line is the rustdoc / blockquote spelling of a paragraph break --
+    ['/// Complete setup before the release\n///\n/// Ships are signed', false],
+    ['> re-derive before the release\n>\n> ships now', false],
     // ...but a real paragraph break is the reader's separation and must keep separating —
     // including a SINGLE blank line, the ordinary Markdown paragraph form, whose halves would
     // otherwise join.
