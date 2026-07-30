@@ -153,12 +153,14 @@ function maskReleasedChangelogSections(text, version) {
   let fence = null; // the opening delimiter of the fence we are inside, if any
   return lines
     .map((line) => {
-      // A fence closes only on AT LEAST the opener's length in the same character — CommonMark's
-      // rule, and what lets a ```` block quote a ``` snippet without the state desyncing.
-      const f = /^\s*(`{3,}|~{3,})/.exec(line);
+      // A fence closes only on AT LEAST the opener's length in the same character, followed by
+      // nothing but whitespace — CommonMark's rules, and what lets a ```` block quote a ```
+      // snippet (or a visible ```rust line) without the state desyncing. An OPENER may carry an
+      // info string; a closer may not.
+      const f = /^\s*(`{3,}|~{3,})(.*)$/.exec(line);
       if (f) {
         if (!fence) fence = f[1];
-        else if (f[1][0] === fence[0] && f[1].length >= fence.length) fence = null;
+        else if (f[1][0] === fence[0] && f[1].length >= fence.length && f[2].trim() === '') fence = null;
       }
       const heading = !fence && /^##\s+\[([^\]]+)\]/.exec(line);
       if (heading) {
@@ -242,13 +244,26 @@ export function findMarkers(text, version) {
     for (const m of compiled) {
       for (let hit; (hit = m.re.exec(joined)); ) {
         let at = idx[0];
+        let end = idx[0];
+        const endIdx = hit.index + hit[0].length - 1;
         for (let k = starts.length - 1; k >= 0; k--) {
           if (hit.index >= starts[k]) {
             at = idx[k];
             break;
           }
         }
-        if (rawLines[at].includes(ALLOW_TOKEN) || (at > 0 && rawLines[at - 1].includes(ALLOW_TOKEN))) continue;
+        for (let k = starts.length - 1; k >= 0; k--) {
+          if (endIdx >= starts[k]) {
+            end = idx[k];
+            break;
+          }
+        }
+        // The exemption counts on ANY line the wrapped marker spans, or the line above its first:
+        // a token on the continuation line ("…release\nships <!-- stale-marker-allow -->") is the
+        // documented same-line form and must work. It still never reaches below the marker.
+        let exempt = at > 0 && rawLines[at - 1].includes(ALLOW_TOKEN);
+        for (let j2 = at; j2 <= end && !exempt; j2++) exempt = rawLines[j2].includes(ALLOW_TOKEN);
+        if (exempt) continue;
         const key = `${m.pattern}@${at}`;
         if (seen.has(key)) continue;
         seen.add(key);
@@ -326,6 +341,8 @@ function selfCheck() {
     ['re-derive this before v9.9.9 ships <!-- stale-marker-allow -->', false],
     ['<!-- stale-marker-allow -->\nre-derive this before v9.9.9 ships', false],
     ['<!-- stale-marker-allow -->\nfiller line\nre-derive this before v9.9.9 ships', true], // must not leak down
+    ['must re-derive before the release\nships now <!-- stale-marker-allow -->', false], // token on the continuation line
+    ['re-derive this before v9.9.9 ships\n<!-- stale-marker-allow -->', true], // ...but never from BELOW the marker
     // An earlier line containing an ordinary word from the marker ("before") must not steal the
     // attribution — the exemption belongs to the line the marker starts on.
     ['A sentence before anything.\n<!-- stale-marker-allow -->\nre-derive this before v9.9.9 ships', false],
@@ -385,7 +402,7 @@ function selfCheck() {
   // mask the rest of the section and fail open.
   const changelog = [
     '# Changelog', '', '## [Unreleased]', '',
-    '````', '```', '## [0.0.1] - a quoted example, not a section', '```', '````', '',
+    '````', '```', '## [0.0.1] - a quoted example, not a section', '```', '````rust', '````', '',
     'UNRELEASED', '',
     '## [9.9.9] - 2026-01-01', '', 'CUTTING', '',
     '## [9.9.8] - 2025-12-01', '', 'SHIPPED', '',
