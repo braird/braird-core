@@ -110,16 +110,45 @@ const stripLinePrefix = (line) => line.replace(/^\s*(\/\/\/|\/\/!|\/\/|\/\*+|\*+
  * unverified claim, which by this checker's own standard is worse than a documented gap. Unescaped
  * brackets, the form anyone actually writes, ARE handled.
  */
+/**
+ * Replace every inline link and image with its visible label, walking the destination with a real
+ * parenthesis counter. CommonMark allows a plain destination's parens to balance to ANY depth and
+ * an angle-bracketed destination (`(<https://a_(b>)`) to hold arbitrary text up to `>` — a
+ * fixed-depth regex is an evasion exactly one level deeper, the same lesson the fixed-size window
+ * taught. An unclosed construct is left untouched: the later bracket rules space it apart, which
+ * can only miss, never forge.
+ */
+const reduceLinks = (s) => {
+  const re = /!?\[([^\]]*)\]\(/g;
+  let out = '';
+  let last = 0;
+  let m;
+  while ((m = re.exec(s))) {
+    let i = re.lastIndex;
+    if (s[i] === '<') {
+      const gt = s.indexOf('>', i);
+      i = gt === -1 ? s.length : gt + 1;
+    }
+    let depth = 1;
+    while (i < s.length && depth > 0) {
+      if (s[i] === '(') depth++;
+      else if (s[i] === ')') depth--;
+      i++;
+    }
+    if (depth === 0) {
+      out += s.slice(last, m.index) + m[1];
+      last = i;
+      re.lastIndex = i;
+    }
+  }
+  return out + s.slice(last);
+};
+
 const normalizeInline = (s) =>
-  s
-    // No HTML-comment rule here: comments can span lines, so findMarkers blanks them on the whole
-    // text before any per-line work — a rule at this level was mutation-tested as redundant.
-    .replace(/\[\^[^\]]*\]/g, ' ') // footnote refs, before the link rules claim the brackets
-    // Images + inline links -> visible label. The destination may be angle-bracketed
-    // (`(<https://a_(b)>)`, CommonMark's escape for awkward URLs) or a plain URL with one level of
-    // balanced parens (`https://en.wikipedia.org/wiki/A_(b)`) — both are valid forms where a naive
-    // `[^)]*` stops at the destination's own `)` and leaves debris inside the phrase.
-    .replace(/!?\[([^\]]*)\]\((?:<[^>]*>)?(?:[^()]|\([^()]*\))*\)/g, '$1')
+  // No HTML-comment rule here: comments can span lines, so findMarkers blanks them on the whole
+  // text before any per-line work — a rule at this level was mutation-tested as redundant.
+  // Footnote refs go first, before the link rules claim the brackets.
+  reduceLinks(s.replace(/\[\^[^\]]*\]/g, ' '))
     .replace(/\[([^\]]*)\]\[[^\]]*\]/g, '$1') // reference links -> visible label
     // The split between the next two rules is what the RENDERED text demands. Inline FORMATTING
     // tags contribute no whitespace — `be<em>fore</em>` reads "before", so a space would split the
@@ -418,6 +447,9 @@ function selfCheck() {
     // Balanced parens in a plain destination (the Wikipedia-URL shape). Pinned via the prose marker:
     // the version marker's own `\)?` tolerance would absorb the debris and mask a regression.
     ['re-derive it before [the release](https://x.invalid/wiki/A_(b)) ships', true],
+    // CommonMark balances destination parens to ANY depth — two levels, so a single-level
+    // matcher (the previous implementation) pins as insufficient.
+    ['re-derive it before [the release](https://x.invalid/a_(b_(c))_d) ships', true],
     ['re-derive it before [v9.9.9][rel] ships', true],                         // reference link
     ['re-derive it before ![v9.9.9](img.png) ships', true],                    // image syntax
     ['re-derive it before [v9.9.9] ships', true],                              // bare brackets
