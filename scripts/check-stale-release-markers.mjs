@@ -298,17 +298,43 @@ export function findMarkers(text, version) {
   // prose, so "before the release" ending one paragraph never joins "ships …" opening the next),
   // while a line swallowed whole by a comment is skipped WITHOUT closing it (it renders nothing,
   // and a long comment must not split the phrase around it).
+  //
+  // Markdown also starts a new block WITHOUT a blank line: a heading, a list item, or the first
+  // line of a blockquote each render as their own block, and joining across that boundary would
+  // manufacture a phrase no reader sees ("- Complete setup before the release" + "- Ships are
+  // signed" must not become one sentence). So a heading is a run of exactly its own line; a
+  // bullet, ordered item, or quote-entry line closes the run before itself and opens a new one —
+  // which keeps lazy continuations (indented follow-on text) and consecutive `>` lines joined,
+  // both of which DO render as one paragraph. The comment prefix is stripped first so rustdoc
+  // Markdown gets the same block structure. `*` is deliberately NOT a bullet here: it is also the
+  // block-comment continuation prefix, where joining is required; the cost of that ambiguity is
+  // only a possible over-match on `*`-bullets (this repo's house style is `-`), never a miss.
+  const mdBody = (l) => l.replace(/^\s*(?:\/\/\/|\/\/!|\/\/)\s?/, '');
+  const isHeading = (l) => /^\s*#{1,6}\s/.test(mdBody(l));
+  const isQuote = (l) => /^\s*>/.test(mdBody(l));
+  const startsBlock = (j) =>
+    /^\s*(?:[-+]\s|\d+[.)]\s)/.test(mdBody(rawLines[j])) ||
+    (isQuote(rawLines[j]) && !(j > 0 && isQuote(rawLines[j - 1])));
   const runs = [];
   let run = [];
+  const flush = () => {
+    if (run.length) runs.push(run);
+    run = [];
+  };
   for (let j = 0; j < lines.length; j++) {
     if (rawLines[j].trim() === '') {
-      if (run.length) runs.push(run);
-      run = [];
+      flush();
     } else if (segsAll[j] !== '') {
+      if (isHeading(rawLines[j])) {
+        flush();
+        runs.push([j]);
+        continue;
+      }
+      if (startsBlock(j)) flush();
       run.push(j);
     }
   }
-  if (run.length) runs.push(run);
+  flush();
   for (const idx of runs) {
     const starts = [];
     let window = '';
@@ -414,6 +440,13 @@ spanning lines --> ships`, true],                                               
 /// detail line one
 /// detail line two
 /// --> ships and then stop`, true],
+    // -- adjacent Markdown BLOCKS are separate rendered text even without a blank line between:
+    //    list items, headings, and quote entries bound the join; lazy continuations and
+    //    consecutive quote lines (pinned as positives above) still join --
+    ['- Complete setup before the release\n- Ships are signed and uploaded.', false],
+    ['## Notes on before the release\nships an additive API', false],
+    ['re-derive before the release\n> ships now', false],
+    ['/// re-derive before the release\n/// - ships now', false],   // bullet inside a doc comment
     // ...but a real paragraph break is the reader's separation and must keep separating —
     // including a SINGLE blank line, the ordinary Markdown paragraph form, whose halves would
     // otherwise join.
@@ -434,7 +467,10 @@ ships in this channel are signed`, false],
     ['/* re-derive before the release\n * ships */', true],
     ['> re-derive before the release\n> ships now', true],
     ['- re-derive before the release\n  ships now', true],
-    ['# re-run it before the release\n# ships', true],
+    // Two consecutive HEADINGS are two rendered blocks — this row was a positive when `#` was
+    // treated as a mere wrapping prefix, and flipped when runs learned block structure: no reader
+    // sees these five words as one phrase.
+    ['# re-run it before the release\n# ships', false],
     // Every word on its own line: no fixed-size window contains this, only a paragraph scan does.
     [`/// re-derive before
 /// the
