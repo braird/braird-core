@@ -43,10 +43,11 @@ const STATIC_MARKERS = [
   {
     pattern: 'provisional pending',
     // A short bridge of punctuation/whitespace is the same deferral: "provisional, pending the
-    // device pass" and "provisional — pending" read identically to the bare pair. A sentence
-    // boundary does NOT bridge (`.` is absent from the class): "The API is provisional. Pending
-    // items…" is two unrelated statements and must not join.
-    source: 'provisional[\\s,;:\\u2013\\u2014-]{1,3}pending',
+    // device pass", "provisional — pending", and the parenthetical "provisional (pending …)"
+    // all read identically to the bare pair. A sentence boundary does NOT bridge (`.` is absent
+    // from the class): "The API is provisional. Pending items…" is two unrelated statements and
+    // must not join.
+    source: 'provisional[\\s,;:(\\u2013\\u2014-]{1,3}pending',
     why: 'a value still labelled provisional',
   },
   { pattern: 'before the release ships', why: 'work deferred to release time' },
@@ -126,18 +127,23 @@ const normalizeInline = (s) =>
     // elements, autolinks, unknown tags — becomes a space, because those DO render as separation
     // and deleting them would forge joined-up text out of adjacent table cells (`<td>TUNE</td>
     // <td>(x)</td>` must not become `TUNE(x)`). A `<br>` mid-phrase thus joins with a space, the
-    // same semantics the 3-line window gives a hard line wrap. No separate autolink rule:
+    // same semantics the paragraph join gives a hard line wrap. No separate autolink rule:
     // `<https://…>` is consumed by the generic rule, mutation-tested as redundant rather than assumed.
     .replace(/<\/?(?:em|strong|b|i|code|span|sub|sup|u|s|small|abbr|mark|kbd|a)(?:\s[^>]*)?\s*\/?>/gi, '')
     .replace(/<\/?[a-zA-Z][^>]*>/g, ' ')
     // Numeric character references DECODE to their character: `bef&#x6f;re` renders as "before",
     // so blanking to a space would split the word and hide the marker. Decimal and hex (either
-    // case marker) are both decoded; out-of-range codepoints blank rather than throw. NAMED
-    // references still blank to a space — HTML names none of the bare ASCII letters, so a named
-    // reference can separate words but never spell one (accepted residue: ligature oddities like
-    // `&fjlig;` render letter PAIRS, none of which occur inside any marker word).
+    // case marker) are both decoded; out-of-range codepoints blank rather than throw.
     .replace(/&#(\d+);/g, (_, d) => (+d <= 0x10ffff ? String.fromCodePoint(+d) : ' '))
     .replace(/&#[xX]([0-9a-fA-F]+);/g, (_, h) => (parseInt(h, 16) <= 0x10ffff ? String.fromCodePoint(parseInt(h, 16)) : ' '))
+    // NAMED references split by what they can spell. HTML names none of the bare ASCII letters,
+    // but it does name PUNCTUATION — `v9&period;9&period;9` renders "v9.9.9" — so every named
+    // reference for a character that can appear inside a marker (the version's dot, the
+    // annotation's parens, the provisional pair's bridge punctuation) decodes via this map. All
+    // other names blank to a space: they can separate words but never spell one (accepted
+    // residue: ligature oddities like `&fjlig;` render letter PAIRS, none inside a marker word).
+    .replace(/&(period|lpar|rpar|comma|colon|semi|ndash|mdash);/g,
+      (_, n) => ({ period: '.', lpar: '(', rpar: ')', comma: ',', colon: ':', semi: ';', ndash: '–', mdash: '—' }[n]))
     .replace(/&[a-zA-Z][a-zA-Z0-9]*;/g, ' ')
     .replace(/[|[\]]/g, ' ') // table pipes + any leftover brackets
     .replace(/[`*_~]/g, ''); // emphasis / code / strikethrough delimiters
@@ -161,7 +167,7 @@ const normalize = (lines) =>
  *   `fortune(` or `attune(`. Note this is necessary but NOT sufficient on its own — it does nothing
  *   about an exact `tune(`, which is why case sensitivity carries that weight.
  *
- * Always global: the scan must see EVERY occurrence in a window, not the first. The statefulness a
+ * Always global: the scan must see EVERY occurrence in a paragraph, not the first. The statefulness a
  * `g` regex carries is safe here because every exec loop runs to exhaustion, which resets it.
  */
 const toMatcher = (pattern, caseSensitive = false, source = null) =>
@@ -230,7 +236,7 @@ function sourceFiles(root) {
  * amended with supersede notes rather than frozen (ADR 0006 was amended, not left stale), and the
  * incident this gate exists for was partly IN an ADR — so they stay fully in scope.
  *
- * Lines are blanked rather than removed so reported line numbers stay true and a 3-line window can
+ * Lines are blanked rather than removed so reported line numbers stay true and a paragraph run can
  * never straddle a section boundary.
  */
 function maskReleasedChangelogSections(text, version) {
@@ -265,10 +271,9 @@ export function findMarkers(text, version) {
       why: `work deferred until v${version}, which is the release being cut`,
     });
   }
-  // Scan a 3-line sliding window with whitespace collapsed, not line by line. Prose here wraps at
-  // ~100 cols, so a marker routinely straddles a line break — the real ADR 0007 case was "before
-  // the release\n   ships", which every single-line check walks straight past. Hits are deduped by
-  // (line, pattern) so a marker sitting inside three overlapping windows is reported once.
+  // Scan paragraph by paragraph with whitespace collapsed, never line by line: a marker routinely
+  // straddles a line break — the real ADR 0007 case was "before the release\n   ships", which
+  // every single-line check walks straight past.
   //
   // HTML comments are blanked up front with newlines kept, so a comment can never shield part of a
   // phrase — including one spanning a line break, which the per-line normalization below cannot
@@ -286,38 +291,36 @@ export function findMarkers(text, version) {
   // "before", which both misreported the line and pointed the allow-token check above the wrong
   // one, turning an explicitly exempted marker into a release blocker.
   const segsAll = lines.map((l) => normalize([l]).trim());
-  // The window slides over CONTENT-BEARING lines, not physical ones. A line swallowed whole by a
-  // comment carries no rendered text, so it is dropped from the sequence — otherwise a comment
-  // spanning four physical lines pushes the phrase's two halves out of every 3-line window and the
-  // marker escapes. A line that is blank in the RAW text stays: a real paragraph break separates
-  // prose for the reader, and windows must keep respecting that.
-  const scannable = [];
+  // Markers are matched against whole rendered PARAGRAPHS, not a fixed-size window. Prose wraps
+  // at ~100 cols and a doc comment can legally put every word of a phrase on its own line, so any
+  // fixed line cap is an evasion exactly that many lines long. A paragraph run is a maximal
+  // stretch of content-bearing lines: a raw-blank line closes it (the reader sees separated
+  // prose, so "before the release" ending one paragraph never joins "ships …" opening the next),
+  // while a line swallowed whole by a comment is skipped WITHOUT closing it (it renders nothing,
+  // and a long comment must not split the phrase around it).
+  const runs = [];
+  let run = [];
   for (let j = 0; j < lines.length; j++) {
-    if (segsAll[j] === '' && rawLines[j].trim() !== '') continue;
-    scannable.push(j);
+    if (rawLines[j].trim() === '') {
+      if (run.length) runs.push(run);
+      run = [];
+    } else if (segsAll[j] !== '') {
+      run.push(j);
+    }
   }
-  for (let p = 0; p < scannable.length; p++) {
-    const idx = scannable.slice(p, p + 3);
+  if (run.length) runs.push(run);
+  for (const idx of runs) {
     const starts = [];
     let window = '';
     for (const j of idx) {
-      const seg = segsAll[j];
-      // A raw-blank line is a paragraph break: the reader sees separated prose, so the window
-      // carries a hard boundary no phrase can match across. Without it, "before the release" at
-      // the end of one paragraph and "ships …" opening the next would join into a marker.
-      if (seg === '' && rawLines[j].trim() === '') {
-        if (window) window += ' ¶';
-        starts.push(window.length);
-        continue;
-      }
-      if (seg && window) window += ' ';
+      if (window) window += ' ';
       starts.push(window.length);
-      window += seg;
+      window += segsAll[j];
     }
     for (const m of compiled) {
       // EVERY occurrence is examined. With the cue heuristic gone this is belt-and-braces (the
       // exemption and the dedupe are both line-scoped), but running the global regex to exhaustion
-      // is also what resets it between windows.
+      // is also what resets it between paragraphs.
       for (let hit; (hit = m.re.exec(window)); ) {
         // The line this occurrence STARTS on — the last recorded segment offset at or before it.
         let at = idx[0];
@@ -330,7 +333,7 @@ export function findMarkers(text, version) {
         // Explicit exemption on the hit's own line or the one above it (eslint-disable-next-line
         // semantics), so an author can keep descriptive prose the unconditional markers misjudge.
         if (rawLines[at].includes(ALLOW_TOKEN) || (at > 0 && rawLines[at - 1].includes(ALLOW_TOKEN))) continue;
-        // Dedupe on the resolved line, so overlapping windows report a marker exactly once.
+        // Dedupe on the resolved line, so a marker repeated on one line is reported once.
         const key = `${m.pattern}@${at}`;
         if (seen.has(key)) continue;
         seen.add(key);
@@ -370,6 +373,7 @@ function selfCheck() {
     // -- punctuation bridges the provisional pair; a sentence boundary must not --
     ['This threshold is provisional, pending the real-device pass.', true],
     ['the floor is provisional — pending the S25U pass', true],
+    ['This threshold is provisional (pending the device pass)', true],
     ['The API is provisional. Pending items are tracked in Linear.', false],
     ['deferred until before **the release** ships', true],               // emphasis INSIDE a phrase
     ['the value is _provisional pending_ the device pass', true],        // underscore also broke \b
@@ -398,11 +402,13 @@ function selfCheck() {
     ['re-derive it be<em>fore</em> v9.9.9 ships', true],                       // formatting tag mid-word
     ['re-derive it bef&#x6f;re v9.9.9 ships', true],                           // hex reference spells a letter
     ['re-derive it bef&#111;re v9.9.9 ships', true],                           // decimal reference spells a letter
+    ['re-derive it before v9&period;9&period;9 ships', true],                  // named reference spells the dot
+    ['/// TUNE&lpar;SUR-1019 step 8a&rpar; needs the device pass', true],      // ...and the annotation parens
     ['re-derive it before <https://x.invalid> v9.9.9 ships', true],            // autolink between words
     ['re-run it before the release <!-- editor note --> ships', true],          // HTML comment
     [`re-run it before the release <!-- a note
 spanning lines --> ships`, true],                                               // comment straddling a line break
-    // A comment swallowing WHOLE lines must not push the phrase's halves out of window range —
+    // A comment swallowing WHOLE lines must not push the phrase's halves out of matching range —
     // this is a rendered phrase split across five physical lines, prefixes and all.
     [`/// re-derive before the release <!-- editor
 /// detail line one
@@ -410,7 +416,7 @@ spanning lines --> ships`, true],                                               
 /// --> ships and then stop`, true],
     // ...but a real paragraph break is the reader's separation and must keep separating —
     // including a SINGLE blank line, the ordinary Markdown paragraph form, whose halves would
-    // otherwise share one window and join.
+    // otherwise join.
     [`must re-derive before the release
 
 
@@ -429,6 +435,11 @@ ships in this channel are signed`, false],
     ['> re-derive before the release\n> ships now', true],
     ['- re-derive before the release\n  ships now', true],
     ['# re-run it before the release\n# ships', true],
+    // Every word on its own line: no fixed-size window contains this, only a paragraph scan does.
+    [`/// re-derive before
+/// the
+/// release
+/// ships now`, true],
     // -- the markers fail CLOSED: descriptive prose fires too, and keeps a stale-marker-allow if
     //    it is legitimate. The cue heuristic that tried to pass these automatically failed OPEN on
     //    any imperative verb outside its list — an open class no allowlist closes --
