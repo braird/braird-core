@@ -80,7 +80,8 @@ const stripLinePrefix = (line) => line.replace(/^\s*(\/\/\/|\/\/!|\/\/|\/\*+|\*+
  */
 const normalizeInline = (s) =>
   s
-    .replace(/<!--[\s\S]*?-->/g, ' ') // HTML comments (including multiline) -> separation
+    // No HTML-comment rule here: a comment legally spans lines, so findMarkers blanks comments on
+    // the WHOLE text before any per-line work — a rule at this level can never see one.
     .replace(/\[\^[^\]]*\]/g, ' ') // footnote refs, before the link rules claim the brackets
     .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1') // images + inline links -> visible label
     .replace(/\[([^\]]*)\]\[[^\]]*\]/g, '$1') // reference links -> visible label
@@ -182,7 +183,12 @@ export function findMarkers(text, version) {
     });
   }
   const rawLines = text.split('\n');
-  const segs = rawLines.map(normalizeLine);
+  // HTML comments are blanked whole-text with newlines kept: an editor note legally spans lines,
+  // even mid-phrase ("before the release <!-- note\n--> ships" renders the marker). Raw lines
+  // keep serving the allow-token check — the token's own carrier is a comment — and identical
+  // line counts keep the two aligned.
+  const blanked = text.replace(/<!--[\s\S]*?-->/g, (c) => c.replace(/[^\n]/g, ' ')).split('\n');
+  const segs = blanked.map(normalizeLine);
   const mdBody = (l) => l.replace(/^\s*(?:\/\/\/|\/\/!|\/\/)\s?/, '');
 
   // Markers are matched against PARAGRAPH RUNS, not single lines: prose wraps at ~100 cols, so a
@@ -205,7 +211,10 @@ export function findMarkers(text, version) {
   };
   for (let j = 0; j < rawLines.length; j++) {
     if (segs[j] === '') {
-      flush();
+      // A content-empty line closes the run — EXCEPT one swallowed whole by a multiline comment
+      // (raw text had content, blanked line is empty): the comment renders as nothing, so the
+      // phrase around it must stay joined.
+      if (blanked[j].trim() !== '' || rawLines[j].trim() === '') flush();
     } else if (isHeading(rawLines[j])) {
       flush();
       runs.push([j]);
@@ -284,6 +293,9 @@ function selfCheck() {
     ['> re-derive before the release\n> ships now', true],
     ['- re-derive before the release\n  ships now', true], // lazy continuation joins
     ['/// re-derive before\n/// the\n/// release\n/// ships now', true], // a run has no line cap
+    // -- an editor note renders as nothing, wherever its lines fall --
+    ['re-run it before the release <!-- editor note --> ships', true],
+    ['Remove this before the release <!-- editor note\nkeep until migration lands\n--> ships', true],
     // -- the reader's separations must keep separating: no phrase forged across them --
     ['must re-derive before the release\n\nships now', false], // paragraph break
     ['/// Complete setup before the release\n///\n/// Ships are signed', false], // prefix-only break
@@ -317,6 +329,9 @@ function selfCheck() {
     // An earlier line containing an ordinary word from the marker ("before") must not steal the
     // attribution — the exemption belongs to the line the marker starts on.
     ['A sentence before anything.\n<!-- stale-marker-allow -->\nre-derive this before v9.9.9 ships', false],
+    // Comment blanking must preserve LINE COUNT, or every raw-line lookup below a multiline
+    // comment (allow token, excerpt) shifts onto the wrong line.
+    ['<!-- an\neditor\nnote -->\n<!-- stale-marker-allow -->\nre-derive this before v9.9.9 ships', false],
     // -- ACCEPTED MISSES: adversarial concealment is out of threat model (see header). These rows
     //    pin the boundary; flipping one to true is a deliberate scope change, not a bug fix. --
     ['re-derive it bef&#x6f;re v9.9.9 ships', false], // character reference spelling a letter
