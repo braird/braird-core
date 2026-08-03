@@ -476,8 +476,12 @@ impl PostgrestSink for PostgrestClient {
             // parse — re-fetching could hand the import preflight a clean second page its
             // fail-closed contract forbids (Codex review), so it stays unclassified like every
             // other unknown error: carried, never retried.
-            if e.is::<PostgrestError>() {
-                e.to_string()
+            if let Some(pg) = e.downcast_ref::<PostgrestError>() {
+                // Status only, body REDACTED (Codex review): a Postgres error body can quote
+                // record-specific detail, and SyncError's contract is that per-record server detail
+                // never crosses the FFI. The status was the whole SUR-1031 diagnosis anyway
+                // (429 vs 401 vs 5xx). Clipping bounds; this redacts.
+                format!("PostgREST {}", pg.status)
             } else if e
                 .downcast_ref::<reqwest::Error>()
                 .is_some_and(|re| !re.is_decode())

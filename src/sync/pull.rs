@@ -389,7 +389,7 @@ mod tests {
                     self.fail_remaining.set(self.fail_remaining.get() - 1);
                 }
                 if self.fail_postgrest {
-                    return Err("PostgREST 429 — rate limited".to_string());
+                    return Err("PostgREST 429".to_string()); // the real sink is status-only (redacted)
                 }
                 return Err(format!("transport: {table} fetch failed"));
             }
@@ -617,6 +617,12 @@ mod tests {
                 "transport: notes fetch failed (persisted after retry; first attempt: transport: notes fetch failed)"
             )],
         );
+        assert_eq!(store.get_seq_cursor("books").unwrap(), Some(1));
+        assert_eq!(
+            store.get_seq_cursor("notes").unwrap(),
+            None,
+            "failed table's cursor stays put so its window re-pulls"
+        );
     }
 
     #[test]
@@ -633,7 +639,7 @@ mod tests {
             .iter()
             .map(|f| (f.table.as_str(), f.error.as_str()))
             .collect();
-        assert_eq!(failures, vec![("books", "PostgREST 429 — rate limited")]);
+        assert_eq!(failures, vec![("books", "PostgREST 429")]);
     }
 
     #[test]
@@ -656,12 +662,6 @@ mod tests {
         );
         assert_eq!(res.merged, 1);
         assert_eq!(store.get_seq_cursor("books").unwrap(), Some(1));
-        assert_eq!(store.get_seq_cursor("books").unwrap(), Some(1));
-        assert_eq!(
-            store.get_seq_cursor("notes").unwrap(),
-            None,
-            "failed table's cursor stays put so its window re-pulls"
-        );
     }
 
     #[test]
