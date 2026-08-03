@@ -470,13 +470,21 @@ impl PostgrestSink for PostgrestClient {
     ) -> Result<Vec<Value>, String> {
         self.get_page(table, after_seq, limit).await.map_err(|e| {
             // SUR-1031: classify at the one boundary that still holds the TYPE. An application-level
-            // PostgREST response keeps its own Display; everything else (reqwest connect/read
-            // failures — the dead-reused-connection class) gets the `transport: ` prefix that
-            // `pull_table`'s retry WHITELISTS on. Unknown errors are deliberately not retried.
+            // PostgREST response keeps its own Display. ONLY reqwest non-decode failures (connect /
+            // timeout / body-read — the dead-reused-connection class) earn the `transport: ` prefix
+            // that `pull_table`'s retry WHITELISTS on. A decode failure is a 200 whose body didn't
+            // parse — re-fetching could hand the import preflight a clean second page its
+            // fail-closed contract forbids (Codex review), so it stays unclassified like every
+            // other unknown error: carried, never retried.
             if e.is::<PostgrestError>() {
                 e.to_string()
-            } else {
+            } else if e
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(|re| !re.is_decode())
+            {
                 format!("transport: {e}")
+            } else {
+                e.to_string()
             }
         })
     }
