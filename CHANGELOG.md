@@ -6,6 +6,23 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Fixed
+- **A per-table pull failure now carries its underlying error instead of a bare table name
+  (SUR-1031).** `pull::pull`'s isolation arm discarded the error it isolated (`Err(_)`) and its
+  `eprintln!` named only the table — which on Android reaches nothing anyway (stderr never hits
+  logcat). Every host-facing aggregation ("pull failed for books — aborting flush …",
+  "pull failed for all tables: …", the skipped-reconciliation log) therefore reported *that*
+  a table failed but never *why*, making an HTTP 429, a 401, and a merge failure
+  indistinguishable — the 2026-08-03 S25U incident (11 consecutive `pull failed for books`
+  syncs, cause still unknown) took `run-as` DB forensics for the third time on this bug family.
+  `PullResult.failed_tables` is now `Vec<TableFailure>` (table + error, `Display` as
+  `books (PostgREST 429 — …)`); errors are clipped to 200 chars before aggregation (a proxy
+  failure page can be a whole HTML document) and merge errors never quote row content (serde
+  errors are positional). Observability only: per-table isolation, cursor semantics, and the
+  SUR-736 flush abort are unchanged, and no `#[uniffi::export]` signature moves — the detail
+  rides the existing error strings, which Android's SUR-1025 diagnostics (#101) already log
+  (debug builds carry the message; release logs class names only).
+
 ### Added
 - **The release now fails on documentation that contradicts it (`scripts/check-stale-release-markers.mjs`).**
   Cutting v0.14.0 exposed a gap with no owner: `release.yml` verifies the tag, the crate version and

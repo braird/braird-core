@@ -50,6 +50,41 @@ use crate::store::{table_schema, Store};
 /// (`surfc/src/supabase.js`). `pull_table` loops `fetch_page` until a page shorter than this.
 const PULL_PAGE_LIMIT: i64 = 1000;
 
+/// One failed table with its (clipped) underlying error. SUR-1031: this used to be a bare table
+/// name — the `Err(_)` below cost three field-debugging sessions on one bug family, because an
+/// HTTP 429, a 401, and a merge failure were indistinguishable in what the host saw. The error text
+/// is host-visible (Android logs it in debug builds only, per its SUR-764 posture); [`clip_error`]
+/// bounds it, and merge errors never quote row content (serde errors are positional).
+#[derive(Debug)]
+pub struct TableFailure {
+    pub table: String,
+    pub error: String,
+}
+
+impl std::fmt::Display for TableFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.table, self.error)
+    }
+}
+
+/// Render failures for an aggregated error/log line: `books (PostgREST 429 — …), notes (…)`.
+pub fn describe_failures(failures: &[TableFailure]) -> String {
+    failures.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+}
+
+/// Bound a failure string before it rides an aggregated host-facing error — a proxy error page can
+/// be a whole HTML document. Char-based, so it can't split a UTF-8 sequence.
+fn clip_error(e: String) -> String {
+    const MAX_CHARS: usize = 200;
+    if e.chars().count() <= MAX_CHARS {
+        e
+    } else {
+        let mut clipped: String = e.chars().take(MAX_CHARS).collect();
+        clipped.push('…');
+        clipped
+    }
+}
+
 /// Counts across a whole pull (one or more tables). `failed_tables` are the tables whose fetch or
 /// merge errored — their cursor is left at the last merged page so the window re-pulls next time
 /// (per-table failure isolation, the SUR-659 per-table-cursor rationale).
@@ -60,7 +95,7 @@ pub struct PullResult {
     pub skipped_tombstones: usize,
     /// Local edits dropped because a strictly-newer remote row won LWW (SUR-736/738).
     pub superseded: Vec<SupersededEdit>,
-    pub failed_tables: Vec<String>,
+    pub failed_tables: Vec<TableFailure>,
 }
 
 #[derive(Debug, Default)]
@@ -87,12 +122,14 @@ pub async fn pull<S: PostgrestSink>(
                 result.skipped_tombstones += stats.skipped_tombstones;
                 result.superseded.extend(stats.superseded);
             }
-            Err(_) => {
-                // ponytail: log the dropped table — a silent failure would read as "nothing to
-                // pull". The cursor stays at the last merged page (retry next pull); the caller
-                // decides if all-tables-failed is a hard error (see the FFI `pull`).
-                eprintln!("pull: table {table} failed (cursor at last merged page)");
-                result.failed_tables.push(table.to_string());
+            Err(e) => {
+                // SUR-1031: carry the error, don't just name the table — a silent failure would
+                // read as "nothing to pull", and a nameless one is undiagnosable from the host
+                // (the 2026-08-03 books incident). The cursor stays at the last merged page
+                // (retry next pull); the caller decides if all-tables-failed is a hard error.
+                let failure = TableFailure { table: table.to_string(), error: clip_error(e) };
+                eprintln!("pull: table {failure} failed (cursor at last merged page)");
+                result.failed_tables.push(failure);
             }
         }
     }
@@ -496,13 +533,28 @@ mod tests {
         let res = block(pull(&store, &sink, &["books", "notes"])).unwrap();
 
         assert_eq!(res.merged, 1, "books still merged");
-        assert_eq!(res.failed_tables, vec!["notes".to_string()]);
+        // SUR-1031: the failure carries its underlying error, not just the table name — an Err(_)
+        // here once made an HTTP 429 and a decode failure indistinguishable from the host.
+        let failures: Vec<(&str, &str)> =
+            res.failed_tables.iter().map(|f| (f.table.as_str(), f.error.as_str())).collect();
+        assert_eq!(failures, vec![("notes", "notes fetch failed")]);
         assert_eq!(store.get_seq_cursor("books").unwrap(), Some(1));
         assert_eq!(
             store.get_seq_cursor("notes").unwrap(),
             None,
             "failed table's cursor stays put so its window re-pulls"
         );
+    }
+
+    #[test]
+    fn clip_error_bounds_a_proxy_page_but_keeps_short_errors_whole() {
+        // SUR-1031: a Cloudflare/proxy failure body can be a whole HTML document — the clip keeps
+        // the aggregated host-facing error bounded without touching ordinary errors.
+        assert_eq!(clip_error("PostgREST 429 — rate limited".into()), "PostgREST 429 — rate limited");
+        let long = "x".repeat(500);
+        let clipped = clip_error(long);
+        assert_eq!(clipped.chars().count(), 201, "200 chars + ellipsis");
+        assert!(clipped.ends_with('…'));
     }
 
     #[test]

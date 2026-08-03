@@ -1422,7 +1422,7 @@ impl SyncEngine {
         if result.failed_tables.len() == tables.len() {
             return Err(SyncError::Flush(format!(
                 "pull failed for all tables: {}",
-                result.failed_tables.join(", ")
+                pull::describe_failures(&result.failed_tables)
             )));
         }
         Ok(PullSummary {
@@ -2196,7 +2196,7 @@ pub async fn pull_then_flush<S: http::PostgrestSink + http::CoverEgress>(
         return Err(format!(
             "pull failed for {} — aborting flush so a stale edit can't re-push over a newer server \
              row (SUR-736); retry sync",
-            pulled.failed_tables.join(", ")
+            pull::describe_failures(&pulled.failed_tables)
         ));
     }
     // Best-effort (SUR-820): a reconciliation hiccup must never abort an otherwise-clean
@@ -2247,7 +2247,7 @@ pub async fn pull_and_reconcile<S: http::PostgrestSink + http::CoverEgress>(
         eprintln!(
             "pull: skipping reconciliation — {} failed to pull this round (stale-data risk); \
              retries next pull",
-            pulled.failed_tables.join(", ")
+            pull::describe_failures(&pulled.failed_tables)
         );
         return Ok((pulled, reconcile::ReconcileResult::default()));
     }

@@ -372,8 +372,8 @@ fn pull_and_reconcile_skips_reconciliation_on_a_partial_pull_failure() {
     .expect("a partial failure must not error the whole call");
 
     assert!(
-        pulled.failed_tables.contains(&"custom_ideas".to_string()),
-        "the partial pull failure is still reported"
+        pulled.failed_tables.iter().any(|f| f.table == "custom_ideas" && !f.error.is_empty()),
+        "the partial pull failure is still reported, with its error carried (SUR-1031)"
     );
     assert_eq!(
         (
