@@ -171,13 +171,15 @@ async fn pull_table<S: PostgrestSink>(
         // fails (with both attempts' errors carried), keeping the per-table isolation semantics.
         let rows = match sink.fetch_page(table, cursor, page_size).await {
             Ok(rows) => rows,
-            // An application-level response (the sink's `PostgrestError` Display) is NOT retried
-            // (Codex review): the server answered, and an identical immediate GET can only add load
-            // — a 429 especially must not be answered with a duplicate request. The re-attempt is
-            // for transport-level deaths only, the dead-reused-connection class the gateway logs
-            // proved. String-prefix classification because the sink trait is String-typed end to
-            // end; promoting it to a typed error enum sweeps every sink impl — founder's call.
-            Err(first) if first.starts_with("PostgREST ") => return Err(first),
+            // Retry is a WHITELIST (Codex review): only errors the production sink explicitly
+            // classified as transport-level (`transport: ` — the dead-reused-connection class the
+            // gateway logs proved) get the one immediate re-attempt. Everything else fails without
+            // a second request: an application-level PostgREST response was already answered (a 429
+            // re-GET worsens the throttling it reports), and the import sanitizer's validation
+            // failures must fail CLOSED — a malformed preflight page never deserves a second chance
+            // its contract forbids. String-prefix classification because the sink trait is
+            // String-typed end to end; a typed error enum sweeps every sink impl — founder's call.
+            Err(first) if !first.starts_with("transport: ") => return Err(first),
             Err(first) => {
                 let first = clip_error(first);
                 eprintln!("pull: {table} page fetch failed ({first}); retrying once on a fresh connection");
@@ -389,7 +391,7 @@ mod tests {
                 if self.fail_postgrest {
                     return Err("PostgREST 429 — rate limited".to_string());
                 }
-                return Err(format!("{table} fetch failed"));
+                return Err(format!("transport: {table} fetch failed"));
             }
             let mut rows = self.rows.get(table).cloned().unwrap_or_default();
             rows.truncate(limit as usize);
@@ -432,9 +434,9 @@ mod tests {
         ) -> Result<Vec<Value>, String> {
             let n = self.calls.get();
             self.calls.set(n + 1);
-            if self.fail_after.is_some_and(|f| n >= f) {
-                // Persistent from the n-th call on — the SUR-1031 single retry must NOT absorb a
-                // mid-pagination failure for these tests to keep pinning cursor isolation.
+            if self.fail_after == Some(n) {
+                // Unclassified (no `transport: ` prefix), so the SUR-1031 retry whitelist never
+                // absorbs it — the mid-pagination cursor-isolation pin stays intact.
                 return Err("simulated mid-pagination fetch failure".into());
             }
             let mut page: Vec<Value> = self
@@ -612,7 +614,7 @@ mod tests {
             failures,
             vec![(
                 "notes",
-                "notes fetch failed (persisted after retry; first attempt: notes fetch failed)"
+                "transport: notes fetch failed (persisted after retry; first attempt: transport: notes fetch failed)"
             )],
         );
     }

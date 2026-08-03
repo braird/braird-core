@@ -31,9 +31,13 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   other seven tables ride the fresh connection to their 200s). A page fetch is an idempotent GET,
   so `pull_table` now re-attempts a failed fetch once — riding the connection the failure forced
   open — and only a failure that persists across both attempts fails the table (both errors
-  carried, per the entry above). Mid-pagination isolation semantics are pinned unchanged by the
-  updated tests; the import preflight's fail-closed contract likewise (its fakes now fail both
-  attempts, as a persistently-failing server would).
+  carried, per the entry above). The retry is a **whitelist** (Codex review): the production sink
+  stamps transport-level failures with a `transport: ` prefix at the one boundary that still holds
+  the error type, and only those are re-attempted — an application-level PostgREST response was
+  already answered (re-GETting a 429 worsens the throttling it reports), and the import
+  preflight's validation failures fail CLOSED, never re-fetched (a malformed page gets no second
+  chance; the sanitizer preserves the transport/application classification while still dropping
+  every server body). Mid-pagination isolation semantics are pinned unchanged by the tests.
 
 ### Added
 - **The release now fails on documentation that contradicts it (`scripts/check-stale-release-markers.mjs`).**

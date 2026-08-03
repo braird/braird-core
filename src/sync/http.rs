@@ -468,9 +468,17 @@ impl PostgrestSink for PostgrestClient {
         after_seq: i64,
         limit: i64,
     ) -> Result<Vec<Value>, String> {
-        self.get_page(table, after_seq, limit)
-            .await
-            .map_err(|e| e.to_string())
+        self.get_page(table, after_seq, limit).await.map_err(|e| {
+            // SUR-1031: classify at the one boundary that still holds the TYPE. An application-level
+            // PostgREST response keeps its own Display; everything else (reqwest connect/read
+            // failures — the dead-reused-connection class) gets the `transport: ` prefix that
+            // `pull_table`'s retry WHITELISTS on. Unknown errors are deliberately not retried.
+            if e.is::<PostgrestError>() {
+                e.to_string()
+            } else {
+                format!("transport: {e}")
+            }
+        })
     }
 
     async fn patch(
