@@ -22,6 +22,18 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   SUR-736 flush abort are unchanged, and no `#[uniffi::export]` signature moves — the detail
   rides the existing error strings, which Android's SUR-1025 diagnostics (#101) already log
   (debug builds carry the message; release logs class names only).
+- **A transient page-fetch failure no longer fails the table: one immediate idempotent re-attempt
+  (SUR-1031 root cause).** The Supabase gateway logs closed the field question: during the failing
+  windows the books requests either never reached the edge at all, or (13:24:58, 13:43:27) returned
+  200 at the gateway while core still reported the table failed ~16 s later — a client-side
+  connection failure on a reused/stale connection, always eaten by the volley's FIRST request
+  (`books` is first in `synced_schema()`, which is why "always books" was never about books; the
+  other seven tables ride the fresh connection to their 200s). A page fetch is an idempotent GET,
+  so `pull_table` now re-attempts a failed fetch once — riding the connection the failure forced
+  open — and only a failure that persists across both attempts fails the table (both errors
+  carried, per the entry above). Mid-pagination isolation semantics are pinned unchanged by the
+  updated tests; the import preflight's fail-closed contract likewise (its fakes now fail both
+  attempts, as a persistently-failing server would).
 
 ### Added
 - **The release now fails on documentation that contradicts it (`scripts/check-stale-release-markers.mjs`).**

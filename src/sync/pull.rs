@@ -155,7 +155,22 @@ async fn pull_table<S: PostgrestSink>(
 
     let mut stats = TableStats::default();
     loop {
-        let rows = sink.fetch_page(table, cursor, page_size).await?;
+        // SUR-1031 root-cause arm: the FIRST request of a pull volley can eat a connection that died
+        // idle — in the 2026-08-03 field incident, `books` (first in `synced_schema()`) failed 12/12
+        // while the other seven tables' requests all 200'd, and the gateway logs showed the failing
+        // requests never arrived at Supabase at all (client-side, a pooled/h2 connection-reuse race).
+        // A page fetch is an idempotent GET, so ONE immediate re-attempt — riding the fresh connection
+        // the failure just forced open — is safe and collapses the class. A persistent failure still
+        // fails (with both attempts' errors carried), keeping the per-table isolation semantics.
+        let rows = match sink.fetch_page(table, cursor, page_size).await {
+            Ok(rows) => rows,
+            Err(first) => {
+                eprintln!("pull: {table} page fetch failed ({first}); retrying once on a fresh connection");
+                sink.fetch_page(table, cursor, page_size)
+                    .await
+                    .map_err(|second| format!("{second} (persisted after retry; first attempt: {first})"))?
+            }
+        };
         let page_len = rows.len();
         let mut page_max = cursor;
 
@@ -283,12 +298,16 @@ mod tests {
     struct MapSink {
         rows: HashMap<String, Vec<Value>>,
         fail: Option<String>,
+        /// How many more fetches of [`fail`]'s table error: `u32::MAX` = persistent ([`failing`]),
+        /// `1` = the SUR-1031 transient dead-connection shape ([`failing_once`]).
+        fail_remaining: std::cell::Cell<u32>,
     }
     impl MapSink {
         fn new() -> Self {
             Self {
                 rows: HashMap::new(),
                 fail: None,
+                fail_remaining: std::cell::Cell::new(0),
             }
         }
         fn with(mut self, table: &str, rows: Vec<Value>) -> Self {
@@ -310,6 +329,14 @@ mod tests {
         }
         fn failing(mut self, table: &str) -> Self {
             self.fail = Some(table.to_string());
+            self.fail_remaining.set(u32::MAX);
+            self
+        }
+        /// The SUR-1031 transient shape: the named table's FIRST fetch errors (a dead pooled
+        /// connection), every later one succeeds — the retry must absorb it.
+        fn failing_once(mut self, table: &str) -> Self {
+            self.fail = Some(table.to_string());
+            self.fail_remaining.set(1);
             self
         }
     }
@@ -323,7 +350,12 @@ mod tests {
             _after_seq: i64,
             limit: i64,
         ) -> Result<Vec<Value>, String> {
-            if self.fail.as_deref() == Some(table) {
+            if self.fail.as_deref() == Some(table) && self.fail_remaining.get() > 0 {
+                // Persistent (u32::MAX) keeps failing; the transient shape (1) is consumed here, so
+                // the SUR-1031 retry's second attempt gets a live connection.
+                if self.fail_remaining.get() != u32::MAX {
+                    self.fail_remaining.set(self.fail_remaining.get() - 1);
+                }
                 return Err(format!("{table} fetch failed"));
             }
             let mut rows = self.rows.get(table).cloned().unwrap_or_default();
@@ -334,8 +366,9 @@ mod tests {
 
     /// A keyset-faithful stub: holds one table's rows (each with an explicit `change_seq`) and serves
     /// real `change_seq > after_seq` pages ordered asc, capped at `limit` — so the pagination LOOP in
-    /// `pull_table` is exercised. `failing_after(n)` makes the (0-based) n-th fetch error, to prove a
-    /// mid-pagination failure leaves the cursor at the last fully-merged page.
+    /// `pull_table` is exercised. `failing_after(n)` makes every fetch from the (0-based) n-th on
+    /// error — persistent, so the SUR-1031 single retry can't absorb it — to prove a mid-pagination
+    /// failure leaves the cursor at the last fully-merged page.
     struct PagingSink {
         rows: Vec<Value>,
         calls: std::cell::Cell<u32>,
@@ -366,7 +399,9 @@ mod tests {
         ) -> Result<Vec<Value>, String> {
             let n = self.calls.get();
             self.calls.set(n + 1);
-            if self.fail_after == Some(n) {
+            if self.fail_after.is_some_and(|f| n >= f) {
+                // Persistent from the n-th call on — the SUR-1031 single retry must NOT absorb a
+                // mid-pagination failure for these tests to keep pinning cursor isolation.
                 return Err("simulated mid-pagination fetch failure".into());
             }
             let mut page: Vec<Value> = self
@@ -537,7 +572,29 @@ mod tests {
         // here once made an HTTP 429 and a decode failure indistinguishable from the host.
         let failures: Vec<(&str, &str)> =
             res.failed_tables.iter().map(|f| (f.table.as_str(), f.error.as_str())).collect();
-        assert_eq!(failures, vec![("notes", "notes fetch failed")]);
+        assert_eq!(
+            failures,
+            vec![("notes", "notes fetch failed (persisted after retry; first attempt: notes fetch failed)")],
+        );
+    }
+
+    #[test]
+    fn transient_first_fetch_failure_is_absorbed_by_the_retry() {
+        // SUR-1031 root-cause arm: the volley's first request eating a dead pooled connection must
+        // not fail the table — the immediate re-attempt rides the fresh connection the failure
+        // forced open, and the pull completes as if nothing happened.
+        let store = Store::open_in_memory().unwrap();
+        let sink = MapSink::new()
+            .with(
+                "books",
+                vec![json!({ "id": "b1", "title": "T", "updated_at": 1000, "deleted": false })],
+            )
+            .failing_once("books");
+        let res = block(pull(&store, &sink, &["books"])).unwrap();
+
+        assert!(res.failed_tables.is_empty(), "the retry absorbed the dead connection");
+        assert_eq!(res.merged, 1);
+        assert_eq!(store.get_seq_cursor("books").unwrap(), Some(1));
         assert_eq!(store.get_seq_cursor("books").unwrap(), Some(1));
         assert_eq!(
             store.get_seq_cursor("notes").unwrap(),

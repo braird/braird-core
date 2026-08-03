@@ -516,6 +516,9 @@ mod tests {
                 "deleted":false,"change_seq":1
             })]),
         );
+        // Twice: the SUR-1031 transport retry re-fetches a failed page once, and a server
+        // persistently failing must fail both attempts for the preflight to reject.
+        sink.pull_result("notes", Err("SERVER_BODY_SECRET"));
         sink.pull_result("notes", Err("SERVER_BODY_SECRET"));
 
         let error = run(merge_parsed_with_sink(
@@ -544,6 +547,8 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let sink = RecordingSink::default();
         for table in synced_table_names() {
+            // Twice per table — see above: the transport retry consumes the duplicate.
+            sink.pull_result(table, Err("TOTAL_FAILURE_BODY"));
             sink.pull_result(table, Err("TOTAL_FAILURE_BODY"));
         }
         let error = run(merge_parsed_with_sink(
@@ -613,6 +618,9 @@ mod tests {
             );
             let store = Store::open_in_memory().unwrap();
             let sink = RecordingSink::default();
+            // Twice: the SUR-1031 transport retry re-fetches a rejected page once, and a server
+            // persistently serving the malformed row must fail both attempts.
+            sink.pull_result("books", Ok(vec![malformed.clone()]));
             sink.pull_result("books", Ok(vec![malformed]));
 
             let outcome = run(merge_parsed_with_sink(
@@ -694,6 +702,8 @@ mod tests {
             let store = Store::open_in_memory().unwrap();
             store.set_seq_cursor("books", cursor).unwrap();
             let sink = RecordingSink::default();
+            // Twice — the SUR-1031 transport retry re-fetches a rejected page once (see above).
+            sink.pull_result("books", Ok(page.clone()));
             sink.pull_result("books", Ok(page));
 
             let outcome = run(merge_parsed_with_sink(
