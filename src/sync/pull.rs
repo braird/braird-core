@@ -50,6 +50,45 @@ use crate::store::{table_schema, Store};
 /// (`surfc/src/supabase.js`). `pull_table` loops `fetch_page` until a page shorter than this.
 const PULL_PAGE_LIMIT: i64 = 1000;
 
+/// One failed table with its (clipped) underlying error. SUR-1031: this used to be a bare table
+/// name — the `Err(_)` below cost three field-debugging sessions on one bug family, because an
+/// HTTP 429, a 401, and a merge failure were indistinguishable in what the host saw. The error text
+/// is host-visible (Android logs it in debug builds only, per its SUR-764 posture); [`clip_error`]
+/// bounds it, and merge errors never quote row content (serde errors are positional).
+#[derive(Debug)]
+pub struct TableFailure {
+    pub table: String,
+    pub error: String,
+}
+
+impl std::fmt::Display for TableFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.table, self.error)
+    }
+}
+
+/// Render failures for an aggregated error/log line: `books (PostgREST 429 — …), notes (…)`.
+pub fn describe_failures(failures: &[TableFailure]) -> String {
+    failures
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Bound a failure string before it rides an aggregated host-facing error — a proxy error page can
+/// be a whole HTML document. Char-based, so it can't split a UTF-8 sequence.
+fn clip_error(e: String) -> String {
+    const MAX_CHARS: usize = 200;
+    if e.chars().count() <= MAX_CHARS {
+        e
+    } else {
+        let mut clipped: String = e.chars().take(MAX_CHARS).collect();
+        clipped.push('…');
+        clipped
+    }
+}
+
 /// Counts across a whole pull (one or more tables). `failed_tables` are the tables whose fetch or
 /// merge errored — their cursor is left at the last merged page so the window re-pulls next time
 /// (per-table failure isolation, the SUR-659 per-table-cursor rationale).
@@ -60,7 +99,7 @@ pub struct PullResult {
     pub skipped_tombstones: usize,
     /// Local edits dropped because a strictly-newer remote row won LWW (SUR-736/738).
     pub superseded: Vec<SupersededEdit>,
-    pub failed_tables: Vec<String>,
+    pub failed_tables: Vec<TableFailure>,
 }
 
 #[derive(Debug, Default)]
@@ -87,12 +126,17 @@ pub async fn pull<S: PostgrestSink>(
                 result.skipped_tombstones += stats.skipped_tombstones;
                 result.superseded.extend(stats.superseded);
             }
-            Err(_) => {
-                // ponytail: log the dropped table — a silent failure would read as "nothing to
-                // pull". The cursor stays at the last merged page (retry next pull); the caller
-                // decides if all-tables-failed is a hard error (see the FFI `pull`).
-                eprintln!("pull: table {table} failed (cursor at last merged page)");
-                result.failed_tables.push(table.to_string());
+            Err(e) => {
+                // SUR-1031: carry the error, don't just name the table — a silent failure would
+                // read as "nothing to pull", and a nameless one is undiagnosable from the host
+                // (the 2026-08-03 books incident). The cursor stays at the last merged page
+                // (retry next pull); the caller decides if all-tables-failed is a hard error.
+                let failure = TableFailure {
+                    table: table.to_string(),
+                    error: clip_error(e),
+                };
+                eprintln!("pull: table {failure} failed (cursor at last merged page)");
+                result.failed_tables.push(failure);
             }
         }
     }
@@ -118,7 +162,34 @@ async fn pull_table<S: PostgrestSink>(
 
     let mut stats = TableStats::default();
     loop {
-        let rows = sink.fetch_page(table, cursor, page_size).await?;
+        // SUR-1031 root-cause arm: the FIRST request of a pull volley can eat a connection that died
+        // idle — in the 2026-08-03 field incident, `books` (first in `synced_schema()`) failed 12/12
+        // while the other seven tables' requests all 200'd, and the gateway logs showed the failing
+        // requests never arrived at Supabase at all (client-side, a pooled/h2 connection-reuse race).
+        // A page fetch is an idempotent GET, so ONE immediate re-attempt — riding the fresh connection
+        // the failure just forced open — is safe and collapses the class. A persistent failure still
+        // fails (with both attempts' errors carried), keeping the per-table isolation semantics.
+        let rows = match sink.fetch_page(table, cursor, page_size).await {
+            Ok(rows) => rows,
+            // Retry is a WHITELIST (Codex review): only errors the production sink explicitly
+            // classified as transport-level (`transport: ` — the dead-reused-connection class the
+            // gateway logs proved) get the one immediate re-attempt. Everything else fails without
+            // a second request: an application-level PostgREST response was already answered (a 429
+            // re-GET worsens the throttling it reports), and the import sanitizer's validation
+            // failures must fail CLOSED — a malformed preflight page never deserves a second chance
+            // its contract forbids. String-prefix classification because the sink trait is
+            // String-typed end to end; a typed error enum sweeps every sink impl — founder's call.
+            Err(first) if !first.starts_with("transport: ") => return Err(first),
+            Err(first) => {
+                let first = clip_error(first);
+                eprintln!("pull: {table} page fetch failed ({first}); retrying once on a fresh connection");
+                sink.fetch_page(table, cursor, page_size)
+                    .await
+                    .map_err(|second| {
+                        format!("{second} (persisted after retry; first attempt: {first})")
+                    })?
+            }
+        };
         let page_len = rows.len();
         let mut page_max = cursor;
 
@@ -146,7 +217,9 @@ async fn pull_table<S: PostgrestSink>(
             // needs; a full-row replace on a win comes from `apply_row`.
             let local_updated = store
                 .get_row(table, id)
-                .map_err(|e| format!("read local {table}/{id}: {e}"))?
+                // No record id in the error (Codex review): SUR-1031 carries these strings across
+                // the FFI, and SyncError's contract is coarse — never per-record server detail.
+                .map_err(|e| format!("read local {table} row: {e}"))?
                 .map(|r| r.get("updated_at").and_then(Value::as_i64).unwrap_or(0));
 
             // Tombstone: a delete for a row we don't have locally is NOT resurrected — mirrors JS
@@ -177,7 +250,8 @@ async fn pull_table<S: PostgrestSink>(
                 // (SUR-736) — leaving it would let the next flush re-push it over this newer row.
                 let dropped = store
                     .apply_row_rebasing_outbox(table, obj, incoming_updated)
-                    .map_err(|e| format!("apply {table}/{id}: {e}"))?;
+                    // Coarse like the read error above — table + error class, no record id.
+                    .map_err(|e| format!("apply a {table} row: {e}"))?;
                 stats.merged += 1;
                 // A dropped entry = a local edit superseded by the remote winner (SUR-738). Key it
                 // by the newest discarded stamp.
@@ -246,12 +320,19 @@ mod tests {
     struct MapSink {
         rows: HashMap<String, Vec<Value>>,
         fail: Option<String>,
+        /// How many more fetches of [`fail`]'s table error: `u32::MAX` = persistent ([`failing`]),
+        /// `1` = the SUR-1031 transient dead-connection shape ([`failing_once`]).
+        fail_remaining: std::cell::Cell<u32>,
+        /// Error with the application-level `PostgREST …` shape instead of a transport string.
+        fail_postgrest: bool,
     }
     impl MapSink {
         fn new() -> Self {
             Self {
                 rows: HashMap::new(),
                 fail: None,
+                fail_remaining: std::cell::Cell::new(0),
+                fail_postgrest: false,
             }
         }
         fn with(mut self, table: &str, rows: Vec<Value>) -> Self {
@@ -273,6 +354,21 @@ mod tests {
         }
         fn failing(mut self, table: &str) -> Self {
             self.fail = Some(table.to_string());
+            self.fail_remaining.set(u32::MAX);
+            self
+        }
+        /// The SUR-1031 transient shape: the named table's FIRST fetch errors (a dead pooled
+        /// connection), every later one succeeds — the retry must absorb it.
+        fn failing_once(mut self, table: &str) -> Self {
+            self.fail = Some(table.to_string());
+            self.fail_remaining.set(1);
+            self
+        }
+        /// An application-level PostgREST response — the shape the retry must NOT touch.
+        fn failing_postgrest(mut self, table: &str) -> Self {
+            self.fail = Some(table.to_string());
+            self.fail_remaining.set(u32::MAX);
+            self.fail_postgrest = true;
             self
         }
     }
@@ -286,8 +382,16 @@ mod tests {
             _after_seq: i64,
             limit: i64,
         ) -> Result<Vec<Value>, String> {
-            if self.fail.as_deref() == Some(table) {
-                return Err(format!("{table} fetch failed"));
+            if self.fail.as_deref() == Some(table) && self.fail_remaining.get() > 0 {
+                // Persistent (u32::MAX) keeps failing; the transient shape (1) is consumed here, so
+                // the SUR-1031 retry's second attempt gets a live connection.
+                if self.fail_remaining.get() != u32::MAX {
+                    self.fail_remaining.set(self.fail_remaining.get() - 1);
+                }
+                if self.fail_postgrest {
+                    return Err("PostgREST 429".to_string()); // the real sink is status-only (redacted)
+                }
+                return Err(format!("transport: {table} fetch failed"));
             }
             let mut rows = self.rows.get(table).cloned().unwrap_or_default();
             rows.truncate(limit as usize);
@@ -297,8 +401,9 @@ mod tests {
 
     /// A keyset-faithful stub: holds one table's rows (each with an explicit `change_seq`) and serves
     /// real `change_seq > after_seq` pages ordered asc, capped at `limit` — so the pagination LOOP in
-    /// `pull_table` is exercised. `failing_after(n)` makes the (0-based) n-th fetch error, to prove a
-    /// mid-pagination failure leaves the cursor at the last fully-merged page.
+    /// `pull_table` is exercised. `failing_after(n)` makes every fetch from the (0-based) n-th on
+    /// error — persistent, so the SUR-1031 single retry can't absorb it — to prove a mid-pagination
+    /// failure leaves the cursor at the last fully-merged page.
     struct PagingSink {
         rows: Vec<Value>,
         calls: std::cell::Cell<u32>,
@@ -330,6 +435,8 @@ mod tests {
             let n = self.calls.get();
             self.calls.set(n + 1);
             if self.fail_after == Some(n) {
+                // Unclassified (no `transport: ` prefix), so the SUR-1031 retry whitelist never
+                // absorbs it — the mid-pagination cursor-isolation pin stays intact.
                 return Err("simulated mid-pagination fetch failure".into());
             }
             let mut page: Vec<Value> = self
@@ -496,13 +603,79 @@ mod tests {
         let res = block(pull(&store, &sink, &["books", "notes"])).unwrap();
 
         assert_eq!(res.merged, 1, "books still merged");
-        assert_eq!(res.failed_tables, vec!["notes".to_string()]);
+        // SUR-1031: the failure carries its underlying error, not just the table name — an Err(_)
+        // here once made an HTTP 429 and a decode failure indistinguishable from the host.
+        let failures: Vec<(&str, &str)> = res
+            .failed_tables
+            .iter()
+            .map(|f| (f.table.as_str(), f.error.as_str()))
+            .collect();
+        assert_eq!(
+            failures,
+            vec![(
+                "notes",
+                "transport: notes fetch failed (persisted after retry; first attempt: transport: notes fetch failed)"
+            )],
+        );
         assert_eq!(store.get_seq_cursor("books").unwrap(), Some(1));
         assert_eq!(
             store.get_seq_cursor("notes").unwrap(),
             None,
             "failed table's cursor stays put so its window re-pulls"
         );
+    }
+
+    #[test]
+    fn an_application_level_response_is_never_retried() {
+        // A server that ANSWERED (PostgREST 4xx/5xx) must not be asked the identical question again
+        // — a 429 answered with a duplicate GET worsens the throttling it reports. The error's
+        // missing "persisted after retry" suffix is the proof no second attempt was made.
+        let store = Store::open_in_memory().unwrap();
+        let sink = MapSink::new().failing_postgrest("books");
+        let res = block(pull(&store, &sink, &["books"])).unwrap();
+
+        let failures: Vec<(&str, &str)> = res
+            .failed_tables
+            .iter()
+            .map(|f| (f.table.as_str(), f.error.as_str()))
+            .collect();
+        assert_eq!(failures, vec![("books", "PostgREST 429")]);
+    }
+
+    #[test]
+    fn transient_first_fetch_failure_is_absorbed_by_the_retry() {
+        // SUR-1031 root-cause arm: the volley's first request eating a dead pooled connection must
+        // not fail the table — the immediate re-attempt rides the fresh connection the failure
+        // forced open, and the pull completes as if nothing happened.
+        let store = Store::open_in_memory().unwrap();
+        let sink = MapSink::new()
+            .with(
+                "books",
+                vec![json!({ "id": "b1", "title": "T", "updated_at": 1000, "deleted": false })],
+            )
+            .failing_once("books");
+        let res = block(pull(&store, &sink, &["books"])).unwrap();
+
+        assert!(
+            res.failed_tables.is_empty(),
+            "the retry absorbed the dead connection"
+        );
+        assert_eq!(res.merged, 1);
+        assert_eq!(store.get_seq_cursor("books").unwrap(), Some(1));
+    }
+
+    #[test]
+    fn clip_error_bounds_a_proxy_page_but_keeps_short_errors_whole() {
+        // SUR-1031: a Cloudflare/proxy failure body can be a whole HTML document — the clip keeps
+        // the aggregated host-facing error bounded without touching ordinary errors.
+        assert_eq!(
+            clip_error("PostgREST 429 — rate limited".into()),
+            "PostgREST 429 — rate limited"
+        );
+        let long = "x".repeat(500);
+        let clipped = clip_error(long);
+        assert_eq!(clipped.chars().count(), 201, "200 chars + ellipsis");
+        assert!(clipped.ends_with('…'));
     }
 
     #[test]

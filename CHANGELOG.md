@@ -6,6 +6,39 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Fixed
+- **A per-table pull failure now carries its underlying error instead of a bare table name
+  (SUR-1031).** `pull::pull`'s isolation arm discarded the error it isolated (`Err(_)`) and its
+  `eprintln!` named only the table — which on Android reaches nothing anyway (stderr never hits
+  logcat). Every host-facing aggregation ("pull failed for books — aborting flush …",
+  "pull failed for all tables: …", the skipped-reconciliation log) therefore reported *that*
+  a table failed but never *why*, making an HTTP 429, a 401, and a merge failure
+  indistinguishable — the 2026-08-03 S25U incident (11 consecutive `pull failed for books`
+  syncs, cause still unknown) took `run-as` DB forensics for the third time on this bug family.
+  `PullResult.failed_tables` is now `Vec<TableFailure>` (table + error, `Display` as
+  `books (PostgREST 429 — …)`); errors are clipped to 200 chars before aggregation (a proxy
+  failure page can be a whole HTML document) and merge errors never quote row content (serde
+  errors are positional). Observability only: per-table isolation, cursor semantics, and the
+  SUR-736 flush abort are unchanged, and no `#[uniffi::export]` signature moves — the detail
+  rides the existing error strings, which Android's SUR-1025 diagnostics (#101) already log
+  (debug builds carry the message; release logs class names only).
+- **A transient page-fetch failure no longer fails the table: one immediate idempotent re-attempt
+  (SUR-1031 root cause).** The Supabase gateway logs closed the field question: during the failing
+  windows the books requests either never reached the edge at all, or (13:24:58, 13:43:27) returned
+  200 at the gateway while core still reported the table failed ~16 s later — a client-side
+  connection failure on a reused/stale connection, always eaten by the volley's FIRST request
+  (`books` is first in `synced_schema()`, which is why "always books" was never about books; the
+  other seven tables ride the fresh connection to their 200s). A page fetch is an idempotent GET,
+  so `pull_table` now re-attempts a failed fetch once — riding the connection the failure forced
+  open — and only a failure that persists across both attempts fails the table (both errors
+  carried, per the entry above). The retry is a **whitelist** (Codex review): the production sink
+  stamps transport-level failures with a `transport: ` prefix at the one boundary that still holds
+  the error type, and only those are re-attempted — an application-level PostgREST response was
+  already answered (re-GETting a 429 worsens the throttling it reports), and the import
+  preflight's validation failures fail CLOSED, never re-fetched (a malformed page gets no second
+  chance; the sanitizer preserves the transport/application classification while still dropping
+  every server body). Mid-pagination isolation semantics are pinned unchanged by the tests.
+
 ### Added
 - **The release now fails on documentation that contradicts it (`scripts/check-stale-release-markers.mjs`).**
   Cutting v0.14.0 exposed a gap with no owner: `release.yml` verifies the tag, the crate version and

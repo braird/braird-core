@@ -46,7 +46,22 @@ impl<S: PostgrestSink> PostgrestSink for SanitizedSink<'_, S> {
             .0
             .fetch_page(table, after_seq, limit)
             .await
-            .map_err(|_| IMPORT_PREFLIGHT_FAILED.to_string())?;
+            // Codex review (SUR-1031): keep the CLASSIFICATION while sanitizing the body. The
+            // `transport: ` prefix is what `pull_table`'s retry whitelists on — a dead-connection
+            // blip during the import preflight deserves the same single re-attempt as ordinary
+            // sync. An application-level response keeps a one-word marker (informative, never
+            // retried). Both drop the server body, so the sanitization contract holds. The
+            // validation failures below carry neither prefix — a malformed page fails CLOSED,
+            // never re-fetched.
+            .map_err(|e| {
+                if e.starts_with("transport: ") {
+                    format!("transport: {IMPORT_PREFLIGHT_FAILED}")
+                } else if e.starts_with("PostgREST ") {
+                    format!("PostgREST response — {IMPORT_PREFLIGHT_FAILED}")
+                } else {
+                    IMPORT_PREFLIGHT_FAILED.to_string()
+                }
+            })?;
         validate_pull_page(table, after_seq, &rows)?;
         Ok(rows)
     }
@@ -560,6 +575,72 @@ mod tests {
             .calls()
             .iter()
             .any(|call| matches!(call, Call::Fetch { .. })));
+    }
+
+    #[test]
+    fn a_transport_blip_in_the_preflight_is_absorbed_by_the_retry() {
+        // SUR-1031: the dead-connection class hits the import preflight's pull too. A classified
+        // `transport: ` failure gets the same single re-attempt as ordinary sync; the retried page
+        // (default empty here) passes validation and the import proceeds.
+        let archive = parsed(
+            "books",
+            vec![json!({"id":"import-b","title":"archive","updatedAt":50})],
+            10,
+        );
+        let store = Store::open_in_memory().unwrap();
+        let sink = RecordingSink::default();
+        sink.pull_result("books", Err("transport: connection reset by peer"));
+
+        let summary = run(merge_parsed_with_sink(
+            &store,
+            &sink,
+            &Vault::generate(),
+            archive,
+            10,
+        ))
+        .unwrap();
+        assert_eq!(
+            summary.imported.books, 1,
+            "the healed preflight let the import proceed"
+        );
+    }
+
+    #[test]
+    fn an_application_level_preflight_failure_is_not_retried_and_stays_sanitized() {
+        // Codex review (SUR-1031): the sanitizer must preserve the "PostgREST " classification so
+        // pull_table's transport-only retry guard sees it — a 429 the server answered must not be
+        // asked again by the import preflight either. One canned failure, NO duplicate: exactly one
+        // pull call proves the retry never fired; the error still echoes no server detail.
+        let archive = parsed(
+            "books",
+            vec![json!({"id":"import-b","title":"archive","updatedAt":50})],
+            10,
+        );
+        let store = Store::open_in_memory().unwrap();
+        let sink = RecordingSink::default();
+        sink.pull_result("books", Err("PostgREST 429 — rate limited (SECRET_BODY)"));
+
+        let error = run(merge_parsed_with_sink(
+            &store,
+            &sink,
+            &Vault::generate(),
+            archive,
+            10,
+        ))
+        .unwrap_err();
+
+        let books_pulls = sink
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, Call::Pull(t) if t == "books"))
+            .count();
+        assert_eq!(books_pulls, 1, "an answered request is never re-asked");
+        let message = error.to_string();
+        assert!(!message.contains("429") && !message.contains("SECRET_BODY"));
+        assert!(
+            store.get_row("books", "import-b").unwrap().is_none(),
+            "nothing staged"
+        );
     }
 
     #[test]
