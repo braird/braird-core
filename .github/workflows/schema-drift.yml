@@ -116,5 +116,11 @@ jobs:
           # never from argv, and redacts it out of any psql error before printing. It fails closed
           # when unset — no skip path, because a schema gate that passes without opening a
           # connection is worse than no gate.
+          #
+          # Holds a SESSION-POOLER URI for the dedicated read-only `schema_checker` role (not the
+          # migration/service credential — this job only reads catalogs). If it ever reports every
+          # column of a live table as missing, suspect the grant before the schema:
+          # information_schema.columns is privilege-filtered, and tables created AFTER the role's
+          # GRANT need ALTER DEFAULT PRIVILEGES to be visible at all.
           BRAIRD_STAGING_DB_URL: ${{ secrets.BRAIRD_STAGING_DB_URL }}
         run: node scripts/check-native-schema.mjs --check

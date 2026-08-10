@@ -31,6 +31,17 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   `schema-drift.yml` as its own job (per-PR + the weekly cron that is the only trigger able to see
   staging-side drift while this repo sits still), fail-closed when `BRAIRD_STAGING_DB_URL` is unset,
   with the gate's own comparison logic unit-tested via `node --test`.
+  Because `PostgrestClient::get_page` sends **no `user_id` filter**, RLS is the tenant boundary rather
+  than a backstop — so the leg validates the **policies**, not just `relrowsecurity`: enabled-with-no-policy
+  (deny-all, which makes sync silently unusable), a `USING (true)` policy granted to `authenticated`
+  (a cross-tenant leak), and policies that never reference `auth.uid()` all fail, though the flag reads
+  `true` in every case. It likewise requires `change_seq`'s **stamping trigger**, not just the column —
+  pushes never supply the value, so a bare `NOT NULL` column rejects every insert and a nullable one
+  leaves rows permanently invisible to `change_seq > cursor`. Integer columns must be **`bigint`**:
+  `updated_at` is epoch milliseconds (~1.8×10¹²) and pg `integer` caps at 2.1×10⁹, so the logical-type
+  vocabulary — which calls both `int`, correctly, for a 64-bit SQLite mirror — would otherwise green-light
+  a column whose first upsert fails on numeric range. And a `NOT NULL` cloud-only column with no default
+  is now an error rather than a notice, since a push sends only the fixture columns plus `user_id`.
   The staging leg also **requires** the two server-side columns the fixture deliberately omits —
   `user_id` and `change_seq` — because `push::upsert_group` injects `user_id` into every row and every
   pull filters and orders on `change_seq`, so a migration omitting either reports green on a

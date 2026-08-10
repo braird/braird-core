@@ -64,17 +64,46 @@ const manifest = (backend, extra = {}) => ({
 
 // Build a `queryStaging`-shaped payload. `cols` is { column: pg data_type }. `key` is the cloud
 // constraint's column set (default: a plain PK on the local pk).
-const staged = (cols, { rls = true, absent = false, key = ['id'], keyType = 'p' } = {}) => () => ({
+// `cols` values may be a bare pg type string, or {type, nullable, default} for the NOT NULL cases.
+const OK_POLICY = {
+  table: 'widgets',
+  name: 'owner',
+  roles: ['authenticated'],
+  cmd: 'ALL',
+  qual: '(auth.uid() = user_id)',
+  with_check: '(auth.uid() = user_id)',
+};
+const OK_TRIGGER = { table: 'widgets', name: 't02_change_seq', fn: 'stamp_change_seq' };
+
+const staged = (
+  cols,
+  {
+    rls = true,
+    absent = false,
+    key = ['id'],
+    keyType = 'p',
+    policies = [OK_POLICY],
+    triggers = [OK_TRIGGER],
+  } = {}
+) => () => ({
   tables: absent ? [] : [{ table: 'widgets', rls }],
   constraints: absent || !key ? [] : [{ table: 'widgets', type: keyType, cols: key }],
+  policies: absent ? [] : policies,
+  triggers: absent ? [] : triggers,
   columns: absent
     ? []
-    : Object.entries(cols).map(([column, data_type]) => ({
-        table: 'widgets',
-        column,
-        data_type,
-        udt: data_type,
-      })),
+    : Object.entries(cols).map(([column, spec]) => {
+        const { type, nullable = 'YES', default: def = null } =
+          typeof spec === 'string' ? { type: spec } : spec;
+        return {
+          table: 'widgets',
+          column,
+          data_type: type,
+          udt: type,
+          nullable,
+          default: def,
+        };
+      }),
 });
 
 const CLOUD_OK = {
@@ -116,9 +145,12 @@ test('a retyped cloud column fails', () => {
   assert.match(errors[0], /"count" is text \(logical "text"\).*says "int"/s);
 });
 
-test('logical equivalence does not fail — bigint and integer are both `int`', () => {
+test('a narrow integer column fails — epoch ms overflows int4', () => {
+  // The logical vocabulary calls integer and bigint both `int`, which is right for the SQLite
+  // mirror and wrong as a cloud acceptance rule: updated_at is epoch MILLISECONDS (~1.8e12).
   const { errors } = run(manifest('live'), staged({ ...CLOUD_OK, count: 'integer' }));
-  assert.deepEqual(errors, []);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /cannot hold an epoch-millisecond value/);
 });
 
 test('RLS disabled on a live table fails', () => {
@@ -258,6 +290,54 @@ test('a mistyped change_seq fails', () => {
   assert.equal(errors.length, 1);
   assert.match(errors[0], /"change_seq" is text .*needs "int"/s);
 });
+
+// --- RLS policies, not just the flag (SUR-1048 review round 3, P1) ---
+// get_page sends no user_id filter, so RLS IS the tenant boundary. relrowsecurity=true with no
+// policy is deny-all; with USING (true) it is a cross-tenant leak. Both leave the flag true.
+
+test('RLS enabled with NO policies fails — that is deny-all', () => {
+  const { errors } = run(manifest('live'), staged(CLOUD_OK, { policies: [] }));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /RLS ENABLED but NO policies/);
+});
+
+test('a USING (true) policy for authenticated fails — cross-tenant exposure', () => {
+  const leaky = { ...OK_POLICY, qual: 'true', with_check: 'true' };
+  const { errors } = run(manifest('live'), staged(CLOUD_OK, { policies: [leaky] }));
+  assert.ok(errors.length >= 1);
+  assert.match(errors.join('\n'), /grants every user access to every other user's rows/);
+});
+
+test('policies that never consult auth.uid() fail', () => {
+  const notScoped = { ...OK_POLICY, qual: '(status = \'live\')', with_check: null };
+  const { errors } = run(manifest('live'), staged(CLOUD_OK, { policies: [notScoped] }));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /none reference auth\.uid\(\)/);
+});
+
+// --- change_seq must be stamped, not merely present (round 3, P1) ---
+
+test('a change_seq column without its stamping trigger fails', () => {
+  const { errors } = run(manifest('live'), staged(CLOUD_OK, { triggers: [] }));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /no change_seq stamping trigger/);
+});
+
+// --- unfillable mandatory cloud columns (round 3, P1) ---
+
+test('a NOT NULL cloud-only column with no default fails', () => {
+  const { errors } = run(
+    manifest('live'),
+    staged(
+      { ...CLOUD_OK, tenant: { type: 'text', nullable: 'NO' } },
+      { triggers: [] } // no trigger that could populate it
+    )
+  );
+  // The missing trigger also trips the change_seq check; assert ours is present.
+  assert.match(errors.join('\n'), /NOT NULL cloud-only column\(s\) tenant/);
+});
+
+// (the nullable-extra-column case is covered by "a cloud-only column is a notice, not a failure")
 
 // --- the shared logical-type map (SUR-1048 review, regression-reviewer) ---
 // logical-type.mjs is imported by BOTH gates, so its contract is tested directly rather than only

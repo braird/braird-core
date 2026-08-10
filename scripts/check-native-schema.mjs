@@ -169,14 +169,29 @@ function queryStaging(tables) {
   }
   const list = tables.map((t) => `'${t}'`).join(', ');
 
-  // One round trip: the column shapes plus each table's rowsecurity flag, as one JSON document.
+  // One round trip: column shapes (with nullability + default), the rowsecurity flag, the actual
+  // RLS policies, and the non-internal triggers — as one JSON document.
   const sql = `
     SELECT json_build_object(
       'columns', (
         SELECT coalesce(json_agg(json_build_object(
-          'table', table_name, 'column', column_name, 'data_type', data_type, 'udt', udt_name)), '[]'::json)
+          'table', table_name, 'column', column_name, 'data_type', data_type, 'udt', udt_name,
+          'nullable', is_nullable, 'default', column_default)), '[]'::json)
         FROM information_schema.columns
         WHERE table_schema = 'public' AND table_name IN (${list})),
+      'policies', (
+        SELECT coalesce(json_agg(json_build_object(
+          'table', tablename, 'name', policyname, 'roles', roles, 'cmd', cmd,
+          'qual', qual, 'with_check', with_check)), '[]'::json)
+        FROM pg_policies WHERE schemaname = 'public' AND tablename IN (${list})),
+      'triggers', (
+        SELECT coalesce(json_agg(json_build_object(
+          'table', t.relname, 'name', tg.tgname, 'fn', p.proname)), '[]'::json)
+        FROM pg_trigger tg
+        JOIN pg_class t ON t.oid = tg.tgrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        JOIN pg_proc p ON p.oid = tg.tgfoid
+        WHERE NOT tg.tgisinternal AND n.nspname = 'public' AND t.relname IN (${list})),
       'tables', (
         SELECT coalesce(json_agg(json_build_object('table', c.relname, 'rls', c.relrowsecurity)), '[]'::json)
         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -258,6 +273,82 @@ function checkKey(table, row, constraints, errors) {
   }
 }
 
+// RLS. `relrowsecurity = true` is necessary and nowhere near sufficient (raised on review):
+// enabling RLS with NO policy is deny-all, which makes native sync silently unusable, and a
+// `USING (true)` policy leaves the flag true while exposing every user's rows. This matters more
+// here than for a typical table because `PostgrestClient::get_page` does NOT filter by user_id —
+// the pull URL is `?change_seq=gt.N&order=...`, so RLS *is* the tenant boundary, not a backstop.
+const EXPOSED_ROLES = new Set(['public', 'authenticated', 'anon']);
+
+function checkRls(table, policies, errors) {
+  const mine = policies.filter((p) => p.table === table);
+  if (!mine.length) {
+    errors.push(
+      `braird-staging "${table}" has RLS ENABLED but NO policies — that is deny-all.\n` +
+        `  Every native sync read returns zero rows and every write is rejected, with no error that ` +
+        `names RLS as the cause.`
+    );
+    return;
+  }
+  for (const p of mine) {
+    const roles = (p.roles ?? []).map((r) => String(r).toLowerCase());
+    const exposed = roles.some((r) => EXPOSED_ROLES.has(r));
+    for (const [kind, pred] of [['USING', p.qual], ['WITH CHECK', p.with_check]]) {
+      if (pred != null && String(pred).trim().toLowerCase() === 'true' && exposed) {
+        errors.push(
+          `braird-staging "${table}" policy "${p.name}" is ${kind} (true) for role(s) ` +
+            `${roles.join(', ')} — that grants every user access to every other user's rows.`
+        );
+      }
+    }
+  }
+  // Supabase's user-scoping idiom. A table whose policies never consult the caller's identity is
+  // not user-scoped, whatever else the predicates say.
+  if (!mine.some((p) => `${p.qual ?? ''} ${p.with_check ?? ''}`.includes('auth.uid()'))) {
+    errors.push(
+      `braird-staging "${table}" has policies, but none reference auth.uid() — nothing ties a row ` +
+        `to its owner. Every braird native table is user-scoped; the pull path relies on this ` +
+        `entirely (get_page sends no user_id filter).`
+    );
+  }
+}
+
+// `change_seq` must be STAMPED SERVER-SIDE on every write, not merely present. `upsert_group` never
+// sends it, so: a bare NOT NULL column rejects every insert, and a nullable one leaves the value
+// NULL — which `change_seq=gt.<cursor>` excludes, making the row permanently invisible to pull.
+// surfc does this with the migration-0051 trigger; the column without the trigger is a trap.
+// The logical vocabulary collapses every integer width to `int`, which is right for comparing a
+// SQLite mirror (INTEGER is 64-bit) but wrong as an acceptance rule for the CLOUD column: braird
+// stamps `updated_at` and friends in epoch MILLISECONDS (~1.8e12, see src/sync/mod.rs), and pg
+// `integer` tops out at 2.1e9. A migration declaring `integer` would pass a logical-type compare
+// and then fail every upsert with a numeric-range error. Native tables use bigint for every integer
+// column — there is no reason for a narrower one, so this needs no per-column allowlist.
+function checkIntWidth(table, column, found, errors) {
+  const t = String(found.data_type).toLowerCase();
+  if (t === 'integer' || t === 'smallint') {
+    errors.push(
+      `braird-staging "${table}"."${column}" is ${found.data_type}, which cannot hold an ` +
+        `epoch-millisecond value (~1.8e12 today; ${t} caps at ${t === 'smallint' ? '32767' : '2.1e9'}).\n` +
+        `  Native tables use bigint for every integer column — the first upsert would fail with a ` +
+        `numeric range error despite a green logical-type compare.`
+    );
+  }
+}
+
+function checkChangeSeqTrigger(table, triggers, errors) {
+  const stamps = triggers.filter(
+    (t) => t.table === table && /change_seq/i.test(`${t.name} ${t.fn}`)
+  );
+  if (!stamps.length) {
+    errors.push(
+      `braird-staging "${table}" has no change_seq stamping trigger.\n` +
+        `  The column alone is not enough: pushes never supply change_seq, so without the ` +
+        `server-side trigger (surfc migration 0051, t02_change_seq) rows are either rejected ` +
+        `(NOT NULL) or invisible to every pull (NULL fails change_seq > cursor).`
+    );
+  }
+}
+
 // --- (b) DDL ----------------------------------------------------------------------
 // `introspect` is injected so the comparison can be exercised against recorded payloads
 // (scripts/check-native-schema.test.mjs) — the DDL leg is the half no fixture in this repo can
@@ -268,6 +359,8 @@ export function checkDdl(fixture, rows, errors, notices, introspect = queryStagi
 
   const live = introspect(tables);
   const present = new Map(live.tables.map((t) => [t.table, t.rls]));
+  const policies = live.policies ?? [];
+  const triggers = live.triggers ?? [];
   const columnsByTable = new Map();
   for (const c of live.columns) {
     if (!columnsByTable.has(c.table)) columnsByTable.set(c.table, new Map());
@@ -306,7 +399,10 @@ export function checkDdl(fixture, rows, errors, notices, introspect = queryStagi
           `  Every user-scoped native table ships with RLS (SUR-1047); without it one user's rows are ` +
           `readable by another's token.`
       );
+    } else {
+      checkRls(table, policies, errors);
     }
+    checkChangeSeqTrigger(table, triggers, errors);
 
     const actual = columnsByTable.get(table) ?? new Map();
     for (const [column, want] of Object.entries(fixture[table])) {
@@ -330,7 +426,9 @@ export function checkDdl(fixture, rows, errors, notices, introspect = queryStagi
           `braird-staging "${table}"."${column}" is ${found.data_type} (logical "${got}"), but ` +
             `${FIXTURE} says "${want}".`
         );
+        continue;
       }
+      checkIntWidth(table, column, found, errors);
     }
 
     checkKey(table, row, live.constraints ?? [], errors);
@@ -364,9 +462,30 @@ export function checkDdl(fixture, rows, errors, notices, introspect = queryStagi
     const extra = [...actual.keys()].filter(
       (c) => !(c in fixture[table]) && !(c in SERVER_REQUIRED_COLUMNS)
     );
-    if (extra.length) {
+
+    // A cloud-only column is only harmless if the server can fill it. A push sends the fixture
+    // columns plus user_id and nothing else, so a NOT NULL extra with no default and no trigger to
+    // populate it rejects EVERY insert for that table (raised on review — this branch used to emit
+    // a notice and stay green).
+    const unfillable = extra.filter((c) => {
+      const col = actual.get(c);
+      if (col.nullable !== 'NO' || col.default != null) return false;
+      return !triggers.some((t) => t.table === table); // any trigger might populate it — say so, don't guess
+    });
+    if (unfillable.length) {
+      errors.push(
+        `braird-staging "${table}" has NOT NULL cloud-only column(s) ${unfillable.join(', ')} with ` +
+          `no default.\n` +
+          `  A push sends only the fixture columns plus user_id, so every insert for this table ` +
+          `would be rejected. Give the column a default, make it nullable, populate it from a ` +
+          `trigger, or add it to ${FIXTURE} and native_schema() so clients supply it.`
+      );
+    }
+
+    const benign = extra.filter((c) => !unfillable.includes(c));
+    if (benign.length) {
       notices.push(
-        `"${table}" has cloud-only column(s) ${extra.join(', ')} — allowed (additive-nullable ` +
+        `"${table}" has cloud-only column(s) ${benign.join(', ')} — allowed (additive-nullable ` +
           `contract; apply_row projects unknown columns out), but if the native store should carry ` +
           `them, add them to ${FIXTURE} and native_schema().`
       );
