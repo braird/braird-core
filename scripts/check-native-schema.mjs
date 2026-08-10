@@ -52,15 +52,20 @@ const MANIFEST = 'vendored/schema/native-manifest.json';
 const DB_URL_ENV = 'BRAIRD_STAGING_DB_URL';
 
 const VALID_BACKEND = new Set(['live', 'pending']);
+const VALID_PK_SCOPE = new Set(['global', 'per_user']);
 const TICKET_RE = /^SUR-\d+$/;
 // A table identifier we are willing to interpolate into SQL. The names come from our own
 // checked-in fixture, but a gate that builds SQL from a file should still refuse anything that
 // isn't a plain identifier.
 const IDENT_RE = /^[a-z_][a-z0-9_]*$/;
 
-// Columns the cloud has and the local mirror deliberately never stores. Named so the notice about
-// cloud-only columns stays signal: these two are expected on every table.
-const SERVER_ONLY_COLUMNS = new Set(['user_id', 'change_seq']);
+// Columns the cloud MUST have that the local mirror deliberately never stores. Not merely tolerated
+// — required, and type-checked (raised on SUR-1048 review): `push::upsert_group` injects `user_id`
+// into every row unconditionally, and `PostgrestClient::get_page` filters and orders every pull on
+// `change_seq`. A migration that omits either reports green on a fixture-only compare and then fails
+// at runtime on the first push or pull. Absent from the fixture because the local store never holds
+// them, which is exactly why they need naming here.
+const SERVER_REQUIRED_COLUMNS = { user_id: 'text', change_seq: 'int' };
 
 const readJson = (path) => {
   const raw = readFileSync(path, 'utf8');
@@ -103,6 +108,13 @@ export function checkManifest(fixture, errors, manifest = readJson(MANIFEST)) {
       errors.push(
         `${where}: REQUIRES a non-empty "pk" array of column names — the key is what decides ` +
           `convergence (deterministic-pk OR-set vs duplicate rows), so it cannot go unstated.`
+      );
+    }
+    if (!VALID_PK_SCOPE.has(row.pk_scope)) {
+      errors.push(
+        `${where}: REQUIRES "pk_scope" of global|per_user — whether the local pk is unique across ` +
+          `all users (a uuid) or only within one (a settings key). Guessing it wrong either blocks ` +
+          `users from each other or permits duplicate rows, and it is not derivable from the shape.`
       );
     }
     if (!VALID_BACKEND.has(row.backend)) {
@@ -192,28 +204,43 @@ function queryStaging(tables) {
 const pgTypeOf = (col) =>
   col.data_type === 'ARRAY' ? `${String(col.udt).replace(/^_/, '')}[]` : col.data_type;
 
-// The cloud key must enforce the SAME uniqueness the local pk does. It is allowed to be
-// user-scoped — the local mirror never stores `user_id` (auth-injected at push), so a per-user KV
-// keyed `key` locally is keyed `(user_id, key)` in the cloud. Anything else is a real divergence:
-// a broader key permits duplicate logical rows (breaking the deterministic-pk OR-set that makes two
-// devices converge), a narrower one collides across users. PRIMARY KEY or UNIQUE both satisfy it —
-// PostgREST upserts resolve on either.
+// The cloud key must enforce the SAME uniqueness the local pk does, and `pk_scope` says what that
+// is. The distinction is load-bearing (raised on SUR-1048 review):
+//
+//   global   — the local pk is unique across ALL users on its own (a uuid, or an id derived from
+//              uuids). `(pk)` and `(pk, user_id)` both express that, so either is accepted.
+//   per_user — the local pk is only unique WITHIN a user. `user_settings.key` is the case: every
+//              user has a row keyed "prompt_cadence". A bare UNIQUE (key) would let the first user
+//              to write it occupy that key globally, and the next user's upsert would conflict with
+//              a row RLS hides from them — a bug that only appears with two accounts. Only
+//              `(pk, user_id)` is accepted.
+//
+// A key broader than required is equally wrong in either mode: it permits duplicate logical rows,
+// breaking the deterministic-pk OR-set that makes two devices converge on one. PRIMARY KEY and
+// UNIQUE both satisfy the check — PostgREST upserts resolve on either.
 function checkKey(table, row, constraints, errors) {
   if (!Array.isArray(row.pk) || !row.pk.length) return; // already reported by checkManifest
-  const want = [...row.pk].sort().join(',');
-  const wantScoped = [...row.pk, 'user_id'].sort().join(',');
+  const scoped = [...row.pk, 'user_id'].sort().join(',');
+  const bare = [...row.pk].sort().join(',');
+  const perUser = row.pk_scope === 'per_user';
+  const acceptable = perUser ? [scoped] : [scoped, bare];
 
   const found = constraints
     .filter((c) => c.table === table)
     .map((c) => [...(c.cols ?? [])].sort().join(','));
 
-  if (!found.some((cols) => cols === want || cols === wantScoped)) {
+  if (!found.some((cols) => acceptable.includes(cols))) {
+    const wanted = acceptable
+      .map((c) => `(${c.split(',').join(', ')})`)
+      .join(' or ');
     errors.push(
-      `braird-staging "${table}" has no PRIMARY KEY or UNIQUE constraint on (${row.pk.join(', ')}) ` +
-        `or (${row.pk.join(', ')}, user_id).\n` +
+      `braird-staging "${table}" has no PRIMARY KEY or UNIQUE constraint on ${wanted}.\n` +
         `  Found: ${found.length ? found.map((c) => `(${c.split(',').join(', ')})`).join(' ') : 'none'}.\n` +
-        `  The key decides convergence — a broader key lets two devices create duplicate logical ` +
-        `rows instead of converging on one, and PostgREST upserts need it to resolve.`
+        (perUser
+          ? `  This table is pk_scope:per_user — "${row.pk.join(', ')}" repeats across users, so the ` +
+            `constraint MUST include user_id or one user's row blocks every other user's.`
+          : `  The key decides convergence — a broader key lets two devices create duplicate logical ` +
+            `rows instead of converging on one, and PostgREST upserts need it to resolve.`)
     );
   }
 }
@@ -295,8 +322,34 @@ export function checkDdl(fixture, rows, errors, notices, introspect = queryStagi
 
     checkKey(table, row, live.constraints ?? [], errors);
 
+    for (const [column, want] of Object.entries(SERVER_REQUIRED_COLUMNS)) {
+      const found = actual.get(column);
+      if (!found) {
+        errors.push(
+          `braird-staging "${table}" is MISSING the server-side column "${column}".\n` +
+            `  It is absent from the fixture by design (the local store never holds it), but the ` +
+            `cloud table cannot work without it: push injects user_id into every row, and every ` +
+            `pull filters and orders on change_seq.`
+        );
+        continue;
+      }
+      let got;
+      try {
+        got = logicalType(pgTypeOf(found));
+      } catch (e) {
+        errors.push(`braird-staging "${table}"."${column}": ${e.message}`);
+        continue;
+      }
+      if (got !== want) {
+        errors.push(
+          `braird-staging "${table}"."${column}" is ${found.data_type} (logical "${got}"), but the ` +
+            `sync engine needs "${want}".`
+        );
+      }
+    }
+
     const extra = [...actual.keys()].filter(
-      (c) => !(c in fixture[table]) && !SERVER_ONLY_COLUMNS.has(c)
+      (c) => !(c in fixture[table]) && !(c in SERVER_REQUIRED_COLUMNS)
     );
     if (extra.length) {
       notices.push(

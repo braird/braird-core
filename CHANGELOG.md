@@ -31,6 +31,15 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   `schema-drift.yml` as its own job (per-PR + the weekly cron that is the only trigger able to see
   staging-side drift while this repo sits still), fail-closed when `BRAIRD_STAGING_DB_URL` is unset,
   with the gate's own comparison logic unit-tested via `node --test`.
+  The staging leg also **requires** the two server-side columns the fixture deliberately omits —
+  `user_id` and `change_seq` — because `push::upsert_group` injects `user_id` into every row and every
+  pull filters and orders on `change_seq`, so a migration omitting either reports green on a
+  fixture-only compare and then fails on the first sync. And a manifest row declares `pk_scope`:
+  `global` (the local pk is a uuid, unique across all users — the cloud may key it either way) or
+  `per_user` (the key repeats across users, so the cloud constraint MUST include `user_id`). Without
+  that distinction a bare `UNIQUE (key)` on `user_settings` would pass, letting the first user to
+  write `prompt_cadence` occupy it globally while every other user's upsert conflicts with a row RLS
+  hides from them — a bug that only shows up with two accounts.
   The registry also locks each native table's **primary key** (`native-manifest.json` `pk`, reconciled
   against `TableSchema.pk`, with the cloud required to carry a matching `PRIMARY KEY`/`UNIQUE` on either
   the local key or that key plus `user_id`): a column-only compare is blind to the key, but the key is

@@ -18,7 +18,15 @@ const FIXTURE = {
 
 const manifest = (backend, extra = {}) => ({
   entries: [
-    { table: 'widgets', ticket: 'SUR-1', backend, backend_ticket: 'SUR-2', pk: ['id'], ...extra },
+    {
+      table: 'widgets',
+      ticket: 'SUR-1',
+      backend,
+      backend_ticket: 'SUR-2',
+      pk: ['id'],
+      pk_scope: 'global',
+      ...extra,
+    },
   ],
 });
 
@@ -144,7 +152,7 @@ test('a UNIQUE constraint satisfies the key requirement, not just PRIMARY KEY', 
 test('a key on the wrong column fails', () => {
   const { errors } = run(manifest('live'), staged(CLOUD_OK, { key: ['count'] }));
   assert.equal(errors.length, 1);
-  assert.match(errors[0], /no PRIMARY KEY or UNIQUE constraint on \(id\)/);
+  assert.match(errors[0], /no PRIMARY KEY or UNIQUE constraint on \(id, user_id\) or \(id\)/);
 });
 
 test('a broader composite key fails — it would permit duplicate logical rows', () => {
@@ -165,6 +173,58 @@ test('a manifest row without a pk fails', () => {
   const { errors } = run(doc, staged({}, { absent: true }));
   assert.equal(errors.length, 1);
   assert.match(errors[0], /REQUIRES a non-empty "pk" array/);
+});
+
+// --- per-user key scope (SUR-1048 review round 2, P1) ---
+// user_settings.key repeats across users: a bare UNIQUE(key) lets the first user to write
+// "prompt_cadence" occupy it globally, and the next user's upsert conflicts with a row RLS hides.
+
+test('a per_user table REJECTS a bare key on the local pk', () => {
+  const { errors } = run(
+    manifest('live', { pk_scope: 'per_user' }),
+    staged(CLOUD_OK, { key: ['id'] })
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /pk_scope:per_user.*MUST include user_id/s);
+});
+
+test('a per_user table accepts the user-scoped key', () => {
+  const { errors } = run(
+    manifest('live', { pk_scope: 'per_user' }),
+    staged(CLOUD_OK, { key: ['user_id', 'id'] })
+  );
+  assert.deepEqual(errors, []);
+});
+
+test('a manifest row without pk_scope fails', () => {
+  const doc = manifest('pending');
+  delete doc.entries[0].pk_scope;
+  const { errors } = run(doc, staged({}, { absent: true }));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /REQUIRES "pk_scope" of global\|per_user/);
+});
+
+// --- required server-side columns (SUR-1048 review round 2, P1) ---
+// Absent from the fixture by design, but the cloud table cannot function without them.
+
+test('a live table missing user_id fails', () => {
+  const { user_id, ...noUserId } = CLOUD_OK;
+  const { errors } = run(manifest('live'), staged(noUserId));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /MISSING the server-side column "user_id"/);
+});
+
+test('a live table missing change_seq fails', () => {
+  const { change_seq, ...noSeq } = CLOUD_OK;
+  const { errors } = run(manifest('live'), staged(noSeq));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /MISSING the server-side column "change_seq"/);
+});
+
+test('a mistyped change_seq fails', () => {
+  const { errors } = run(manifest('live'), staged({ ...CLOUD_OK, change_seq: 'text' }));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /"change_seq" is text .*needs "int"/s);
 });
 
 // --- timestamp columns (SUR-1048 review, P2) ---
@@ -188,6 +248,7 @@ test('a manifest row for an unknown table fails', () => {
     backend: 'pending',
     backend_ticket: 'SUR-4',
     pk: ['id'],
+    pk_scope: 'global',
   });
   const { errors } = run(doc, staged({}, { absent: true }));
   assert.equal(errors.length, 1);
