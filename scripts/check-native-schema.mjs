@@ -62,7 +62,7 @@ const IDENT_RE = /^[a-z_][a-z0-9_]*$/;
 // cloud-only columns stays signal: these two are expected on every table.
 const SERVER_ONLY_COLUMNS = new Set(['user_id', 'change_seq']);
 
-export const readJson = (path) => {
+const readJson = (path) => {
   const raw = readFileSync(path, 'utf8');
   try {
     return JSON.parse(raw);
