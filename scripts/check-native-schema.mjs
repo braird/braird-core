@@ -279,6 +279,7 @@ function checkKey(table, row, constraints, errors) {
 // here than for a typical table because `PostgrestClient::get_page` does NOT filter by user_id —
 // the pull URL is `?change_seq=gt.N&order=...`, so RLS *is* the tenant boundary, not a backstop.
 const EXPOSED_ROLES = new Set(['public', 'authenticated', 'anon']);
+const WRITE_COMMANDS = new Set(['ALL', 'INSERT', 'UPDATE']);
 
 function checkRls(table, policies, errors) {
   const mine = policies.filter((p) => p.table === table);
@@ -293,11 +294,32 @@ function checkRls(table, policies, errors) {
   for (const p of mine) {
     const roles = (p.roles ?? []).map((r) => String(r).toLowerCase());
     const exposed = roles.some((r) => EXPOSED_ROLES.has(r));
-    for (const [kind, pred] of [['USING', p.qual], ['WITH CHECK', p.with_check]]) {
-      if (pred != null && String(pred).trim().toLowerCase() === 'true' && exposed) {
+
+    // Read side: a bare `true` USING hands every row to every caller.
+    if (p.qual != null && String(p.qual).trim().toLowerCase() === 'true' && exposed) {
+      errors.push(
+        `braird-staging "${table}" policy "${p.name}" is USING (true) for role(s) ` +
+          `${roles.join(', ')} — that grants every user read access to every other user's rows.`
+      );
+    }
+
+    // Write side, checked SEPARATELY (migration-reviewer, SUR-1048). A scoped USING with a
+    // permissive WITH CHECK is the write-escape: reads are correctly fenced, but a user can INSERT
+    // or UPDATE rows carrying someone else's user_id. Testing the two predicates together — or
+    // only for a literal `true` — misses it, since the scoped read predicate satisfies the search
+    // and a permissive check need not be spelled `true`.
+    //
+    // Postgres: when WITH CHECK is omitted on UPDATE/ALL, USING governs writes too, so the
+    // effective write predicate is `with_check ?? qual`. INSERT policies have no USING at all.
+    if (WRITE_COMMANDS.has(String(p.cmd ?? '').toUpperCase())) {
+      const effective = p.with_check ?? p.qual;
+      if (effective == null || !String(effective).includes('auth.uid()')) {
         errors.push(
-          `braird-staging "${table}" policy "${p.name}" is ${kind} (true) for role(s) ` +
-            `${roles.join(', ')} — that grants every user access to every other user's rows.`
+          `braird-staging "${table}" policy "${p.name}" governs writes (${p.cmd}) but its ` +
+            `effective WITH CHECK predicate does not reference auth.uid()` +
+            (p.with_check == null ? ' (none set, and USING does not either)' : `: ${p.with_check}`) +
+            `.\n  A user could INSERT or UPDATE rows owned by another user even though reads are ` +
+            `scoped — the write side needs its own predicate.`
         );
       }
     }

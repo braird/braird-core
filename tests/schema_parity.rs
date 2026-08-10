@@ -22,7 +22,10 @@
 //! Native-only: the store (rusqlite) is gated off wasm32.
 #![cfg(not(target_arch = "wasm32"))]
 
-use braird_core::store::{native_schema, synced_schema, Store, TableSchema, LOCAL_ONLY_TABLES};
+use braird_core::store::{
+    native_schema, synced_schema, synced_table_names, table_schema, Store, TableSchema,
+    LOCAL_ONLY_TABLES,
+};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -157,6 +160,31 @@ fn native_primary_keys_match_the_manifest() {
                 t.name
             );
         }
+    }
+}
+
+#[test]
+fn native_tables_are_registered_but_not_yet_writable_or_pulled() {
+    // The seal boundary is currently enforced by ABSENCE — native-first tables are simply missing
+    // from `table_schema()` and the pull scope. Absence is invisible: nothing breaks if a future
+    // change quietly resolves them, and `apply_row` would then write `open_questions` with no
+    // encryption contract (plaintext question text reaching SQLite is the crypto-reviewer BLOCKER
+    // class). This pins the gap so SUR-1042 has to DELETE a failing test to open the path —
+    // a deliberate act with a reviewer attached — rather than widening a lookup and moving on.
+    for t in native_schema() {
+        assert!(
+            table_schema(t.name).is_none(),
+            "`{}` resolves via table_schema(), which makes apply_row/get_row write it. If SUR-1042 \
+             is wiring the sync legs, delete this assertion in the same commit that lands the \
+             encryption boundary — not before",
+            t.name
+        );
+        assert!(
+            !synced_table_names().contains(&t.name),
+            "`{}` is in the pull scope, but its cloud table only exists once SUR-1047's migration \
+             lands — every pull would 404 until then",
+            t.name
+        );
     }
 }
 

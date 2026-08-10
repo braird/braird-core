@@ -31,6 +31,11 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   `schema-drift.yml` as its own job (per-PR + the weekly cron that is the only trigger able to see
   staging-side drift while this repo sits still), fail-closed when `BRAIRD_STAGING_DB_URL` is unset,
   with the gate's own comparison logic unit-tested via `node --test`.
+  The read and write sides of RLS are checked **separately**: a policy with a scoped `USING` but a
+  permissive `WITH CHECK` fences reads while letting a user INSERT or UPDATE rows carrying someone
+  else's `user_id`, and testing the two predicates together hides it because the read side satisfies
+  the search. Any policy governing writes must have an effective `WITH CHECK` (falling back to `USING`,
+  as Postgres does when it is omitted) that references `auth.uid()`.
   Because `PostgrestClient::get_page` sends **no `user_id` filter**, RLS is the tenant boundary rather
   than a backstop — so the leg validates the **policies**, not just `relrowsecurity`: enabled-with-no-policy
   (deny-all, which makes sync silently unusable), a `USING (true)` policy granted to `authenticated`

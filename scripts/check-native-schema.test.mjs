@@ -304,15 +304,49 @@ test('RLS enabled with NO policies fails — that is deny-all', () => {
 test('a USING (true) policy for authenticated fails — cross-tenant exposure', () => {
   const leaky = { ...OK_POLICY, qual: 'true', with_check: 'true' };
   const { errors } = run(manifest('live'), staged(CLOUD_OK, { policies: [leaky] }));
-  assert.ok(errors.length >= 1);
-  assert.match(errors.join('\n'), /grants every user access to every other user's rows/);
+  const joined = errors.join('\n');
+  // Wide open in both directions, so it trips the read leak AND the write escape — they are
+  // independent checks and a policy this permissive genuinely fails both.
+  assert.match(joined, /grants every user read access to every other user's rows/);
+  assert.match(joined, /governs writes/);
+});
+
+test('a scoped USING with WITH CHECK (true) fails — the write escape', () => {
+  // Reads are correctly fenced; writes are not. Checking the two predicates together would pass
+  // this, because the USING side satisfies the auth.uid() search.
+  const escape = { ...OK_POLICY, qual: '(auth.uid() = user_id)', with_check: 'true' };
+  const { errors } = run(manifest('live'), staged(CLOUD_OK, { policies: [escape] }));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /governs writes \(ALL\).*does not reference auth\.uid\(\)/s);
+});
+
+test('a permissive-but-not-literal WITH CHECK still fails', () => {
+  const sneaky = { ...OK_POLICY, qual: '(auth.uid() = user_id)', with_check: '(1 = 1)' };
+  const { errors } = run(manifest('live'), staged(CLOUD_OK, { policies: [sneaky] }));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /governs writes/);
+});
+
+test('an omitted WITH CHECK on UPDATE is fine when USING is scoped', () => {
+  // Postgres falls back to USING for writes when WITH CHECK is omitted, so this is genuinely safe.
+  const ok = { ...OK_POLICY, cmd: 'UPDATE', qual: '(auth.uid() = user_id)', with_check: null };
+  const { errors } = run(manifest('live'), staged(CLOUD_OK, { policies: [ok] }));
+  assert.deepEqual(errors, []);
+});
+
+test('a SELECT-only policy is not held to the write predicate', () => {
+  const readOnly = { ...OK_POLICY, cmd: 'SELECT', with_check: null };
+  const { errors } = run(manifest('live'), staged(CLOUD_OK, { policies: [readOnly] }));
+  assert.deepEqual(errors, []);
 });
 
 test('policies that never consult auth.uid() fail', () => {
   const notScoped = { ...OK_POLICY, qual: '(status = \'live\')', with_check: null };
   const { errors } = run(manifest('live'), staged(CLOUD_OK, { policies: [notScoped] }));
-  assert.equal(errors.length, 1);
-  assert.match(errors[0], /none reference auth\.uid\(\)/);
+  // Two independent complaints: the write side has no owner predicate, and no policy on the table
+  // consults the caller's identity at all.
+  assert.match(errors.join('\n'), /none reference auth\.uid\(\)/);
+  assert.match(errors.join('\n'), /governs writes/);
 });
 
 // --- change_seq must be stamped, not merely present (round 3, P1) ---
