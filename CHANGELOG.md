@@ -6,6 +6,36 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **A native-first schema registry, so a table core authors itself is under contract from its first
+  commit (SUR-1048).** The SUR-723 guard could only cover tables *derived* from surfc: `sync-schema.json`
+  is re-derived by `scripts/extract-sync-schema.mjs`, which is what makes an exact-equality assertion
+  possible. The SUR-996 tables (`open_questions`, `question_note_overrides`, `user_settings`) have no
+  PWA counterpart and never will, so they could join neither side of that fixture — and the alternative,
+  a waiver list, gives a table zero shape protection and rots as native-first grows. They now register
+  in a first-class native section instead: `store::native_schema()` is the source of truth,
+  `vendored/schema/native-schema.json` is a hand-authored **lock** of it (a shape change is a
+  deliberate two-file diff; a one-file change fails `tests/schema_parity.rs`), and
+  `vendored/schema/native-manifest.json` names each table's owning ticket (SUR-842 pattern).
+  Three things close the loop: the store↔fixture lock, a **no-third-category** rule — every table in
+  `sqlite_master` must appear in exactly one of the derived fixture, the native fixture, or
+  `store::LOCAL_ONLY_TABLES`, so an unregistered table fails the build rather than belonging to no
+  contract — and `scripts/check-native-schema.mjs`, which reads `braird-staging`'s `information_schema`
+  and asserts the fixture matches the DDL **actually applied** (the one failure a Rust build cannot
+  see: a migration written, merged, and never applied). The DDL leg compares as a subset — the cloud
+  legitimately carries `user_id` (auth-injected at push) and `change_seq` (surfc migration 0051), and
+  cloud-only columns are a notice, not a failure — but a fixture column that is missing or retyped
+  fails, as does a live table with row-level security disabled. Tables whose migration has not landed
+  yet carry `backend: pending` with a tracking ticket: the DDL leg skips them loudly **and fails if it
+  finds them present anyway**, so the marker cannot quietly become a permanent exemption. Wired into
+  `schema-drift.yml` as its own job (per-PR + the weekly cron that is the only trigger able to see
+  staging-side drift while this repo sits still), fail-closed when `BRAIRD_STAGING_DB_URL` is unset,
+  with the gate's own comparison logic unit-tested via `node --test`.
+  Registration only — these tables are created and locked, but deliberately absent from `table_schema()`
+  and the pull scope until SUR-1042 defines their encryption boundary and sync legs.
+  Note for SUR-1047: `user_settings` must carry `deleted` (pull's tombstone gate reads it generically
+  on every table), which amends SUR-996's `(user_id, key, value, updated_at)` sketch.
+
 ### Fixed
 - **A per-table pull failure now carries its underlying error instead of a bare table name
   (SUR-1031).** `pull::pull`'s isolation arm discarded the error it isolated (`Err(_)`) and its

@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "comment": "SUR-1048 native-first schema registry. One row per table in vendored/schema/native-schema.json — the tables braird-core AUTHORS rather than mirrors from surfc (native-first per the 2026-07-18 rule, so there is no PWA counterpart to derive from). Source of truth for 'who owns this table and does it exist in the cloud yet'. `ticket` names the core ticket that owns the shape. `backend`: live (the table exists in braird-staging — scripts/check-native-schema.mjs asserts its information_schema DDL matches the fixture) | pending (the migration has not been applied yet — the DDL leg SKIPS the table and says so loudly, and FAILS if it finds the table present anyway, so the marker cannot rot); a pending row REQUIRES a backend_ticket. The store<->fixture lock in tests/schema_parity.rs applies regardless of backend state.",
+  "entries": [
+    {
+      "table": "open_questions",
+      "ticket": "SUR-1042",
+      "backend": "pending",
+      "backend_ticket": "SUR-1047",
+      "note": "SUR-996 R1 question log. `text` is enc:v2 ciphertext (AAD = question id), never plaintext — the seal boundary lands with the sync legs in SUR-1042. Shape registered here so the table is under the guard from its first commit."
+    },
+    {
+      "table": "question_note_overrides",
+      "ticket": "SUR-1042",
+      "backend": "pending",
+      "backend_ticket": "SUR-1047",
+      "note": "SUR-996 R1 question<->note curation. Plaintext metadata (id pairs + timestamps), same trade-off as collection_memberships. Deterministic `question_id:note_id` pk so concurrent curation of one pair converges to a single row (OR-set, not the note_links bag)."
+    },
+    {
+      "table": "user_settings",
+      "ticket": "SUR-1042",
+      "backend": "pending",
+      "backend_ticket": "SUR-1047",
+      "note": "SUR-996 R4 — braird's first synced settings, a per-user KV with LWW per ROW so one device's cadence change cannot stomp another key. Deliberately NOT columns on user_profiles (hot, server-authoritative; whole-row LWW would stomp quota/billing state). Rule going forward: server writes profiles, clients write settings. Carries `deleted` because pull's tombstone gate reads it generically — SUR-1047's migration must include it (amends SUR-996's four-column sketch)."
+    }
+  ]
+}

@@ -111,6 +111,11 @@ use ColType::{Bool, Int, Json, Real, Text};
 /// The read/write helpers (`get_row` / `apply_row`) and the pull loop use this to stay
 /// table-generic — SUR-726 fans out to the other six stores by extending the pull table list,
 /// not by touching these helpers.
+///
+/// **Deliberately does NOT resolve [`native_schema`] tables (SUR-1048).** Those are created and
+/// shape-locked, but not yet syncable: widening this lookup would make `apply_row` write
+/// `open_questions` before SUR-1042 defines the seal boundary. SUR-1042 widens it (and the pull
+/// scope) in the same change that gives those tables an encryption contract.
 pub fn table_schema(name: &str) -> Option<&'static TableSchema> {
     synced_schema().iter().find(|t| t.name == name)
 }
@@ -339,6 +344,96 @@ pub fn synced_schema() -> &'static [TableSchema] {
     ]
 }
 
+/// The **native-first** synced tables (SUR-1048) — stores whose shape braird-core AUTHORS
+/// rather than mirrors. [`synced_schema`] above is derived from surfc (the PWA is the source
+/// of truth, `extract-sync-schema.mjs` re-derives the fixture, and drift there means "we fell
+/// behind surfc"). These tables have no PWA counterpart and never will (SUR-996 ships native-only,
+/// per the 2026-07-18 native-first rule), so the authority runs the other way: **this descriptor
+/// is the source of truth**, and `vendored/schema/native-schema.json` is a hand-authored LOCK of
+/// it — not a derivation.
+///
+/// What the lock buys, given nothing can be re-derived to check it:
+///   - every shape change is a deliberate TWO-FILE diff (descriptor + fixture) a reviewer sees;
+///     an accidental one-file change fails `tests/schema_parity.rs` in CI;
+///   - `scripts/check-native-schema.mjs` proves the fixture matches the DDL actually applied to
+///     `braird-staging` — the one leg that can catch "the migration was written but never applied";
+///   - `vendored/schema/native-manifest.json` names the owning ticket per table (SUR-842 pattern),
+///     so a table can't sit here unattributed.
+///
+/// **Registered, not yet wired.** These tables are CREATED by [`Store::init_schema`] and locked by
+/// the guard, but they are deliberately absent from [`table_schema`] and [`synced_table_names`]:
+/// the pull scope must not fan out to a cloud table that does not exist yet (SUR-1047), and
+/// `apply_row` must not become writable for `open_questions` before SUR-1042 defines its
+/// encryption boundary — `text` is ciphertext (enc:v2, AAD = the question id, like `notes.text`),
+/// and a plaintext question reaching SQLite is the `crypto-reviewer` BLOCKER class. SUR-1042 wires
+/// the sync legs; this ticket only puts the shapes under the guard.
+///
+/// **Convergence (SUR-737 contract, extended).** Whole-row LWW by `updated_at`, like everything
+/// else. `question_note_overrides.id` is the DETERMINISTIC `question_id:note_id` join (the
+/// `collection_memberships` OR-set pattern, NOT the `note_links` random-uid bag) so two devices
+/// curating the same pair converge to one row and a contradictory `include`/`exclude` resolves by
+/// LWW instead of leaving both. SUR-1042 owns the derivation helper and must handle the
+/// re-add-after-delete-in-one-batch case that deterministic pks are prone to. `user_settings` is a
+/// per-key KV (`key` is the whole local pk; `user_id` is auth-injected at push like every other
+/// table), so LWW lands per SETTING rather than per settings-blob — the reason it is a standalone
+/// table and not columns on `user_profiles` (a hot, server-authoritative row whose whole-row LWW
+/// would stomp quota/billing state).
+///
+/// `updated_at` + `deleted` are structural, not stylistic: `pull`'s LWW compare and its tombstone
+/// gate read them generically on every table (`every_synced_table_has_updated_at_and_deleted`).
+/// `user_settings` therefore carries `deleted` even though a setting is never user-deletable — and
+/// SUR-1047's migration must carry it too (this amends SUR-996's `(user_id, key, value, updated_at)`).
+pub fn native_schema() -> &'static [TableSchema] {
+    &[
+        TableSchema {
+            name: "open_questions",
+            pk: &["id"],
+            columns: &[
+                ("id", Text),
+                ("text", Text), // ciphertext (enc:v2, AAD = question id) — never plaintext
+                ("status", Text), // live | resolved | dismissed
+                ("tone", Text), // introspective | productive, as chosen AT ANSWER time
+                ("resolved_at", Int),
+                ("checked_in_at", Int),
+                ("checkin_response", Text),
+                ("created_at", Int),
+                ("updated_at", Int),
+                ("deleted", Bool),
+            ],
+        },
+        TableSchema {
+            name: "question_note_overrides",
+            pk: &["id"],
+            columns: &[
+                ("id", Text), // deterministic `question_id:note_id`
+                ("question_id", Text),
+                ("note_id", Text),
+                ("kind", Text), // include | exclude
+                ("created_at", Int),
+                ("updated_at", Int),
+                ("deleted", Bool),
+            ],
+        },
+        TableSchema {
+            name: "user_settings",
+            pk: &["key"],
+            columns: &[
+                ("key", Text),
+                ("value", Text),
+                ("updated_at", Int),
+                ("deleted", Bool),
+            ],
+        },
+    ]
+}
+
+/// Every table this store creates from a [`TableSchema`] descriptor — the surfc-derived synced set
+/// plus the native-first set. The DDL, the additive-column migration and the `updated_at` index all
+/// iterate this, so a native-first table is a first-class store table, not a special case.
+fn descriptor_tables() -> impl Iterator<Item = &'static TableSchema> {
+    synced_schema().iter().chain(native_schema())
+}
+
 /// The synced tables in dependency (topological) order — every FK parent precedes its children.
 /// Derived from [`synced_schema`] so the pull scope (SUR-726 fans out to all eight) and the flush
 /// order both follow the descriptor: a ninth table joins both by being added to `synced_schema`
@@ -364,6 +459,11 @@ pub fn membership_id(collection_id: &str, note_id: &str) -> String {
 /// per-table sync cursors (a KV store), `outbox` the pending-write queue keyed
 /// `(table, record_id)`, `embeddings` the device-local sealed search vectors, and
 /// `discovery_jobs` the local job queue. Raw DDL — they have no cloud counterpart.
+/// The names created by [`LOCAL_ONLY_DDL`]. Hand-kept in step with it — the registry test
+/// (`tests/schema_parity.rs`) reconciles this list against `sqlite_master`, so a table added to the
+/// DDL without a name here fails the build rather than becoming an unregistered third category.
+pub const LOCAL_ONLY_TABLES: &[&str] = &["meta", "outbox", "embeddings", "discovery_jobs"];
+
 const LOCAL_ONLY_DDL: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);",
     "CREATE TABLE IF NOT EXISTS outbox (\
@@ -439,7 +539,7 @@ impl Store {
     /// re-opening an existing store is a no-op — plus the additive column migration
     /// below for stores created before a descriptor column existed.
     fn init_schema(&self) -> rusqlite::Result<()> {
-        for t in synced_schema() {
+        for t in descriptor_tables() {
             self.conn.execute_batch(&create_table_sql(t))?;
             // SUR-1005 — additive local-DB migration (see `ensure_columns`): a store
             // predating a descriptor column would fail its first pull-apply
@@ -484,6 +584,19 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// Every table the live store actually holds, read from `sqlite_master`. The registry guard
+    /// (SUR-1048) reconciles this against the two vendored fixtures + [`LOCAL_ONLY_TABLES`]; asking
+    /// SQLite is the point — a descriptor-driven list could never see a table created by raw DDL,
+    /// which is exactly the gap an unregistered table would slip through.
+    pub fn table_names(&self) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' \
+             ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect()
     }
 
     /// Whether a table exists in the store (for tests / host introspection).
@@ -1244,14 +1357,14 @@ mod tests {
     #[test]
     fn opens_and_creates_every_table() {
         let store = Store::open_in_memory().unwrap();
-        for t in synced_schema() {
+        for t in descriptor_tables() {
             assert!(
                 store.table_exists(t.name).unwrap(),
-                "missing synced table {}",
+                "missing descriptor table {}",
                 t.name
             );
         }
-        for name in ["meta", "outbox", "embeddings", "discovery_jobs"] {
+        for name in LOCAL_ONLY_TABLES {
             assert!(
                 store.table_exists(name).unwrap(),
                 "missing local-only table {name}"
@@ -1262,7 +1375,7 @@ mod tests {
     #[test]
     fn ddl_columns_match_the_descriptor() {
         let store = Store::open_in_memory().unwrap();
-        for t in synced_schema() {
+        for t in descriptor_tables() {
             let actual: Vec<String> = store
                 .table_columns(t.name)
                 .unwrap()
@@ -1276,7 +1389,10 @@ mod tests {
 
     #[test]
     fn every_synced_table_has_updated_at_and_deleted() {
-        for t in synced_schema() {
+        // Native-first tables included (SUR-1048): `pull`'s LWW compare and tombstone gate read
+        // both columns generically, so a native table without them would be unsyncable by
+        // construction — the invariant is structural, not a convention of the surfc-derived set.
+        for t in descriptor_tables() {
             let names: Vec<&str> = t.columns.iter().map(|(n, _)| *n).collect();
             assert!(names.contains(&"updated_at"), "{} lacks updated_at", t.name);
             assert!(names.contains(&"deleted"), "{} lacks deleted", t.name);
@@ -1800,7 +1916,7 @@ mod tests {
     #[test]
     fn synced_tables_have_updated_at_index() {
         let store = Store::open_in_memory().unwrap();
-        for t in synced_schema() {
+        for t in descriptor_tables() {
             let idx = format!("{}_updated_at_idx", t.name);
             let n: i64 = store
                 .conn

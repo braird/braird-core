@@ -26,6 +26,9 @@ on:
     paths:
       - 'vendored/schema/**'
       - 'scripts/extract-sync-schema.mjs'
+      - 'scripts/check-native-schema.mjs'
+      - 'scripts/check-native-schema.test.mjs'
+      - 'scripts/logical-type.mjs'
       - '.github/workflows/schema-drift.yml'
   # Weekly: the only trigger that catches surfc-side drift when NO PR here touches anything
   # (surfc adds a synced column while this repo is static) — the cross-repo case a per-PR
@@ -69,3 +72,45 @@ jobs:
       - name: Assert sync-schema.json has not drifted from surfc/main
         if: steps.guard.outputs.ready == 'true'
         run: node scripts/extract-sync-schema.mjs /tmp/surfc --check vendored/schema/sync-schema.json
+
+  # SUR-1048. The native-first tables (SUR-996) have no surfc counterpart, so there is nothing to
+  # re-derive: `native_schema()` in src/store.rs is the source of truth and
+  # vendored/schema/native-schema.json is a hand-authored lock of it, reconciled by
+  # tests/schema_parity.rs on every `cargo test`. This job covers the one thing the Rust build
+  # cannot see — the DDL actually applied to braird-staging. A migration written but never applied
+  # (or applied with a different type) is invisible everywhere else in the stack.
+  #
+  # No surfc clone: this leg talks to the database, not to the PWA. Runs on the same triggers as
+  # the derived leg — per-PR (a fixture edit is checked immediately) plus the weekly cron, which is
+  # the only trigger that catches STAGING-side drift while this repo sits still, exactly as the
+  # weekly surfc re-derivation catches PWA-side drift.
+  native:
+    name: native-first schema lock vs braird-staging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.15.0'
+
+      # The DDL leg only ever executes against braird-staging, so its comparison logic (missing
+      # column, retyped column, RLS off, a stale backend:pending row) would otherwise ship having
+      # never run. These exercise it against recorded information_schema payloads.
+      - name: Unit-check the gate's own comparison logic
+        run: node --test scripts/check-native-schema.test.mjs
+
+      # Preinstalled on ubuntu-latest; asserted explicitly so a runner-image change is diagnosed
+      # here rather than as a confusing spawn failure inside the script.
+      - name: Assert the psql client is available
+        run: psql --version
+
+      - name: Assert native-schema.json matches braird-staging's information_schema
+        env:
+          # Secret referenced by name only (GATING §4). The script reads it from the environment,
+          # never from argv, and redacts it out of any psql error before printing. It fails closed
+          # when unset — no skip path, because a schema gate that passes without opening a
+          # connection is worse than no gate.
+          BRAIRD_STAGING_DB_URL: ${{ secrets.BRAIRD_STAGING_DB_URL }}
+        run: node scripts/check-native-schema.mjs --check
