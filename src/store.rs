@@ -394,8 +394,10 @@ pub fn native_schema() -> &'static [TableSchema] {
                 ("status", Text), // live | resolved | dismissed
                 ("tone", Text), // introspective | productive, as chosen AT ANSWER time
                 ("resolved_at", Int),
-                ("checked_in_at", Int),
-                ("checkin_response", Text),
+                // `checkin_*`, not `checked_in_at` + `checkin_response` — one compound form per
+                // concept, so the pair reads as one column group (naming-reviewer, SUR-1048).
+                ("checkin_at", Int),
+                ("checkin_response", Text), // plaintext metadata (still_open|resolved|new), NOT sealed
                 ("created_at", Int),
                 ("updated_at", Int),
                 ("deleted", Bool),

@@ -10,7 +10,39 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { checkDdl, checkManifest } from './check-native-schema.mjs';
+import { logicalType } from './logical-type.mjs';
+
+const SCRIPT = fileURLToPath(new URL('./check-native-schema.mjs', import.meta.url));
+const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
+
+// Run the CLI for real, with BRAIRD_STAGING_DB_URL scrubbed so the assertion holds in CI (where the
+// secret IS set) exactly as it does locally.
+const runCli = (args) =>
+  spawnSync(process.execPath, [SCRIPT, ...args], {
+    cwd: REPO_ROOT,
+    encoding: 'utf8',
+    env: { ...process.env, BRAIRD_STAGING_DB_URL: '' },
+  });
+
+// --- exit-code discipline (SUR-1048 review, release-integrity-reviewer) ---
+// GATING §3.1 on scripts/: "a check that can pass without running is worse than no check". These
+// pin the two ways this one could silently become a no-op.
+
+test('the CLI refuses to run without --check instead of exiting 0', () => {
+  const { status, stderr } = runCli([]);
+  assert.notEqual(status, 0, 'a bare invocation must not look like success');
+  assert.equal(status, 2);
+  assert.match(stderr, /usage:/);
+});
+
+test('the CLI exits non-zero when the DB secret is missing — it never skips silently', () => {
+  const { status, stderr } = runCli(['--check']);
+  assert.equal(status, 1);
+  assert.match(stderr, /BRAIRD_STAGING_DB_URL is not set/);
+});
 
 const FIXTURE = {
   widgets: { id: 'text', count: 'int', updated_at: 'int', deleted: 'bool' },
@@ -225,6 +257,27 @@ test('a mistyped change_seq fails', () => {
   const { errors } = run(manifest('live'), staged({ ...CLOUD_OK, change_seq: 'text' }));
   assert.equal(errors.length, 1);
   assert.match(errors[0], /"change_seq" is text .*needs "int"/s);
+});
+
+// --- the shared logical-type map (SUR-1048 review, regression-reviewer) ---
+// logical-type.mjs is imported by BOTH gates, so its contract is tested directly rather than only
+// through this script's callers — the timestamp rejection changed extract-sync-schema.mjs's
+// behaviour too (it used to map timestamps to `int`), and that change needs its own pin.
+
+test('logicalType rejects every timestamp/date/time form, for both callers', () => {
+  for (const t of ['timestamp', 'timestamp with time zone', 'timestamptz', 'date', 'time']) {
+    assert.throws(() => logicalType(t), /unusable pg type/, `${t} should be rejected`);
+  }
+});
+
+test('logicalType still maps the types the synced fixture actually uses', () => {
+  assert.equal(logicalType('bigint'), 'int');
+  assert.equal(logicalType('text'), 'text');
+  assert.equal(logicalType('uuid'), 'text');
+  assert.equal(logicalType('boolean'), 'bool');
+  assert.equal(logicalType('double precision'), 'real');
+  assert.equal(logicalType('jsonb'), 'json');
+  assert.equal(logicalType('text[]'), 'json');
 });
 
 // --- timestamp columns (SUR-1048 review, P2) ---

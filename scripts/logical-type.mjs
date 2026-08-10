@@ -24,10 +24,9 @@ export function logicalType(pgType) {
   // as NULL, silently, on every sync. Mapping it to `int` here would let that ship green (caught on
   // SUR-1048 review). Reject it as physically incompatible instead.
   if (t.startsWith('timestamp') || t.startsWith('date') || t.startsWith('time'))
-    return unusable(pgType, 'braird stores epoch bigint; PostgREST sends timestamps as ISO strings, which store.rs coerces to NULL. Use bigint.');
+    throw new Error(
+      `unusable pg type "${pgType}": braird stores epoch bigint; PostgREST sends timestamps as ` +
+        `ISO strings, which store.rs coerces to NULL. Use bigint.`
+    );
   throw new Error(`unmapped pg type: "${pgType}"`);
-}
-
-function unusable(pgType, why) {
-  throw new Error(`unusable pg type "${pgType}": ${why}`);
 }

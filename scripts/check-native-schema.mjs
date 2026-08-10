@@ -36,11 +36,24 @@
 //   redacted out of any psql error before it reaches the CI log. Fails closed when unset: a schema
 //   gate that passes because a secret went missing is worse than no gate at all.
 //
-//   The role in that URL must be able to SEE the registered tables: `information_schema.columns` is
-//   privilege-filtered, while the `pg_class` half is not. A role without access therefore reports a
-//   live table's columns as all-missing, or a pending table as "present but empty" — both LOUD
-//   failures rather than silent passes, but confusing ones, so use a role with read access to
-//   `public` (the migration/service role, not an anon key).
+//   Use a DEDICATED READ-ONLY role — this gate only reads catalogs, so a migration/service
+//   credential in CI would be over-privileged for the job (raised by security-reviewer):
+//
+//     CREATE ROLE schema_checker LOGIN PASSWORD '…';
+//     GRANT USAGE ON SCHEMA public TO schema_checker;
+//     GRANT SELECT ON ALL TABLES IN SCHEMA public TO schema_checker;
+//     ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO schema_checker;
+//
+//   That last line is not optional: the tables this registry is FOR do not exist yet, so without
+//   default privileges they land outside the grant and every column reads as missing.
+//   The role must be able to SEE the registered tables — `information_schema.columns` is
+//   privilege-filtered, while the `pg_class` half is not. An under-privileged role therefore
+//   reports a live table's columns as all-missing (a loud failure, but a confusing one). Note the
+//   present/absent verdict itself comes from `pg_class` and stays correct regardless of grants.
+//
+//   Connection string: use Supabase's SESSION POOLER host, not the direct `db.<ref>.supabase.co`
+//   one — direct connections are IPv6-only on post-2024 projects and GitHub runners are IPv4-only.
+//   The pooler encodes the project ref in the username (`<role>.<project-ref>`).
 
 import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
