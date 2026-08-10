@@ -31,6 +31,14 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   `schema-drift.yml` as its own job (per-PR + the weekly cron that is the only trigger able to see
   staging-side drift while this repo sits still), fail-closed when `BRAIRD_STAGING_DB_URL` is unset,
   with the gate's own comparison logic unit-tested via `node --test`.
+  The registry also locks each native table's **primary key** (`native-manifest.json` `pk`, reconciled
+  against `TableSchema.pk`, with the cloud required to carry a matching `PRIMARY KEY`/`UNIQUE` on either
+  the local key or that key plus `user_id`): a column-only compare is blind to the key, but the key is
+  what decides convergence — `question_note_overrides`'s deterministic `question_id:note_id` is the OR-set
+  that makes two devices curating the same pair land on one row instead of two contradictory ones. And a
+  `timestamp`/`timestamptz` column is now **rejected** rather than normalised to `int`: PostgREST sends
+  those as ISO strings, which `ColType::Int`'s `as_i64()` turns into NULL on every sync, so equating them
+  with an epoch bigint would have let that ship green.
   Registration only — these tables are created and locked, but deliberately absent from `table_schema()`
   and the pull scope until SUR-1042 defines their encryption boundary and sync legs.
   Note for SUR-1047: `user_settings` must carry `deleted` (pull's tombstone gate reads it generically

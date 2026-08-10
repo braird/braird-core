@@ -18,6 +18,16 @@ export function logicalType(pgType) {
   if (t === 'boolean' || t === 'bool') return 'bool';
   if (t === 'real' || t === 'double precision' || t === 'float4' || t === 'float8') return 'real';
   if (t === 'jsonb' || t === 'json' || t.endsWith('[]')) return 'json';
-  if (t.startsWith('timestamp')) return 'int'; // epoch bigint convention; none today
+  // A timestamp column is ALWAYS wrong here, never "an int in disguise". Braird's wire format is
+  // epoch bigint; PostgREST serialises timestamp/timestamptz as an ISO *string*, and store.rs's
+  // `ColType::Int` path is `val.as_i64()` — a string yields None, so the value would land in SQLite
+  // as NULL, silently, on every sync. Mapping it to `int` here would let that ship green (caught on
+  // SUR-1048 review). Reject it as physically incompatible instead.
+  if (t.startsWith('timestamp') || t.startsWith('date') || t.startsWith('time'))
+    return unusable(pgType, 'braird stores epoch bigint; PostgREST sends timestamps as ISO strings, which store.rs coerces to NULL. Use bigint.');
   throw new Error(`unmapped pg type: "${pgType}"`);
+}
+
+function unusable(pgType, why) {
+  throw new Error(`unusable pg type "${pgType}": ${why}`);
 }

@@ -17,12 +17,16 @@ const FIXTURE = {
 };
 
 const manifest = (backend, extra = {}) => ({
-  entries: [{ table: 'widgets', ticket: 'SUR-1', backend, backend_ticket: 'SUR-2', ...extra }],
+  entries: [
+    { table: 'widgets', ticket: 'SUR-1', backend, backend_ticket: 'SUR-2', pk: ['id'], ...extra },
+  ],
 });
 
-// Build a `queryStaging`-shaped payload. `cols` is { column: pg data_type }.
-const staged = (cols, { rls = true, absent = false } = {}) => () => ({
+// Build a `queryStaging`-shaped payload. `cols` is { column: pg data_type }. `key` is the cloud
+// constraint's column set (default: a plain PK on the local pk).
+const staged = (cols, { rls = true, absent = false, key = ['id'], keyType = 'p' } = {}) => () => ({
   tables: absent ? [] : [{ table: 'widgets', rls }],
+  constraints: absent || !key ? [] : [{ table: 'widgets', type: keyType, cols: key }],
   columns: absent
     ? []
     : Object.entries(cols).map(([column, data_type]) => ({
@@ -122,9 +126,69 @@ test('a fixture table with no manifest row fails', () => {
   assert.match(errors[0], /table "widgets" has no row/);
 });
 
+// --- key constraint (SUR-1048 review, P1) ---
+// A wrong key is invisible to a column-only compare but changes convergence outright.
+
+test('a user-scoped cloud key satisfies the local pk', () => {
+  // Local pk is `key`-style single-column; the cloud scopes it by user_id. Both express the same
+  // uniqueness because the local mirror never stores user_id.
+  const { errors } = run(manifest('live'), staged(CLOUD_OK, { key: ['user_id', 'id'] }));
+  assert.deepEqual(errors, []);
+});
+
+test('a UNIQUE constraint satisfies the key requirement, not just PRIMARY KEY', () => {
+  const { errors } = run(manifest('live'), staged(CLOUD_OK, { key: ['id'], keyType: 'u' }));
+  assert.deepEqual(errors, []);
+});
+
+test('a key on the wrong column fails', () => {
+  const { errors } = run(manifest('live'), staged(CLOUD_OK, { key: ['count'] }));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /no PRIMARY KEY or UNIQUE constraint on \(id\)/);
+});
+
+test('a broader composite key fails — it would permit duplicate logical rows', () => {
+  const { errors } = run(manifest('live'), staged(CLOUD_OK, { key: ['id', 'count'] }));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /no PRIMARY KEY or UNIQUE constraint/);
+});
+
+test('no key at all fails', () => {
+  const { errors } = run(manifest('live'), staged(CLOUD_OK, { key: null }));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /Found: none/);
+});
+
+test('a manifest row without a pk fails', () => {
+  const doc = manifest('pending');
+  delete doc.entries[0].pk;
+  const { errors } = run(doc, staged({}, { absent: true }));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /REQUIRES a non-empty "pk" array/);
+});
+
+// --- timestamp columns (SUR-1048 review, P2) ---
+
+test('a timestamptz column fails instead of passing as an epoch int', () => {
+  // PostgREST sends these as ISO strings; store.rs's ColType::Int is as_i64(), so they would land
+  // as NULL on every sync. Equating them with `int` would have shipped that green.
+  const { errors } = run(
+    manifest('live'),
+    staged({ ...CLOUD_OK, updated_at: 'timestamp with time zone' })
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /unusable pg type .*Use bigint/s);
+});
+
 test('a manifest row for an unknown table fails', () => {
   const doc = manifest('pending');
-  doc.entries.push({ table: 'ghosts', ticket: 'SUR-3', backend: 'pending', backend_ticket: 'SUR-4' });
+  doc.entries.push({
+    table: 'ghosts',
+    ticket: 'SUR-3',
+    backend: 'pending',
+    backend_ticket: 'SUR-4',
+    pk: ['id'],
+  });
   const { errors } = run(doc, staged({}, { absent: true }));
   assert.equal(errors.length, 1);
   assert.match(errors[0], /"ghosts" is not a table in/);

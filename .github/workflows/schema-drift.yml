@@ -87,6 +87,10 @@ jobs:
   native:
     name: native-first schema lock vs braird-staging
     runs-on: ubuntu-latest
+    # Least privilege (CodeQL actions/missing-workflow-permissions): this job only reads the repo
+    # and a DB secret — it never writes to GitHub, so the token needs nothing beyond checkout.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 

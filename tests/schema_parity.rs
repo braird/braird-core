@@ -113,26 +113,77 @@ fn core_native_schema_matches_vendored_fixture() {
 }
 
 #[test]
+fn native_primary_keys_match_the_manifest() {
+    // The column-only compare above is blind to the KEY, and for these tables the key is not
+    // bookkeeping: `question_note_overrides`'s deterministic `question_id:note_id` id is what makes
+    // two devices curating the same pair converge to ONE row instead of two contradictory ones, and
+    // `user_settings` is keyed per SETTING so one device's cadence change cannot stomp another key.
+    // SUR-1047 authors its migration from this contract, so a wrong key would be invented there and
+    // caught by nothing (raised on review; the SUR-723 sibling defers PK coverage on the grounds
+    // that a surfc PK change is a breaking cloud migration — an assumption native-first voids,
+    // since the cloud table does not exist yet).
+    let manifest = std::fs::read_to_string(format!(
+        "{}/vendored/schema/native-manifest.json",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("read native-manifest.json");
+    let manifest: Value = serde_json::from_str(&manifest).expect("parse native-manifest.json");
+    let rows = manifest["entries"].as_array().expect("entries array");
+
+    for t in native_schema() {
+        let row = rows
+            .iter()
+            .find(|r| r["table"] == t.name)
+            .unwrap_or_else(|| panic!("no native-manifest.json row for `{}`", t.name));
+        let declared: Vec<String> = row["pk"]
+            .as_array()
+            .unwrap_or_else(|| panic!("`{}` row has no \"pk\" array", t.name))
+            .iter()
+            .map(|c| c.as_str().expect("pk column is a string").to_string())
+            .collect();
+        let actual: Vec<String> = t.pk.iter().map(|c| c.to_string()).collect();
+        assert_eq!(
+            actual, declared,
+            "primary key for `{}` diverged between native_schema() and native-manifest.json",
+            t.name
+        );
+
+        // A pk column that is not in the table is a typo the DDL check would only surface against
+        // staging — much later, and only once the migration lands.
+        for col in &actual {
+            assert!(
+                t.columns.iter().any(|(name, _)| name == col),
+                "`{}` declares pk column `{col}`, which is not one of its columns",
+                t.name
+            );
+        }
+    }
+}
+
+#[test]
 fn every_store_table_is_registered_in_exactly_one_contract() {
     let synced = fixture_schema("sync-schema.json");
     let native = fixture_schema("native-schema.json");
 
-    // No table may be claimed by both fixtures — "exactly one" is what makes the partition
-    // meaningful, and a surfc-derived table quietly copied into the hand-authored fixture would
-    // escape re-derivation in schema-drift.yml.
-    let overlap: Vec<&String> = native.keys().filter(|t| synced.contains_key(*t)).collect();
-    assert!(
-        overlap.is_empty(),
-        "table(s) {overlap:?} are in BOTH vendored/schema/sync-schema.json and native-schema.json \
-         — a table is either derived from surfc or native-first, never both"
-    );
-
-    let registered: BTreeSet<String> = synced
+    // EXACTLY one, checked before deduping. Collecting straight into a set would collapse a table
+    // claimed by two contracts and let the union comparison below pass — so the duplicate check runs
+    // on the flat list, across all three contracts at once (not just synced-vs-native: a table in
+    // both a fixture and LOCAL_ONLY_TABLES is the same lie, and would mean a synced table silently
+    // exempted from the drift guard).
+    let claimed: Vec<String> = synced
         .keys()
         .chain(native.keys())
         .cloned()
         .chain(LOCAL_ONLY_TABLES.iter().map(|s| s.to_string()))
         .collect();
+    let registered: BTreeSet<String> = claimed.iter().cloned().collect();
+    assert_eq!(
+        claimed.len(),
+        registered.len(),
+        "a table is claimed by more than one contract. Each must appear in exactly ONE of \
+         vendored/schema/sync-schema.json (derived from surfc), vendored/schema/native-schema.json \
+         (native-first), or store::LOCAL_ONLY_TABLES (device-local) — claimed: {claimed:?}"
+    );
 
     // Ask SQLite, not the descriptors: a descriptor-driven list is blind to a table created by raw
     // DDL (LOCAL_ONLY_DDL), which is exactly the gap an unregistered table would slip through.

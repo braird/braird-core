@@ -97,6 +97,14 @@ export function checkManifest(fixture, errors, manifest = readJson(MANIFEST)) {
     if (!TICKET_RE.test(row.ticket ?? '')) {
       errors.push(`${where}: REQUIRES a "ticket" matching SUR-nnn (who owns this table's shape).`);
     }
+    // `pk` is locked against TableSchema.pk by tests/schema_parity.rs; here we only need it to be
+    // present and well-formed, since the DDL leg compares it to the cloud's key constraint.
+    if (!Array.isArray(row.pk) || !row.pk.length || !row.pk.every((c) => typeof c === 'string')) {
+      errors.push(
+        `${where}: REQUIRES a non-empty "pk" array of column names — the key is what decides ` +
+          `convergence (deterministic-pk OR-set vs duplicate rows), so it cannot go unstated.`
+      );
+    }
     if (!VALID_BACKEND.has(row.backend)) {
       errors.push(`${where}: backend "${row.backend}" is not one of live|pending.`);
       continue;
@@ -147,7 +155,20 @@ function queryStaging(tables) {
       'tables', (
         SELECT coalesce(json_agg(json_build_object('table', c.relname, 'rls', c.relrowsecurity)), '[]'::json)
         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relname IN (${list})))`;
+        WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relname IN (${list})),
+      'constraints', (
+        SELECT coalesce(json_agg(j), '[]'::json) FROM (
+          SELECT json_build_object(
+            'table', t.relname,
+            'type', con.contype,
+            'cols', (SELECT array_agg(a.attname ORDER BY a.attname)
+                     FROM unnest(con.conkey) AS k(attnum)
+                     JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum)) AS j
+          FROM pg_constraint con
+          JOIN pg_class t ON t.oid = con.conrelid
+          JOIN pg_namespace n ON n.oid = t.relnamespace
+          WHERE n.nspname = 'public' AND con.contype IN ('p', 'u') AND t.relname IN (${list})
+        ) sub))`;
 
   let out;
   try {
@@ -170,6 +191,32 @@ function queryStaging(tables) {
 // (`_text` → `text[]`); everything else is already the type name the map expects.
 const pgTypeOf = (col) =>
   col.data_type === 'ARRAY' ? `${String(col.udt).replace(/^_/, '')}[]` : col.data_type;
+
+// The cloud key must enforce the SAME uniqueness the local pk does. It is allowed to be
+// user-scoped — the local mirror never stores `user_id` (auth-injected at push), so a per-user KV
+// keyed `key` locally is keyed `(user_id, key)` in the cloud. Anything else is a real divergence:
+// a broader key permits duplicate logical rows (breaking the deterministic-pk OR-set that makes two
+// devices converge), a narrower one collides across users. PRIMARY KEY or UNIQUE both satisfy it —
+// PostgREST upserts resolve on either.
+function checkKey(table, row, constraints, errors) {
+  if (!Array.isArray(row.pk) || !row.pk.length) return; // already reported by checkManifest
+  const want = [...row.pk].sort().join(',');
+  const wantScoped = [...row.pk, 'user_id'].sort().join(',');
+
+  const found = constraints
+    .filter((c) => c.table === table)
+    .map((c) => [...(c.cols ?? [])].sort().join(','));
+
+  if (!found.some((cols) => cols === want || cols === wantScoped)) {
+    errors.push(
+      `braird-staging "${table}" has no PRIMARY KEY or UNIQUE constraint on (${row.pk.join(', ')}) ` +
+        `or (${row.pk.join(', ')}, user_id).\n` +
+        `  Found: ${found.length ? found.map((c) => `(${c.split(',').join(', ')})`).join(' ') : 'none'}.\n` +
+        `  The key decides convergence — a broader key lets two devices create duplicate logical ` +
+        `rows instead of converging on one, and PostgREST upserts need it to resolve.`
+    );
+  }
+}
 
 // --- (b) DDL ----------------------------------------------------------------------
 // `introspect` is injected so the comparison can be exercised against recorded payloads
@@ -245,6 +292,8 @@ export function checkDdl(fixture, rows, errors, notices, introspect = queryStagi
         );
       }
     }
+
+    checkKey(table, row, live.constraints ?? [], errors);
 
     const extra = [...actual.keys()].filter(
       (c) => !(c in fixture[table]) && !SERVER_ONLY_COLUMNS.has(c)
