@@ -73,7 +73,8 @@ const OK_POLICY = {
   qual: '(auth.uid() = user_id)',
   with_check: '(auth.uid() = user_id)',
 };
-const OK_TRIGGER = { table: 'widgets', name: 't02_change_seq', fn: 'stamp_change_seq' };
+// BEFORE (2) + ROW (1) + INSERT (4) + UPDATE (16) = 23, enabled.
+const OK_TRIGGER = { table: 'widgets', name: 't02_change_seq', fn: 'stamp_change_seq', enabled: 'O', type: 23 };
 
 const staged = (
   cols,
@@ -329,23 +330,76 @@ test('a permissive-but-not-literal WITH CHECK still fails', () => {
 
 test('an omitted WITH CHECK on UPDATE is fine when USING is scoped', () => {
   // Postgres falls back to USING for writes when WITH CHECK is omitted, so this is genuinely safe.
-  const ok = { ...OK_POLICY, cmd: 'UPDATE', qual: '(auth.uid() = user_id)', with_check: null };
-  const { errors } = run(manifest('live'), staged(CLOUD_OK, { policies: [ok] }));
+  // Paired with SELECT + INSERT policies so the command-coverage rule doesn't mask what's under test.
+  const update = { ...OK_POLICY, name: 'owner_upd', cmd: 'UPDATE', with_check: null };
+  const others = ['SELECT', 'INSERT'].map((cmd) => ({ ...OK_POLICY, name: `owner_${cmd}`, cmd }));
+  const { errors } = run(manifest('live'), staged(CLOUD_OK, { policies: [update, ...others] }));
   assert.deepEqual(errors, []);
 });
 
-test('a SELECT-only policy is not held to the write predicate', () => {
+test('a user-scoped SELECT-only policy fails — RLS denies every push', () => {
+  // The subtle one: reads work, the policy IS user-scoped, and "at least one policy mentions
+  // auth.uid()" passes. But RLS denies any command no policy covers, so every INSERT/UPDATE is
+  // rejected — a green gate over broken sync.
   const readOnly = { ...OK_POLICY, cmd: 'SELECT', with_check: null };
   const { errors } = run(manifest('live'), staged(CLOUD_OK, { policies: [readOnly] }));
+  const joined = errors.join('\n');
+  assert.match(joined, /no RLS policy covering INSERT/);
+  assert.match(joined, /no RLS policy covering UPDATE/);
+});
+
+test('separate scoped SELECT + INSERT + UPDATE policies pass', () => {
+  const per = (cmd) => ({ ...OK_POLICY, name: `owner_${cmd}`, cmd });
+  const { errors } = run(
+    manifest('live'),
+    staged(CLOUD_OK, { policies: [per('SELECT'), per('INSERT'), per('UPDATE')] })
+  );
   assert.deepEqual(errors, []);
+});
+
+// --- uuid is a constraint the client cannot honour (round 5, P1) ---
+
+test('a uuid column where the fixture says text fails', () => {
+  // question_note_overrides.id is the colon-joined `question_id:note_id`, not a uuid.
+  const { errors } = run(manifest('live'), staged({ ...CLOUD_OK, id: 'uuid' }));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /is uuid, but the native store treats it as opaque text/);
+});
+
+test('user_id may be uuid — it is server-supplied, not client-written', () => {
+  const { errors } = run(manifest('live'), staged(CLOUD_OK));
+  assert.deepEqual(errors, []);
+});
+
+// --- the trigger must actually stamp (round 5, P1) ---
+
+test('a DISABLED change_seq trigger fails despite the matching name', () => {
+  const off = { ...OK_TRIGGER, enabled: 'D' };
+  const { errors } = run(manifest('live'), staged(CLOUD_OK, { triggers: [off] }));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /it is DISABLED/);
+});
+
+test('an AFTER trigger fails — too late to set NEW.change_seq', () => {
+  const after = { ...OK_TRIGGER, type: 1 | 4 | 16 }; // ROW + INSERT + UPDATE, no BEFORE bit
+  const { errors } = run(manifest('live'), staged(CLOUD_OK, { triggers: [after] }));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /it is AFTER, too late/);
+});
+
+test('a DELETE-only trigger fails', () => {
+  const del = { ...OK_TRIGGER, type: 1 | 2 | 8 }; // ROW + BEFORE + DELETE
+  const { errors } = run(manifest('live'), staged(CLOUD_OK, { triggers: [del] }));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /does not fire on INSERT/);
 });
 
 test('policies that never consult auth.uid() fail', () => {
   const notScoped = { ...OK_POLICY, qual: '(status = \'live\')', with_check: null };
   const { errors } = run(manifest('live'), staged(CLOUD_OK, { policies: [notScoped] }));
-  // Two independent complaints: the write side has no owner predicate, and no policy on the table
-  // consults the caller's identity at all.
-  assert.match(errors.join('\n'), /none reference auth\.uid\(\)/);
+  // Two independent complaints: the write side has no owner predicate, and the SELECT side's USING
+  // never consults the caller's identity.
+  assert.match(errors.join('\n'), /SELECT policy, but its USING predicate does not reference/);
   assert.match(errors.join('\n'), /governs writes/);
 });
 

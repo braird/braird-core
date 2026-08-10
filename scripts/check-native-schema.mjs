@@ -186,7 +186,8 @@ function queryStaging(tables) {
         FROM pg_policies WHERE schemaname = 'public' AND tablename IN (${list})),
       'triggers', (
         SELECT coalesce(json_agg(json_build_object(
-          'table', t.relname, 'name', tg.tgname, 'fn', p.proname)), '[]'::json)
+          'table', t.relname, 'name', tg.tgname, 'fn', p.proname,
+          'enabled', tg.tgenabled, 'type', tg.tgtype)), '[]'::json)
         FROM pg_trigger tg
         JOIN pg_class t ON t.oid = tg.tgrelid
         JOIN pg_namespace n ON n.oid = t.relnamespace
@@ -324,14 +325,29 @@ function checkRls(table, policies, errors) {
       }
     }
   }
-  // Supabase's user-scoping idiom. A table whose policies never consult the caller's identity is
-  // not user-scoped, whatever else the predicates say.
-  if (!mine.some((p) => `${p.qual ?? ''} ${p.with_check ?? ''}`.includes('auth.uid()'))) {
-    errors.push(
-      `braird-staging "${table}" has policies, but none reference auth.uid() — nothing ties a row ` +
-        `to its owner. Every braird native table is user-scoped; the pull path relies on this ` +
-        `entirely (get_page sends no user_id filter).`
-    );
+  // COVERAGE per operation. "At least one scoped policy exists" is not enough: RLS denies any
+  // command no policy covers, so a table with only a user-scoped SELECT policy reads correctly and
+  // rejects every push — green gate, broken sync (raised on review). Sync needs SELECT (pull),
+  // INSERT and UPDATE (upsert); it never hard-deletes, since `deleted` is a soft-delete column.
+  for (const cmd of ['SELECT', 'INSERT', 'UPDATE']) {
+    const covering = mine.filter((p) => {
+      const c = String(p.cmd ?? '').toUpperCase();
+      return c === cmd || c === 'ALL';
+    });
+    if (!covering.length) {
+      errors.push(
+        `braird-staging "${table}" has no RLS policy covering ${cmd} — RLS denies any command no ` +
+          `policy grants, so this ${cmd === 'SELECT' ? 'makes every pull return nothing' : 'rejects every push'}.`
+      );
+      continue;
+    }
+    // The read side needs its own scoping assertion; the write side is checked above.
+    if (cmd === 'SELECT' && !covering.some((p) => String(p.qual ?? '').includes('auth.uid()'))) {
+      errors.push(
+        `braird-staging "${table}" has a SELECT policy, but its USING predicate does not reference ` +
+          `auth.uid() — nothing ties a readable row to its owner, and get_page sends no user_id filter.`
+      );
+    }
   }
 }
 
@@ -345,9 +361,9 @@ function checkRls(table, policies, errors) {
 // `integer` tops out at 2.1e9. A migration declaring `integer` would pass a logical-type compare
 // and then fail every upsert with a numeric-range error. Native tables use bigint for every integer
 // column — there is no reason for a narrower one, so this needs no per-column allowlist.
-function checkIntWidth(table, column, found, errors) {
+function checkPhysicalType(table, column, want, found, errors) {
   const t = String(found.data_type).toLowerCase();
-  if (t === 'integer' || t === 'smallint') {
+  if (want === 'int' && (t === 'integer' || t === 'smallint')) {
     errors.push(
       `braird-staging "${table}"."${column}" is ${found.data_type}, which cannot hold an ` +
         `epoch-millisecond value (~1.8e12 today; ${t} caps at ${t === 'smallint' ? '32767' : '2.1e9'}).\n` +
@@ -355,12 +371,60 @@ function checkIntWidth(table, column, found, errors) {
         `numeric range error despite a green logical-type compare.`
     );
   }
+  // `uuid` normalises to logical `text`, which is right for the SQLite mirror (no uuid type) and
+  // wrong as a cloud acceptance rule: it is a CONSTRAINT the client cannot honour. Native ids are
+  // not all uuids — `question_note_overrides.id` is the colon-joined `question_id:note_id`, and
+  // `user_settings.key` is a setting name. PostgREST rejects a non-uuid value on every upsert while
+  // the schema gate stays green (raised on review).
+  if (want === 'text' && t === 'uuid') {
+    errors.push(
+      `braird-staging "${table}"."${column}" is uuid, but the native store treats it as opaque ` +
+        `text.\n  Core does not guarantee uuid-shaped values here (deterministic ids and settings ` +
+        `keys are not uuids), so every upsert carrying one would be rejected. Use text.`
+    );
+  }
 }
 
+// pg_trigger.tgtype bitmask. A name match alone accepts a DISABLED trigger, an AFTER trigger (too
+// late to set NEW.change_seq), or a DELETE-only one — none of which stamp an insert (raised on
+// review). tgenabled 'D' is disabled; 'O'/'A'/'R' all fire on origin writes.
+const TG_ROW = 1;
+const TG_BEFORE = 2;
+const TG_INSERT = 4;
+const TG_UPDATE = 16;
+
 function checkChangeSeqTrigger(table, triggers, errors) {
-  const stamps = triggers.filter(
-    (t) => t.table === table && /change_seq/i.test(`${t.name} ${t.fn}`)
-  );
+  const named = triggers.filter((t) => t.table === table && /change_seq/i.test(`${t.name} ${t.fn}`));
+
+  const stamps = named.filter((t) => {
+    const type = Number(t.type ?? 0);
+    return (
+      String(t.enabled ?? 'O').toUpperCase() !== 'D' &&
+      (type & TG_BEFORE) !== 0 &&
+      (type & TG_ROW) !== 0 &&
+      (type & TG_INSERT) !== 0 &&
+      (type & TG_UPDATE) !== 0
+    );
+  });
+
+  if (named.length && !stamps.length) {
+    const t = named[0];
+    const type = Number(t.type ?? 0);
+    const why = [
+      String(t.enabled ?? 'O').toUpperCase() === 'D' && 'it is DISABLED',
+      (type & TG_BEFORE) === 0 && 'it is AFTER, too late to set NEW.change_seq',
+      (type & TG_ROW) === 0 && 'it is a STATEMENT trigger, so it sees no row',
+      (type & TG_INSERT) === 0 && 'it does not fire on INSERT',
+      (type & TG_UPDATE) === 0 && 'it does not fire on UPDATE, so edited rows keep a stale watermark',
+    ].filter(Boolean);
+    errors.push(
+      `braird-staging "${table}" has a change_seq trigger ("${t.name}") that cannot stamp writes: ` +
+        `${why.join('; ')}.\n  It must be BEFORE INSERT OR UPDATE FOR EACH ROW and enabled, or ` +
+        `pushed rows carry no watermark and never come back on a pull.`
+    );
+    return;
+  }
+
   if (!stamps.length) {
     errors.push(
       `braird-staging "${table}" has no change_seq stamping trigger.\n` +
@@ -450,7 +514,7 @@ export function checkDdl(fixture, rows, errors, notices, introspect = queryStagi
         );
         continue;
       }
-      checkIntWidth(table, column, found, errors);
+      checkPhysicalType(table, column, want, found, errors);
     }
 
     checkKey(table, row, live.constraints ?? [], errors);
