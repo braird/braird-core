@@ -207,6 +207,55 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
         );
     }
 
+    // ── 4b. B SEEDS ROWS IT LEGITIMATELY OWNS ────────────────────────────────────────────────
+    // Needed before the write probes below: an override claiming A's user_id must reference
+    // parents B CAN see, or the policy's EXISTS clauses reject it and mask the ownership
+    // predicate that is actually under test (raised on review). These rows are also what step 6
+    // attempts to transfer.
+    let (b_uid, b_tok) = (b.user_id.clone(), b.access_token.clone());
+    let (b_q, b_n) = (format!("q-{b_uid}"), format!("n-{b_uid}"));
+    let b_ov = format!("{b_q}:{b_n}");
+
+    for (table, on_conflict, row) in [
+        (
+            "open_questions",
+            "id",
+            json!({
+                "id": b_q, "user_id": b_uid, "text": "enc:v2:aXY=.Y3Q=", "status": "live",
+                "created_at": TS, "updated_at": TS, "deleted": false
+            }),
+        ),
+        (
+            "notes",
+            "id",
+            json!({
+                "id": b_n, "user_id": b_uid, "text": "enc:v2:aXY=.Y3Q=",
+                "created_at": TS, "updated_at": TS, "deleted": false
+            }),
+        ),
+        (
+            "question_note_overrides",
+            "id",
+            json!({
+                "id": b_ov, "user_id": b_uid, "question_id": b_q, "note_id": b_n,
+                "kind": "include", "created_at": TS, "updated_at": TS, "deleted": false
+            }),
+        ),
+        (
+            "user_settings",
+            "user_id,key",
+            json!({
+                // A key A does NOT hold. Reusing `prompt_cadence` would make the transfer
+                // target collide with A's existing (user_id, key), so a 409 would satisfy the
+                // assertion below without RLS having rejected anything.
+                "user_id": b_uid, "key": "prompt_tone", "value": "72",
+                "updated_at": TS, "deleted": false
+            }),
+        ),
+    ] {
+        test_support::upsert(&env, &b_tok, table, on_conflict, &json!([row]));
+    }
+
     // ── 5. AND CANNOT WRITE ON A'S BEHALF — on EVERY table ───────────────────────────────────
     // The write half of the boundary, which a scoped USING with a permissive WITH CHECK leaves
     // wide open while every read assertion above still passes.
@@ -226,14 +275,16 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
             }),
         ),
         (
-            // Referencing A's question and note deliberately: FK checks bypass RLS, so the only
-            // things that can reject this are the ownership predicate and the policy's EXISTS
-            // clauses (which, evaluated as B, cannot see A's rows).
+            // B-OWNED parents, deliberately. Pointing at A's question and note would make the
+            // policy's EXISTS clauses reject this (B cannot see A's rows) — and those clauses
+            // would then mask a weakened `auth.uid() = user_id`, leaving the test green for the
+            // exact ownership regression it exists to catch (raised on review). With parents B
+            // can see, the EXISTS clauses pass and ownership is the only thing left to reject it.
             "question_note_overrides",
             "id",
             json!({
-                "id": format!("intruder:{ov_id}"), "user_id": uid,
-                "question_id": q_id, "note_id": note_id, "kind": "include",
+                "id": format!("intruder:{b_ov}"), "user_id": uid,
+                "question_id": b_q, "note_id": b_n, "kind": "include",
                 "created_at": TS, "updated_at": TS, "deleted": false
             }),
         ),
@@ -291,49 +342,6 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
     // B therefore seeds rows it legitimately owns, then attempts the ownership transfer. `USING`
     // passes (B owns them), so the request reaches `WITH CHECK` — which is the predicate under
     // test. A 2xx here means the transfer succeeded.
-    let (b_uid, b_tok) = (b.user_id.clone(), b.access_token.clone());
-    let (b_q, b_n) = (format!("q-{b_uid}"), format!("n-{b_uid}"));
-    let b_ov = format!("{b_q}:{b_n}");
-
-    for (table, on_conflict, row) in [
-        (
-            "open_questions",
-            "id",
-            json!({
-                "id": b_q, "user_id": b_uid, "text": "enc:v2:aXY=.Y3Q=", "status": "live",
-                "created_at": TS, "updated_at": TS, "deleted": false
-            }),
-        ),
-        (
-            "notes",
-            "id",
-            json!({
-                "id": b_n, "user_id": b_uid, "text": "enc:v2:aXY=.Y3Q=",
-                "created_at": TS, "updated_at": TS, "deleted": false
-            }),
-        ),
-        (
-            "question_note_overrides",
-            "id",
-            json!({
-                "id": b_ov, "user_id": b_uid, "question_id": b_q, "note_id": b_n,
-                "kind": "include", "created_at": TS, "updated_at": TS, "deleted": false
-            }),
-        ),
-        (
-            "user_settings",
-            "user_id,key",
-            json!({
-                // A key A does NOT hold. Reusing `prompt_cadence` would make the transfer
-                // target collide with A's existing (user_id, key), so a 409 would satisfy the
-                // assertion below without RLS having rejected anything.
-                "user_id": b_uid, "key": "prompt_tone", "value": "72",
-                "updated_at": TS, "deleted": false
-            }),
-        ),
-    ] {
-        test_support::upsert(&env, &b_tok, table, on_conflict, &json!([row]));
-    }
 
     for (table, query) in [
         ("open_questions", format!("id=eq.{b_q}")),
