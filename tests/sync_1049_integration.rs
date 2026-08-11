@@ -31,36 +31,12 @@
 //! `cargo test` with no stack skips it rather than failing.
 #![cfg(not(target_arch = "wasm32"))]
 
-use serde_json::{json, Value};
+use serde_json::json;
 
 /// Epoch **milliseconds**, the wire convention for every synced table. Deliberately larger than
 /// `i32::MAX` (2.1e9): if a migration ever declares one of these columns `integer`, the insert
 /// fails here on numeric range — the failure the logical-type compare cannot see.
 const TS: i64 = 1_777_000_000_000;
-
-/// `upsert` that returns the HTTP status instead of panicking — the isolation assertions need to
-/// observe a REJECTED write, which `test_support::upsert` turns into a panic.
-fn try_upsert(
-    env: &test_support::SupabaseEnv,
-    access_token: &str,
-    table: &str,
-    on_conflict: &str,
-    rows: &Value,
-) -> reqwest::StatusCode {
-    reqwest::blocking::Client::new()
-        .post(format!(
-            "{}/rest/v1/{}?on_conflict={}",
-            env.url, table, on_conflict
-        ))
-        .header("apikey", &env.anon_key)
-        .header("Authorization", format!("Bearer {access_token}"))
-        .header("Content-Type", "application/json")
-        .header("Prefer", "resolution=merge-duplicates")
-        .json(rows)
-        .send()
-        .expect("upsert send")
-        .status()
-}
 
 /// The `change_seq` of the single row matching `query`, or `None` if the row is not visible.
 /// Read as an i64 so a null (never stamped) is distinguishable from a zero.
@@ -249,7 +225,8 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
             }),
         ),
     ] {
-        let status = try_upsert(&env, &b.access_token, table, on_conflict, &json!([row]));
+        let status =
+            test_support::try_upsert(&env, &b.access_token, table, on_conflict, &json!([row]));
         assert!(
             status.is_client_error(),
             "{table}: user B wrote a row owned by user A (HTTP {status}) — the WITH CHECK \

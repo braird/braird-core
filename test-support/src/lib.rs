@@ -149,6 +149,32 @@ pub fn hard_delete(env: &SupabaseEnv, table: &str, query: &str) -> Value {
 /// snake_case column objects; `on_conflict` is the pk column. Uses `resolution=merge-duplicates`,
 /// mirroring the client upsert (`sync::http::post_upsert`).
 pub fn upsert(env: &SupabaseEnv, access_token: &str, table: &str, on_conflict: &str, rows: &Value) {
+    send_upsert(env, access_token, table, on_conflict, rows)
+        .error_for_status()
+        .expect("upsert status");
+}
+
+/// [`upsert`] that returns the status instead of panicking — for tests asserting a write is
+/// REJECTED (SUR-1049's cross-owner RLS probes, where a 4xx is the expected outcome). Shares
+/// [`send_upsert`] with `upsert` so the two cannot drift in headers or query shape.
+pub fn try_upsert(
+    env: &SupabaseEnv,
+    access_token: &str,
+    table: &str,
+    on_conflict: &str,
+    rows: &Value,
+) -> reqwest::StatusCode {
+    send_upsert(env, access_token, table, on_conflict, rows).status()
+}
+
+/// The one PostgREST upsert request both public wrappers issue.
+fn send_upsert(
+    env: &SupabaseEnv,
+    access_token: &str,
+    table: &str,
+    on_conflict: &str,
+    rows: &Value,
+) -> reqwest::blocking::Response {
     reqwest::blocking::Client::new()
         .post(format!(
             "{}/rest/v1/{}?on_conflict={}",
@@ -161,6 +187,4 @@ pub fn upsert(env: &SupabaseEnv, access_token: &str, table: &str, on_conflict: &
         .json(rows)
         .send()
         .expect("upsert send")
-        .error_for_status()
-        .expect("upsert status");
 }
