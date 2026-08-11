@@ -7,7 +7,7 @@
       "ticket": "SUR-1042",
       "pk": ["id"],
       "pk_scope": "global",
-      "backend": "pending",
+      "backend": "live",
       "backend_ticket": "SUR-1047",
       "note": "SUR-996 R1 question log. `text` is enc:v2 ciphertext (AAD = question id), never plaintext — the seal boundary lands with the sync legs in SUR-1042. Shape registered here so the table is under the guard from its first commit."
     },
@@ -16,7 +16,7 @@
       "ticket": "SUR-1042",
       "pk": ["id"],
       "pk_scope": "global",
-      "backend": "pending",
+      "backend": "live",
       "backend_ticket": "SUR-1047",
       "note": "SUR-996 R1 question<->note curation. Plaintext metadata (id pairs + timestamps), same trade-off as collection_memberships. Deterministic `question_id:note_id` pk so concurrent curation of one pair converges to a single row (OR-set, not the note_links bag)."
     },
@@ -25,7 +25,7 @@
       "ticket": "SUR-1042",
       "pk": ["key"],
       "pk_scope": "per_user",
-      "backend": "pending",
+      "backend": "live",
       "backend_ticket": "SUR-1047",
       "note": "SUR-996 R4 — braird's first synced settings, a per-user KV with LWW per ROW so one device's cadence change cannot stomp another key. Deliberately NOT columns on user_profiles (hot, server-authoritative; whole-row LWW would stomp quota/billing state). Rule going forward: server writes profiles, clients write settings. Carries `deleted` because pull's tombstone gate reads it generically — SUR-1047's migration must include it (amends SUR-996's four-column sketch)."
     }
