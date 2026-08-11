@@ -78,7 +78,29 @@ const IDENT_RE = /^[a-z_][a-z0-9_]*$/;
 // `change_seq`. A migration that omits either reports green on a fixture-only compare and then fails
 // at runtime on the first push or pull. Absent from the fixture because the local store never holds
 // them, which is exactly why they need naming here.
-const SERVER_REQUIRED_COLUMNS = { user_id: 'text', change_seq: 'int' };
+// The PHYSICAL type is pinned, not just the logical one. `change_seq` is the watermark every pull
+// compares against and the trigger increments forever, so a narrow int would eventually overflow
+// and stop writes dead; `user_id` holds `auth.uid()`, which is a uuid. Neither column is in the
+// fixture (the local store holds neither), so the fixture-driven type checks never see them —
+// which is exactly why they are spelled out here (raised on review after the first hardening pass).
+// Each spec carries its own aliases and its own explanation, so the loop below stays generic — a
+// future server column adds a row here and needs no new branch in the check (raised on review:
+// the int8 alias and the per-column error text were both name-switches in the loop body).
+const SERVER_REQUIRED_COLUMNS = {
+  user_id: {
+    logical: 'text',
+    physical: 'uuid',
+    why: 'user_id holds auth.uid(), which is a uuid.',
+  },
+  change_seq: {
+    logical: 'int',
+    physical: 'bigint',
+    aliases: new Set(['int8']),
+    why:
+      'change_seq is a monotonically increasing watermark stamped on every write; a narrower type ' +
+      'overflows and then rejects every subsequent write.',
+  },
+};
 
 const readJson = (path) => {
   const raw = readFileSync(path, 'utf8');
@@ -176,7 +198,8 @@ function queryStaging(tables) {
       'columns', (
         SELECT coalesce(json_agg(json_build_object(
           'table', table_name, 'column', column_name, 'data_type', data_type, 'udt', udt_name,
-          'nullable', is_nullable, 'default', column_default)), '[]'::json)
+          'nullable', is_nullable, 'default', column_default,
+          'identity', is_identity, 'generated', is_generated)), '[]'::json)
         FROM information_schema.columns
         WHERE table_schema = 'public' AND table_name IN (${list})),
       'policies', (
@@ -280,6 +303,9 @@ function checkKey(table, row, constraints, errors) {
 // here than for a typical table because `PostgrestClient::get_page` does NOT filter by user_id —
 // the pull URL is `?change_seq=gt.N&order=...`, so RLS *is* the tenant boundary, not a backstop.
 const EXPOSED_ROLES = new Set(['public', 'authenticated', 'anon']);
+// The roles a native client can actually arrive as. `service_role`/`postgres` bypass RLS entirely,
+// so a policy scoped to them proves nothing about what a real caller can do.
+const CLIENT_ROLES = new Set(['public', 'authenticated']);
 const WRITE_COMMANDS = new Set(['ALL', 'INSERT', 'UPDATE']);
 
 function checkRls(table, policies, errors) {
@@ -330,14 +356,40 @@ function checkRls(table, policies, errors) {
   // rejects every push — green gate, broken sync (raised on review). Sync needs SELECT (pull),
   // INSERT and UPDATE (upsert); it never hard-deletes, since `deleted` is a soft-delete column.
   for (const cmd of ['SELECT', 'INSERT', 'UPDATE']) {
-    const covering = mine.filter((p) => {
+    // Only policies granted to a role the CLIENT actually uses count. Native sync reaches
+    // PostgREST as `authenticated`; a policy granted solely to `service_role` or `postgres` covers
+    // a path no client takes, and those roles bypass RLS anyway — so counting it would report
+    // coverage for a command RLS still denies to every real caller (raised on review).
+    //
+    // DIRECT grants only, deliberately. Postgres would also apply a policy granted to a GROUP role
+    // that `authenticated` inherits, and this rejects that (raised on review as a false-positive
+    // risk). Resolving membership means recursing pg_auth_members at introspection time to answer
+    // "could this role ever apply" — more machinery, and a weaker contract, than simply requiring
+    // the policy to name the client role. Supabase's own convention is `TO authenticated`, which is
+    // what migration 0055 does. So this is a stated schema constraint, not an oversight; the error
+    // below says so, and the failure is loud rather than silent.
+    // Two stages, so the question being asked is explicit: first "does any policy cover this
+    // command at all", then "does any of those serve a client role".
+    const forCmd = mine.filter((p) => {
       const c = String(p.cmd ?? '').toUpperCase();
       return c === cmd || c === 'ALL';
     });
+    const covering = forCmd.filter((p) =>
+      (p.roles ?? []).some((r) => CLIENT_ROLES.has(String(r).toLowerCase()))
+    );
     if (!covering.length) {
+      const backendOnly = forCmd;
       errors.push(
-        `braird-staging "${table}" has no RLS policy covering ${cmd} — RLS denies any command no ` +
-          `policy grants, so this ${cmd === 'SELECT' ? 'makes every pull return nothing' : 'rejects every push'}.`
+        `braird-staging "${table}" has no RLS policy covering ${cmd} for a client role — RLS denies ` +
+          `any command no policy grants, so this ${cmd === 'SELECT' ? 'makes every pull return nothing' : 'rejects every push'}.` +
+          (backendOnly.length
+            ? `\n  There ${backendOnly.length === 1 ? 'is a policy' : 'are policies'} for ${cmd}, but ` +
+              `granted only to ${[...new Set(backendOnly.flatMap((p) => p.roles ?? []))].join(', ')} — ` +
+              `those bypass RLS and are not the role PostgREST uses.\n` +
+              `  Note this check requires a DIRECT grant to ${[...CLIENT_ROLES].join('/')}: a policy on a ` +
+              `group role that authenticated merely inherits would work in Postgres but is rejected ` +
+              `here on purpose, so the grantee is legible from the migration alone.`
+            : '')
       );
       continue;
     }
@@ -519,7 +571,8 @@ export function checkDdl(fixture, rows, errors, notices, introspect = queryStagi
 
     checkKey(table, row, live.constraints ?? [], errors);
 
-    for (const [column, want] of Object.entries(SERVER_REQUIRED_COLUMNS)) {
+    for (const [column, spec] of Object.entries(SERVER_REQUIRED_COLUMNS)) {
+      const want = spec.logical;
       const found = actual.get(column);
       if (!found) {
         errors.push(
@@ -527,6 +580,17 @@ export function checkDdl(fixture, rows, errors, notices, introspect = queryStagi
             `  It is absent from the fixture by design (the local store never holds it), but the ` +
             `cloud table cannot work without it: push injects user_id into every row, and every ` +
             `pull filters and orders on change_seq.`
+        );
+        continue;
+      }
+      // Physical type, not just logical: these columns never pass through the fixture-driven
+      // checks, so `integer`/`smallint` for change_seq (which overflows the forever-incrementing
+      // watermark) or a non-uuid user_id would otherwise be accepted.
+      const physical = String(found.data_type).toLowerCase();
+      if (physical !== spec.physical && !spec.aliases?.has(physical)) {
+        errors.push(
+          `braird-staging "${table}"."${column}" is ${found.data_type}, but the sync engine ` +
+            `requires ${spec.physical}.\n  ${spec.why}`
         );
         continue;
       }
@@ -553,10 +617,19 @@ export function checkDdl(fixture, rows, errors, notices, introspect = queryStagi
     // columns plus user_id and nothing else, so a NOT NULL extra with no default and no trigger to
     // populate it rejects EVERY insert for that table (raised on review — this branch used to emit
     // a notice and stay green).
+    // The trigger escape hatch this used to carry was self-defeating: it accepted ANY trigger on
+    // the table as evidence the column gets populated, and every valid table has the change_seq
+    // trigger — so the check could never fire (raised on review). Proving a specific trigger
+    // assigns a specific column needs execution, not catalogue introspection (SUR-1049). Until
+    // then this is strict: if a cloud-only column is NOT NULL with no default, a push cannot
+    // satisfy it, and the four ways out are named in the message.
     const unfillable = extra.filter((c) => {
       const col = actual.get(c);
       if (col.nullable !== 'NO' || col.default != null) return false;
-      return !triggers.some((t) => t.table === table); // any trigger might populate it — say so, don't guess
+      // An IDENTITY or GENERATED column reports is_nullable='NO' with a NULL column_default, but
+      // Postgres fills it when the insert omits it — so it is fillable despite looking otherwise
+      // (raised on review; this is a false-POSITIVE guard, the opposite of the gaps above).
+      return !(String(col.identity).toUpperCase() === 'YES' || String(col.generated).toUpperCase() === 'ALWAYS');
     });
     if (unfillable.length) {
       errors.push(
