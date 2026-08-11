@@ -184,7 +184,8 @@ function queryStaging(tables) {
       'columns', (
         SELECT coalesce(json_agg(json_build_object(
           'table', table_name, 'column', column_name, 'data_type', data_type, 'udt', udt_name,
-          'nullable', is_nullable, 'default', column_default)), '[]'::json)
+          'nullable', is_nullable, 'default', column_default,
+          'identity', is_identity, 'generated', is_generated)), '[]'::json)
         FROM information_schema.columns
         WHERE table_schema = 'public' AND table_name IN (${list})),
       'policies', (
@@ -345,6 +346,14 @@ function checkRls(table, policies, errors) {
     // PostgREST as `authenticated`; a policy granted solely to `service_role` or `postgres` covers
     // a path no client takes, and those roles bypass RLS anyway — so counting it would report
     // coverage for a command RLS still denies to every real caller (raised on review).
+    //
+    // DIRECT grants only, deliberately. Postgres would also apply a policy granted to a GROUP role
+    // that `authenticated` inherits, and this rejects that (raised on review as a false-positive
+    // risk). Resolving membership means recursing pg_auth_members at introspection time to answer
+    // "could this role ever apply" — more machinery, and a weaker contract, than simply requiring
+    // the policy to name the client role. Supabase's own convention is `TO authenticated`, which is
+    // what migration 0055 does. So this is a stated schema constraint, not an oversight; the error
+    // below says so, and the failure is loud rather than silent.
     const covering = mine.filter((p) => {
       const c = String(p.cmd ?? '').toUpperCase();
       if (c !== cmd && c !== 'ALL') return false;
@@ -361,7 +370,10 @@ function checkRls(table, policies, errors) {
           (backendOnly.length
             ? `\n  There ${backendOnly.length === 1 ? 'is a policy' : 'are policies'} for ${cmd}, but ` +
               `granted only to ${[...new Set(backendOnly.flatMap((p) => p.roles ?? []))].join(', ')} — ` +
-              `those bypass RLS and are not the role PostgREST uses.`
+              `those bypass RLS and are not the role PostgREST uses.\n` +
+              `  Note this check requires a DIRECT grant to ${[...CLIENT_ROLES].join('/')}: a policy on a ` +
+              `group role that authenticated merely inherits would work in Postgres but is rejected ` +
+              `here on purpose, so the grantee is legible from the migration alone.`
             : '')
       );
       continue;
@@ -602,7 +614,11 @@ export function checkDdl(fixture, rows, errors, notices, introspect = queryStagi
     // satisfy it, and the four ways out are named in the message.
     const unfillable = extra.filter((c) => {
       const col = actual.get(c);
-      return col.nullable === 'NO' && col.default == null;
+      if (col.nullable !== 'NO' || col.default != null) return false;
+      // An IDENTITY or GENERATED column reports is_nullable='NO' with a NULL column_default, but
+      // Postgres fills it when the insert omits it — so it is fillable despite looking otherwise
+      // (raised on review; this is a false-POSITIVE guard, the opposite of the gaps above).
+      return !(String(col.identity).toUpperCase() === 'YES' || String(col.generated).toUpperCase() === 'ALWAYS');
     });
     if (unfillable.length) {
       errors.push(

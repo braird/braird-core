@@ -94,8 +94,13 @@ const staged = (
   columns: absent
     ? []
     : Object.entries(cols).map(([column, spec]) => {
-        const { type, nullable = 'YES', default: def = null } =
-          typeof spec === 'string' ? { type: spec } : spec;
+        const {
+          type,
+          nullable = 'YES',
+          default: def = null,
+          identity = 'NO',
+          generated = 'NEVER',
+        } = typeof spec === 'string' ? { type: spec } : spec;
         return {
           table: 'widgets',
           column,
@@ -103,6 +108,8 @@ const staged = (
           udt: type,
           nullable,
           default: def,
+          identity,
+          generated,
         };
       }),
 });
@@ -324,6 +331,24 @@ test('policies granted only to service_role do not count as coverage', () => {
 });
 
 // --- the unfillable check can now actually fire (round 6) ---
+
+test('an IDENTITY cloud-only column is fillable — Postgres supplies it', () => {
+  // is_nullable='NO' with a NULL column_default, but the server fills it on insert. Guards against
+  // the tightened check rejecting valid DDL (the inverse of every earlier finding).
+  const { errors } = run(
+    manifest('live'),
+    staged({ ...CLOUD_OK, seq: { type: 'bigint', nullable: 'NO', identity: 'YES' } })
+  );
+  assert.deepEqual(errors, []);
+});
+
+test('a GENERATED ALWAYS cloud-only column is fillable', () => {
+  const { errors } = run(
+    manifest('live'),
+    staged({ ...CLOUD_OK, slug: { type: 'text', nullable: 'NO', generated: 'ALWAYS' } })
+  );
+  assert.deepEqual(errors, []);
+});
 
 test('a NOT NULL cloud-only column fails even though the table has triggers', () => {
   // Previously any trigger counted as evidence the column was populated — and the change_seq
