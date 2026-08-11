@@ -280,4 +280,85 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
         settings[0]["value"], "336",
         "user_settings: user A's value changed after B's rejected write"
     );
+
+    // ── 6. NOR TRANSFER ITS OWN ROWS TO A ────────────────────────────────────────────────────
+    // Every probe above targets a key that does not exist yet, so they all take the INSERT path
+    // and exercise only the INSERT policy. An UPDATE is a separate RLS decision — `USING` picks
+    // which rows may be changed, `WITH CHECK` decides what they may become — so a permissive
+    // `WITH CHECK` on UPDATE alone would pass everything so far while letting B rewrite one of
+    // its OWN rows to carry A's user_id, planting data in A's account (raised on review).
+    //
+    // B therefore seeds rows it legitimately owns, then attempts the ownership transfer. `USING`
+    // passes (B owns them), so the request reaches `WITH CHECK` — which is the predicate under
+    // test. A 2xx here means the transfer succeeded.
+    let (b_uid, b_tok) = (b.user_id.clone(), b.access_token.clone());
+    let (b_q, b_n) = (format!("q-{b_uid}"), format!("n-{b_uid}"));
+    let b_ov = format!("{b_q}:{b_n}");
+
+    for (table, on_conflict, row) in [
+        (
+            "open_questions",
+            "id",
+            json!({
+                "id": b_q, "user_id": b_uid, "text": "enc:v2:aXY=.Y3Q=", "status": "live",
+                "created_at": TS, "updated_at": TS, "deleted": false
+            }),
+        ),
+        (
+            "notes",
+            "id",
+            json!({
+                "id": b_n, "user_id": b_uid, "text": "enc:v2:aXY=.Y3Q=",
+                "created_at": TS, "updated_at": TS, "deleted": false
+            }),
+        ),
+        (
+            "question_note_overrides",
+            "id",
+            json!({
+                "id": b_ov, "user_id": b_uid, "question_id": b_q, "note_id": b_n,
+                "kind": "include", "created_at": TS, "updated_at": TS, "deleted": false
+            }),
+        ),
+        (
+            "user_settings",
+            "user_id,key",
+            json!({
+                // A key A does NOT hold. Reusing `prompt_cadence` would make the transfer
+                // target collide with A's existing (user_id, key), so a 409 would satisfy the
+                // assertion below without RLS having rejected anything.
+                "user_id": b_uid, "key": "prompt_tone", "value": "72",
+                "updated_at": TS, "deleted": false
+            }),
+        ),
+    ] {
+        test_support::upsert(&env, &b_tok, table, on_conflict, &json!([row]));
+    }
+
+    for (table, query) in [
+        ("open_questions", format!("id=eq.{b_q}")),
+        ("question_note_overrides", format!("id=eq.{b_ov}")),
+        ("user_settings", "key=eq.prompt_tone".to_string()),
+    ] {
+        let status = test_support::try_patch(
+            &env,
+            &b_tok,
+            table,
+            &query,
+            &json!({ "user_id": uid, "updated_at": TS + 3 }),
+        );
+        assert!(
+            status.is_client_error(),
+            "{table}: user B reassigned its own row to user A (HTTP {status}) — UPDATE's WITH \
+             CHECK is not scoping ownership, so B can plant rows in A's account"
+        );
+
+        // And nothing landed in A's account regardless of what the status said.
+        let planted = test_support::select(&env, &tok, table, &query);
+        assert_eq!(
+            planted.as_array().map(Vec::len),
+            Some(0),
+            "{table}: a row owned by user B is now visible to user A"
+        );
+    }
 }

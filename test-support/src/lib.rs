@@ -167,6 +167,28 @@ pub fn try_upsert(
     send_upsert(env, access_token, table, on_conflict, rows).status()
 }
 
+/// PATCH rows matching `query` as the authenticated user, returning the status rather than
+/// panicking. An UPDATE is a DIFFERENT RLS path from an upsert-insert — its `USING` decides which
+/// rows are visible to change and its `WITH CHECK` decides what they may become — so SUR-1049's
+/// ownership-transfer probes need it to reach the update predicate at all.
+pub fn try_patch(
+    env: &SupabaseEnv,
+    access_token: &str,
+    table: &str,
+    query: &str,
+    body: &Value,
+) -> reqwest::StatusCode {
+    reqwest::blocking::Client::new()
+        .patch(format!("{}/rest/v1/{}?{}", env.url, table, query))
+        .header("apikey", &env.anon_key)
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("Content-Type", "application/json")
+        .json(body)
+        .send()
+        .expect("patch send")
+        .status()
+}
+
 /// The one PostgREST upsert request both public wrappers issue.
 fn send_upsert(
     env: &SupabaseEnv,

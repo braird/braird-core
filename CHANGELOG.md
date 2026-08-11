@@ -15,8 +15,9 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   logically but is too narrow for an epoch millisecond. Enumerating properties can only catch the
   mistakes someone already thought of. `tests/sync_1049_integration.rs` executes the path instead —
   insert as a real user through PostgREST, assert the trigger stamped `change_seq`, assert an update
-  re-stamps it, then assert a second user can neither read those rows nor write one owned by the
-  first. Every one of the thirteen fails this naturally.
+  re-stamps it, then assert a second user can neither read those rows, nor create one owned by the
+  first, nor reassign one of its OWN rows to them (INSERT and UPDATE are separate RLS decisions,
+  and a permissive predicate on either alone is a data-planting hole the other would hide). Every one of the thirteen fails this naturally.
   Runs on the **ephemeral local stack** (`sync-integration.yml`, which already replays surfc's
   migrations including SUR-1047's 0055), so there is no test-user provisioning policy and no teardown
   obligation — the database dies with the job — and nothing is ever written to `braird-staging`. The
