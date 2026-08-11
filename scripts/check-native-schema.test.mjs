@@ -289,7 +289,51 @@ test('a live table missing change_seq fails', () => {
 test('a mistyped change_seq fails', () => {
   const { errors } = run(manifest('live'), staged({ ...CLOUD_OK, change_seq: 'text' }));
   assert.equal(errors.length, 1);
-  assert.match(errors[0], /"change_seq" is text .*needs "int"/s);
+  assert.match(errors[0], /"change_seq" is text, but the sync engine requires bigint/);
+});
+
+// --- server-column physical types (round 6) ---
+// Neither column is in the fixture, so the fixture-driven type checks never see them.
+
+test('an integer change_seq fails — the watermark would overflow', () => {
+  const { errors } = run(manifest('live'), staged({ ...CLOUD_OK, change_seq: 'integer' }));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /requires bigint.*overflows and then rejects every subsequent write/s);
+});
+
+test('int8 is accepted as bigint for change_seq', () => {
+  const { errors } = run(manifest('live'), staged({ ...CLOUD_OK, change_seq: 'int8' }));
+  assert.deepEqual(errors, []);
+});
+
+test('a non-uuid user_id fails', () => {
+  const { errors } = run(manifest('live'), staged({ ...CLOUD_OK, user_id: 'text' }));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /user_id holds auth\.uid\(\), which is a uuid/);
+});
+
+// --- client-role policy coverage (round 6) ---
+
+test('policies granted only to service_role do not count as coverage', () => {
+  // service_role bypasses RLS entirely, so such a policy proves nothing about the client path.
+  const backend = { ...OK_POLICY, roles: ['service_role'] };
+  const { errors } = run(manifest('live'), staged(CLOUD_OK, { policies: [backend] }));
+  const joined = errors.join('\n');
+  assert.match(joined, /no RLS policy covering SELECT for a client role/);
+  assert.match(joined, /granted only to service_role/);
+});
+
+// --- the unfillable check can now actually fire (round 6) ---
+
+test('a NOT NULL cloud-only column fails even though the table has triggers', () => {
+  // Previously any trigger counted as evidence the column was populated — and the change_seq
+  // trigger always exists, so this check could never fire.
+  const { errors } = run(
+    manifest('live'),
+    staged({ ...CLOUD_OK, tenant: { type: 'text', nullable: 'NO' } })
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /NOT NULL cloud-only column\(s\) tenant/);
 });
 
 // --- RLS policies, not just the flag (SUR-1048 review round 3, P1) ---

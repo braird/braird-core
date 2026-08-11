@@ -6,6 +6,21 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Fixed
+- **Three staging-DDL checks that could not fail, or could pass a broken table (SUR-1048).** All
+  three were unreachable while the SUR-996 tables were `backend: pending`, so they are fixed now that
+  the flip has made them live. (1) `change_seq` and `user_id` were type-checked only against the
+  logical vocabulary, which the fixture-driven guards never reach for them — an `integer` `change_seq`
+  passed, and it is a monotonically increasing watermark, so it would overflow and then reject every
+  subsequent write. Both now pin the physical type (`bigint`, `uuid`). (2) RLS command coverage counted
+  policies granted to any role, so a table whose only SELECT/INSERT/UPDATE policies belonged to
+  `service_role` reported covered — while `service_role` bypasses RLS entirely and PostgREST arrives as
+  `authenticated`, which RLS would still deny. Coverage now counts client-applicable roles only, and
+  names the backend-only policies it found. (3) The NOT NULL cloud-only column check accepted *any*
+  trigger on the table as evidence the column gets populated — and since every valid table carries the
+  `change_seq` trigger, the check could never fire. That escape hatch is gone; proving a specific
+  trigger assigns a specific column needs execution, not catalogue introspection (SUR-1049).
+
 ### Changed
 - **The three native-first tables are now `backend: live` — the staging DDL check runs against them
   for real (SUR-1047).** SUR-1047's migration has been applied to `braird-staging`, so
