@@ -6,6 +6,19 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Changed
+- **The three native-first tables are now `backend: live` — the staging DDL check runs against them
+  for real (SUR-1047).** SUR-1047's migration has been applied to `braird-staging`, so
+  `open_questions`, `question_note_overrides` and `user_settings` move from `backend: pending` (skip
+  the DDL leg, and fail if the table is found present anyway) to `live`. This is the second half of
+  the SUR-1048 handshake, and it is deliberately a separate commit: the check fails between the
+  migration landing and this flip, which is the signal that the migration landed at all.
+  From here `scripts/check-native-schema.mjs` asserts, per table and on every PR plus the weekly
+  cron, that the applied DDL still matches the locked fixture — column set and logical types, the
+  key constraint, RLS enablement and policies, the `change_seq` stamping trigger, and the
+  server-side `user_id`/`change_seq` columns. Nothing about the fixture or the descriptor changes;
+  this only opens the code path that validates them against the cloud.
+
 ### Added
 - **A native-first schema registry, so a table core authors itself is under contract from its first
   commit (SUR-1048).** The SUR-723 guard could only cover tables *derived* from surfc: `sync-schema.json`
