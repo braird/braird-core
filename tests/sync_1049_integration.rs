@@ -48,12 +48,10 @@ fn change_seq_of(
 ) -> Option<i64> {
     let rows = test_support::select(env, token, table, query);
     let row = rows.as_array().expect("rows array").first()?;
-    Some(row["change_seq"].as_i64().unwrap_or_else(|| {
-        panic!(
-            "{table}: change_seq is not an integer: {}",
-            row["change_seq"]
-        )
-    }))
+    // A NULL change_seq — the never-stamped case — reads back as 0 rather than panicking here.
+    // Panicking would report "not an integer" in precisely the failure this test exists to catch,
+    // burying the caller's `seq > 0` message that actually explains it (raised on review).
+    Some(row["change_seq"].as_i64().unwrap_or(0))
 }
 
 #[test]
