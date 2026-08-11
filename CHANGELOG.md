@@ -6,6 +6,69 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **A native-first schema registry, so a table core authors itself is under contract from its first
+  commit (SUR-1048).** The SUR-723 guard could only cover tables *derived* from surfc: `sync-schema.json`
+  is re-derived by `scripts/extract-sync-schema.mjs`, which is what makes an exact-equality assertion
+  possible. The SUR-996 tables (`open_questions`, `question_note_overrides`, `user_settings`) have no
+  PWA counterpart and never will, so they could join neither side of that fixture — and the alternative,
+  a waiver list, gives a table zero shape protection and rots as native-first grows. They now register
+  in a first-class native section instead: `store::native_schema()` is the source of truth,
+  `vendored/schema/native-schema.json` is a hand-authored **lock** of it (a shape change is a
+  deliberate two-file diff; a one-file change fails `tests/schema_parity.rs`), and
+  `vendored/schema/native-manifest.json` names each table's owning ticket (SUR-842 pattern).
+  Three things close the loop: the store↔fixture lock, a **no-third-category** rule — every table in
+  `sqlite_master` must appear in exactly one of the derived fixture, the native fixture, or
+  `store::LOCAL_ONLY_TABLES`, so an unregistered table fails the build rather than belonging to no
+  contract — and `scripts/check-native-schema.mjs`, which reads `braird-staging`'s `information_schema`
+  and asserts the fixture matches the DDL **actually applied** (the one failure a Rust build cannot
+  see: a migration written, merged, and never applied). The DDL leg compares as a subset — the cloud
+  legitimately carries `user_id` (auth-injected at push) and `change_seq` (surfc migration 0051), and
+  cloud-only columns are a notice, not a failure — but a fixture column that is missing or retyped
+  fails, as does a live table with row-level security disabled. Tables whose migration has not landed
+  yet carry `backend: pending` with a tracking ticket: the DDL leg skips them loudly **and fails if it
+  finds them present anyway**, so the marker cannot quietly become a permanent exemption. Wired into
+  `schema-drift.yml` as its own job (per-PR + the weekly cron that is the only trigger able to see
+  staging-side drift while this repo sits still), fail-closed when `BRAIRD_STAGING_DB_URL` is unset,
+  with the gate's own comparison logic unit-tested via `node --test`.
+  The read and write sides of RLS are checked **separately**: a policy with a scoped `USING` but a
+  permissive `WITH CHECK` fences reads while letting a user INSERT or UPDATE rows carrying someone
+  else's `user_id`, and testing the two predicates together hides it because the read side satisfies
+  the search. Any policy governing writes must have an effective `WITH CHECK` (falling back to `USING`,
+  as Postgres does when it is omitted) that references `auth.uid()`.
+  Because `PostgrestClient::get_page` sends **no `user_id` filter**, RLS is the tenant boundary rather
+  than a backstop — so the leg validates the **policies**, not just `relrowsecurity`: enabled-with-no-policy
+  (deny-all, which makes sync silently unusable), a `USING (true)` policy granted to `authenticated`
+  (a cross-tenant leak), and policies that never reference `auth.uid()` all fail, though the flag reads
+  `true` in every case. It likewise requires `change_seq`'s **stamping trigger**, not just the column —
+  pushes never supply the value, so a bare `NOT NULL` column rejects every insert and a nullable one
+  leaves rows permanently invisible to `change_seq > cursor`. Integer columns must be **`bigint`**:
+  `updated_at` is epoch milliseconds (~1.8×10¹²) and pg `integer` caps at 2.1×10⁹, so the logical-type
+  vocabulary — which calls both `int`, correctly, for a 64-bit SQLite mirror — would otherwise green-light
+  a column whose first upsert fails on numeric range. And a `NOT NULL` cloud-only column with no default
+  is now an error rather than a notice, since a push sends only the fixture columns plus `user_id`.
+  The staging leg also **requires** the two server-side columns the fixture deliberately omits —
+  `user_id` and `change_seq` — because `push::upsert_group` injects `user_id` into every row and every
+  pull filters and orders on `change_seq`, so a migration omitting either reports green on a
+  fixture-only compare and then fails on the first sync. And a manifest row declares `pk_scope`:
+  `global` (the local pk is a uuid, unique across all users — the cloud may key it either way) or
+  `per_user` (the key repeats across users, so the cloud constraint MUST include `user_id`). Without
+  that distinction a bare `UNIQUE (key)` on `user_settings` would pass, letting the first user to
+  write `prompt_cadence` occupy it globally while every other user's upsert conflicts with a row RLS
+  hides from them — a bug that only shows up with two accounts.
+  The registry also locks each native table's **primary key** (`native-manifest.json` `pk`, reconciled
+  against `TableSchema.pk`, with the cloud required to carry a matching `PRIMARY KEY`/`UNIQUE` on either
+  the local key or that key plus `user_id`): a column-only compare is blind to the key, but the key is
+  what decides convergence — `question_note_overrides`'s deterministic `question_id:note_id` is the OR-set
+  that makes two devices curating the same pair land on one row instead of two contradictory ones. And a
+  `timestamp`/`timestamptz` column is now **rejected** rather than normalised to `int`: PostgREST sends
+  those as ISO strings, which `ColType::Int`'s `as_i64()` turns into NULL on every sync, so equating them
+  with an epoch bigint would have let that ship green.
+  Registration only — these tables are created and locked, but deliberately absent from `table_schema()`
+  and the pull scope until SUR-1042 defines their encryption boundary and sync legs.
+  Note for SUR-1047: `user_settings` must carry `deleted` (pull's tombstone gate reads it generically
+  on every table), which amends SUR-996's `(user_id, key, value, updated_at)` sketch.
+
 ### Fixed
 - **A per-table pull failure now carries its underlying error instead of a bare table name
   (SUR-1031).** `pull::pull`'s isolation arm discarded the error it isolated (`Err(_)`) and its

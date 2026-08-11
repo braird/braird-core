@@ -1,0 +1,29 @@
+{
+  "open_questions": {
+    "checkin_at": "int",
+    "checkin_response": "text",
+    "created_at": "int",
+    "deleted": "bool",
+    "id": "text",
+    "resolved_at": "int",
+    "status": "text",
+    "text": "text",
+    "tone": "text",
+    "updated_at": "int"
+  },
+  "question_note_overrides": {
+    "created_at": "int",
+    "deleted": "bool",
+    "id": "text",
+    "kind": "text",
+    "note_id": "text",
+    "question_id": "text",
+    "updated_at": "int"
+  },
+  "user_settings": {
+    "deleted": "bool",
+    "key": "text",
+    "updated_at": "int",
+    "value": "text"
+  }
+}

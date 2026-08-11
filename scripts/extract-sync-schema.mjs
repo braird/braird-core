@@ -25,6 +25,7 @@
 
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { logicalType } from './logical-type.mjs';
 
 // The 8 synced cloud tables (parent SUR-659 §1). Everything else in surfc is
 // local-only or server-only and is NOT mirrored as a synced store.
@@ -39,21 +40,9 @@ const SYNCED_TABLES = [
   'note_signals',
 ];
 
-// pg type → the core's logical-type vocabulary (text | int | bool | real | json).
-// This is the ONE normalization map (founder: "compare (name, logical-type) tuples,
-// not physical reps"). jsonb and text[] both collapse to `json` (stored TEXT-JSON in
-// SQLite ≡ cloud jsonb/text[]); every integer width collapses to `int`; boolean → bool.
-function logicalType(pgType) {
-  const t = pgType.toLowerCase().replace(/\s+/g, ' ').trim();
-  if (t === 'text' || t === 'uuid') return 'text';
-  if (t === 'bigint' || t === 'int8' || t === 'integer' || t === 'int' || t === 'int4' || t === 'smallint' || t === 'int2')
-    return 'int';
-  if (t === 'boolean' || t === 'bool') return 'bool';
-  if (t === 'real' || t === 'double precision' || t === 'float4' || t === 'float8') return 'real';
-  if (t === 'jsonb' || t === 'json' || t.endsWith('[]')) return 'json';
-  if (t.startsWith('timestamp')) return 'int'; // epoch bigint convention; none today
-  throw new Error(`unmapped pg type: "${pgType}"`);
-}
+// pg type → the core's logical-type vocabulary (text | int | bool | real | json) now lives in
+// scripts/logical-type.mjs — SUR-1048's braird-staging check needs the same map, and two copies
+// disagreeing is the drift class these gates exist to catch.
 
 // --- synced column SET, from supabase.js upsert* payloads -------------------------
 function extractSyncedColumns(supabaseJs) {
