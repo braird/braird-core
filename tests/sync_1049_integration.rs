@@ -144,32 +144,57 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
     })
     .collect();
 
-    // ── 3. UPDATE re-stamps ──────────────────────────────────────────────────────────────────
-    // The watermark must ADVANCE on edit too, or an updated row never re-delivers to other
-    // devices. This is the half a BEFORE INSERT-only trigger passes step 2 with.
-    test_support::upsert(
-        &env,
-        &tok,
-        "open_questions",
-        "id",
-        &json!([{
-            "id": q_id, "user_id": uid, "text": "enc:v2:aXY=.Y3Q3",
-            "status": "resolved", "resolved_at": TS + 1,
-            "created_at": TS, "updated_at": TS + 1, "deleted": false
-        }]),
-    );
-    let before = seqs
-        .iter()
-        .find(|(t, _, _)| *t == "open_questions")
-        .map(|(_, _, s)| *s)
-        .expect("open_questions seq");
-    let after = change_seq_of(&env, &tok, "open_questions", &format!("id=eq.{q_id}"))
-        .expect("row still readable after update");
-    assert!(
-        after > before,
-        "open_questions: change_seq did not advance on UPDATE ({before} → {after}) — an edited \
-         row would never re-deliver to another device"
-    );
+    // ── 3. UPDATE re-stamps — on EVERY table ─────────────────────────────────────────────────
+    // The watermark must ADVANCE on edit too, or an updated row never re-delivers to another
+    // device. This is the half a BEFORE INSERT-only trigger passes step 2 with — and per table,
+    // because each `t02_change_seq` is a SEPARATE trigger definition: one created without the
+    // UPDATE event, or bound to a different function, is invisible to a check that only ever
+    // edits `open_questions` (raised on review).
+    //
+    // Every payload bumps `updated_at`. `t01_lww_guard` fires BEFORE UPDATE and cancels
+    // (RETURN NULL) a write that is not strictly newer, which would skip the stamp and read as a
+    // trigger failure here rather than the LWW guard doing its job.
+    for (table, on_conflict, row) in [
+        (
+            "open_questions",
+            "id",
+            json!({
+                "id": q_id, "user_id": uid, "text": "enc:v2:aXY=.Y3Q3",
+                "status": "resolved", "resolved_at": TS + 1,
+                "created_at": TS, "updated_at": TS + 1, "deleted": false
+            }),
+        ),
+        (
+            "question_note_overrides",
+            "id",
+            json!({
+                "id": ov_id, "user_id": uid, "question_id": q_id, "note_id": note_id,
+                "kind": "exclude", "created_at": TS, "updated_at": TS + 1, "deleted": false
+            }),
+        ),
+        (
+            "user_settings",
+            "user_id,key",
+            json!({
+                "user_id": uid, "key": "prompt_cadence", "value": "336",
+                "updated_at": TS + 1, "deleted": false
+            }),
+        ),
+    ] {
+        test_support::upsert(&env, &tok, table, on_conflict, &json!([row]));
+
+        let (_, query, before) = seqs
+            .iter()
+            .find(|(t, _, _)| *t == table)
+            .expect("table captured in step 2");
+        let after = change_seq_of(&env, &tok, table, query)
+            .unwrap_or_else(|| panic!("{table}: row not readable after update"));
+        assert!(
+            after > *before,
+            "{table}: change_seq did not advance on UPDATE ({before} → {after}) — an edited row \
+             would never re-deliver to another device"
+        );
+    }
 
     // ── 4. A SECOND USER SEES NOTHING ────────────────────────────────────────────────────────
     // The tenant boundary, executed rather than inferred. `get_page` sends NO user_id filter, so
@@ -215,12 +240,19 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
             }),
         ),
         (
-            // The per-user KV: B claiming A's (user_id, key) pair is the two-account collision
-            // SUR-1047's composite key exists to make impossible.
+            // The per-user KV: B claiming A's user_id is the two-account collision SUR-1047's
+            // composite key exists to make impossible.
+            //
+            // A key A has NOT written, deliberately. Targeting the existing `prompt_cadence`
+            // would collide, and `resolution=merge-duplicates` then takes the ON CONFLICT DO
+            // UPDATE path — where UPDATE's USING (which B fails, not seeing A's row) rejects it.
+            // The request 4xx's either way, so a permissive INSERT `WITH CHECK` would slip past
+            // while B could still create a NEW setting owned by A (raised on review). A
+            // non-conflicting key forces the INSERT policy to be the thing under test.
             "user_settings",
             "user_id,key",
             json!({
-                "user_id": uid, "key": "prompt_cadence", "value": "hijacked",
+                "user_id": uid, "key": "prompt_tone", "value": "hijacked",
                 "updated_at": TS + 2, "deleted": false
             }),
         ),
@@ -234,11 +266,20 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
         );
     }
 
-    // And A's data is untouched by those attempts — a rejected write must not have partially
-    // applied. `value` is the one field the intruder tried to overwrite.
+    // A rejected write must leave nothing behind — checked from A's side, since B cannot see
+    // these rows either way and a status code alone does not prove nothing was written.
+    // The row B tried to CREATE for A must not exist...
+    let planted = test_support::select(&env, &tok, "user_settings", "key=eq.prompt_tone");
+    assert_eq!(
+        planted.as_array().map(Vec::len),
+        Some(0),
+        "user_settings: user B created a setting owned by user A — the INSERT policy's WITH CHECK \
+         is not scoping writes"
+    );
+    // ...and the row it tried to overwrite must still hold A's own last write (step 3's value).
     let settings = test_support::select(&env, &tok, "user_settings", "key=eq.prompt_cadence");
     assert_eq!(
-        settings[0]["value"], "168",
+        settings[0]["value"], "336",
         "user_settings: user A's value changed after B's rejected write"
     );
 }
