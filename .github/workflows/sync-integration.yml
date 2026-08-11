@@ -87,3 +87,13 @@ jobs:
       - name: Run the sync integration test (the #[ignore]d real-Supabase flush)
         if: steps.guard.outputs.ready == 'true'
         run: cargo test --test sync_659b_integration -- --ignored --nocapture
+
+      # SUR-1049. The native-first tables (SUR-1047's 0055) have no sync legs yet, so this probes
+      # PostgREST directly: insert as a real user, assert the change_seq trigger actually stamped,
+      # assert an update re-stamps, then assert a second user can neither read nor write those rows.
+      # It answers the question scripts/check-native-schema.mjs structurally cannot — the catalogue
+      # says a trigger and a policy exist; only executing the path says they WORK. Runs against the
+      # ephemeral stack, so there is no teardown obligation: the database dies with the job.
+      - name: Run the native-first round-trip (SUR-1049)
+        if: steps.guard.outputs.ready == 'true'
+        run: cargo test --test sync_1049_integration -- --ignored --nocapture

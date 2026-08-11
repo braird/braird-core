@@ -6,6 +6,27 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **A behavioural round-trip against the native-first cloud tables, because the schema check can only
+  ever prove a thing EXISTS (SUR-1049).** `scripts/check-native-schema.mjs` reads catalogues, and
+  across five review rounds it accumulated thirteen findings of a single shape: a column is present
+  but the server cannot stamp it; RLS is enabled but no policy covers INSERT; a trigger is named
+  `change_seq` but is disabled, fires AFTER, or never assigns `NEW.change_seq`; a type matches
+  logically but is too narrow for an epoch millisecond. Enumerating properties can only catch the
+  mistakes someone already thought of. `tests/sync_1049_integration.rs` executes the path instead —
+  insert as a real user through PostgREST, assert the trigger stamped `change_seq`, assert an update
+  re-stamps it, then assert a second user can neither read those rows nor write one owned by the
+  first. Every one of the thirteen fails this naturally.
+  Runs on the **ephemeral local stack** (`sync-integration.yml`, which already replays surfc's
+  migrations including SUR-1047's 0055), so there is no test-user provisioning policy and no teardown
+  obligation — the database dies with the job — and nothing is ever written to `braird-staging`. The
+  two legs now split cleanly: the introspection answers *is the migration applied there*, this
+  answers *does the DDL actually work*.
+  Deliberately raw PostgREST rather than `enqueue_* → flush`: these tables are registered but not yet
+  wired (`table_schema()` and `synced_table_names()` exclude them until SUR-1042), so probing the wire
+  directly proves the cloud side **before** core code is built on top of it. SUR-1042 upgrades the
+  same assertions onto the real outbox path.
+
 ### Fixed
 - **Three staging-DDL checks that could not fail, or could pass a broken table (SUR-1048).** All
   three were unreachable while the SUR-996 tables were `backend: pending`, so they are fixed now that
