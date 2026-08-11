@@ -208,23 +208,60 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
         );
     }
 
-    // ── 5. AND CANNOT WRITE ON A'S BEHALF ────────────────────────────────────────────────────
+    // ── 5. AND CANNOT WRITE ON A'S BEHALF — on EVERY table ───────────────────────────────────
     // The write half of the boundary, which a scoped USING with a permissive WITH CHECK leaves
     // wide open while every read assertion above still passes.
-    let status = try_upsert(
-        &env,
-        &b.access_token,
-        "open_questions",
-        "id",
-        &json!([{
-            "id": format!("intruder-{uid}"), "user_id": uid,
-            "text": "enc:v2:aXY=.Y3Q=", "status": "live",
-            "created_at": TS, "updated_at": TS, "deleted": false
-        }]),
-    );
-    assert!(
-        status.is_client_error(),
-        "user B wrote a row owned by user A (HTTP {status}) — the WITH CHECK predicate is not \
-         scoping writes, even though reads are correctly fenced"
+    //
+    // Probing only one table would leave the other two uncovered by BOTH layers: a
+    // `WITH CHECK (auth.uid() = user_id OR true)` on `user_settings` also satisfies
+    // check-native-schema.mjs, which only searches the predicate for the `auth.uid()` substring
+    // (raised on review). So each table gets its own cross-owner attempt.
+    for (table, on_conflict, row) in [
+        (
+            "open_questions",
+            "id",
+            json!({
+                "id": format!("intruder-{uid}"), "user_id": uid,
+                "text": "enc:v2:aXY=.Y3Q=", "status": "live",
+                "created_at": TS, "updated_at": TS, "deleted": false
+            }),
+        ),
+        (
+            // Referencing A's question and note deliberately: FK checks bypass RLS, so the only
+            // things that can reject this are the ownership predicate and the policy's EXISTS
+            // clauses (which, evaluated as B, cannot see A's rows).
+            "question_note_overrides",
+            "id",
+            json!({
+                "id": format!("intruder:{ov_id}"), "user_id": uid,
+                "question_id": q_id, "note_id": note_id, "kind": "include",
+                "created_at": TS, "updated_at": TS, "deleted": false
+            }),
+        ),
+        (
+            // The per-user KV: B claiming A's (user_id, key) pair is the two-account collision
+            // SUR-1047's composite key exists to make impossible.
+            "user_settings",
+            "user_id,key",
+            json!({
+                "user_id": uid, "key": "prompt_cadence", "value": "hijacked",
+                "updated_at": TS + 2, "deleted": false
+            }),
+        ),
+    ] {
+        let status = try_upsert(&env, &b.access_token, table, on_conflict, &json!([row]));
+        assert!(
+            status.is_client_error(),
+            "{table}: user B wrote a row owned by user A (HTTP {status}) — the WITH CHECK \
+             predicate is not scoping writes, even though reads are correctly fenced"
+        );
+    }
+
+    // And A's data is untouched by those attempts — a rejected write must not have partially
+    // applied. `value` is the one field the intruder tried to overwrite.
+    let settings = test_support::select(&env, &tok, "user_settings", "key=eq.prompt_cadence");
+    assert_eq!(
+        settings[0]["value"], "168",
+        "user_settings: user A's value changed after B's rejected write"
     );
 }

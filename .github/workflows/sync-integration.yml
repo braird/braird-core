@@ -16,6 +16,14 @@ on:
   pull_request:
     branches: [main]
     paths: ['Cargo.toml', 'Cargo.lock', 'src/**', 'tests/**', 'test-support/**', '.github/workflows/sync-integration.yml']
+  # Weekly: the only trigger that catches SURFC-side drift while this repo sits still (SUR-1049).
+  # The stack is built from surfc's migrations, so a migration that weakens a trigger body or an
+  # RLS predicate is invisible to every path-filtered trigger above — those all react to
+  # braird-core changes. Same reasoning, and the same slot, as the sibling drift guards
+  # (schema-drift / vendored-drift / canon-drift / native-parity-drift). A surfc-side repository
+  # dispatch would catch it sooner; the cron is what this repo can do without a cross-repo change.
+  schedule:
+    - cron: '0 9 * * 1' # Monday 09:00 UTC (with the drift checks)
   workflow_dispatch:
 
 jobs:
