@@ -83,9 +83,23 @@ const IDENT_RE = /^[a-z_][a-z0-9_]*$/;
 // and stop writes dead; `user_id` holds `auth.uid()`, which is a uuid. Neither column is in the
 // fixture (the local store holds neither), so the fixture-driven type checks never see them —
 // which is exactly why they are spelled out here (raised on review after the first hardening pass).
+// Each spec carries its own aliases and its own explanation, so the loop below stays generic — a
+// future server column adds a row here and needs no new branch in the check (raised on review:
+// the int8 alias and the per-column error text were both name-switches in the loop body).
 const SERVER_REQUIRED_COLUMNS = {
-  user_id: { logical: 'text', physical: 'uuid' },
-  change_seq: { logical: 'int', physical: 'bigint' },
+  user_id: {
+    logical: 'text',
+    physical: 'uuid',
+    why: 'user_id holds auth.uid(), which is a uuid.',
+  },
+  change_seq: {
+    logical: 'int',
+    physical: 'bigint',
+    aliases: new Set(['int8']),
+    why:
+      'change_seq is a monotonically increasing watermark stamped on every write; a narrower type ' +
+      'overflows and then rejects every subsequent write.',
+  },
 };
 
 const readJson = (path) => {
@@ -354,16 +368,17 @@ function checkRls(table, policies, errors) {
     // the policy to name the client role. Supabase's own convention is `TO authenticated`, which is
     // what migration 0055 does. So this is a stated schema constraint, not an oversight; the error
     // below says so, and the failure is loud rather than silent.
-    const covering = mine.filter((p) => {
+    // Two stages, so the question being asked is explicit: first "does any policy cover this
+    // command at all", then "does any of those serve a client role".
+    const forCmd = mine.filter((p) => {
       const c = String(p.cmd ?? '').toUpperCase();
-      if (c !== cmd && c !== 'ALL') return false;
-      return (p.roles ?? []).some((r) => CLIENT_ROLES.has(String(r).toLowerCase()));
+      return c === cmd || c === 'ALL';
     });
+    const covering = forCmd.filter((p) =>
+      (p.roles ?? []).some((r) => CLIENT_ROLES.has(String(r).toLowerCase()))
+    );
     if (!covering.length) {
-      const backendOnly = mine.filter((p) => {
-        const c = String(p.cmd ?? '').toUpperCase();
-        return c === cmd || c === 'ALL';
-      });
+      const backendOnly = forCmd;
       errors.push(
         `braird-staging "${table}" has no RLS policy covering ${cmd} for a client role — RLS denies ` +
           `any command no policy grants, so this ${cmd === 'SELECT' ? 'makes every pull return nothing' : 'rejects every push'}.` +
@@ -572,14 +587,10 @@ export function checkDdl(fixture, rows, errors, notices, introspect = queryStagi
       // checks, so `integer`/`smallint` for change_seq (which overflows the forever-incrementing
       // watermark) or a non-uuid user_id would otherwise be accepted.
       const physical = String(found.data_type).toLowerCase();
-      if (physical !== spec.physical && !(column === 'change_seq' && physical === 'int8')) {
+      if (physical !== spec.physical && !spec.aliases?.has(physical)) {
         errors.push(
           `braird-staging "${table}"."${column}" is ${found.data_type}, but the sync engine ` +
-            `requires ${spec.physical}.\n` +
-            (column === 'change_seq'
-              ? `  change_seq is a monotonically increasing watermark stamped on every write; a ` +
-                `narrower type overflows and then rejects every subsequent write.`
-              : `  user_id holds auth.uid(), which is a uuid.`)
+            `requires ${spec.physical}.\n  ${spec.why}`
         );
         continue;
       }
