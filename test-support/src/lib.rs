@@ -149,6 +149,54 @@ pub fn hard_delete(env: &SupabaseEnv, table: &str, query: &str) -> Value {
 /// snake_case column objects; `on_conflict` is the pk column. Uses `resolution=merge-duplicates`,
 /// mirroring the client upsert (`sync::http::post_upsert`).
 pub fn upsert(env: &SupabaseEnv, access_token: &str, table: &str, on_conflict: &str, rows: &Value) {
+    send_upsert(env, access_token, table, on_conflict, rows)
+        .error_for_status()
+        .expect("upsert status");
+}
+
+/// [`upsert`] that returns the status instead of panicking — for tests asserting a write is
+/// REJECTED (SUR-1049's cross-owner RLS probes, where a 4xx is the expected outcome). Shares
+/// [`send_upsert`] with `upsert` so the two cannot drift in headers or query shape.
+pub fn try_upsert(
+    env: &SupabaseEnv,
+    access_token: &str,
+    table: &str,
+    on_conflict: &str,
+    rows: &Value,
+) -> reqwest::StatusCode {
+    send_upsert(env, access_token, table, on_conflict, rows).status()
+}
+
+/// PATCH rows matching `query` as the authenticated user, returning the status rather than
+/// panicking. An UPDATE is a DIFFERENT RLS path from an upsert-insert — its `USING` decides which
+/// rows are visible to change and its `WITH CHECK` decides what they may become — so SUR-1049's
+/// ownership-transfer probes need it to reach the update predicate at all.
+pub fn try_patch(
+    env: &SupabaseEnv,
+    access_token: &str,
+    table: &str,
+    query: &str,
+    body: &Value,
+) -> reqwest::StatusCode {
+    reqwest::blocking::Client::new()
+        .patch(format!("{}/rest/v1/{}?{}", env.url, table, query))
+        .header("apikey", &env.anon_key)
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("Content-Type", "application/json")
+        .json(body)
+        .send()
+        .expect("patch send")
+        .status()
+}
+
+/// The one PostgREST upsert request both public wrappers issue.
+fn send_upsert(
+    env: &SupabaseEnv,
+    access_token: &str,
+    table: &str,
+    on_conflict: &str,
+    rows: &Value,
+) -> reqwest::blocking::Response {
     reqwest::blocking::Client::new()
         .post(format!(
             "{}/rest/v1/{}?on_conflict={}",
@@ -161,6 +209,4 @@ pub fn upsert(env: &SupabaseEnv, access_token: &str, table: &str, on_conflict: &
         .json(rows)
         .send()
         .expect("upsert send")
-        .error_for_status()
-        .expect("upsert status");
 }

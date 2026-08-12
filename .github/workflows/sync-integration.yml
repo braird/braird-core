@@ -16,6 +16,14 @@ on:
   pull_request:
     branches: [main]
     paths: ['Cargo.toml', 'Cargo.lock', 'src/**', 'tests/**', 'test-support/**', '.github/workflows/sync-integration.yml']
+  # Weekly: the only trigger that catches SURFC-side drift while this repo sits still (SUR-1049).
+  # The stack is built from surfc's migrations, so a migration that weakens a trigger body or an
+  # RLS predicate is invisible to every path-filtered trigger above — those all react to
+  # braird-core changes. Same reasoning, and the same slot, as the sibling drift guards
+  # (schema-drift / vendored-drift / canon-drift / native-parity-drift). A surfc-side repository
+  # dispatch would catch it sooner; the cron is what this repo can do without a cross-repo change.
+  schedule:
+    - cron: '0 9 * * 1' # Monday 09:00 UTC (with the drift checks)
   workflow_dispatch:
 
 jobs:
@@ -87,3 +95,13 @@ jobs:
       - name: Run the sync integration test (the #[ignore]d real-Supabase flush)
         if: steps.guard.outputs.ready == 'true'
         run: cargo test --test sync_659b_integration -- --ignored --nocapture
+
+      # SUR-1049. The native-first tables (SUR-1047's 0055) have no sync legs yet, so this probes
+      # PostgREST directly: insert as a real user, assert the change_seq trigger actually stamped,
+      # assert an update re-stamps, then assert a second user can neither read nor write those rows.
+      # It answers the question scripts/check-native-schema.mjs structurally cannot — the catalogue
+      # says a trigger and a policy exist; only executing the path says they WORK. Runs against the
+      # ephemeral stack, so there is no teardown obligation: the database dies with the job.
+      - name: Run the native-first round-trip (SUR-1049)
+        if: steps.guard.outputs.ready == 'true'
+        run: cargo test --test sync_1049_integration -- --ignored --nocapture
