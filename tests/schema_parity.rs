@@ -167,7 +167,7 @@ fn native_primary_keys_match_the_manifest() {
 fn native_tables_are_registered_but_not_yet_writable_or_pulled() {
     // The seal boundary is currently enforced by ABSENCE — native-first tables are simply missing
     // from `table_schema()` and the pull scope. Absence is invisible: nothing breaks if a future
-    // change quietly resolves them, and `apply_row` would then write `open_questions` with no
+    // change quietly resolves them, and `apply_row` would then write `questions` with no
     // encryption contract (plaintext question text reaching SQLite is the crypto-reviewer BLOCKER
     // class). This pins the gap so SUR-1042 has to DELETE a failing test to open the path —
     // a deliberate act with a reviewer attached — rather than widening a lookup and moving on.
