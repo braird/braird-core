@@ -450,13 +450,24 @@ fn descriptor_tables() -> impl Iterator<Item = &'static TableSchema> {
 }
 
 /// The synced tables in dependency (topological) order — every FK parent precedes its children.
-/// Derived from [`synced_schema`] so the pull scope (SUR-726 fans out to all eight) and the flush
-/// order both follow the descriptor: a ninth table joins both by being added to `synced_schema`
-/// once. The schema order IS a valid topo order — verified against the surfc FKs: `notes.book_id`
+/// Derived from [`descriptor_tables`] so the pull scope and the flush order both follow the
+/// descriptor: a new table joins both by being added to a schema list once.
+///
+/// The schema order IS a valid topo order — verified against the surfc FKs: `notes.book_id`
 /// → books; `note_links.{from,to}_note_id` → notes; `collection_memberships.{note_id,collection_id}`
 /// → notes/collections; `note_signals.note_id` → notes (each parent listed earlier).
+///
+/// **Widened to the native-first tables by SUR-1042**, once their push legs existed
+/// (`on_conflict_for` / `required_insert_columns` / `fk_deps`). The chain order keeps the topo
+/// property: `questions` precedes `question_note_overrides`, and `notes` — the overrides' other
+/// parent — is in the synced half, so it precedes both. `user_settings` has no FK at all.
+///
+/// This list is load-bearing in THREE places, which is why it moved in its own commit: it is the
+/// flush's dispatch order, the pull's fan-out, and the snapshot-import preflight scope. A single
+/// table 404ing on pull aborts the flush for every table (`pull_then_flush`), so widening it before
+/// the cloud tables exist would break sync wholesale rather than degrade it.
 pub fn synced_table_names() -> Vec<&'static str> {
-    synced_schema().iter().map(|t| t.name).collect()
+    descriptor_tables().map(|t| t.name).collect()
 }
 
 /// The deterministic primary key of a `collection_memberships` row — the byte-exact mirror of

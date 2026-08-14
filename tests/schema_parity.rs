@@ -164,20 +164,17 @@ fn native_primary_keys_match_the_manifest() {
 }
 
 #[test]
-fn native_tables_are_registered_but_not_yet_pulled() {
-    // HALF of this test was deleted by SUR-1042's seal-boundary commit, which is what it was built
-    // to force: `table_schema()` now resolves the native-first tables, because `enqueue_question`
-    // seals `text` (enc:v2, AAD = the question id) before anything is staged. Widening the lookup
-    // without that contract was the crypto-reviewer BLOCKER the deleted assertion guarded.
+fn native_tables_are_fully_wired() {
+    // This test began (SUR-1048) as `native_tables_are_registered_but_not_yet_writable_or_pulled`,
+    // asserting ABSENCE from both `table_schema()` and the pull scope — a deliberate tripwire so
+    // SUR-1042 had to delete a failing assertion to open each path, rather than widening a lookup
+    // and moving on. Both are now open, each in the commit that earned it: the write path alongside
+    // the enc:v2 seal in `enqueue_question`, the pull scope alongside the push legs.
     //
-    // The pull-scope half SURVIVES, and it is not a formality: `synced_table_names()` drives the
-    // flush, the pull fan-out AND the snapshot-import preflight, and a single 404 aborts the flush
-    // for EVERY table (`pull_then_flush`). It comes down in the sync-legs commit, together with the
-    // push arms that make these tables actually flushable.
+    // It is inverted rather than deleted, because the absence it guarded has become a presence
+    // worth guarding: narrowing either lookup would not fail loudly at the seam, it would silently
+    // stop questions syncing.
     for t in native_schema() {
-        // The widening is now pinned POSITIVELY. The old assertion guarded absence, which is
-        // invisible; this one fails if someone narrows `table_schema()` back, which would silently
-        // break every question read and write rather than erroring at the seam.
         assert!(
             table_schema(t.name).is_some(),
             "`{}` no longer resolves via table_schema() — the question entity's reads and writes \
@@ -185,12 +182,24 @@ fn native_tables_are_registered_but_not_yet_pulled() {
             t.name
         );
         assert!(
-            !synced_table_names().contains(&t.name),
-            "`{}` is in the pull scope, but the push legs (on_conflict/required_insert/fk_deps) are \
-             what make it flushable — widen this in the same commit that adds them, not before",
+            synced_table_names().contains(&t.name),
+            "`{}` dropped out of the pull/flush scope — it would stop syncing with no error",
             t.name
         );
     }
+
+    // Topological order is the flush's dispatch order, so it is a correctness property, not a
+    // stylistic one: an override dispatched before its question is rejected by the server.
+    let order = synced_table_names();
+    let pos = |name: &str| order.iter().position(|t| *t == name);
+    assert!(
+        pos("questions") < pos("question_note_overrides"),
+        "questions must be dispatched before the overrides that FK it"
+    );
+    assert!(
+        pos("notes") < pos("question_note_overrides"),
+        "notes must be dispatched before the overrides that FK it"
+    );
 }
 
 #[test]
