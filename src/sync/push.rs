@@ -766,6 +766,42 @@ mod tests {
     }
 
     #[test]
+    fn a_metadata_only_question_flush_patches_instead_of_upserting_over_the_seal() {
+        // The reason `questions` is in `required_insert_columns`. A check-in answer or a resolve
+        // carries no `text` — upserting it would send an INSERT candidate with no ciphertext, which
+        // the server rejects (`text` is NOT NULL, no default) and which, if it ever succeeded, would
+        // overwrite the sealed question with a hollow row. Drop `"questions"` from that list and
+        // this test is what fails; without it, nothing would.
+        let store = Store::open_in_memory().unwrap();
+        store
+            .enqueue(
+                "questions",
+                "q1",
+                r#"{"id":"q1","status":"resolved","resolved_at":999,"updated_at":20,"deleted":false}"#,
+                100,
+            )
+            .unwrap();
+
+        let sink = sink(None);
+        block(flush(&store, &sink, "user-1")).unwrap();
+
+        assert!(
+            sink.calls.borrow().is_empty(),
+            "a text-free question must never upsert"
+        );
+        let patches = sink.patches.borrow();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].0, "questions");
+        assert_eq!(patches[0].1, "id", "the PATCH filters on the LOCAL pk");
+        assert_eq!(patches[0].2, "q1");
+        assert_eq!(patches[0].3["status"], json!("resolved"));
+        assert!(
+            patches[0].3.get("text").is_none(),
+            "the patch must not carry a text column at all"
+        );
+    }
+
+    #[test]
     fn user_settings_upserts_on_the_composite_cloud_key() {
         // Its local pk is `key`, but the CLOUD key is `(user_id, key)` — setting names repeat
         // across accounts, so a bare `on_conflict=key` matches no unique constraint and PostgREST

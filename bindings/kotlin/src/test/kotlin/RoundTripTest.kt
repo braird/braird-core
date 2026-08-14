@@ -28,6 +28,8 @@ import uniffi.braird_core.ImportCounts
 import uniffi.braird_core.ImportSummary
 import uniffi.braird_core.NoteSignalKind
 import uniffi.braird_core.NoteUpsert
+import uniffi.braird_core.QuestionNoteOverride
+import uniffi.braird_core.QuestionUpsert
 import uniffi.braird_core.SearchDocKind
 import uniffi.braird_core.SemanticStatus
 import uniffi.braird_core.SyncEngine
@@ -1007,6 +1009,69 @@ class RoundTripTest {
         } finally {
             FfiConverterTypeEmbedder.handleMap.remove(handle)
         }
+    }
+
+    /** SUR-1042: the question surface over the FFI. This is the leg no Rust test can stand in for —
+     * `QuestionUpsert` carries seven `Option`/`String` fields that each lower to a by-value
+     * `RustBuffer`, and mis-marshalling one of those across JNA is the jna#1259 class that bit
+     * SUR-770 and SUR-843. Rust-side tests call the function directly and never touch the ABI.
+     *
+     * Also pins the crypto claim at the boundary the hosts actually use: plaintext in, plaintext
+     * back out, `enc:v2` at rest in between — and a metadata-only patch (`plaintext = null`) that
+     * must not disturb the seal. */
+    @Test
+    fun questionSurfaceOverFfi() {
+        val db = File.createTempFile("braird-q", ".sqlite").apply { deleteOnExit() }
+        val engine = SyncEngine.open(db.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
+
+        fun question(id: String, plaintext: String?, status: String?, resolvedAt: Long? = null) =
+            QuestionUpsert(
+                id = id, plaintext = plaintext, status = status, tone = "introspective",
+                resolvedAt = resolvedAt, checkinAt = null, checkinResponse = null,
+                createdAt = 100L, deleted = false,
+            )
+
+        engine.enqueueQuestion(question("q1", "what am I avoiding?", "active"))
+
+        // Round-trips as plaintext, and the sealed column never crosses in its enc: form.
+        val listed = engine.listQuestions(50u, 0u).single()
+        assertEquals("q1", listed.id)
+        assertEquals("what am I avoiding?", listed.text)
+        assertEquals(false, listed.decryptFailed)
+        assertEquals("active", listed.status)
+        assertEquals("introspective", listed.tone)
+        assertEquals(false, listed.text?.startsWith("enc:v") ?: false)
+
+        // A metadata-only patch: null plaintext must preserve the seal, not blank it.
+        engine.enqueueQuestion(question("q1", null, "resolved", resolvedAt = 900L))
+        val patched = engine.getQuestion("q1")!!
+        assertEquals("what am I avoiding?", patched.text, "the patch must not disturb the ciphertext")
+        assertEquals("resolved", patched.status)
+        assertEquals(900L, patched.resolvedAt)
+
+        // The effective note set: auto-window ∪ includes − excludes, over the FFI.
+        fun note(id: String, createdAt: Long) = NoteUpsert(
+            id = id, bookId = null, plaintext = "text-$id", page = null, tags = emptyList(),
+            source = null, sourceId = null, sourceMetaJson = null, chapter = null, imagePath = null,
+            inkCropPath = null, createdAt = createdAt, deleted = false, clearNullableFields = emptyList(),
+        )
+        engine.enqueueQuestion(question("q2", "the open one", "active"))
+        engine.enqueueNote(note("in-window", 150L))
+        engine.enqueueNote(note("too-early", 10L))
+        engine.enqueueNote(note("dropped", 160L))
+        engine.enqueueQuestionNoteOverride(
+            QuestionNoteOverride(questionId = "q2", noteId = "too-early", kind = "include", deleted = false)
+        )
+        engine.enqueueQuestionNoteOverride(
+            QuestionNoteOverride(questionId = "q2", noteId = "dropped", kind = "exclude", deleted = false)
+        )
+        assertEquals(
+            listOf("in-window", "too-early"),
+            engine.questionNotes("q2", 10_000L).map { it.id }.sorted(),
+        )
+
+        // The first synced setting, keyed by name (no id column).
+        engine.setUserSetting("prompt_cadence", "168")
     }
 
     /** A stale/invalid handle used to throw InternalException BEFORE the shim's guard,

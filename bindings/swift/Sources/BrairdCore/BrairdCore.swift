@@ -5240,11 +5240,20 @@ public func FfiConverterTypeQuestionRecord_lower(_ value: QuestionRecord) -> Rus
  * A question upsert draft (SUR-1042) — the record form of [`SyncEngine::enqueue_question`]'s
  * arguments, and the entry point to the SUR-996 question log.
  *
- * A record for the same arm64 reason as [`NoteUpsert`] / [`BookUpsert`] (SUR-770/843): eleven
- * fields, of which nine lower to by-value `RustBuffer`s, would spill well past x7. `plaintext` is
- * the only field the Vault ever sees — it is sealed here (enc:v2, AAD = the question id) and the
- * outbox holds ciphertext only. Named to pair with the read model [`read::QuestionRecord`] —
- * `QuestionUpsert` in, `QuestionRecord` out.
+ * A record by MARGIN, not because the SUR-843 guard would have caught the positional form — worth
+ * stating precisely, since the guard's whole value is that its reasoning is checkable. Nine fields,
+ * seven of which lower to by-value `RustBuffer`s (`String` and every `Option<T>`; `created_at: i64`
+ * and `deleted: bool` ride as plain scalars). Counted the way `scripts/check-ffi-arg-slots.mjs`
+ * counts — one integer slot per parameter, receiver first — a positional signature would put its
+ * last `RustBuffer` (`checkin_response`) at slot 8: exactly AT x7's boundary, so the guard, which
+ * fires above 8, would have stayed silent. **One more optional field would trip it**, and the
+ * failure mode is jna#1259 — a mis-marshalled by-value struct on arm64 that x86-64 CI and the
+ * desktop `:core-roundtrip` jar are both structurally blind to. Collapsing now costs nothing and
+ * removes the cliff.
+ *
+ * `plaintext` is the only field the Vault ever sees — it is sealed here (enc:v2, AAD = the question
+ * id) and the outbox holds ciphertext only. Named to pair with the read model
+ * [`read::QuestionRecord`] — `QuestionUpsert` in, `QuestionRecord` out.
  *
  * `plaintext: Some` is a full write. `plaintext: None` is a **metadata-only patch** of an existing
  * row — answering a check-in, resolving, dismissing — which makes NO Vault call and omits `text`

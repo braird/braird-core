@@ -367,20 +367,25 @@ pub fn synced_schema() -> &'static [TableSchema] {
 ///   - `vendored/schema/native-manifest.json` names the owning ticket per table (SUR-842 pattern),
 ///     so a table can't sit here unattributed.
 ///
-/// **Registered, not yet wired.** These tables are CREATED by [`Store::init_schema`] and locked by
-/// the guard, but they are deliberately absent from [`table_schema`] and [`synced_table_names`]:
-/// the pull scope must not fan out to a cloud table that does not exist yet (SUR-1047), and
-/// `apply_row` must not become writable for `questions` before SUR-1042 defines its
-/// encryption boundary — `text` is ciphertext (enc:v2, AAD = the question id, like `notes.text`),
-/// and a plaintext question reaching SQLite is the `crypto-reviewer` BLOCKER class. SUR-1042 wires
-/// the sync legs; this ticket only puts the shapes under the guard.
+/// **Registered AND wired, as of SUR-1042.** These tables are CREATED by [`Store::init_schema`],
+/// locked by the guard, and now resolve through both [`table_schema`] and [`synced_table_names`] —
+/// so they are read, written, flushed and pulled exactly like the surfc-derived eight.
+///
+/// They spent SUR-1048 deliberately absent from both, which is worth remembering rather than
+/// deleting: `apply_row` becoming writable for `questions` is precisely what would let plaintext
+/// question text reach SQLite (the `crypto-reviewer` BLOCKER class), so that lookup could only widen
+/// alongside the seal. `questions.text` is ciphertext (enc:v2, AAD = the question id, like
+/// `notes.text`), sealed at write by `SyncEngine::enqueue_question`; the pull scope widened
+/// separately, with the push legs that make these tables flushable.
 ///
 /// **Convergence (SUR-737 contract, extended).** Whole-row LWW by `updated_at`, like everything
 /// else. `question_note_overrides.id` is the DETERMINISTIC `question_id:note_id` join (the
 /// `collection_memberships` OR-set pattern, NOT the `note_links` random-uid bag) so two devices
 /// curating the same pair converge to one row and a contradictory `include`/`exclude` resolves by
-/// LWW instead of leaving both. SUR-1042 owns the derivation helper and must handle the
-/// re-add-after-delete-in-one-batch case that deterministic pks are prone to. `user_settings` is a
+/// LWW instead of leaving both. The id is derived by [`override_id`], and the
+/// re-add-after-delete-in-one-batch case deterministic pks are prone to is handled in
+/// `SyncEngine::enqueue_question_note_override` (a re-add resurrects past the sticky collapse).
+/// `user_settings` is a
 /// per-key KV (`key` is the whole local pk; `user_id` is auth-injected at push like every other
 /// table), so LWW lands per SETTING rather than per settings-blob — the reason it is a standalone
 /// table and not columns on `user_profiles` (a hot, server-authoritative row whose whole-row LWW

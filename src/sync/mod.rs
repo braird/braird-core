@@ -251,11 +251,20 @@ pub struct BookUpsert {
 /// A question upsert draft (SUR-1042) — the record form of [`SyncEngine::enqueue_question`]'s
 /// arguments, and the entry point to the SUR-996 question log.
 ///
-/// A record for the same arm64 reason as [`NoteUpsert`] / [`BookUpsert`] (SUR-770/843): eleven
-/// fields, of which nine lower to by-value `RustBuffer`s, would spill well past x7. `plaintext` is
-/// the only field the Vault ever sees — it is sealed here (enc:v2, AAD = the question id) and the
-/// outbox holds ciphertext only. Named to pair with the read model [`read::QuestionRecord`] —
-/// `QuestionUpsert` in, `QuestionRecord` out.
+/// A record by MARGIN, not because the SUR-843 guard would have caught the positional form — worth
+/// stating precisely, since the guard's whole value is that its reasoning is checkable. Nine fields,
+/// seven of which lower to by-value `RustBuffer`s (`String` and every `Option<T>`; `created_at: i64`
+/// and `deleted: bool` ride as plain scalars). Counted the way `scripts/check-ffi-arg-slots.mjs`
+/// counts — one integer slot per parameter, receiver first — a positional signature would put its
+/// last `RustBuffer` (`checkin_response`) at slot 8: exactly AT x7's boundary, so the guard, which
+/// fires above 8, would have stayed silent. **One more optional field would trip it**, and the
+/// failure mode is jna#1259 — a mis-marshalled by-value struct on arm64 that x86-64 CI and the
+/// desktop `:core-roundtrip` jar are both structurally blind to. Collapsing now costs nothing and
+/// removes the cliff.
+///
+/// `plaintext` is the only field the Vault ever sees — it is sealed here (enc:v2, AAD = the question
+/// id) and the outbox holds ciphertext only. Named to pair with the read model
+/// [`read::QuestionRecord`] — `QuestionUpsert` in, `QuestionRecord` out.
 ///
 /// `plaintext: Some` is a full write. `plaintext: None` is a **metadata-only patch** of an existing
 /// row — answering a check-in, resolving, dismissing — which makes NO Vault call and omits `text`
@@ -4534,6 +4543,79 @@ mod tests {
     }
 
     #[test]
+    fn set_user_setting_stages_a_row_keyed_by_the_setting_name() {
+        // `user_settings` has no `id` — `key` IS the local pk, so the outbox record id and the
+        // staged row must both key on it. The push-side composite `on_conflict` is pinned
+        // separately in `push.rs`; this covers the FFI method itself.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        engine
+            .set_user_setting("prompt_cadence".into(), Some("168".into()))
+            .unwrap();
+
+        let row = Store::open(db_path)
+            .unwrap()
+            .get_row("user_settings", "prompt_cadence")
+            .unwrap()
+            .expect("the setting is in the local mirror");
+        assert_eq!(row["value"].as_str(), Some("168"));
+        assert_eq!(row["deleted"], json!(false));
+        let queued = collapsed_payload_for(db_path, "user_settings", "prompt_cadence")
+            .expect("a settings upsert is queued");
+        assert_eq!(queued["key"].as_str(), Some("prompt_cadence"));
+        assert!(
+            queued.get("id").is_none(),
+            "user_settings has no id column — an invented one would break the composite upsert"
+        );
+    }
+
+    #[test]
+    fn a_resolved_at_before_created_at_does_not_invert_the_window() {
+        // Clock skew across devices can stamp `resolved_at` earlier than `created_at`. Unclamped,
+        // the window would run backwards and silently return NOTHING — a question whose notes all
+        // vanished, with no error to explain it. The clamp makes the window empty-but-valid.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_question(QuestionUpsert {
+                created_at: 200,
+                status: Some("resolved".into()),
+                resolved_at: Some(100), // BEFORE it opened
+                ..question_upsert("q1", "skewed")
+            })
+            .unwrap();
+        engine
+            .enqueue_note(NoteUpsert {
+                created_at: 200,
+                ..note_upsert("n-at-open", "n")
+            })
+            .unwrap();
+        engine
+            .enqueue_note(NoteUpsert {
+                created_at: 150,
+                ..note_upsert("n-between", "n")
+            })
+            .unwrap();
+
+        let ids: Vec<String> = engine
+            .question_notes("q1".into(), 10_000)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["n-at-open".to_string()],
+            "the window collapses to the single instant it opened, not to nothing and not backwards"
+        );
+    }
+
+    #[test]
     fn whole_row_lww_on_a_question_discards_the_losing_field() {
         // ACCEPTED BEHAVIOUR (founder, 2026-08-14), pinned so it stays a decision rather than
         // becoming a discovery: the answer flow (status/tone) and the check-in flow
@@ -5132,11 +5214,12 @@ mod tests {
             .collect();
         crate::sync::outbox::collapse(items, &std::collections::BTreeMap::new())
             .iter()
-            // note_signals is keyed by note_id (no `id` column) — match either pk shape.
+            // Match on the table's OWN pk column rather than a hardcoded shortlist: `note_signals`
+            // keys on `note_id` and (SUR-1042) `user_settings` on `key`, neither having an `id`.
+            // Descriptor-derived so the next pk-shaped table needs no edit here.
             .find(|c| {
-                c.table == table
-                    && (c.payload.get("id") == Some(&json!(record_id))
-                        || c.payload.get("note_id") == Some(&json!(record_id)))
+                let pk = crate::store::table_schema(table).map_or("id", |t| t.pk[0]);
+                c.table == table && c.payload.get(pk) == Some(&json!(record_id))
             })
             .map(|c| c.payload.clone())
     }
