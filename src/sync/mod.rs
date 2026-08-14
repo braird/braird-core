@@ -1391,9 +1391,9 @@ impl SyncEngine {
     /// `plaintext: None` is the metadata-only patch: no Vault call, and `text`/`created_at` are
     /// OMITTED so the stored ciphertext and birth time survive untouched. This is the common path —
     /// every state change after the first (check-in answered, resolved, dismissed) is metadata — so
-    /// it must not re-seal. Unlike the note patch this does NOT require the row to exist: a question
-    /// is host-created and the host owns its id, so a patch that lands before its create is a
-    /// caller bug the store will surface, not a race worth a typed error.
+    /// it must not re-seal. Like the note patch it REQUIRES an existing live row and returns
+    /// [`SyncError::PatchTargetMissing`] otherwise: staged unconditionally it would insert a live
+    /// row with NULL `text`, which reads back as a real question with no text and no failure flag.
     ///
     /// WHOLE-ROW LWW, ACCEPTED (founder, 2026-08-14). `status`/`tone` (the answer flow) and
     /// `checkin_at`/`checkin_response` (the check-in flow) live on ONE row under whole-row
@@ -1427,14 +1427,36 @@ impl SyncEngine {
         row.insert("updated_at".into(), json!(now));
         row.insert("deleted".into(), json!(deleted));
 
-        if let Some(plaintext) = plaintext {
-            // The ONLY Vault call on this path. `Some(id)` selects enc:v2, making the question id
-            // the AAD — the same binding `notes.text` gets from its note id.
-            let ciphertext = self.vault.encrypt_note(Some(id.clone()), plaintext);
-            row.insert("text".into(), json!(ciphertext));
-            row.insert("created_at".into(), json!(created_at));
+        match plaintext {
+            Some(plaintext) => {
+                // The ONLY Vault call on this path. `Some(id)` selects enc:v2, making the question
+                // id the AAD — the same binding `notes.text` gets from its note id.
+                let ciphertext = self.vault.encrypt_note(Some(id.clone()), plaintext);
+                row.insert("text".into(), json!(ciphertext));
+                row.insert("created_at".into(), json!(created_at));
+                self.stage_write("questions", &id, row)
+            }
+            None => {
+                // A metadata patch REQUIRES an existing live row, and the precondition is enforced
+                // rather than documented. Staged unconditionally, a patch for an id that was never
+                // created inserts a live row carrying only the patch columns: `text` and
+                // `created_at` NULL. That ghost then reads back through `list_questions` as a real
+                // question with `text: None, decrypt_failed: false` — indistinguishable from a
+                // legitimately empty one — while its sparse PATCH matches no server row and stays
+                // queued forever. Failing loudly costs one typed error the host already handles for
+                // notes; the alternative is a question the user never wrote.
+                lock!(self.store)
+                    .stage_local_write_existing_live("questions", &id, row, Vec::new(), now)
+                    .map_err(|e| match e {
+                        crate::store::StageExistingWriteError::TargetMissing => {
+                            SyncError::PatchTargetMissing
+                        }
+                        crate::store::StageExistingWriteError::Sql(e) => {
+                            SyncError::Store(e.to_string())
+                        }
+                    })
+            }
         }
-        self.stage_write("questions", &id, row)
     }
 
     /// Enqueue a question↔note curation override (SUR-1042), keyed by the DETERMINISTIC
@@ -1511,11 +1533,19 @@ impl SyncEngine {
     /// Untyped on purpose at this layer — `key` and `value` are strings, and SUR-1043 owns the typed
     /// `PromptSettings` façade (the key constants and the 72..=672 cadence clamp) on top. Putting the
     /// clamp here would split the settings vocabulary across two tickets for no gain.
-    pub fn set_user_setting(&self, key: String, value: Option<String>) -> Result<(), SyncError> {
+    /// `value` is NOT optional, though the column is nullable. An `Option` here would have meant two
+    /// different things depending on state: `insert_opt` omits a `None`, so on an existing setting
+    /// the merge would keep the old value while bumping `updated_at` (a silent no-op), and on a new
+    /// key it would create one with a NULL value. A `set` API whose effect depends on whether the row
+    /// already exists is a trap. Clearing is not a use case — the two known keys (`prompt_cadence`,
+    /// `prompt_tone`) always carry a value, and `deleted` already expresses removal — so the
+    /// ambiguity is removed rather than defined. If a setting ever genuinely needs null-versus-absent,
+    /// widen it then and write the `None` as an explicit JSON null, never as an omission.
+    pub fn set_user_setting(&self, key: String, value: String) -> Result<(), SyncError> {
         let now = epoch_ms();
         let mut row = Map::new();
         row.insert("key".into(), json!(key));
-        insert_opt(&mut row, "value", value);
+        row.insert("value".into(), json!(value));
         row.insert("updated_at".into(), json!(now));
         row.insert("deleted".into(), json!(false));
         self.stage_write("user_settings", &key, row)
@@ -4355,6 +4385,82 @@ mod tests {
     }
 
     #[test]
+    fn a_question_read_rejects_anything_that_is_not_enc_v2() {
+        // Codex P1. `decrypt_note_text` (the notes gate) accepts enc:v1, plaintext and empty —
+        // all three unbindable to a question id. enc:v1 is the sharp one: `decrypt_note` passes
+        // `aad: None` on that branch and IGNORES the id entirely, so a v1 blob lifted from anywhere
+        // would render as this question's text, defeating the transplant protection v2 exists for.
+        let vault = Vault::generate();
+        let store = Store::open_in_memory().unwrap();
+        // A REAL v1 ciphertext, sealed with no AAD — not a malformed string.
+        let v1 = vault.encrypt_note(None, "lifted from somewhere else".into());
+        assert!(v1.starts_with("enc:v1:"), "precondition: a genuine v1 blob");
+
+        for (case, text) in [
+            ("enc:v1", v1.as_str()),
+            ("plaintext", "a question typed straight in"),
+            ("empty", ""),
+        ] {
+            let row = json!({
+                "id": "q1", "text": text, "status": "active",
+                "created_at": 1, "updated_at": 1, "deleted": false
+            });
+            store
+                .apply_row("questions", row.as_object().unwrap())
+                .unwrap();
+            let got = read::get_question(&store, &vault, "q1").unwrap().unwrap();
+            assert!(
+                got.decrypt_failed && got.text.is_none(),
+                "{case} must read as a decrypt failure, not as the question's text"
+            );
+        }
+
+        // …and the notes gate is deliberately NOT tightened: v1 is a real legacy corpus there.
+        let note_row = json!({
+            "id": "n1", "text": v1, "tags": [],
+            "created_at": 1, "updated_at": 1, "deleted": false
+        });
+        store
+            .apply_row("notes", note_row.as_object().unwrap())
+            .unwrap();
+        let note = read::get_note(&store, &vault, "n1").unwrap().unwrap();
+        assert_eq!(note.text.as_deref(), Some("lifted from somewhere else"));
+    }
+
+    #[test]
+    fn a_metadata_patch_for_a_question_that_was_never_created_is_rejected() {
+        // Codex P2. Staged unconditionally this inserted a live row with NULL text, which read back
+        // as a real question with `decrypt_failed: false` — a question the user never wrote — while
+        // its sparse PATCH matched no server row and stayed queued forever.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        let err = engine
+            .enqueue_question(QuestionUpsert {
+                plaintext: None,
+                status: Some("resolved".into()),
+                ..question_upsert("ghost", "")
+            })
+            .unwrap_err();
+        assert!(matches!(err, SyncError::PatchTargetMissing), "got {err:?}");
+
+        assert!(
+            engine.list_questions(10, 0).unwrap().is_empty(),
+            "no ghost question may appear in the log"
+        );
+        assert!(
+            Store::open(db_path)
+                .unwrap()
+                .outbox_items()
+                .unwrap()
+                .is_empty(),
+            "and nothing may be queued for a row that does not exist"
+        );
+    }
+
+    #[test]
     fn override_id_is_question_then_note() {
         assert_eq!(crate::store::override_id("q1", "n1"), "q1:n1");
     }
@@ -4553,7 +4659,7 @@ mod tests {
         let engine = engine_at(db_path);
 
         engine
-            .set_user_setting("prompt_cadence".into(), Some("168".into()))
+            .set_user_setting("prompt_cadence".into(), "168".into())
             .unwrap();
 
         let row = Store::open(db_path)

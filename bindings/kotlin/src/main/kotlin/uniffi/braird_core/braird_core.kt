@@ -1383,7 +1383,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note_signals() != 65282.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_question() != 32906.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_question() != 36841.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_question_note_override() != 50313.toShort()) {
@@ -1479,7 +1479,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_set_access_token() != 47386.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_set_user_setting() != 24285.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_set_user_setting() != 2882.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_similar_notes() != 52094.toShort()) {
@@ -2577,9 +2577,9 @@ public interface SyncEngineInterface {
      * `plaintext: None` is the metadata-only patch: no Vault call, and `text`/`created_at` are
      * OMITTED so the stored ciphertext and birth time survive untouched. This is the common path —
      * every state change after the first (check-in answered, resolved, dismissed) is metadata — so
-     * it must not re-seal. Unlike the note patch this does NOT require the row to exist: a question
-     * is host-created and the host owns its id, so a patch that lands before its create is a
-     * caller bug the store will surface, not a race worth a typed error.
+     * it must not re-seal. Like the note patch it REQUIRES an existing live row and returns
+     * [`SyncError::PatchTargetMissing`] otherwise: staged unconditionally it would insert a live
+     * row with NULL `text`, which reads back as a real question with no text and no failure flag.
      *
      * WHOLE-ROW LWW, ACCEPTED (founder, 2026-08-14). `status`/`tone` (the answer flow) and
      * `checkin_at`/`checkin_response` (the check-in flow) live on ONE row under whole-row
@@ -2969,8 +2969,16 @@ public interface SyncEngineInterface {
      * Untyped on purpose at this layer — `key` and `value` are strings, and SUR-1043 owns the typed
      * `PromptSettings` façade (the key constants and the 72..=672 cadence clamp) on top. Putting the
      * clamp here would split the settings vocabulary across two tickets for no gain.
+     * `value` is NOT optional, though the column is nullable. An `Option` here would have meant two
+     * different things depending on state: `insert_opt` omits a `None`, so on an existing setting
+     * the merge would keep the old value while bumping `updated_at` (a silent no-op), and on a new
+     * key it would create one with a NULL value. A `set` API whose effect depends on whether the row
+     * already exists is a trap. Clearing is not a use case — the two known keys (`prompt_cadence`,
+     * `prompt_tone`) always carry a value, and `deleted` already expresses removal — so the
+     * ambiguity is removed rather than defined. If a setting ever genuinely needs null-versus-absent,
+     * widen it then and write the `None` as an explicit JSON null, never as an omission.
      */
-    fun `setUserSetting`(`key`: kotlin.String, `value`: kotlin.String?)
+    fun `setUserSetting`(`key`: kotlin.String, `value`: kotlin.String)
     
     /**
      * Notes semantically nearest to `note_id` (SUR-997 item 4 → SUR-647/SUR-996's
@@ -3445,9 +3453,9 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * `plaintext: None` is the metadata-only patch: no Vault call, and `text`/`created_at` are
      * OMITTED so the stored ciphertext and birth time survive untouched. This is the common path —
      * every state change after the first (check-in answered, resolved, dismissed) is metadata — so
-     * it must not re-seal. Unlike the note patch this does NOT require the row to exist: a question
-     * is host-created and the host owns its id, so a patch that lands before its create is a
-     * caller bug the store will surface, not a race worth a typed error.
+     * it must not re-seal. Like the note patch it REQUIRES an existing live row and returns
+     * [`SyncError::PatchTargetMissing`] otherwise: staged unconditionally it would insert a live
+     * row with NULL `text`, which reads back as a real question with no text and no failure flag.
      *
      * WHOLE-ROW LWW, ACCEPTED (founder, 2026-08-14). `status`/`tone` (the answer flow) and
      * `checkin_at`/`checkin_response` (the check-in flow) live on ONE row under whole-row
@@ -4185,13 +4193,21 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * Untyped on purpose at this layer — `key` and `value` are strings, and SUR-1043 owns the typed
      * `PromptSettings` façade (the key constants and the 72..=672 cadence clamp) on top. Putting the
      * clamp here would split the settings vocabulary across two tickets for no gain.
+     * `value` is NOT optional, though the column is nullable. An `Option` here would have meant two
+     * different things depending on state: `insert_opt` omits a `None`, so on an existing setting
+     * the merge would keep the old value while bumping `updated_at` (a silent no-op), and on a new
+     * key it would create one with a NULL value. A `set` API whose effect depends on whether the row
+     * already exists is a trap. Clearing is not a use case — the two known keys (`prompt_cadence`,
+     * `prompt_tone`) always carry a value, and `deleted` already expresses removal — so the
+     * ambiguity is removed rather than defined. If a setting ever genuinely needs null-versus-absent,
+     * widen it then and write the `None` as an explicit JSON null, never as an omission.
      */
-    @Throws(SyncException::class)override fun `setUserSetting`(`key`: kotlin.String, `value`: kotlin.String?)
+    @Throws(SyncException::class)override fun `setUserSetting`(`key`: kotlin.String, `value`: kotlin.String)
         = 
     callWithPointer {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_set_user_setting(
-        it, FfiConverterString.lower(`key`),FfiConverterOptionalString.lower(`value`),_status)
+        it, FfiConverterString.lower(`key`),FfiConverterString.lower(`value`),_status)
 }
     }
     

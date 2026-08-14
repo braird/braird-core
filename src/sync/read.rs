@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
-use crate::note_encryption::is_encrypted;
+use crate::note_encryption::{is_encrypted, is_encrypted_v2};
 use crate::search::{SearchDoc, SearchDocKind};
 use crate::store::Store;
 use crate::vault::Vault;
@@ -705,9 +705,7 @@ fn note_record(row: &Map<String, Value>, vault: &Vault) -> NoteRecord {
 
 fn question_record(row: &Map<String, Value>, vault: &Vault) -> QuestionRecord {
     let id = string_field(row, "id").unwrap_or_default();
-    // The SAME gate `notes` uses — one implementation of the decrypt/skip rule, so the two can
-    // never drift on what counts as a decrypt failure.
-    let (text, decrypt_failed) = decrypt_note_text(row, &id, vault);
+    let (text, decrypt_failed) = decrypt_question_text(row, &id, vault);
     QuestionRecord {
         text,
         decrypt_failed,
@@ -801,6 +799,42 @@ pub(super) fn decrypt_note_text(
             Err(_) => (None, true),
         },
         Some(t) => (Some(t), false),
+    }
+}
+
+/// Decrypt a `questions.text` on the way out — **stricter than [`decrypt_note_text`], deliberately**
+/// (SUR-1042). Anything that is not `enc:v2` is a decryption FAILURE here, where the notes gate
+/// would accept it.
+///
+/// Sharing the notes gate was the original implementation and it was wrong. `decrypt_note_text`
+/// accepts three things a question must refuse:
+///   - **`enc:v1`** — no AAD at all, so `decrypt_note` ignores the id argument entirely and the blob
+///     opens under ANY row. A v1 ciphertext lifted from anywhere would render as this question's
+///     text, which is precisely the transplant the AAD binding exists to prevent;
+///   - **plaintext passthrough** — a `text` that never went through the Vault would be displayed
+///     verbatim as the question;
+///   - **empty string** — read as "sealed nothing" rather than as the crypto defect it is.
+///
+/// `notes` must keep accepting all three: v1 is a real legacy corpus, and a plaintext-era note is a
+/// degraded row, not an attack. `questions` has no legacy corpus — the table was created sealed —
+/// so the only thing it can legitimately hold is v2, and surfc `0055` says as much in its own words
+/// ("a question row without ciphertext is a crypto defect, not a degraded row").
+///
+/// An ABSENT `text` still yields `(None, false)`: the column making no claim is different from the
+/// column making an unverifiable one.
+fn decrypt_question_text(
+    row: &Map<String, Value>,
+    id: &str,
+    vault: &Vault,
+) -> (Option<String>, bool) {
+    match string_field(row, "text") {
+        None => (None, false),
+        Some(t) if is_encrypted_v2(&t) => match vault.decrypt_note(Some(id.to_string()), t) {
+            Ok(plaintext) => (Some(plaintext), false),
+            Err(_) => (None, true),
+        },
+        // v1, plaintext, empty, or garbage — all unbindable to this question.
+        Some(_) => (None, true),
     }
 }
 
