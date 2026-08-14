@@ -6,6 +6,29 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Changed
+- **`open_questions` is now `questions`, and its `status` vocabulary is `active` rather than `live`
+  (SUR-1042).** SUR-1042 exports this entity over UniFFI, and deriving the API name from the table
+  exposed the misnomer: the table holds the *whole* question log — active, resolved and dismissed
+  alike — so `open_questions` named a subset of its own contents. `live` had a second and worse
+  problem: `vendored/schema/native-manifest.json` already uses `backend: live` for a table's
+  **migration lifecycle**, so a reader of these two files met one word meaning two unrelated things.
+  `checkin_response` moves `still_open` → `active` for the same one-word-per-concept reason.
+  This is a **registry-only change** — `store::native_schema()`, both vendored fixtures, and the
+  SUR-1049 integration test's payloads. The tables are still deliberately absent from
+  `table_schema()` and `synced_table_names()`; the seal boundary and the sync legs remain SUR-1042's
+  next PRs, and `tests/schema_parity.rs`'s boundary test still guards that gap.
+  **Paired with surfc migration `0056`, and the two are not independent.** This runs SUR-1048's
+  handshake in the opposite direction from SUR-1047's: there, the cloud caught up with the registry
+  and the manifest flipped `pending → live`; here the cloud moves *first*, so from the moment `0056`
+  is applied to braird-staging, `scripts/check-native-schema.mjs` fails on every core PR (finding
+  `questions` where the fixture still said `open_questions`) until this merges. That red window is
+  the coordination signal, but it is repo-wide CI — land this immediately after the staging apply,
+  and don't open it alongside an unrelated core PR.
+  Free exactly once: no shipped release contains these tables (`braird-core.lock` pins v0.14.0; they
+  landed after that tag), so no device has an `open_questions` table to migrate. After the sync legs
+  ship, the same rename is a coordinated three-repo data migration.
+
 ### Added
 - **A behavioural round-trip against the native-first cloud tables, because the schema check can only
   ever prove a thing EXISTS (SUR-1049).** `scripts/check-native-schema.mjs` reads catalogues, and

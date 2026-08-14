@@ -3,7 +3,7 @@
 // braird-staging (SUR-1048).
 //
 // `vendored/schema/sync-schema.json` is DERIVED from surfc, so `schema-drift.yml` can re-derive it
-// and catch drift by construction. The native-first tables (SUR-996: open_questions,
+// and catch drift by construction. The native-first tables (SUR-996: questions,
 // question_note_overrides, user_settings) have no PWA counterpart — `src/store.rs`'s
 // `native_schema()` IS the source of truth and `vendored/schema/native-schema.json` is a
 // hand-authored LOCK of it. `tests/schema_parity.rs` reconciles those two.

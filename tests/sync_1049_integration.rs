@@ -1,5 +1,5 @@
 //! SUR-1049 — a BEHAVIOURAL round-trip against the native-first cloud tables
-//! (`open_questions`, `question_note_overrides`, `user_settings`, SUR-1047's migration 0055).
+//! (`questions`, `question_note_overrides`, `user_settings`, SUR-1047's migration 0055).
 //!
 //! Why this exists, when `scripts/check-native-schema.mjs` already validates the same tables:
 //! that check reads catalogues, and across five review rounds it accumulated thirteen findings of
@@ -79,12 +79,12 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
     test_support::upsert(
         &env,
         &tok,
-        "open_questions",
+        "questions",
         "id",
         &json!([{
             "id": q_id, "user_id": uid,
             "text": "enc:v2:aXY=.Y3Q=",           // opaque ciphertext — the server never reads it
-            "status": "live", "tone": "introspective",
+            "status": "active", "tone": "introspective",
             "created_at": TS, "updated_at": TS, "deleted": false
         }]),
     );
@@ -95,7 +95,7 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
         "user_id,key",
         &json!([{ "user_id": uid, "key": "prompt_cadence", "value": "168", "updated_at": TS, "deleted": false }]),
     );
-    // question_note_overrides FKs both open_questions(id) and notes(id), so the note must exist
+    // question_note_overrides FKs both questions(id) and notes(id), so the note must exist
     // first — a real one, owned by the same user, or the FK rejects with 23503.
     test_support::upsert(
         &env,
@@ -125,7 +125,7 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
     // assigning it, all land as null — and a null is invisible to `change_seq=gt.<cursor>`, i.e.
     // a row that syncs to nobody, forever.
     let seqs: Vec<(&str, String, i64)> = [
-        ("open_questions", format!("id=eq.{q_id}")),
+        ("questions", format!("id=eq.{q_id}")),
         ("question_note_overrides", format!("id=eq.{ov_id}")),
         ("user_settings", "key=eq.prompt_cadence".to_string()),
     ]
@@ -147,14 +147,14 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
     // device. This is the half a BEFORE INSERT-only trigger passes step 2 with — and per table,
     // because each `t02_change_seq` is a SEPARATE trigger definition: one created without the
     // UPDATE event, or bound to a different function, is invisible to a check that only ever
-    // edits `open_questions` (raised on review).
+    // edits `questions` (raised on review).
     //
     // Every payload bumps `updated_at`. `t01_lww_guard` fires BEFORE UPDATE and cancels
     // (RETURN NULL) a write that is not strictly newer, which would skip the stamp and read as a
     // trigger failure here rather than the LWW guard doing its job.
     for (table, on_conflict, row) in [
         (
-            "open_questions",
+            "questions",
             "id",
             json!({
                 "id": q_id, "user_id": uid, "text": "enc:v2:aXY=.Y3Q3",
@@ -218,10 +218,10 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
 
     for (table, on_conflict, row) in [
         (
-            "open_questions",
+            "questions",
             "id",
             json!({
-                "id": b_q, "user_id": b_uid, "text": "enc:v2:aXY=.Y3Q=", "status": "live",
+                "id": b_q, "user_id": b_uid, "text": "enc:v2:aXY=.Y3Q=", "status": "active",
                 "created_at": TS, "updated_at": TS, "deleted": false
             }),
         ),
@@ -266,11 +266,11 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
     // (raised on review). So each table gets its own cross-owner attempt.
     for (table, on_conflict, row) in [
         (
-            "open_questions",
+            "questions",
             "id",
             json!({
                 "id": format!("intruder-{uid}"), "user_id": uid,
-                "text": "enc:v2:aXY=.Y3Q=", "status": "live",
+                "text": "enc:v2:aXY=.Y3Q=", "status": "active",
                 "created_at": TS, "updated_at": TS, "deleted": false
             }),
         ),
@@ -344,7 +344,7 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
     // test. A 2xx here means the transfer succeeded.
 
     for (table, query) in [
-        ("open_questions", format!("id=eq.{b_q}")),
+        ("questions", format!("id=eq.{b_q}")),
         ("question_note_overrides", format!("id=eq.{b_ov}")),
         ("user_settings", "key=eq.prompt_tone".to_string()),
     ] {

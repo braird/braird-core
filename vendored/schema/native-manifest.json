@@ -3,13 +3,13 @@
   "comment": "SUR-1048 native-first schema registry. One row per table in vendored/schema/native-schema.json — the tables braird-core AUTHORS rather than mirrors from surfc (native-first per the 2026-07-18 rule, so there is no PWA counterpart to derive from). Source of truth for 'who owns this table and does it exist in the cloud yet'. `ticket` names the core ticket that owns the shape. `backend`: live (the table exists in braird-staging — scripts/check-native-schema.mjs asserts its information_schema DDL matches the fixture) | pending (the migration has not been applied yet — the DDL leg SKIPS the table and says so loudly, and FAILS if it finds the table present anyway, so the marker cannot rot); a pending row REQUIRES a backend_ticket. The store<->fixture lock in tests/schema_parity.rs applies regardless of backend state. `pk` is the table's LOCAL primary key, locked against TableSchema.pk in src/store.rs. It lives here rather than in native-schema.json so that fixture keeps the exact {table -> {column -> type}} shape of its surfc-derived sibling. The cloud counterpart may additionally scope the key by user_id — the DDL check accepts a PRIMARY KEY or UNIQUE constraint on either the local pk or the local pk plus user_id, and nothing else. Added on SUR-1048 review: a wrong key is invisible to a column-only compare but silently changes convergence (deterministic-pk OR-set vs duplicate rows) and can break PostgREST upserts.",
   "entries": [
     {
-      "table": "open_questions",
+      "table": "questions",
       "ticket": "SUR-1042",
       "pk": ["id"],
       "pk_scope": "global",
       "backend": "live",
       "backend_ticket": "SUR-1047",
-      "note": "SUR-996 R1 question log. `text` is enc:v2 ciphertext (AAD = question id), never plaintext — the seal boundary lands with the sync legs in SUR-1042. Shape registered here so the table is under the guard from its first commit."
+      "note": "SUR-996 R1 question log. `text` is enc:v2 ciphertext (AAD = question id), never plaintext — the seal boundary lands with the sync legs in SUR-1042. Shape registered here so the table is under the guard from its first commit. Renamed from `open_questions` by SUR-1042 (surfc migration 0056) — the table holds the whole log, active + resolved + dismissed, so the old name described a subset of its own contents; `status` moved `live` -> `active` in the same pass because `live` is already this manifest's word for a table's migration lifecycle."
     },
     {
       "table": "question_note_overrides",

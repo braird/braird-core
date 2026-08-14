@@ -114,7 +114,7 @@ use ColType::{Bool, Int, Json, Real, Text};
 ///
 /// **Deliberately does NOT resolve [`native_schema`] tables (SUR-1048).** Those are created and
 /// shape-locked, but not yet syncable: widening this lookup would make `apply_row` write
-/// `open_questions` before SUR-1042 defines the seal boundary. SUR-1042 widens it (and the pull
+/// `questions` before SUR-1042 defines the seal boundary. SUR-1042 widens it (and the pull
 /// scope) in the same change that gives those tables an encryption contract.
 pub fn table_schema(name: &str) -> Option<&'static TableSchema> {
     synced_schema().iter().find(|t| t.name == name)
@@ -363,7 +363,7 @@ pub fn synced_schema() -> &'static [TableSchema] {
 /// **Registered, not yet wired.** These tables are CREATED by [`Store::init_schema`] and locked by
 /// the guard, but they are deliberately absent from [`table_schema`] and [`synced_table_names`]:
 /// the pull scope must not fan out to a cloud table that does not exist yet (SUR-1047), and
-/// `apply_row` must not become writable for `open_questions` before SUR-1042 defines its
+/// `apply_row` must not become writable for `questions` before SUR-1042 defines its
 /// encryption boundary — `text` is ciphertext (enc:v2, AAD = the question id, like `notes.text`),
 /// and a plaintext question reaching SQLite is the `crypto-reviewer` BLOCKER class. SUR-1042 wires
 /// the sync legs; this ticket only puts the shapes under the guard.
@@ -386,18 +386,24 @@ pub fn synced_schema() -> &'static [TableSchema] {
 pub fn native_schema() -> &'static [TableSchema] {
     &[
         TableSchema {
-            name: "open_questions",
+            // Renamed from `open_questions` by SUR-1042 (surfc migration 0056), because this table
+            // holds the WHOLE log — active, resolved and dismissed alike — so the old name described
+            // a subset of its own contents. Free to do only because no shipped release contained it.
+            name: "questions",
             pk: &["id"],
             columns: &[
                 ("id", Text),
                 ("text", Text), // ciphertext (enc:v2, AAD = question id) — never plaintext
-                ("status", Text), // live | resolved | dismissed
-                ("tone", Text), // introspective | productive, as chosen AT ANSWER time
+                // `active`, not `live` (SUR-1042): `live` already means a table's MIGRATION
+                // LIFECYCLE in native-manifest.json, and one word meaning two things across two
+                // files that are read together is how a reader learns the wrong thing.
+                ("status", Text), // active | resolved | dismissed
+                ("tone", Text),   // introspective | productive, as chosen AT ANSWER time
                 ("resolved_at", Int),
                 // `checkin_*`, not `checked_in_at` + `checkin_response` — one compound form per
                 // concept, so the pair reads as one column group (naming-reviewer, SUR-1048).
                 ("checkin_at", Int),
-                ("checkin_response", Text), // plaintext metadata (still_open|resolved|new), NOT sealed
+                ("checkin_response", Text), // plaintext metadata (active|resolved|new), NOT sealed
                 ("created_at", Int),
                 ("updated_at", Int),
                 ("deleted", Bool),
