@@ -398,7 +398,7 @@ pub fn native_schema() -> &'static [TableSchema] {
                 // LIFECYCLE in native-manifest.json, and one word meaning two things across two
                 // files that are read together is how a reader learns the wrong thing.
                 ("status", Text), // active | resolved | dismissed
-                ("tone", Text), // introspective | productive, as chosen AT ANSWER time
+                ("tone", Text),   // introspective | productive, as chosen AT ANSWER time
                 ("resolved_at", Int),
                 // `checkin_*`, not `checked_in_at` + `checkin_response` — one compound form per
                 // concept, so the pair reads as one column group (naming-reviewer, SUR-1048).
