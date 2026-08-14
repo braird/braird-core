@@ -1042,6 +1042,60 @@ public protocol SyncEngineProtocol : AnyObject {
     func enqueueNoteSignals(noteId: String, sourcePrior: Double, returnVisits: Int64, hasAnnotation: Bool, stitchSpawns: Int64, exposureRecencyAt: Int64, engagementRecencyAt: Int64, importance: Double, createdAt: Int64, deleted: Bool) throws 
     
     /**
+     * Enqueue a question write or a metadata-only patch (SUR-1042) — the SUR-996 question log.
+     *
+     * SEAL AT WRITE, exactly as [`SyncEngine::enqueue_note`] does and for the same reason (ADR
+     * 0003): `plaintext: Some` is sealed HERE, while the plaintext is in hand, so the outbox and
+     * the local mirror hold only `enc:v2` ciphertext. The plaintext exists for the duration of this
+     * call and is never persisted, logged, or flushed. AAD is the question id, which binds the
+     * ciphertext to its row — a blob transplanted onto another question fails to open rather than
+     * silently decrypting under the wrong identity.
+     *
+     * `plaintext: None` is the metadata-only patch: no Vault call, and `text`/`created_at` are
+     * OMITTED so the stored ciphertext and birth time survive untouched. This is the common path —
+     * every state change after the first (check-in answered, resolved, dismissed) is metadata — so
+     * it must not re-seal. Unlike the note patch this does NOT require the row to exist: a question
+     * is host-created and the host owns its id, so a patch that lands before its create is a
+     * caller bug the store will surface, not a race worth a typed error.
+     *
+     * WHOLE-ROW LWW, ACCEPTED (founder, 2026-08-14). `status`/`tone` (the answer flow) and
+     * `checkin_at`/`checkin_response` (the check-in flow) live on ONE row under whole-row
+     * last-write-wins, so a dismiss on one device and a check-in on another inside the same window
+     * resolve to whichever `updated_at` is larger — the loser's field is discarded, not merged. The
+     * alternative (a check-in satellite row, the `note_signals`/migration-0047 precedent) was
+     * considered and rejected: v1 has ONE live question and both flows are user-initiated seconds
+     * apart at worst. Documented rather than engineered around, and pinned by a test so it stays a
+     * decision instead of becoming a discovery.
+     */
+    func enqueueQuestion(draft: QuestionUpsert) throws 
+    
+    /**
+     * Enqueue a question↔note curation override (SUR-1042), keyed by the DETERMINISTIC
+     * `question_id:note_id` ([`crate::store::override_id`]).
+     *
+     * THE RE-ADD FORK, and why it is not optional. A deterministic pk makes
+     * `include → remove → include` inside ONE un-flushed batch collapse onto a single outbox key,
+     * and the collapse makes `deleted` **sticky** across the group (SUR-724, "within a batch,
+     * delete wins"). So the re-add would flush as a tombstone: the local mirror reads correctly —
+     * the note still shows pinned — while push sends a delete, every other device drops it, and the
+     * next pull LWW-overwrites the local copy. A silent lost write whose local read masks it. This
+     * is the [`SyncEngine::enqueue_collection_membership`] class (SUR-940), and `store.rs`'s
+     * descriptor doc names this table as the case to extend the split for.
+     *
+     * So: a re-add (`deleted: false`) routes through `stage_local_write_resurrecting`, which drops
+     * any pending tombstone for this id and stages the live write in ONE transaction. A genuine
+     * soft-delete stays on the sticky path, because a delete SHOULD win. The tombstone arm also
+     * preserves the stored `created_at` — the server column is NOT NULL with no default and the
+     * pushed payload IS the outbox partial, so a reconstructed row would push a fresh timestamp
+     * over the real one.
+     *
+     * Both arms take ONE held store guard. A released-and-reacquired lock would let a concurrent
+     * re-add stage `deleted: false` between the lookup and the stage, with this tombstone landing
+     * after it and collapsing sticky-deleted — the same loss re-opened as a race.
+     */
+    func enqueueQuestionNoteOverride(draft: QuestionNoteOverride) throws 
+    
+    /**
      * Export a plaintext, PWA-compatible snapshot of every live synced row. Note ciphertext is
      * decrypted inside the core; a single decryption failure aborts the entire export so neither
      * ciphertext nor a partial archive can cross the FFI. Local-only tables are never included.
@@ -1068,6 +1122,11 @@ public protocol SyncEngineProtocol : AnyObject {
      * One note by id, decrypted, or `None` if absent or soft-deleted.
      */
     func getNote(id: String) throws  -> NoteRecord?
+    
+    /**
+     * One question by id, or `None` if absent or soft-deleted.
+     */
+    func getQuestion(id: String) throws  -> QuestionRecord?
     
     /**
      * Per-idea live-note counts (SUR-858) — the tree's counts, `{idea, count}` sorted by idea name,
@@ -1112,6 +1171,11 @@ public protocol SyncEngineProtocol : AnyObject {
      * that book's notes. `text` is decrypted plaintext, or `None` with `decrypt_failed = true`.
      */
     func listNotes(bookId: String?, limit: UInt32, offset: UInt32) throws  -> [NoteRecord]
+    
+    /**
+     * The SUR-996 question log, newest-first — every status, decrypted in core (SUR-1042).
+     */
+    func listQuestions(limit: UInt32, offset: UInt32) throws  -> [QuestionRecord]
     
     /**
      * Merge duplicate source books into `survivor_id` (SUR-915): rehome the losers' notes, keep the
@@ -1181,6 +1245,14 @@ public protocol SyncEngineProtocol : AnyObject {
      * flush destroying a newer SERVER row before a pull can see it is the server's job, PR-3.)
      */
     func pull() throws  -> PullSummary
+    
+    /**
+     * The effective note set of one question — `(auto ∪ includes) − excludes`, newest-first
+     * (SUR-1042). `now_ms` closes the active window of a question that has no `resolved_at`; the
+     * host supplies it so this stays a pure function of its inputs (see [`read::question_notes`]).
+     * An absent or soft-deleted question yields an empty set, never an error.
+     */
+    func questionNotes(questionId: String, nowMs: Int64) throws  -> [NoteRecord]
     
     /**
      * Hybrid ranked search (SUR-1019, ADR 0007 — the SUR-157 query path): ONE ranked
@@ -1360,6 +1432,22 @@ public protocol SyncEngineProtocol : AnyObject {
      * PostgREST calls with it; the `user_id` stamped on each row is the token's `sub` claim.
      */
     func setAccessToken(jwt: String) 
+    
+    /**
+     * Write one synced user setting (SUR-1042) — braird's first synced settings, a per-user KV
+     * whose local pk is `key` (there is no `id` column).
+     *
+     * LWW lands per SETTING, not per settings-blob, which is the whole reason this is a standalone
+     * table rather than columns on `user_profiles`: one device changing prompt cadence cannot stomp
+     * another device's tone, and neither can stomp the server-authoritative quota/billing state on
+     * `user_profiles`. The rule going forward is that the server writes profiles and clients write
+     * settings.
+     *
+     * Untyped on purpose at this layer — `key` and `value` are strings, and SUR-1043 owns the typed
+     * `PromptSettings` façade (the key constants and the 72..=672 cadence clamp) on top. Putting the
+     * clamp here would split the settings vocabulary across two tickets for no gain.
+     */
+    func setUserSetting(key: String, value: String?) throws 
     
     /**
      * Notes semantically nearest to `note_id` (SUR-997 item 4 → SUR-647/SUR-996's
@@ -1774,6 +1862,70 @@ open func enqueueNoteSignals(noteId: String, sourcePrior: Double, returnVisits: 
 }
     
     /**
+     * Enqueue a question write or a metadata-only patch (SUR-1042) — the SUR-996 question log.
+     *
+     * SEAL AT WRITE, exactly as [`SyncEngine::enqueue_note`] does and for the same reason (ADR
+     * 0003): `plaintext: Some` is sealed HERE, while the plaintext is in hand, so the outbox and
+     * the local mirror hold only `enc:v2` ciphertext. The plaintext exists for the duration of this
+     * call and is never persisted, logged, or flushed. AAD is the question id, which binds the
+     * ciphertext to its row — a blob transplanted onto another question fails to open rather than
+     * silently decrypting under the wrong identity.
+     *
+     * `plaintext: None` is the metadata-only patch: no Vault call, and `text`/`created_at` are
+     * OMITTED so the stored ciphertext and birth time survive untouched. This is the common path —
+     * every state change after the first (check-in answered, resolved, dismissed) is metadata — so
+     * it must not re-seal. Unlike the note patch this does NOT require the row to exist: a question
+     * is host-created and the host owns its id, so a patch that lands before its create is a
+     * caller bug the store will surface, not a race worth a typed error.
+     *
+     * WHOLE-ROW LWW, ACCEPTED (founder, 2026-08-14). `status`/`tone` (the answer flow) and
+     * `checkin_at`/`checkin_response` (the check-in flow) live on ONE row under whole-row
+     * last-write-wins, so a dismiss on one device and a check-in on another inside the same window
+     * resolve to whichever `updated_at` is larger — the loser's field is discarded, not merged. The
+     * alternative (a check-in satellite row, the `note_signals`/migration-0047 precedent) was
+     * considered and rejected: v1 has ONE live question and both flows are user-initiated seconds
+     * apart at worst. Documented rather than engineered around, and pinned by a test so it stays a
+     * decision instead of becoming a discovery.
+     */
+open func enqueueQuestion(draft: QuestionUpsert)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_enqueue_question(self.uniffiClonePointer(),
+        FfiConverterTypeQuestionUpsert.lower(draft),$0
+    )
+}
+}
+    
+    /**
+     * Enqueue a question↔note curation override (SUR-1042), keyed by the DETERMINISTIC
+     * `question_id:note_id` ([`crate::store::override_id`]).
+     *
+     * THE RE-ADD FORK, and why it is not optional. A deterministic pk makes
+     * `include → remove → include` inside ONE un-flushed batch collapse onto a single outbox key,
+     * and the collapse makes `deleted` **sticky** across the group (SUR-724, "within a batch,
+     * delete wins"). So the re-add would flush as a tombstone: the local mirror reads correctly —
+     * the note still shows pinned — while push sends a delete, every other device drops it, and the
+     * next pull LWW-overwrites the local copy. A silent lost write whose local read masks it. This
+     * is the [`SyncEngine::enqueue_collection_membership`] class (SUR-940), and `store.rs`'s
+     * descriptor doc names this table as the case to extend the split for.
+     *
+     * So: a re-add (`deleted: false`) routes through `stage_local_write_resurrecting`, which drops
+     * any pending tombstone for this id and stages the live write in ONE transaction. A genuine
+     * soft-delete stays on the sticky path, because a delete SHOULD win. The tombstone arm also
+     * preserves the stored `created_at` — the server column is NOT NULL with no default and the
+     * pushed payload IS the outbox partial, so a reconstructed row would push a fresh timestamp
+     * over the real one.
+     *
+     * Both arms take ONE held store guard. A released-and-reacquired lock would let a concurrent
+     * re-add stage `deleted: false` between the lookup and the stage, with this tombstone landing
+     * after it and collapsing sticky-deleted — the same loss re-opened as a race.
+     */
+open func enqueueQuestionNoteOverride(draft: QuestionNoteOverride)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_enqueue_question_note_override(self.uniffiClonePointer(),
+        FfiConverterTypeQuestionNoteOverride.lower(draft),$0
+    )
+}
+}
+    
+    /**
      * Export a plaintext, PWA-compatible snapshot of every live synced row. Note ciphertext is
      * decrypted inside the core; a single decryption failure aborts the entire export so neither
      * ciphertext nor a partial archive can cross the FFI. Local-only tables are never included.
@@ -1818,6 +1970,17 @@ open func getBook(id: String)throws  -> BookRecord? {
 open func getNote(id: String)throws  -> NoteRecord? {
     return try  FfiConverterOptionTypeNoteRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_get_note(self.uniffiClonePointer(),
+        FfiConverterString.lower(id),$0
+    )
+})
+}
+    
+    /**
+     * One question by id, or `None` if absent or soft-deleted.
+     */
+open func getQuestion(id: String)throws  -> QuestionRecord? {
+    return try  FfiConverterOptionTypeQuestionRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_get_question(self.uniffiClonePointer(),
         FfiConverterString.lower(id),$0
     )
 })
@@ -1908,6 +2071,18 @@ open func listNotes(bookId: String?, limit: UInt32, offset: UInt32)throws  -> [N
     return try  FfiConverterSequenceTypeNoteRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_list_notes(self.uniffiClonePointer(),
         FfiConverterOptionString.lower(bookId),
+        FfiConverterUInt32.lower(limit),
+        FfiConverterUInt32.lower(offset),$0
+    )
+})
+}
+    
+    /**
+     * The SUR-996 question log, newest-first — every status, decrypted in core (SUR-1042).
+     */
+open func listQuestions(limit: UInt32, offset: UInt32)throws  -> [QuestionRecord] {
+    return try  FfiConverterSequenceTypeQuestionRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_list_questions(self.uniffiClonePointer(),
         FfiConverterUInt32.lower(limit),
         FfiConverterUInt32.lower(offset),$0
     )
@@ -2030,6 +2205,21 @@ open func pendingEmbedCount()throws  -> UInt32 {
 open func pull()throws  -> PullSummary {
     return try  FfiConverterTypePullSummary.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_pull(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * The effective note set of one question — `(auto ∪ includes) − excludes`, newest-first
+     * (SUR-1042). `now_ms` closes the active window of a question that has no `resolved_at`; the
+     * host supplies it so this stays a pure function of its inputs (see [`read::question_notes`]).
+     * An absent or soft-deleted question yields an empty set, never an error.
+     */
+open func questionNotes(questionId: String, nowMs: Int64)throws  -> [NoteRecord] {
+    return try  FfiConverterSequenceTypeNoteRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_question_notes(self.uniffiClonePointer(),
+        FfiConverterString.lower(questionId),
+        FfiConverterInt64.lower(nowMs),$0
     )
 })
 }
@@ -2262,6 +2452,28 @@ open func semanticSearch(query: String, limit: UInt32)throws  -> [SemanticHit] {
 open func setAccessToken(jwt: String) {try! rustCall() {
     uniffi_braird_core_fn_method_syncengine_set_access_token(self.uniffiClonePointer(),
         FfiConverterString.lower(jwt),$0
+    )
+}
+}
+    
+    /**
+     * Write one synced user setting (SUR-1042) — braird's first synced settings, a per-user KV
+     * whose local pk is `key` (there is no `id` column).
+     *
+     * LWW lands per SETTING, not per settings-blob, which is the whole reason this is a standalone
+     * table rather than columns on `user_profiles`: one device changing prompt cadence cannot stomp
+     * another device's tone, and neither can stomp the server-authoritative quota/billing state on
+     * `user_profiles`. The rule going forward is that the server writes profiles and clients write
+     * settings.
+     *
+     * Untyped on purpose at this layer — `key` and `value` are strings, and SUR-1043 owns the typed
+     * `PromptSettings` façade (the key constants and the 72..=672 cadence clamp) on top. Putting the
+     * clamp here would split the settings vocabulary across two tickets for no gain.
+     */
+open func setUserSetting(key: String, value: String?)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_set_user_setting(self.uniffiClonePointer(),
+        FfiConverterString.lower(key),
+        FfiConverterOptionString.lower(value),$0
     )
 }
 }
@@ -4769,6 +4981,413 @@ public func FfiConverterTypePullSummary_lower(_ value: PullSummary) -> RustBuffe
 
 
 /**
+ * One question↔note curation override (SUR-996 R1) — the user pinning a note onto a question, or
+ * excluding one the active-window join offered.
+ *
+ * Plaintext id pair, the same trade-off as `collection_memberships`: the question's *text* is
+ * sealed, the fact that it relates to a note is not. Its row id is **derived**, not carried —
+ * [`crate::store::override_id`] makes it `question_id:note_id` so two devices curating the same
+ * pair converge on one row.
+ *
+ * A record by API shape rather than arm64 necessity (four fields is nowhere near the 8-slot limit
+ * the SUR-843 guard enforces): the pair + kind is one concept, and passing it as one argument
+ * keeps the call site readable and the field names on the wire. Deliberately NOT named
+ * `QuestionNoteOverrideUpsert` — there is no `…Record` read model to pair against, because the
+ * effective note set is exposed as notes ([`SyncEngine::question_notes`]), never as raw override
+ * rows. The ticket specifies this name.
+ */
+public struct QuestionNoteOverride {
+    public var questionId: String
+    public var noteId: String
+    /**
+     * `include` (pin a note the window missed) or `exclude` (drop one it offered). Not validated
+     * here — same forward-extensible-vocabulary reasoning as [`QuestionUpsert::status`].
+     */
+    public var kind: String
+    /**
+     * Soft-delete the override, returning the pair to whatever the active-window join says.
+     */
+    public var deleted: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(questionId: String, noteId: String, 
+        /**
+         * `include` (pin a note the window missed) or `exclude` (drop one it offered). Not validated
+         * here — same forward-extensible-vocabulary reasoning as [`QuestionUpsert::status`].
+         */kind: String, 
+        /**
+         * Soft-delete the override, returning the pair to whatever the active-window join says.
+         */deleted: Bool) {
+        self.questionId = questionId
+        self.noteId = noteId
+        self.kind = kind
+        self.deleted = deleted
+    }
+}
+
+
+
+extension QuestionNoteOverride: Equatable, Hashable {
+    public static func ==(lhs: QuestionNoteOverride, rhs: QuestionNoteOverride) -> Bool {
+        if lhs.questionId != rhs.questionId {
+            return false
+        }
+        if lhs.noteId != rhs.noteId {
+            return false
+        }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.deleted != rhs.deleted {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(questionId)
+        hasher.combine(noteId)
+        hasher.combine(kind)
+        hasher.combine(deleted)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeQuestionNoteOverride: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> QuestionNoteOverride {
+        return
+            try QuestionNoteOverride(
+                questionId: FfiConverterString.read(from: &buf), 
+                noteId: FfiConverterString.read(from: &buf), 
+                kind: FfiConverterString.read(from: &buf), 
+                deleted: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: QuestionNoteOverride, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.questionId, into: &buf)
+        FfiConverterString.write(value.noteId, into: &buf)
+        FfiConverterString.write(value.kind, into: &buf)
+        FfiConverterBool.write(value.deleted, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQuestionNoteOverride_lift(_ buf: RustBuffer) throws -> QuestionNoteOverride {
+    return try FfiConverterTypeQuestionNoteOverride.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQuestionNoteOverride_lower(_ value: QuestionNoteOverride) -> RustBuffer {
+    return FfiConverterTypeQuestionNoteOverride.lower(value)
+}
+
+
+/**
+ * One question from the SUR-996 log (SUR-1042). `text` is **plaintext**, decrypted in core through
+ * the same [`decrypt_note_text`] gate `notes` uses, or `None` when the row failed to decrypt
+ * (`decrypt_failed = true`) — a corrupt or foreign-AAD question never fails the whole page, and
+ * ciphertext never crosses the FFI in its `enc:` form.
+ *
+ * `status` is `active | resolved | dismissed`; `checkin_response` is `active | resolved | new`.
+ * Both are read defensively as `Option` (like [`LensRecord`]'s `combinator`) even though
+ * `enqueue_question` always writes a status: the vocabulary is client-authored with no server
+ * CHECK, so a row written by a newer client must not panic an older read.
+ *
+ * Deliberately NO note count or active-date-range field — those are Lexicon presentation shapes and
+ * belong to SUR-1044, which builds them on [`question_notes`] rather than beside it.
+ */
+public struct QuestionRecord {
+    public var id: String
+    public var text: String?
+    public var decryptFailed: Bool
+    public var status: String?
+    public var tone: String?
+    public var resolvedAt: Int64?
+    public var checkinAt: Int64?
+    public var checkinResponse: String?
+    public var createdAt: Int64
+    public var updatedAt: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, text: String?, decryptFailed: Bool, status: String?, tone: String?, resolvedAt: Int64?, checkinAt: Int64?, checkinResponse: String?, createdAt: Int64, updatedAt: Int64) {
+        self.id = id
+        self.text = text
+        self.decryptFailed = decryptFailed
+        self.status = status
+        self.tone = tone
+        self.resolvedAt = resolvedAt
+        self.checkinAt = checkinAt
+        self.checkinResponse = checkinResponse
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+}
+
+
+
+extension QuestionRecord: Equatable, Hashable {
+    public static func ==(lhs: QuestionRecord, rhs: QuestionRecord) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.text != rhs.text {
+            return false
+        }
+        if lhs.decryptFailed != rhs.decryptFailed {
+            return false
+        }
+        if lhs.status != rhs.status {
+            return false
+        }
+        if lhs.tone != rhs.tone {
+            return false
+        }
+        if lhs.resolvedAt != rhs.resolvedAt {
+            return false
+        }
+        if lhs.checkinAt != rhs.checkinAt {
+            return false
+        }
+        if lhs.checkinResponse != rhs.checkinResponse {
+            return false
+        }
+        if lhs.createdAt != rhs.createdAt {
+            return false
+        }
+        if lhs.updatedAt != rhs.updatedAt {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(text)
+        hasher.combine(decryptFailed)
+        hasher.combine(status)
+        hasher.combine(tone)
+        hasher.combine(resolvedAt)
+        hasher.combine(checkinAt)
+        hasher.combine(checkinResponse)
+        hasher.combine(createdAt)
+        hasher.combine(updatedAt)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeQuestionRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> QuestionRecord {
+        return
+            try QuestionRecord(
+                id: FfiConverterString.read(from: &buf), 
+                text: FfiConverterOptionString.read(from: &buf), 
+                decryptFailed: FfiConverterBool.read(from: &buf), 
+                status: FfiConverterOptionString.read(from: &buf), 
+                tone: FfiConverterOptionString.read(from: &buf), 
+                resolvedAt: FfiConverterOptionInt64.read(from: &buf), 
+                checkinAt: FfiConverterOptionInt64.read(from: &buf), 
+                checkinResponse: FfiConverterOptionString.read(from: &buf), 
+                createdAt: FfiConverterInt64.read(from: &buf), 
+                updatedAt: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: QuestionRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterOptionString.write(value.text, into: &buf)
+        FfiConverterBool.write(value.decryptFailed, into: &buf)
+        FfiConverterOptionString.write(value.status, into: &buf)
+        FfiConverterOptionString.write(value.tone, into: &buf)
+        FfiConverterOptionInt64.write(value.resolvedAt, into: &buf)
+        FfiConverterOptionInt64.write(value.checkinAt, into: &buf)
+        FfiConverterOptionString.write(value.checkinResponse, into: &buf)
+        FfiConverterInt64.write(value.createdAt, into: &buf)
+        FfiConverterInt64.write(value.updatedAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQuestionRecord_lift(_ buf: RustBuffer) throws -> QuestionRecord {
+    return try FfiConverterTypeQuestionRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQuestionRecord_lower(_ value: QuestionRecord) -> RustBuffer {
+    return FfiConverterTypeQuestionRecord.lower(value)
+}
+
+
+/**
+ * A question upsert draft (SUR-1042) — the record form of [`SyncEngine::enqueue_question`]'s
+ * arguments, and the entry point to the SUR-996 question log.
+ *
+ * A record for the same arm64 reason as [`NoteUpsert`] / [`BookUpsert`] (SUR-770/843): eleven
+ * fields, of which nine lower to by-value `RustBuffer`s, would spill well past x7. `plaintext` is
+ * the only field the Vault ever sees — it is sealed here (enc:v2, AAD = the question id) and the
+ * outbox holds ciphertext only. Named to pair with the read model [`read::QuestionRecord`] —
+ * `QuestionUpsert` in, `QuestionRecord` out.
+ *
+ * `plaintext: Some` is a full write. `plaintext: None` is a **metadata-only patch** of an existing
+ * row — answering a check-in, resolving, dismissing — which makes NO Vault call and omits `text`
+ * and `created_at`, preserving the stored ciphertext byte-for-byte. That split matters more here
+ * than on notes: every state transition after the first is metadata-only, so the common path must
+ * never re-seal (a re-seal with the same key and a fresh IV is harmless, but a re-seal from a host
+ * that no longer has the plaintext would blank the question).
+ *
+ * `status` is `active | resolved | dismissed` and `checkin_response` is `active | resolved | new`
+ * (SUR-1042 vocabulary — `live` and `still_open` are retired). Neither is validated here: the
+ * server has no CHECK constraint on them by deliberate design, because the vocabulary is
+ * client-authored and forward-extensible, and a core that rejected a newer client's value would
+ * reintroduce exactly the coupling that decision avoided.
+ */
+public struct QuestionUpsert {
+    public var id: String
+    /**
+     * The question text. `Some` → sealed here (enc:v2, AAD = [`id`]). `None` → metadata-only patch.
+     */
+    public var plaintext: String?
+    public var status: String?
+    public var tone: String?
+    public var resolvedAt: Int64?
+    public var checkinAt: Int64?
+    public var checkinResponse: String?
+    public var createdAt: Int64
+    public var deleted: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, 
+        /**
+         * The question text. `Some` → sealed here (enc:v2, AAD = [`id`]). `None` → metadata-only patch.
+         */plaintext: String?, status: String?, tone: String?, resolvedAt: Int64?, checkinAt: Int64?, checkinResponse: String?, createdAt: Int64, deleted: Bool) {
+        self.id = id
+        self.plaintext = plaintext
+        self.status = status
+        self.tone = tone
+        self.resolvedAt = resolvedAt
+        self.checkinAt = checkinAt
+        self.checkinResponse = checkinResponse
+        self.createdAt = createdAt
+        self.deleted = deleted
+    }
+}
+
+
+
+extension QuestionUpsert: Equatable, Hashable {
+    public static func ==(lhs: QuestionUpsert, rhs: QuestionUpsert) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.plaintext != rhs.plaintext {
+            return false
+        }
+        if lhs.status != rhs.status {
+            return false
+        }
+        if lhs.tone != rhs.tone {
+            return false
+        }
+        if lhs.resolvedAt != rhs.resolvedAt {
+            return false
+        }
+        if lhs.checkinAt != rhs.checkinAt {
+            return false
+        }
+        if lhs.checkinResponse != rhs.checkinResponse {
+            return false
+        }
+        if lhs.createdAt != rhs.createdAt {
+            return false
+        }
+        if lhs.deleted != rhs.deleted {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(plaintext)
+        hasher.combine(status)
+        hasher.combine(tone)
+        hasher.combine(resolvedAt)
+        hasher.combine(checkinAt)
+        hasher.combine(checkinResponse)
+        hasher.combine(createdAt)
+        hasher.combine(deleted)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeQuestionUpsert: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> QuestionUpsert {
+        return
+            try QuestionUpsert(
+                id: FfiConverterString.read(from: &buf), 
+                plaintext: FfiConverterOptionString.read(from: &buf), 
+                status: FfiConverterOptionString.read(from: &buf), 
+                tone: FfiConverterOptionString.read(from: &buf), 
+                resolvedAt: FfiConverterOptionInt64.read(from: &buf), 
+                checkinAt: FfiConverterOptionInt64.read(from: &buf), 
+                checkinResponse: FfiConverterOptionString.read(from: &buf), 
+                createdAt: FfiConverterInt64.read(from: &buf), 
+                deleted: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: QuestionUpsert, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterOptionString.write(value.plaintext, into: &buf)
+        FfiConverterOptionString.write(value.status, into: &buf)
+        FfiConverterOptionString.write(value.tone, into: &buf)
+        FfiConverterOptionInt64.write(value.resolvedAt, into: &buf)
+        FfiConverterOptionInt64.write(value.checkinAt, into: &buf)
+        FfiConverterOptionString.write(value.checkinResponse, into: &buf)
+        FfiConverterInt64.write(value.createdAt, into: &buf)
+        FfiConverterBool.write(value.deleted, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQuestionUpsert_lift(_ buf: RustBuffer) throws -> QuestionUpsert {
+    return try FfiConverterTypeQuestionUpsert.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQuestionUpsert_lower(_ value: QuestionUpsert) -> RustBuffer {
+    return FfiConverterTypeQuestionUpsert.lower(value)
+}
+
+
+/**
  * One fused search result. The shape of [`SearchHit`] (same `kind`/`ref_id`/`title`/
  * `snippet` display fields, hydrated from the same decrypted corpus) plus the fusion
  * verdict: `score` is the reciprocal-rank-fusion (RRF) score — the per-engine raw scores are
@@ -6307,6 +6926,30 @@ fileprivate struct FfiConverterOptionTypeNoteRecord: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeQuestionRecord: FfiConverterRustBuffer {
+    typealias SwiftType = QuestionRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeQuestionRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeQuestionRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceFloat: FfiConverterRustBuffer {
     typealias SwiftType = [Float]
 
@@ -6607,6 +7250,31 @@ fileprivate struct FfiConverterSequenceTypeNoteRecord: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeQuestionRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [QuestionRecord]
+
+    public static func write(_ value: [QuestionRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeQuestionRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [QuestionRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [QuestionRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeQuestionRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeRankedHit: FfiConverterRustBuffer {
     typealias SwiftType = [RankedHit]
 
@@ -6806,6 +7474,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_enqueue_note_signals() != 65282) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_braird_core_checksum_method_syncengine_enqueue_question() != 32906) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_enqueue_question_note_override() != 50313) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_braird_core_checksum_method_syncengine_export_snapshot() != 42276) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6816,6 +7490,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_get_note() != 41812) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_get_question() != 18093) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_idea_counts() != 10262) {
@@ -6837,6 +7514,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_list_notes() != 26133) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_list_questions() != 7468) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_merge_books() != 55148) {
@@ -6863,6 +7543,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_pull() != 8960) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_braird_core_checksum_method_syncengine_question_notes() != 6988) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_braird_core_checksum_method_syncengine_ranked_search() != 46931) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6885,6 +7568,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_set_access_token() != 47386) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_set_user_setting() != 24285) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_similar_notes() != 52094) {

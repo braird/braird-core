@@ -164,25 +164,30 @@ fn native_primary_keys_match_the_manifest() {
 }
 
 #[test]
-fn native_tables_are_registered_but_not_yet_writable_or_pulled() {
-    // The seal boundary is currently enforced by ABSENCE — native-first tables are simply missing
-    // from `table_schema()` and the pull scope. Absence is invisible: nothing breaks if a future
-    // change quietly resolves them, and `apply_row` would then write `questions` with no
-    // encryption contract (plaintext question text reaching SQLite is the crypto-reviewer BLOCKER
-    // class). This pins the gap so SUR-1042 has to DELETE a failing test to open the path —
-    // a deliberate act with a reviewer attached — rather than widening a lookup and moving on.
+fn native_tables_are_registered_but_not_yet_pulled() {
+    // HALF of this test was deleted by SUR-1042's seal-boundary commit, which is what it was built
+    // to force: `table_schema()` now resolves the native-first tables, because `enqueue_question`
+    // seals `text` (enc:v2, AAD = the question id) before anything is staged. Widening the lookup
+    // without that contract was the crypto-reviewer BLOCKER the deleted assertion guarded.
+    //
+    // The pull-scope half SURVIVES, and it is not a formality: `synced_table_names()` drives the
+    // flush, the pull fan-out AND the snapshot-import preflight, and a single 404 aborts the flush
+    // for EVERY table (`pull_then_flush`). It comes down in the sync-legs commit, together with the
+    // push arms that make these tables actually flushable.
     for t in native_schema() {
+        // The widening is now pinned POSITIVELY. The old assertion guarded absence, which is
+        // invisible; this one fails if someone narrows `table_schema()` back, which would silently
+        // break every question read and write rather than erroring at the seam.
         assert!(
-            table_schema(t.name).is_none(),
-            "`{}` resolves via table_schema(), which makes apply_row/get_row write it. If SUR-1042 \
-             is wiring the sync legs, delete this assertion in the same commit that lands the \
-             encryption boundary — not before",
+            table_schema(t.name).is_some(),
+            "`{}` no longer resolves via table_schema() — the question entity's reads and writes \
+             all funnel through it (get_row/list_live/count_live/apply_row)",
             t.name
         );
         assert!(
             !synced_table_names().contains(&t.name),
-            "`{}` is in the pull scope, but its cloud table only exists once SUR-1047's migration \
-             lands — every pull would 404 until then",
+            "`{}` is in the pull scope, but the push legs (on_conflict/required_insert/fk_deps) are \
+             what make it flushable — widen this in the same commit that adds them, not before",
             t.name
         );
     }
