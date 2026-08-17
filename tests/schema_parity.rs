@@ -164,28 +164,42 @@ fn native_primary_keys_match_the_manifest() {
 }
 
 #[test]
-fn native_tables_are_registered_but_not_yet_writable_or_pulled() {
-    // The seal boundary is currently enforced by ABSENCE — native-first tables are simply missing
-    // from `table_schema()` and the pull scope. Absence is invisible: nothing breaks if a future
-    // change quietly resolves them, and `apply_row` would then write `questions` with no
-    // encryption contract (plaintext question text reaching SQLite is the crypto-reviewer BLOCKER
-    // class). This pins the gap so SUR-1042 has to DELETE a failing test to open the path —
-    // a deliberate act with a reviewer attached — rather than widening a lookup and moving on.
+fn native_tables_are_fully_wired() {
+    // This test began (SUR-1048) as `native_tables_are_registered_but_not_yet_writable_or_pulled`,
+    // asserting ABSENCE from both `table_schema()` and the pull scope — a deliberate tripwire so
+    // SUR-1042 had to delete a failing assertion to open each path, rather than widening a lookup
+    // and moving on. Both are now open, each in the commit that earned it: the write path alongside
+    // the enc:v2 seal in `enqueue_question`, the pull scope alongside the push legs.
+    //
+    // It is inverted rather than deleted, because the absence it guarded has become a presence
+    // worth guarding: narrowing either lookup would not fail loudly at the seam, it would silently
+    // stop questions syncing.
     for t in native_schema() {
         assert!(
-            table_schema(t.name).is_none(),
-            "`{}` resolves via table_schema(), which makes apply_row/get_row write it. If SUR-1042 \
-             is wiring the sync legs, delete this assertion in the same commit that lands the \
-             encryption boundary — not before",
+            table_schema(t.name).is_some(),
+            "`{}` no longer resolves via table_schema() — the question entity's reads and writes \
+             all funnel through it (get_row/list_live/count_live/apply_row)",
             t.name
         );
         assert!(
-            !synced_table_names().contains(&t.name),
-            "`{}` is in the pull scope, but its cloud table only exists once SUR-1047's migration \
-             lands — every pull would 404 until then",
+            synced_table_names().contains(&t.name),
+            "`{}` dropped out of the pull/flush scope — it would stop syncing with no error",
             t.name
         );
     }
+
+    // Topological order is the flush's dispatch order, so it is a correctness property, not a
+    // stylistic one: an override dispatched before its question is rejected by the server.
+    let order = synced_table_names();
+    let pos = |name: &str| order.iter().position(|t| *t == name);
+    assert!(
+        pos("questions") < pos("question_note_overrides"),
+        "questions must be dispatched before the overrides that FK it"
+    );
+    assert!(
+        pos("notes") < pos("question_note_overrides"),
+        "notes must be dispatched before the overrides that FK it"
+    );
 }
 
 #[test]

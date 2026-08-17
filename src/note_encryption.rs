@@ -18,6 +18,18 @@ pub fn is_encrypted(value: &str) -> bool {
     value.starts_with(SENTINEL_V1) || value.starts_with(SENTINEL_V2)
 }
 
+/// Structural check for the **AAD-bound** format specifically (SUR-1042). Narrower than
+/// [`is_encrypted`] on purpose: `enc:v1` carries no AAD, so [`decrypt_note`] opens a v1 payload
+/// under ANY id — the id argument is ignored entirely on that branch. For `notes` that is required
+/// legacy-read behaviour; for a surface with no legacy corpus it is a hole, because the
+/// transplant protection v2 exists to give is silently absent.
+///
+/// Callers that need "this ciphertext is bound to THIS row" must gate on this, not on
+/// [`is_encrypted`].
+pub fn is_encrypted_v2(value: &str) -> bool {
+    value.starts_with(SENTINEL_V2)
+}
+
 /// Seal plaintext. `note_id = Some` → enc:v2 (AAD = UTF-8 noteId); `None` → enc:v1.
 pub fn encrypt_note(mk: &[u8], note_id: Option<&str>, plaintext: &str, iv: &[u8]) -> String {
     let (aad, sentinel) = match note_id {

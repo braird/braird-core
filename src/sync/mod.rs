@@ -44,7 +44,7 @@ use export_import::import::{compute_importance, source_prior};
 use http::{user_id_from_jwt, PostgrestClient};
 use read::{
     BookRecord, CollectionNoteCount, CollectionRecord, CustomIdeaRecord, IdeaCount, LensRecord,
-    NoteLinkRecord, NoteRecord, StoreCounts,
+    NoteLinkRecord, NoteRecord, QuestionRecord, StoreCounts,
 };
 use reconcile::BookMergeUndo;
 
@@ -246,6 +246,75 @@ pub struct BookUpsert {
     pub created_at: i64,
     pub deleted: bool,
     pub clear_nullable_fields: Vec<String>,
+}
+
+/// A question upsert draft (SUR-1042) — the record form of [`SyncEngine::enqueue_question`]'s
+/// arguments, and the entry point to the SUR-996 question log.
+///
+/// A record by MARGIN, not because the SUR-843 guard would have caught the positional form — worth
+/// stating precisely, since the guard's whole value is that its reasoning is checkable. Nine fields,
+/// seven of which lower to by-value `RustBuffer`s (`String` and every `Option<T>`; `created_at: i64`
+/// and `deleted: bool` ride as plain scalars). Counted the way `scripts/check-ffi-arg-slots.mjs`
+/// counts — one integer slot per parameter, receiver first — a positional signature would put its
+/// last `RustBuffer` (`checkin_response`) at slot 8: exactly AT x7's boundary, so the guard, which
+/// fires above 8, would have stayed silent. **One more optional field would trip it**, and the
+/// failure mode is jna#1259 — a mis-marshalled by-value struct on arm64 that x86-64 CI and the
+/// desktop `:core-roundtrip` jar are both structurally blind to. Collapsing now costs nothing and
+/// removes the cliff.
+///
+/// `plaintext` is the only field the Vault ever sees — it is sealed here (enc:v2, AAD = the question
+/// id) and the outbox holds ciphertext only. Named to pair with the read model
+/// [`read::QuestionRecord`] — `QuestionUpsert` in, `QuestionRecord` out.
+///
+/// `plaintext: Some` is a full write. `plaintext: None` is a **metadata-only patch** of an existing
+/// row — answering a check-in, resolving, dismissing — which makes NO Vault call and omits `text`
+/// and `created_at`, preserving the stored ciphertext byte-for-byte. That split matters more here
+/// than on notes: every state transition after the first is metadata-only, so the common path must
+/// never re-seal (a re-seal with the same key and a fresh IV is harmless, but a re-seal from a host
+/// that no longer has the plaintext would blank the question).
+///
+/// `status` is `active | resolved | dismissed` and `checkin_response` is `active | resolved | new`
+/// (SUR-1042 vocabulary — `live` and `still_open` are retired). Neither is validated here: the
+/// server has no CHECK constraint on them by deliberate design, because the vocabulary is
+/// client-authored and forward-extensible, and a core that rejected a newer client's value would
+/// reintroduce exactly the coupling that decision avoided.
+#[derive(Debug, uniffi::Record)]
+pub struct QuestionUpsert {
+    pub id: String,
+    /// The question text. `Some` → sealed here (enc:v2, AAD = [`id`]). `None` → metadata-only patch.
+    pub plaintext: Option<String>,
+    pub status: Option<String>,
+    pub tone: Option<String>,
+    pub resolved_at: Option<i64>,
+    pub checkin_at: Option<i64>,
+    pub checkin_response: Option<String>,
+    pub created_at: i64,
+    pub deleted: bool,
+}
+
+/// One question↔note curation override (SUR-996 R1) — the user pinning a note onto a question, or
+/// excluding one the active-window join offered.
+///
+/// Plaintext id pair, the same trade-off as `collection_memberships`: the question's *text* is
+/// sealed, the fact that it relates to a note is not. Its row id is **derived**, not carried —
+/// [`crate::store::override_id`] makes it `question_id:note_id` so two devices curating the same
+/// pair converge on one row.
+///
+/// A record by API shape rather than arm64 necessity (four fields is nowhere near the 8-slot limit
+/// the SUR-843 guard enforces): the pair + kind is one concept, and passing it as one argument
+/// keeps the call site readable and the field names on the wire. Deliberately NOT named
+/// `QuestionNoteOverrideUpsert` — there is no `…Record` read model to pair against, because the
+/// effective note set is exposed as notes ([`SyncEngine::question_notes`]), never as raw override
+/// rows. The ticket specifies this name.
+#[derive(Debug, uniffi::Record)]
+pub struct QuestionNoteOverride {
+    pub question_id: String,
+    pub note_id: String,
+    /// `include` (pin a note the window missed) or `exclude` (drop one it offered). Not validated
+    /// here — same forward-extensible-vocabulary reasoning as [`QuestionUpsert::status`].
+    pub kind: String,
+    /// Soft-delete the override, returning the pair to whatever the active-window join says.
+    pub deleted: bool,
 }
 
 /// The kind of behavioural signal a host records for a note (SUR-966), mirroring surfc
@@ -1310,6 +1379,178 @@ impl SyncEngine {
         }
     }
 
+    /// Enqueue a question write or a metadata-only patch (SUR-1042) — the SUR-996 question log.
+    ///
+    /// SEAL AT WRITE, exactly as [`SyncEngine::enqueue_note`] does and for the same reason (ADR
+    /// 0003): `plaintext: Some` is sealed HERE, while the plaintext is in hand, so the outbox and
+    /// the local mirror hold only `enc:v2` ciphertext. The plaintext exists for the duration of this
+    /// call and is never persisted, logged, or flushed. AAD is the question id, which binds the
+    /// ciphertext to its row — a blob transplanted onto another question fails to open rather than
+    /// silently decrypting under the wrong identity.
+    ///
+    /// `plaintext: None` is the metadata-only patch: no Vault call, and `text`/`created_at` are
+    /// OMITTED so the stored ciphertext and birth time survive untouched. This is the common path —
+    /// every state change after the first (check-in answered, resolved, dismissed) is metadata — so
+    /// it must not re-seal. Like the note patch it REQUIRES an existing live row and returns
+    /// [`SyncError::PatchTargetMissing`] otherwise: staged unconditionally it would insert a live
+    /// row with NULL `text`, which reads back as a real question with no text and no failure flag.
+    ///
+    /// WHOLE-ROW LWW, ACCEPTED (founder, 2026-08-14). `status`/`tone` (the answer flow) and
+    /// `checkin_at`/`checkin_response` (the check-in flow) live on ONE row under whole-row
+    /// last-write-wins, so a dismiss on one device and a check-in on another inside the same window
+    /// resolve to whichever `updated_at` is larger — the loser's field is discarded, not merged. The
+    /// alternative (a check-in satellite row, the `note_signals`/migration-0047 precedent) was
+    /// considered and rejected: v1 has ONE live question and both flows are user-initiated seconds
+    /// apart at worst. Documented rather than engineered around, and pinned by a test so it stays a
+    /// decision instead of becoming a discovery.
+    pub fn enqueue_question(&self, draft: QuestionUpsert) -> Result<(), SyncError> {
+        let QuestionUpsert {
+            id,
+            plaintext,
+            status,
+            tone,
+            resolved_at,
+            checkin_at,
+            checkin_response,
+            created_at,
+            deleted,
+        } = draft;
+
+        let now = epoch_ms();
+        let mut row = Map::new();
+        row.insert("id".into(), json!(id));
+        insert_opt(&mut row, "status", status);
+        insert_opt(&mut row, "tone", tone);
+        insert_opt(&mut row, "resolved_at", resolved_at);
+        insert_opt(&mut row, "checkin_at", checkin_at);
+        insert_opt(&mut row, "checkin_response", checkin_response);
+        row.insert("updated_at".into(), json!(now));
+        row.insert("deleted".into(), json!(deleted));
+
+        match plaintext {
+            Some(plaintext) => {
+                // The ONLY Vault call on this path. `Some(id)` selects enc:v2, making the question
+                // id the AAD — the same binding `notes.text` gets from its note id.
+                let ciphertext = self.vault.encrypt_note(Some(id.clone()), plaintext);
+                row.insert("text".into(), json!(ciphertext));
+                row.insert("created_at".into(), json!(created_at));
+                self.stage_write("questions", &id, row)
+            }
+            None => {
+                // A metadata patch REQUIRES an existing live row, and the precondition is enforced
+                // rather than documented. Staged unconditionally, a patch for an id that was never
+                // created inserts a live row carrying only the patch columns: `text` and
+                // `created_at` NULL. That ghost then reads back through `list_questions` as a real
+                // question with `text: None, decrypt_failed: false` — indistinguishable from a
+                // legitimately empty one — while its sparse PATCH matches no server row and stays
+                // queued forever. Failing loudly costs one typed error the host already handles for
+                // notes; the alternative is a question the user never wrote.
+                lock!(self.store)
+                    .stage_local_write_existing_live("questions", &id, row, Vec::new(), now)
+                    .map_err(|e| match e {
+                        crate::store::StageExistingWriteError::TargetMissing => {
+                            SyncError::PatchTargetMissing
+                        }
+                        crate::store::StageExistingWriteError::Sql(e) => {
+                            SyncError::Store(e.to_string())
+                        }
+                    })
+            }
+        }
+    }
+
+    /// Enqueue a question↔note curation override (SUR-1042), keyed by the DETERMINISTIC
+    /// `question_id:note_id` ([`crate::store::override_id`]).
+    ///
+    /// THE RE-ADD FORK, and why it is not optional. A deterministic pk makes
+    /// `include → remove → include` inside ONE un-flushed batch collapse onto a single outbox key,
+    /// and the collapse makes `deleted` **sticky** across the group (SUR-724, "within a batch,
+    /// delete wins"). So the re-add would flush as a tombstone: the local mirror reads correctly —
+    /// the note still shows pinned — while push sends a delete, every other device drops it, and the
+    /// next pull LWW-overwrites the local copy. A silent lost write whose local read masks it. This
+    /// is the [`SyncEngine::enqueue_collection_membership`] class (SUR-940), and `store.rs`'s
+    /// descriptor doc names this table as the case to extend the split for.
+    ///
+    /// So: a re-add (`deleted: false`) routes through `stage_local_write_resurrecting`, which drops
+    /// any pending tombstone for this id and stages the live write in ONE transaction. A genuine
+    /// soft-delete stays on the sticky path, because a delete SHOULD win. The tombstone arm also
+    /// preserves the stored `created_at` — the server column is NOT NULL with no default and the
+    /// pushed payload IS the outbox partial, so a reconstructed row would push a fresh timestamp
+    /// over the real one.
+    ///
+    /// Both arms take ONE held store guard. A released-and-reacquired lock would let a concurrent
+    /// re-add stage `deleted: false` between the lookup and the stage, with this tombstone landing
+    /// after it and collapsing sticky-deleted — the same loss re-opened as a race.
+    pub fn enqueue_question_note_override(
+        &self,
+        draft: QuestionNoteOverride,
+    ) -> Result<(), SyncError> {
+        let QuestionNoteOverride {
+            question_id,
+            note_id,
+            kind,
+            deleted,
+        } = draft;
+        let now = epoch_ms();
+        let id = crate::store::override_id(&question_id, &note_id);
+        let mut row = Map::new();
+        row.insert("id".into(), json!(id));
+        row.insert("question_id".into(), json!(question_id));
+        row.insert("note_id".into(), json!(note_id));
+        row.insert("kind".into(), json!(kind));
+        row.insert("created_at".into(), json!(now));
+        row.insert("updated_at".into(), json!(now));
+        row.insert("deleted".into(), json!(deleted));
+
+        let store = lock!(self.store);
+        if deleted {
+            if let Some(existing) = store
+                .get_row("question_note_overrides", &id)
+                .map_err(store_err)?
+                .and_then(|r| r.get("created_at").and_then(Value::as_i64))
+            {
+                row.insert("created_at".into(), json!(existing));
+            }
+            store
+                .stage_local_write("question_note_overrides", &id, row, now)
+                .map_err(store_err)
+        } else {
+            store
+                .stage_local_write_resurrecting("question_note_overrides", &id, row, now)
+                .map_err(store_err)
+        }
+    }
+
+    /// Write one synced user setting (SUR-1042) — braird's first synced settings, a per-user KV
+    /// whose local pk is `key` (there is no `id` column).
+    ///
+    /// LWW lands per SETTING, not per settings-blob, which is the whole reason this is a standalone
+    /// table rather than columns on `user_profiles`: one device changing prompt cadence cannot stomp
+    /// another device's tone, and neither can stomp the server-authoritative quota/billing state on
+    /// `user_profiles`. The rule going forward is that the server writes profiles and clients write
+    /// settings.
+    ///
+    /// Untyped on purpose at this layer — `key` and `value` are strings, and SUR-1043 owns the typed
+    /// `PromptSettings` façade (the key constants and the 72..=672 cadence clamp) on top. Putting the
+    /// clamp here would split the settings vocabulary across two tickets for no gain.
+    /// `value` is NOT optional, though the column is nullable. An `Option` here would have meant two
+    /// different things depending on state: `insert_opt` omits a `None`, so on an existing setting
+    /// the merge would keep the old value while bumping `updated_at` (a silent no-op), and on a new
+    /// key it would create one with a NULL value. A `set` API whose effect depends on whether the row
+    /// already exists is a trap. Clearing is not a use case — the two known keys (`prompt_cadence`,
+    /// `prompt_tone`) always carry a value, and `deleted` already expresses removal — so the
+    /// ambiguity is removed rather than defined. If a setting ever genuinely needs null-versus-absent,
+    /// widen it then and write the `None` as an explicit JSON null, never as an omission.
+    pub fn set_user_setting(&self, key: String, value: String) -> Result<(), SyncError> {
+        let now = epoch_ms();
+        let mut row = Map::new();
+        row.insert("key".into(), json!(key));
+        row.insert("value".into(), json!(value));
+        row.insert("updated_at".into(), json!(now));
+        row.insert("deleted".into(), json!(false));
+        self.stage_write("user_settings", &key, row)
+    }
+
     /// Enqueue a note-signals upsert (SUR-726) — per-note behavioural counters, keyed by `note_id`
     /// (there is NO separate `id` column; the payload carries `note_id` only, matching
     /// `upsertNoteSignals`). Whole-row LWW; concurrent increments are lossy but self-heal (SUR-737,
@@ -1541,6 +1782,35 @@ impl SyncEngine {
     pub fn get_book(&self, id: String) -> Result<Option<BookRecord>, SyncError> {
         let store = lock!(self.store);
         read::get_book(&store, &id).map_err(store_err)
+    }
+
+    /// The SUR-996 question log, newest-first — every status, decrypted in core (SUR-1042).
+    pub fn list_questions(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<QuestionRecord>, SyncError> {
+        let store = lock!(self.store);
+        read::list_questions(&store, &self.vault, limit as i64, offset as i64).map_err(store_err)
+    }
+
+    /// One question by id, or `None` if absent or soft-deleted.
+    pub fn get_question(&self, id: String) -> Result<Option<QuestionRecord>, SyncError> {
+        let store = lock!(self.store);
+        read::get_question(&store, &self.vault, &id).map_err(store_err)
+    }
+
+    /// The effective note set of one question — `(auto ∪ includes) − excludes`, newest-first
+    /// (SUR-1042). `now_ms` closes the active window of a question that has no `resolved_at`; the
+    /// host supplies it so this stays a pure function of its inputs (see [`read::question_notes`]).
+    /// An absent or soft-deleted question yields an empty set, never an error.
+    pub fn question_notes(
+        &self,
+        question_id: String,
+        now_ms: i64,
+    ) -> Result<Vec<NoteRecord>, SyncError> {
+        let store = lock!(self.store);
+        read::question_notes(&store, &self.vault, &question_id, now_ms).map_err(store_err)
     }
 
     /// Notes newest-first. `book_id = None` → the Commonplace flat list (all notes); `Some` →
@@ -3957,6 +4227,532 @@ mod tests {
         collapsed_membership_payload(db_path)["deleted"].clone()
     }
 
+    // ── SUR-1042: the question entity ────────────────────────────────────────
+
+    /// A minimal live question. Override with struct-update, as [`note_upsert`] is used.
+    fn question_upsert(id: &str, plaintext: &str) -> QuestionUpsert {
+        QuestionUpsert {
+            id: id.into(),
+            plaintext: Some(plaintext.into()),
+            status: Some("active".into()),
+            tone: Some("introspective".into()),
+            resolved_at: None,
+            checkin_at: None,
+            checkin_response: None,
+            created_at: 0,
+            deleted: false,
+        }
+    }
+
+    #[test]
+    fn enqueue_question_seals_text_and_no_plaintext_reaches_disk() {
+        // The crypto boundary, asserted the way the note path asserts it: a distinctive marker goes
+        // in as plaintext and must exist NOWHERE on disk — not in the synced mirror, not in the
+        // outbox payload, not in a WAL sidecar (hence the directory sweep, not a row read).
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        let marker = "questionmarkerzzz";
+
+        engine
+            .enqueue_question(question_upsert("q1", &format!("what about {marker}?")))
+            .unwrap();
+
+        let row = Store::open(db_path)
+            .unwrap()
+            .get_row("questions", "q1")
+            .unwrap()
+            .unwrap();
+        assert!(
+            row["text"].as_str().unwrap().starts_with("enc:v2:"),
+            "questions.text must be enc:v2 at rest"
+        );
+        // The outbox holds the SAME ciphertext — seal-at-write, not seal-at-flush (ADR 0003).
+        let queued =
+            collapsed_payload_for(db_path, "questions", "q1").expect("a question upsert queued");
+        assert!(queued["text"].as_str().unwrap().starts_with("enc:v2:"));
+        assert_no_marker_on_disk(dir.path(), marker);
+    }
+
+    #[test]
+    fn question_round_trips_to_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+        engine
+            .enqueue_question(question_upsert("q1", "what am I avoiding?"))
+            .unwrap();
+
+        let got = engine.list_questions(10, 0).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].text.as_deref(), Some("what am I avoiding?"));
+        assert!(!got[0].decrypt_failed);
+        assert_eq!(got[0].status.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn question_ciphertext_is_bound_to_its_own_id() {
+        // AAD = the question id. Transplanting q1's sealed blob onto q2 must FAIL to open rather
+        // than decrypt under the wrong identity — the property enc:v2 exists to give.
+        let vault = Vault::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        // Opened directly, not via `engine_at`, because this assertion needs a vault the test
+        // still holds — it reads the row back through `read::get_question` with the same key.
+        let engine = SyncEngine::open(
+            db_path.into(),
+            "https://x.supabase.co".into(),
+            "anon".into(),
+            vault.clone(),
+        )
+        .unwrap();
+        engine
+            .enqueue_question(question_upsert("q1", "bound to q1"))
+            .unwrap();
+
+        let store = Store::open(db_path).unwrap();
+        let mut transplanted = store.get_row("questions", "q1").unwrap().unwrap();
+        transplanted.insert("id".into(), json!("q2"));
+        store.apply_row("questions", &transplanted).unwrap();
+
+        let q2 = read::get_question(&store, &vault, "q2").unwrap().unwrap();
+        assert!(
+            q2.decrypt_failed && q2.text.is_none(),
+            "a blob sealed under q1 must not open under q2"
+        );
+        // …and the transplant does not poison the page: q1 still reads.
+        let q1 = read::get_question(&store, &vault, "q1").unwrap().unwrap();
+        assert_eq!(q1.text.as_deref(), Some("bound to q1"));
+    }
+
+    #[test]
+    fn metadata_patch_makes_no_vault_call_and_preserves_ciphertext_and_created_at() {
+        // The common path: every state change after the first is metadata-only. It must not
+        // re-seal, and must not blank `text` — a host answering a check-in has no plaintext.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_question(QuestionUpsert {
+                created_at: 111,
+                ..question_upsert("q1", "the original text")
+            })
+            .unwrap();
+        let sealed = Store::open(db_path)
+            .unwrap()
+            .get_row("questions", "q1")
+            .unwrap()
+            .unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        engine
+            .enqueue_question(QuestionUpsert {
+                plaintext: None,
+                status: Some("resolved".into()),
+                resolved_at: Some(999),
+                created_at: 777, // ignored on a patch
+                ..question_upsert("q1", "")
+            })
+            .unwrap();
+
+        let row = Store::open(db_path)
+            .unwrap()
+            .get_row("questions", "q1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row["text"].as_str().unwrap(),
+            sealed,
+            "a metadata patch must preserve the stored ciphertext byte-for-byte"
+        );
+        assert_eq!(
+            row["created_at"].as_i64(),
+            Some(111),
+            "created_at immutable"
+        );
+        assert_eq!(row["status"].as_str(), Some("resolved"));
+        assert_eq!(row["resolved_at"].as_i64(), Some(999));
+        // And the text still opens — proof the patch did not corrupt the seal.
+        assert_eq!(
+            engine.get_question("q1".into()).unwrap().unwrap().text,
+            Some("the original text".into())
+        );
+    }
+
+    #[test]
+    fn a_question_read_rejects_anything_that_is_not_enc_v2() {
+        // Codex P1. `decrypt_note_text` (the notes gate) accepts enc:v1, plaintext and empty —
+        // all three unbindable to a question id. enc:v1 is the sharp one: `decrypt_note` passes
+        // `aad: None` on that branch and IGNORES the id entirely, so a v1 blob lifted from anywhere
+        // would render as this question's text, defeating the transplant protection v2 exists for.
+        let vault = Vault::generate();
+        let store = Store::open_in_memory().unwrap();
+        // A REAL v1 ciphertext, sealed with no AAD — not a malformed string.
+        let v1 = vault.encrypt_note(None, "lifted from somewhere else".into());
+        assert!(v1.starts_with("enc:v1:"), "precondition: a genuine v1 blob");
+
+        for (case, text) in [
+            ("enc:v1", v1.as_str()),
+            ("plaintext", "a question typed straight in"),
+            ("empty", ""),
+        ] {
+            let row = json!({
+                "id": "q1", "text": text, "status": "active",
+                "created_at": 1, "updated_at": 1, "deleted": false
+            });
+            store
+                .apply_row("questions", row.as_object().unwrap())
+                .unwrap();
+            let got = read::get_question(&store, &vault, "q1").unwrap().unwrap();
+            assert!(
+                got.decrypt_failed && got.text.is_none(),
+                "{case} must read as a decrypt failure, not as the question's text"
+            );
+        }
+
+        // …and the notes gate is deliberately NOT tightened: v1 is a real legacy corpus there.
+        let note_row = json!({
+            "id": "n1", "text": v1, "tags": [],
+            "created_at": 1, "updated_at": 1, "deleted": false
+        });
+        store
+            .apply_row("notes", note_row.as_object().unwrap())
+            .unwrap();
+        let note = read::get_note(&store, &vault, "n1").unwrap().unwrap();
+        assert_eq!(note.text.as_deref(), Some("lifted from somewhere else"));
+    }
+
+    #[test]
+    fn a_metadata_patch_for_a_question_that_was_never_created_is_rejected() {
+        // Codex P2. Staged unconditionally this inserted a live row with NULL text, which read back
+        // as a real question with `decrypt_failed: false` — a question the user never wrote — while
+        // its sparse PATCH matched no server row and stayed queued forever.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        let err = engine
+            .enqueue_question(QuestionUpsert {
+                plaintext: None,
+                status: Some("resolved".into()),
+                ..question_upsert("ghost", "")
+            })
+            .unwrap_err();
+        assert!(matches!(err, SyncError::PatchTargetMissing), "got {err:?}");
+
+        assert!(
+            engine.list_questions(10, 0).unwrap().is_empty(),
+            "no ghost question may appear in the log"
+        );
+        assert!(
+            Store::open(db_path)
+                .unwrap()
+                .outbox_items()
+                .unwrap()
+                .is_empty(),
+            "and nothing may be queued for a row that does not exist"
+        );
+    }
+
+    #[test]
+    fn override_id_is_question_then_note() {
+        assert_eq!(crate::store::override_id("q1", "n1"), "q1:n1");
+    }
+
+    #[test]
+    fn override_re_add_after_delete_resurrects_past_the_sticky_collapse() {
+        // THE deterministic-pk regression (the SUR-940 class). include → remove → include inside
+        // ONE un-flushed batch. Assert the COLLAPSED OUTBOX, never a live read: the mirror is
+        // correct either way, which is exactly what makes this bug silent.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        let ov = |deleted| QuestionNoteOverride {
+            question_id: "q1".into(),
+            note_id: "n1".into(),
+            kind: "include".into(),
+            deleted,
+        };
+        engine.enqueue_question_note_override(ov(false)).unwrap();
+        engine.enqueue_question_note_override(ov(true)).unwrap();
+        engine.enqueue_question_note_override(ov(false)).unwrap();
+
+        let payload = collapsed_payload_for(db_path, "question_note_overrides", "q1:n1")
+            .expect("an override upsert is queued");
+        assert_eq!(
+            payload["deleted"],
+            json!(false),
+            "the re-add must survive the collapse — a sticky tombstone here is a silent lost write"
+        );
+        assert_eq!(payload["id"], json!("q1:n1"));
+    }
+
+    #[test]
+    fn override_delete_without_re_add_still_wins_the_collapse() {
+        // The other half: a genuine delete must NOT be softened by the resurrect path.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        let ov = |deleted| QuestionNoteOverride {
+            question_id: "q1".into(),
+            note_id: "n1".into(),
+            kind: "include".into(),
+            deleted,
+        };
+        engine.enqueue_question_note_override(ov(false)).unwrap();
+        engine.enqueue_question_note_override(ov(true)).unwrap();
+
+        let payload = collapsed_payload_for(db_path, "question_note_overrides", "q1:n1").unwrap();
+        assert_eq!(payload["deleted"], json!(true));
+    }
+
+    #[test]
+    fn override_tombstone_preserves_the_stored_created_at() {
+        // The server column is NOT NULL with no default and the pushed payload IS the outbox
+        // partial, so a reconstructed tombstone would push a fresh timestamp over the real one.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_question_note_override(QuestionNoteOverride {
+                question_id: "q1".into(),
+                note_id: "n1".into(),
+                kind: "include".into(),
+                deleted: false,
+            })
+            .unwrap();
+        let filed_at = Store::open(db_path)
+            .unwrap()
+            .get_row("question_note_overrides", "q1:n1")
+            .unwrap()
+            .unwrap()["created_at"]
+            .as_i64()
+            .unwrap();
+
+        engine
+            .enqueue_question_note_override(QuestionNoteOverride {
+                question_id: "q1".into(),
+                note_id: "n1".into(),
+                kind: "include".into(),
+                deleted: true,
+            })
+            .unwrap();
+
+        let row = Store::open(db_path)
+            .unwrap()
+            .get_row("question_note_overrides", "q1:n1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row["created_at"].as_i64(), Some(filed_at));
+        assert_eq!(row["deleted"], json!(true));
+        // And in the PUSHED payload, which is the half that actually reaches the server.
+        let pushed = collapsed_payload_for(db_path, "question_note_overrides", "q1:n1").unwrap();
+        assert_eq!(pushed["created_at"].as_i64(), Some(filed_at));
+    }
+
+    #[test]
+    fn question_notes_is_auto_window_union_includes_minus_excludes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        // The question opens at t=100 and is still active.
+        engine
+            .enqueue_question(QuestionUpsert {
+                created_at: 100,
+                ..question_upsert("q1", "the question")
+            })
+            .unwrap();
+        // in-window, before-window, after-`now`, and one to pin / one to drop
+        for (id, created) in [
+            ("in", 150),
+            ("before", 50),
+            ("future", 5_000),
+            ("pinned", 10),
+            ("dropped", 160),
+        ] {
+            engine
+                .enqueue_note(NoteUpsert {
+                    created_at: created,
+                    ..note_upsert(id, id)
+                })
+                .unwrap();
+        }
+        let ov = |note_id: &str, kind: &str| QuestionNoteOverride {
+            question_id: "q1".into(),
+            note_id: note_id.into(),
+            kind: kind.into(),
+            deleted: false,
+        };
+        engine
+            .enqueue_question_note_override(ov("pinned", "include"))
+            .unwrap();
+        engine
+            .enqueue_question_note_override(ov("dropped", "exclude"))
+            .unwrap();
+
+        let mut got: Vec<String> = engine
+            .question_notes("q1".into(), 1_000)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["in".to_string(), "pinned".to_string()],
+            "auto-window ∪ includes − excludes"
+        );
+    }
+
+    #[test]
+    fn question_notes_window_closes_at_resolved_at() {
+        // A resolved question's set stops growing — notes captured after it closed are not its.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_question(QuestionUpsert {
+                created_at: 100,
+                status: Some("resolved".into()),
+                resolved_at: Some(200),
+                ..question_upsert("q1", "resolved question")
+            })
+            .unwrap();
+        for (id, created) in [("inside", 150), ("after", 300)] {
+            engine
+                .enqueue_note(NoteUpsert {
+                    created_at: created,
+                    ..note_upsert(id, id)
+                })
+                .unwrap();
+        }
+
+        let got: Vec<String> = engine
+            .question_notes("q1".into(), 10_000)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(got, vec!["inside".to_string()]);
+    }
+
+    #[test]
+    fn set_user_setting_stages_a_row_keyed_by_the_setting_name() {
+        // `user_settings` has no `id` — `key` IS the local pk, so the outbox record id and the
+        // staged row must both key on it. The push-side composite `on_conflict` is pinned
+        // separately in `push.rs`; this covers the FFI method itself.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        engine
+            .set_user_setting("prompt_cadence".into(), "168".into())
+            .unwrap();
+
+        let row = Store::open(db_path)
+            .unwrap()
+            .get_row("user_settings", "prompt_cadence")
+            .unwrap()
+            .expect("the setting is in the local mirror");
+        assert_eq!(row["value"].as_str(), Some("168"));
+        assert_eq!(row["deleted"], json!(false));
+        let queued = collapsed_payload_for(db_path, "user_settings", "prompt_cadence")
+            .expect("a settings upsert is queued");
+        assert_eq!(queued["key"].as_str(), Some("prompt_cadence"));
+        assert!(
+            queued.get("id").is_none(),
+            "user_settings has no id column — an invented one would break the composite upsert"
+        );
+    }
+
+    #[test]
+    fn a_resolved_at_before_created_at_does_not_invert_the_window() {
+        // Clock skew across devices can stamp `resolved_at` earlier than `created_at`. Unclamped,
+        // the window would run backwards and silently return NOTHING — a question whose notes all
+        // vanished, with no error to explain it. The clamp makes the window empty-but-valid.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_question(QuestionUpsert {
+                created_at: 200,
+                status: Some("resolved".into()),
+                resolved_at: Some(100), // BEFORE it opened
+                ..question_upsert("q1", "skewed")
+            })
+            .unwrap();
+        engine
+            .enqueue_note(NoteUpsert {
+                created_at: 200,
+                ..note_upsert("n-at-open", "n")
+            })
+            .unwrap();
+        engine
+            .enqueue_note(NoteUpsert {
+                created_at: 150,
+                ..note_upsert("n-between", "n")
+            })
+            .unwrap();
+
+        let ids: Vec<String> = engine
+            .question_notes("q1".into(), 10_000)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["n-at-open".to_string()],
+            "the window collapses to the single instant it opened, not to nothing and not backwards"
+        );
+    }
+
+    #[test]
+    fn whole_row_lww_on_a_question_discards_the_losing_field() {
+        // ACCEPTED BEHAVIOUR (founder, 2026-08-14), pinned so it stays a decision rather than
+        // becoming a discovery: the answer flow (status/tone) and the check-in flow
+        // (checkin_at/checkin_response) share ONE row under whole-row LWW, so a concurrent pair
+        // resolves to the larger `updated_at` and the loser's field is GONE, not merged.
+        let store = Store::open_in_memory().unwrap();
+        let dismissed_on_tablet = json!({
+            "id": "q1", "text": "enc:v2:aXY=.Y3Q=", "status": "dismissed",
+            "created_at": 1, "updated_at": 100, "deleted": false
+        });
+        let checked_in_on_phone = json!({
+            "id": "q1", "text": "enc:v2:aXY=.Y3Q=", "status": "active",
+            "checkin_at": 90, "checkin_response": "active",
+            "created_at": 1, "updated_at": 101, "deleted": false
+        });
+        store
+            .apply_row("questions", dismissed_on_tablet.as_object().unwrap())
+            .unwrap();
+        store
+            .apply_row("questions", checked_in_on_phone.as_object().unwrap())
+            .unwrap();
+
+        let row = store.get_row("questions", "q1").unwrap().unwrap();
+        assert_eq!(row["status"].as_str(), Some("active"));
+        assert_eq!(
+            row["checkin_response"].as_str(),
+            Some("active"),
+            "the later whole row wins entirely — the dismissal is discarded, not merged"
+        );
+    }
+
     /// The `created_at` the local synced mirror holds for the sole membership (what a reconcile or an
     /// export would read), distinct from the pushed outbox payload.
     fn membership_mirror_created_at(db_path: &str, id: &str) -> i64 {
@@ -4524,11 +5320,12 @@ mod tests {
             .collect();
         crate::sync::outbox::collapse(items, &std::collections::BTreeMap::new())
             .iter()
-            // note_signals is keyed by note_id (no `id` column) — match either pk shape.
+            // Match on the table's OWN pk column rather than a hardcoded shortlist: `note_signals`
+            // keys on `note_id` and (SUR-1042) `user_settings` on `key`, neither having an `id`.
+            // Descriptor-derived so the next pk-shaped table needs no edit here.
             .find(|c| {
-                c.table == table
-                    && (c.payload.get("id") == Some(&json!(record_id))
-                        || c.payload.get("note_id") == Some(&json!(record_id)))
+                let pk = crate::store::table_schema(table).map_or("id", |t| t.pk[0]);
+                c.table == table && c.payload.get(pk) == Some(&json!(record_id))
             })
             .map(|c| c.payload.clone())
     }

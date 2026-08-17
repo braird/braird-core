@@ -887,7 +887,11 @@ mod tests {
             .iter()
             .position(|call| matches!(call, Call::Fetch { .. }))
             .unwrap();
-        assert_eq!(first_fetch, 8, "all eight pull calls must precede fetches");
+        assert_eq!(
+            first_fetch,
+            synced_table_names().len(),
+            "every preflight pull must precede the targeted fetches"
+        );
         assert!(!calls.iter().any(|call| matches!(call, Call::Upsert(_))));
     }
 
@@ -1144,12 +1148,19 @@ mod tests {
         assert_eq!(summary.imported, ones);
         assert_eq!(summary.skipped_stale, ImportCounts::default());
         let queued = store.outbox_items().unwrap();
+        // The snapshot covers exactly the EIGHT PWA-parity tables — `synced_schema()`, not
+        // `synced_table_names()`, which SUR-1042 widened to include the native-first three.
+        // That exclusion is deliberate, not an oversight of the hardcoded `SnapshotExport` fields:
+        // export/import exists for PWA↔native archive interchange, and `questions` /
+        // `question_note_overrides` / `user_settings` have no PWA counterpart to interchange with.
+        // Asserting against `synced_schema()` is what keeps that a stated scope rather than an
+        // accident — if the snapshot ever should carry them, this test fails and asks.
         assert_eq!(
             queued
                 .iter()
                 .map(|item| item.1.as_str())
                 .collect::<Vec<_>>(),
-            synced_table_names()
+            synced_schema().iter().map(|t| t.name).collect::<Vec<_>>()
         );
         for schema in synced_schema() {
             let id = if schema.name == "note_signals" {

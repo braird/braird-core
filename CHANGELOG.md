@@ -6,6 +6,45 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **The SUR-996 question entity: sealed at write, synced end to end (SUR-1042).** `enqueue_question`
+  seals `text` as `enc:v2` with the question id as AAD — the same boundary `enqueue_note` has held
+  since ADR 0003, so the plaintext exists only for the duration of the call and the outbox, the local
+  mirror and the cloud hold ciphertext alone. `plaintext: None` is a metadata-only patch that makes
+  no Vault call and omits `text`/`created_at`; that is the *common* path, since every state change
+  after the first (a check-in answered, a question resolved or dismissed) is metadata, and it must
+  never re-seal — a host answering a check-in has no plaintext to re-seal with.
+  `question_note_overrides` carries the curation (`include`/`exclude`) under a **deterministic
+  `question_id:note_id` pk**, so two devices curating the same pair converge on one row instead of
+  accumulating edges. That pk is also what makes the SUR-940 collapse reachable, so a re-add routes
+  through `stage_local_write_resurrecting`: without it, `include → remove → include` inside one
+  un-flushed batch collapses to a sticky tombstone and pushes a **delete** while the local mirror
+  still reads correctly — a silent lost write that a live read cannot see, which is why its tests
+  assert the collapsed outbox instead. `question_notes()` derives the effective set,
+  `(auto-window ∪ includes) − excludes`, with `now` supplied by the host so it stays a pure function
+  of its inputs — the property "converges across devices" is actually testable against.
+  `set_user_setting` writes braird's first synced settings; SUR-1043 puts the typed `PromptSettings`
+  façade and the cadence clamp on top.
+  **Two seams that were one string until now.** `on_conflict_for()` is the *cloud* upsert target and
+  `record_id_column()` the *local* pk, split because `user_settings` has no `id` and its cloud key is
+  the composite `(user_id, key)` — setting names repeat across accounts, so a bare `on_conflict=key`
+  matches no unique constraint and PostgREST rejects it, a failure no single-account test reproduces.
+  Left merged, every settings group would also have read an empty record id from
+  `payload["user_id,key"]`.
+  `questions.text` joins `required_insert_columns` (it is `not null` with no default, deliberately
+  unlike `notes.text`), so a metadata patch PATCHes rather than upserting a hollow row over the seal.
+  `question_note_overrides` gains both FK deps, which is what holds an override back until its
+  question and note have flushed — surfc 0055 rejects an early one as RLS `42501`, deliberately
+  indistinguishable from a permission denial, so the ordering is enforced before dispatch rather than
+  classified after it.
+  **Accepted and pinned, not discovered:** the question row carries the answer flow
+  (`status`/`tone`) and the check-in flow (`checkin_at`/`checkin_response`) under whole-row LWW, so a
+  concurrent dismiss and check-in resolve to the larger `updated_at` and the loser's field is gone
+  rather than merged (founder, 2026-08-14). A test states it.
+  Export/import still covers exactly the eight PWA-parity tables: the native-first three have no PWA
+  counterpart to interchange with, and that exclusion is now asserted against `synced_schema()` so it
+  stays a stated scope rather than an artifact of a hardcoded field list.
+
 ### Changed
 - **`open_questions` is now `questions`, and its `status` vocabulary is `active` rather than `live`
   (SUR-1042).** SUR-1042 exports this entity over UniFFI, and deriving the API name from the table

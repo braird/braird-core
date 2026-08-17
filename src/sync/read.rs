@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
-use crate::note_encryption::is_encrypted;
+use crate::note_encryption::{is_encrypted, is_encrypted_v2};
 use crate::search::{SearchDoc, SearchDocKind};
 use crate::store::Store;
 use crate::vault::Vault;
@@ -151,6 +151,32 @@ pub struct NoteLinkRecord {
 pub struct CollectionNoteCount {
     pub collection_id: String,
     pub count: u32,
+}
+
+/// One question from the SUR-996 log (SUR-1042). `text` is **plaintext**, decrypted in core through
+/// the same [`decrypt_note_text`] gate `notes` uses, or `None` when the row failed to decrypt
+/// (`decrypt_failed = true`) — a corrupt or foreign-AAD question never fails the whole page, and
+/// ciphertext never crosses the FFI in its `enc:` form.
+///
+/// `status` is `active | resolved | dismissed`; `checkin_response` is `active | resolved | new`.
+/// Both are read defensively as `Option` (like [`LensRecord`]'s `combinator`) even though
+/// `enqueue_question` always writes a status: the vocabulary is client-authored with no server
+/// CHECK, so a row written by a newer client must not panic an older read.
+///
+/// Deliberately NO note count or active-date-range field — those are Lexicon presentation shapes and
+/// belong to SUR-1044, which builds them on [`question_notes`] rather than beside it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct QuestionRecord {
+    pub id: String,
+    pub text: Option<String>,
+    pub decrypt_failed: bool,
+    pub status: Option<String>,
+    pub tone: Option<String>,
+    pub resolved_at: Option<i64>,
+    pub checkin_at: Option<i64>,
+    pub checkin_response: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 // ── store reads → DTOs ───────────────────────────────────────────────────────
@@ -355,6 +381,104 @@ pub fn collection_ids_for_note(store: &Store, note_id: &str) -> rusqlite::Result
         .iter()
         .filter_map(|row| string_field(row, "collection_id"))
         .filter(|id| seen.insert(id.clone()))
+        .collect())
+}
+
+/// The question log, newest-first (SUR-1042) — live rows only, every status. Decrypted in core.
+pub fn list_questions(
+    store: &Store,
+    vault: &Vault,
+    limit: i64,
+    offset: i64,
+) -> rusqlite::Result<Vec<QuestionRecord>> {
+    Ok(store
+        .list_live("questions", None, limit, offset)?
+        .iter()
+        .map(|row| question_record(row, vault))
+        .collect())
+}
+
+pub fn get_question(
+    store: &Store,
+    vault: &Vault,
+    id: &str,
+) -> rusqlite::Result<Option<QuestionRecord>> {
+    match store.get_row("questions", id)? {
+        Some(row) if !is_deleted(&row) => Ok(Some(question_record(&row, vault))),
+        _ => Ok(None),
+    }
+}
+
+/// The EFFECTIVE note set of one question (SUR-996 R1): `(auto ∪ includes) − excludes`,
+/// newest-first, decrypted in core.
+///
+/// `auto` is the active-window join — every live note whose `created_at` falls inside the
+/// question's active window, `[created_at, resolved_at ?? now]`. A resolved or dismissed question
+/// closes its window at `resolved_at`, so its set stops growing; a still-active one runs to `now`,
+/// which the HOST supplies rather than core reading a clock, matching [`notes_this_week`]. That
+/// keeps this a pure function of (store, question, now) — the property the acceptance criterion
+/// "converges across devices" is actually testable against.
+///
+/// `excludes` beats `includes` only by being the later write: the two are not ranks but the same
+/// deterministic `question_id:note_id` row under whole-row LWW, so the surviving `kind` IS the
+/// answer. A pair with a live `exclude` row is dropped even if the window would have offered it; a
+/// live `include` adds a note the window missed. Soft-deleted override rows are simply absent, which
+/// returns the pair to whatever the window says — the reason `enqueue_question_note_override` must
+/// resurrect rather than let a re-add collapse into a tombstone.
+///
+/// ponytail: scan-then-filter over live notes and this question's overrides, no index. Same posture
+/// as [`notes_by_idea`] and correct at personal-archive scale; revisit only if a profile says so.
+pub fn question_notes(
+    store: &Store,
+    vault: &Vault,
+    question_id: &str,
+    now_ms: i64,
+) -> rusqlite::Result<Vec<NoteRecord>> {
+    let Some(question) = store.get_row("questions", question_id)? else {
+        return Ok(Vec::new());
+    };
+    if is_deleted(&question) {
+        return Ok(Vec::new());
+    }
+    let opened_at = int_field(&question, "created_at");
+    // An unresolved question's window runs to `now`; `resolved_at` closes it. A `resolved_at`
+    // BEFORE `created_at` (clock skew across devices) would invert the window and silently empty
+    // the set, so the window end is clamped to at least its start.
+    let closed_at = opt_int_field(&question, "resolved_at")
+        .unwrap_or(now_ms)
+        .max(opened_at);
+
+    let mut includes = HashSet::new();
+    let mut excludes = HashSet::new();
+    for row in store.list_live(
+        "question_note_overrides",
+        Some(("question_id", question_id)),
+        -1,
+        0,
+    )? {
+        let Some(note_id) = string_field(&row, "note_id") else {
+            continue;
+        };
+        match string_field(&row, "kind").as_deref() {
+            Some("exclude") => excludes.insert(note_id),
+            // Anything else that survived LWW is treated as an include. An unknown `kind` from a
+            // newer client should widen the set, never silently drop a note the user pinned.
+            _ => includes.insert(note_id),
+        };
+    }
+
+    Ok(store
+        .list_live("notes", None, -1, 0)?
+        .into_iter()
+        .filter(|row| {
+            let id = string_field(row, "id").unwrap_or_default();
+            if excludes.contains(&id) {
+                return false;
+            }
+            let created = int_field(row, "created_at");
+            includes.contains(&id) || (created >= opened_at && created <= closed_at)
+        })
+        .map(|row| note_record(&row, vault))
         .collect())
 }
 
@@ -579,6 +703,23 @@ fn note_record(row: &Map<String, Value>, vault: &Vault) -> NoteRecord {
     }
 }
 
+fn question_record(row: &Map<String, Value>, vault: &Vault) -> QuestionRecord {
+    let id = string_field(row, "id").unwrap_or_default();
+    let (text, decrypt_failed) = decrypt_question_text(row, &id, vault);
+    QuestionRecord {
+        text,
+        decrypt_failed,
+        status: string_field(row, "status"),
+        tone: string_field(row, "tone"),
+        resolved_at: opt_int_field(row, "resolved_at"),
+        checkin_at: opt_int_field(row, "checkin_at"),
+        checkin_response: string_field(row, "checkin_response"),
+        created_at: int_field(row, "created_at"),
+        updated_at: int_field(row, "updated_at"),
+        id,
+    }
+}
+
 fn custom_idea_record(row: &Map<String, Value>) -> CustomIdeaRecord {
     CustomIdeaRecord {
         id: string_field(row, "id").unwrap_or_default(),
@@ -658,6 +799,42 @@ pub(super) fn decrypt_note_text(
             Err(_) => (None, true),
         },
         Some(t) => (Some(t), false),
+    }
+}
+
+/// Decrypt a `questions.text` on the way out — **stricter than [`decrypt_note_text`], deliberately**
+/// (SUR-1042). Anything that is not `enc:v2` is a decryption FAILURE here, where the notes gate
+/// would accept it.
+///
+/// Sharing the notes gate was the original implementation and it was wrong. `decrypt_note_text`
+/// accepts three things a question must refuse:
+///   - **`enc:v1`** — no AAD at all, so `decrypt_note` ignores the id argument entirely and the blob
+///     opens under ANY row. A v1 ciphertext lifted from anywhere would render as this question's
+///     text, which is precisely the transplant the AAD binding exists to prevent;
+///   - **plaintext passthrough** — a `text` that never went through the Vault would be displayed
+///     verbatim as the question;
+///   - **empty string** — read as "sealed nothing" rather than as the crypto defect it is.
+///
+/// `notes` must keep accepting all three: v1 is a real legacy corpus, and a plaintext-era note is a
+/// degraded row, not an attack. `questions` has no legacy corpus — the table was created sealed —
+/// so the only thing it can legitimately hold is v2, and surfc `0055` says as much in its own words
+/// ("a question row without ciphertext is a crypto defect, not a degraded row").
+///
+/// An ABSENT `text` still yields `(None, false)`: the column making no claim is different from the
+/// column making an unverifiable one.
+fn decrypt_question_text(
+    row: &Map<String, Value>,
+    id: &str,
+    vault: &Vault,
+) -> (Option<String>, bool) {
+    match string_field(row, "text") {
+        None => (None, false),
+        Some(t) if is_encrypted_v2(&t) => match vault.decrypt_note(Some(id.to_string()), t) {
+            Ok(plaintext) => (Some(plaintext), false),
+            Err(_) => (None, true),
+        },
+        // v1, plaintext, empty, or garbage — all unbindable to this question.
+        Some(_) => (None, true),
     }
 }
 

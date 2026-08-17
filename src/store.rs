@@ -112,12 +112,19 @@ use ColType::{Bool, Int, Json, Real, Text};
 /// table-generic — SUR-726 fans out to the other six stores by extending the pull table list,
 /// not by touching these helpers.
 ///
-/// **Deliberately does NOT resolve [`native_schema`] tables (SUR-1048).** Those are created and
-/// shape-locked, but not yet syncable: widening this lookup would make `apply_row` write
-/// `questions` before SUR-1042 defines the seal boundary. SUR-1042 widens it (and the pull
-/// scope) in the same change that gives those tables an encryption contract.
+/// **Resolves the native-first tables too, as of SUR-1042** — the widening SUR-1048 deliberately
+/// withheld. It was withheld because it is what makes `apply_row`/`get_row` writable for
+/// `questions`, and a writable `questions` without an encryption contract means plaintext question
+/// text in SQLite (the `crypto-reviewer` BLOCKER class). That contract now exists: `enqueue_question`
+/// seals `text` (enc:v2, AAD = the question id) before it is ever staged, exactly as `enqueue_note`
+/// does, and [`super::sync::read`] decrypts on the way out through the one shared gate. The seal
+/// boundary and this lookup land together, in one commit, on purpose.
+///
+/// Note this opens the five descriptor-driven helpers at once — `get_row`, `list_live`,
+/// `count_live`, `apply_row` and the pull's pk lookup — because they all funnel through
+/// [`schema_or_err`]. That is the intended blast radius, not an accident of implementation.
 pub fn table_schema(name: &str) -> Option<&'static TableSchema> {
-    synced_schema().iter().find(|t| t.name == name)
+    descriptor_tables().find(|t| t.name == name)
 }
 
 /// Descriptor lookup that fails loudly for a non-synced table (a caller bug, not a data error).
@@ -360,20 +367,25 @@ pub fn synced_schema() -> &'static [TableSchema] {
 ///   - `vendored/schema/native-manifest.json` names the owning ticket per table (SUR-842 pattern),
 ///     so a table can't sit here unattributed.
 ///
-/// **Registered, not yet wired.** These tables are CREATED by [`Store::init_schema`] and locked by
-/// the guard, but they are deliberately absent from [`table_schema`] and [`synced_table_names`]:
-/// the pull scope must not fan out to a cloud table that does not exist yet (SUR-1047), and
-/// `apply_row` must not become writable for `questions` before SUR-1042 defines its
-/// encryption boundary — `text` is ciphertext (enc:v2, AAD = the question id, like `notes.text`),
-/// and a plaintext question reaching SQLite is the `crypto-reviewer` BLOCKER class. SUR-1042 wires
-/// the sync legs; this ticket only puts the shapes under the guard.
+/// **Registered AND wired, as of SUR-1042.** These tables are CREATED by [`Store::init_schema`],
+/// locked by the guard, and now resolve through both [`table_schema`] and [`synced_table_names`] —
+/// so they are read, written, flushed and pulled exactly like the surfc-derived eight.
+///
+/// They spent SUR-1048 deliberately absent from both, which is worth remembering rather than
+/// deleting: `apply_row` becoming writable for `questions` is precisely what would let plaintext
+/// question text reach SQLite (the `crypto-reviewer` BLOCKER class), so that lookup could only widen
+/// alongside the seal. `questions.text` is ciphertext (enc:v2, AAD = the question id, like
+/// `notes.text`), sealed at write by `SyncEngine::enqueue_question`; the pull scope widened
+/// separately, with the push legs that make these tables flushable.
 ///
 /// **Convergence (SUR-737 contract, extended).** Whole-row LWW by `updated_at`, like everything
 /// else. `question_note_overrides.id` is the DETERMINISTIC `question_id:note_id` join (the
 /// `collection_memberships` OR-set pattern, NOT the `note_links` random-uid bag) so two devices
 /// curating the same pair converge to one row and a contradictory `include`/`exclude` resolves by
-/// LWW instead of leaving both. SUR-1042 owns the derivation helper and must handle the
-/// re-add-after-delete-in-one-batch case that deterministic pks are prone to. `user_settings` is a
+/// LWW instead of leaving both. The id is derived by [`override_id`], and the
+/// re-add-after-delete-in-one-batch case deterministic pks are prone to is handled in
+/// `SyncEngine::enqueue_question_note_override` (a re-add resurrects past the sticky collapse).
+/// `user_settings` is a
 /// per-key KV (`key` is the whole local pk; `user_id` is auth-injected at push like every other
 /// table), so LWW lands per SETTING rather than per settings-blob — the reason it is a standalone
 /// table and not columns on `user_profiles` (a hot, server-authoritative row whose whole-row LWW
@@ -443,13 +455,24 @@ fn descriptor_tables() -> impl Iterator<Item = &'static TableSchema> {
 }
 
 /// The synced tables in dependency (topological) order — every FK parent precedes its children.
-/// Derived from [`synced_schema`] so the pull scope (SUR-726 fans out to all eight) and the flush
-/// order both follow the descriptor: a ninth table joins both by being added to `synced_schema`
-/// once. The schema order IS a valid topo order — verified against the surfc FKs: `notes.book_id`
+/// Derived from [`descriptor_tables`] so the pull scope and the flush order both follow the
+/// descriptor: a new table joins both by being added to a schema list once.
+///
+/// The schema order IS a valid topo order — verified against the surfc FKs: `notes.book_id`
 /// → books; `note_links.{from,to}_note_id` → notes; `collection_memberships.{note_id,collection_id}`
 /// → notes/collections; `note_signals.note_id` → notes (each parent listed earlier).
+///
+/// **Widened to the native-first tables by SUR-1042**, once their push legs existed
+/// (`on_conflict_for` / `required_insert_columns` / `fk_deps`). The chain order keeps the topo
+/// property: `questions` precedes `question_note_overrides`, and `notes` — the overrides' other
+/// parent — is in the synced half, so it precedes both. `user_settings` has no FK at all.
+///
+/// This list is load-bearing in THREE places, which is why it moved in its own commit: it is the
+/// flush's dispatch order, the pull's fan-out, and the snapshot-import preflight scope. A single
+/// table 404ing on pull aborts the flush for every table (`pull_then_flush`), so widening it before
+/// the cloud tables exist would break sync wholesale rather than degrade it.
 pub fn synced_table_names() -> Vec<&'static str> {
-    synced_schema().iter().map(|t| t.name).collect()
+    descriptor_tables().map(|t| t.name).collect()
 }
 
 /// The deterministic primary key of a `collection_memberships` row — the byte-exact mirror of
@@ -460,6 +483,22 @@ pub fn synced_table_names() -> Vec<&'static str> {
 /// a dev warning on a stray colon, and this does not re-validate — same assumption as the oracle).
 pub fn membership_id(collection_id: &str, note_id: &str) -> String {
     format!("{collection_id}:{note_id}")
+}
+
+/// The deterministic primary key of a `question_note_overrides` row — `question_id:note_id`,
+/// **question id first**, the same shape and for the same reason as [`membership_id`]: two devices
+/// curating the same (question, note) pair must converge to ONE row, so the id is derived rather
+/// than host-supplied (the SUR-737 OR-set add, not the `note_links` random-uid bag). A contradictory
+/// `include` / `exclude` on the same pair then resolves by whole-row LWW instead of leaving both.
+///
+/// Same stated assumption as its sibling: neither id contains a `:`. Question ids are host-generated
+/// uuids and note ids are server uuids, so this does not re-validate.
+///
+/// The pk being deterministic is exactly what makes the re-add-after-delete collapse reachable here
+/// — see [`super::sync::SyncEngine::enqueue_question_note_override`], which routes a re-add through
+/// `stage_local_write_resurrecting` for that reason.
+pub fn override_id(question_id: &str, note_id: &str) -> String {
+    format!("{question_id}:{note_id}")
 }
 
 /// The local-only / derived stores (parent SUR-659 §1) — present in the mirror but

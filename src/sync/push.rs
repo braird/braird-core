@@ -27,20 +27,45 @@ use serde_json::{json, Value};
 
 use super::http::PostgrestSink;
 use super::outbox::{collapse, resolve_book_id, Collapsed, OutboxItem};
-use crate::store::{synced_table_names, Store};
+use crate::store::{synced_table_names, table_schema, Store};
 
 /// `meta` key holding the offline-merge temp→server book-id map (JSON object). Persisted so a
 /// remap survives a process restart between the book flush and a later note flush.
 const BOOK_ID_REMAP_KEY: &str = "bookIdRemap";
 
-/// The pk each table upserts on (the PostgREST `on_conflict` target) — also the pk column the flush
-/// reads a group's record id from. All eight synced tables key on `id` except `note_signals`
-/// (keyed on `note_id`).
+/// The PostgREST `on_conflict` target — the CLOUD constraint an upsert resolves against.
+///
+/// Usually the local pk, but not always, and SUR-1042 is where the two part company.
+/// `user_settings` has no `id` at all and its cloud key is the COMPOSITE `(user_id, key)`: setting
+/// names like `prompt_cadence` repeat across every account, so a bare `unique (key)` would let the
+/// first writer occupy that name globally and collide every later user against a row RLS HIDES from
+/// them — a failure no single-account test can reproduce. `on_conflict=key` alone matches no unique
+/// constraint on that table, and PostgREST rejects it outright.
+///
+/// This is deliberately NOT derived from `TableSchema.pk`. The descriptor describes the LOCAL
+/// mirror, and for `user_settings` the local pk (`key`) is a strict subset of the cloud key —
+/// deriving it here would produce the wrong target for exactly the one table that cannot tolerate
+/// it. Use [`record_id_column`] when you want the local pk.
 fn on_conflict_for(table: &str) -> &'static str {
     match table {
         "note_signals" => "note_id",
+        // (user_id, key) — see above. `upsert_group` injects `user_id` into every row, so the
+        // column is present in the payload even though it is never stored locally.
+        "user_settings" => "user_id,key",
         _ => "id",
     }
+}
+
+/// The LOCAL primary-key column — where the flush reads a group's record id, and the column a
+/// sparse group's PATCH filters on.
+///
+/// Split out from [`on_conflict_for`] by SUR-1042, which is the point the two stopped being the
+/// same string. `on_conflict_for("user_settings")` is now `"user_id,key"`, and reading
+/// `payload["user_id,key"]` would yield `None` → an empty record id for every settings group (which
+/// silently breaks the FK hold-back bookkeeping) and a nonsense PATCH filter. Descriptor-derived, so
+/// a new table gets the right answer by existing rather than by being remembered here.
+fn record_id_column(table: &str) -> &'static str {
+    table_schema(table).map_or("id", |t| t.pk[0])
 }
 
 /// The columns a table's INSERT shape requires, so a collapsed group missing ANY of them cannot
@@ -69,6 +94,16 @@ fn required_insert_columns(table: &str) -> &'static [&'static str] {
         "collection_memberships" => &["note_id", "collection_id", "created_at"],
         "note_links" => &["from_note_id", "to_note_id", "created_at"],
         "note_signals" => &["created_at"],
+        // SUR-1042. `questions.text` is `not null` with NO default — deliberately unlike
+        // `notes.text`'s `default ''`, because a question row without ciphertext is a crypto defect
+        // rather than a degraded row, so the server refuses it outright. Listing it here is what
+        // makes a metadata-only patch (a check-in answer, a resolve) PATCH instead of upserting a
+        // hollow row over the sealed one — the same lesson SUR-724 established for notes and
+        // SUR-1009 for books, applied to a second content column before it can bite.
+        "questions" => &["text", "created_at"],
+        "question_note_overrides" => &["question_id", "note_id", "kind", "created_at"],
+        // `user_settings` deliberately omitted: `value` is nullable and everything else NOT NULL
+        // carries a server default, so no payload it can produce is unfillable.
         _ => &[],
     }
 }
@@ -83,6 +118,14 @@ fn fk_deps(table: &str) -> &'static [(&'static str, &'static str)] {
         "note_links" => &[("from_note_id", "notes"), ("to_note_id", "notes")],
         "collection_memberships" => &[("note_id", "notes"), ("collection_id", "collections")],
         "note_signals" => &[("note_id", "notes")],
+        // SUR-1042 / surfc 0055. Both endpoints are real FKs with ON DELETE CASCADE, so an override
+        // dispatched before its question or its note is a server rejection. This hold-back is what
+        // satisfies that ordering constraint — and note the rejection would arrive as RLS `42501`,
+        // not FK `23503`, because the policy's WITH CHECK requires both endpoints to resolve under
+        // the writer's own RLS (SUR-1047 closed a cross-user reference that way). The two cases are
+        // now deliberately indistinguishable, which is exactly why the ordering is enforced here
+        // rather than classified after the fact from an error code.
+        "question_note_overrides" => &[("question_id", "questions"), ("note_id", "notes")],
         _ => &[],
     }
 }
@@ -154,7 +197,7 @@ pub async fn flush<S: PostgrestSink>(
             // note_signals). Recorded in `failed` if this group can't flush, so its children hold.
             let record_id = group
                 .payload
-                .get(on_conflict_for(table))
+                .get(record_id_column(table))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
@@ -181,7 +224,7 @@ pub async fn flush<S: PostgrestSink>(
                 .iter()
                 .any(|column| !group.payload.contains_key(*column));
             let write_result = if sparse {
-                patch_group(sink, &group, on_conflict_for(table), &record_id).await
+                patch_group(sink, &group, record_id_column(table), &record_id).await
             } else {
                 upsert_group(sink, &group, user_id).await
             };
@@ -685,6 +728,30 @@ mod tests {
         enqueue_row(&store, "custom_ideas", "id", "ci1", json!({}));
         enqueue_row(&store, "notes", "id", "n1", json!({ "text": "enc:v2:x" }));
         enqueue_row(&store, "books", "id", "b1", json!({}));
+        // SUR-1042's three, enqueued LAST and out of dependency order on purpose — the whole point
+        // of the assertion below is that dispatch follows the schema, not the enqueue sequence.
+        // Each carries its full `required_insert_columns` shape so it upserts rather than patching.
+        enqueue_row(
+            &store,
+            "user_settings",
+            "key",
+            "prompt_cadence",
+            json!({ "value": "168" }),
+        );
+        enqueue_row(
+            &store,
+            "question_note_overrides",
+            "id",
+            "q1:n1",
+            json!({ "question_id": "q1", "note_id": "n1", "kind": "include", "created_at": 1 }),
+        );
+        enqueue_row(
+            &store,
+            "questions",
+            "id",
+            "q1",
+            json!({ "text": "enc:v2:x", "created_at": 1 }),
+        );
 
         let s = sink(None);
         let res = block(flush(&store, &s, "user-1")).unwrap();
@@ -694,8 +761,104 @@ mod tests {
             synced_table_names(),
             "dispatch order is the topological (schema) order regardless of enqueue order"
         );
-        assert_eq!(res.ok.len(), 8, "every table flushed");
+        assert_eq!(res.ok.len(), 11, "every table flushed");
         assert!(res.failed.is_empty());
+    }
+
+    #[test]
+    fn a_metadata_only_question_flush_patches_instead_of_upserting_over_the_seal() {
+        // The reason `questions` is in `required_insert_columns`. A check-in answer or a resolve
+        // carries no `text` — upserting it would send an INSERT candidate with no ciphertext, which
+        // the server rejects (`text` is NOT NULL, no default) and which, if it ever succeeded, would
+        // overwrite the sealed question with a hollow row. Drop `"questions"` from that list and
+        // this test is what fails; without it, nothing would.
+        let store = Store::open_in_memory().unwrap();
+        store
+            .enqueue(
+                "questions",
+                "q1",
+                r#"{"id":"q1","status":"resolved","resolved_at":999,"updated_at":20,"deleted":false}"#,
+                100,
+            )
+            .unwrap();
+
+        let sink = sink(None);
+        block(flush(&store, &sink, "user-1")).unwrap();
+
+        assert!(
+            sink.calls.borrow().is_empty(),
+            "a text-free question must never upsert"
+        );
+        let patches = sink.patches.borrow();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].0, "questions");
+        assert_eq!(patches[0].1, "id", "the PATCH filters on the LOCAL pk");
+        assert_eq!(patches[0].2, "q1");
+        assert_eq!(patches[0].3["status"], json!("resolved"));
+        assert!(
+            patches[0].3.get("text").is_none(),
+            "the patch must not carry a text column at all"
+        );
+    }
+
+    #[test]
+    fn user_settings_upserts_on_the_composite_cloud_key() {
+        // Its local pk is `key`, but the CLOUD key is `(user_id, key)` — setting names repeat
+        // across accounts, so a bare `on_conflict=key` matches no unique constraint and PostgREST
+        // rejects it. Only reproducible with two accounts in production, hence a unit pin here.
+        let store = Store::open_in_memory().unwrap();
+        enqueue_row(
+            &store,
+            "user_settings",
+            "key",
+            "prompt_cadence",
+            json!({ "value": "168" }),
+        );
+        let s = sink(None);
+        block(flush(&store, &s, "user-1")).unwrap();
+        assert!(
+            s.conflicts
+                .borrow()
+                .iter()
+                .any(|(table, target)| table == "user_settings" && target == "user_id,key"),
+            "user_settings must upsert on the composite (user_id, key) target"
+        );
+    }
+
+    #[test]
+    fn an_override_is_held_back_when_its_question_fails() {
+        // The FK ordering constraint surfc 0055 pins. An override whose parents have not reached
+        // the cloud is rejected — and as RLS 42501, not FK 23503, because the policy requires both
+        // endpoints to resolve under the writer's own RLS. Indistinguishable from a permission
+        // denial after the fact, so the ordering is enforced BEFORE dispatch, not classified after.
+        let store = Store::open_in_memory().unwrap();
+        enqueue_row(
+            &store,
+            "questions",
+            "id",
+            "q1",
+            json!({ "text": "enc:v2:x", "created_at": 1 }),
+        );
+        enqueue_row(
+            &store,
+            "question_note_overrides",
+            "id",
+            "q1:n1",
+            json!({ "question_id": "q1", "note_id": "n1", "kind": "include", "created_at": 1 }),
+        );
+
+        let s = sink(Some("questions"));
+        let res = block(flush(&store, &s, "user-1")).unwrap();
+
+        assert!(
+            !s.calls
+                .borrow()
+                .iter()
+                .any(|t| t == "question_note_overrides"),
+            "the override must not be dispatched while its question is unflushed"
+        );
+        assert_eq!(res.ok.len(), 0);
+        assert_eq!(res.failed.len(), 2, "both stay queued for the next flush");
     }
 
     #[test]

@@ -949,4 +949,68 @@ final class RoundTripTests: XCTestCase {
         XCTAssertEqual(progress.pending, 1)
         XCTAssertThrowsError(try engine.semanticSearch(query: "query", limit: 5))
     }
+
+    /// SUR-1042: the question surface over the FFI — the Swift half of `questionSurfaceOverFfi`.
+    /// `QuestionUpsert` carries seven `Optional`/`String` fields that each lower to a by-value
+    /// buffer, and the Rust tests call the function directly, never crossing the ABI. Also pins the
+    /// crypto claim where the hosts meet it: plaintext in, plaintext out, and a metadata-only patch
+    /// (`plaintext: nil`) that must leave the seal untouched.
+    func testQuestionSurfaceOverFfi() throws {
+        let db = FileManager.default.temporaryDirectory
+            .appendingPathComponent("braird-q-\(UUID().uuidString).sqlite")
+        let engine = try SyncEngine.open(
+            dbPath: db.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
+            vault: Vault.generate())
+
+        func question(
+            _ id: String, _ plaintext: String?, _ status: String?, resolvedAt: Int64? = nil
+        ) -> QuestionUpsert {
+            QuestionUpsert(
+                id: id, plaintext: plaintext, status: status, tone: "introspective",
+                resolvedAt: resolvedAt, checkinAt: nil, checkinResponse: nil,
+                createdAt: 100, deleted: false)
+        }
+
+        try engine.enqueueQuestion(draft: question("q1", "what am I avoiding?", "active"))
+
+        let listed = try engine.listQuestions(limit: 50, offset: 0)
+        XCTAssertEqual(listed.count, 1)
+        XCTAssertEqual(listed[0].id, "q1")
+        XCTAssertEqual(listed[0].text, "what am I avoiding?")
+        XCTAssertFalse(listed[0].decryptFailed)
+        XCTAssertEqual(listed[0].status, "active")
+        XCTAssertEqual(listed[0].tone, "introspective")
+        XCTAssertFalse(listed[0].text?.hasPrefix("enc:v") ?? false)
+
+        // A metadata-only patch must preserve the ciphertext, not blank it.
+        try engine.enqueueQuestion(draft: question("q1", nil, "resolved", resolvedAt: 900))
+        let patched = try engine.getQuestion(id: "q1")
+        XCTAssertEqual(patched?.text, "what am I avoiding?")
+        XCTAssertEqual(patched?.status, "resolved")
+        XCTAssertEqual(patched?.resolvedAt, 900)
+
+        // The effective note set: auto-window ∪ includes − excludes.
+        func note(_ id: String, _ createdAt: Int64) -> NoteUpsert {
+            NoteUpsert(
+                id: id, bookId: nil, plaintext: "text-\(id)", page: nil, tags: [],
+                source: nil, sourceId: nil, sourceMetaJson: nil, chapter: nil, imagePath: nil,
+                inkCropPath: nil, createdAt: createdAt, deleted: false, clearNullableFields: [])
+        }
+        try engine.enqueueQuestion(draft: question("q2", "the open one", "active"))
+        try engine.enqueueNote(draft: note("in-window", 150))
+        try engine.enqueueNote(draft: note("too-early", 10))
+        try engine.enqueueNote(draft: note("dropped", 160))
+        try engine.enqueueQuestionNoteOverride(
+            draft: QuestionNoteOverride(
+                questionId: "q2", noteId: "too-early", kind: "include", deleted: false))
+        try engine.enqueueQuestionNoteOverride(
+            draft: QuestionNoteOverride(
+                questionId: "q2", noteId: "dropped", kind: "exclude", deleted: false))
+        XCTAssertEqual(
+            try engine.questionNotes(questionId: "q2", nowMs: 10_000).map { $0.id }.sorted(),
+            ["in-window", "too-early"])
+
+        // The first synced setting, keyed by name (no id column).
+        try engine.setUserSetting(key: "prompt_cadence", value: "168")
+    }
 }

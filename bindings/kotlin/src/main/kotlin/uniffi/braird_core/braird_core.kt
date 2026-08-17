@@ -888,6 +888,18 @@ internal open class UniffiVTableCallbackInterfaceEmbedder(
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -950,6 +962,10 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_enqueue_note_signals(`ptr`: Pointer,`noteId`: RustBuffer.ByValue,`sourcePrior`: Double,`returnVisits`: Long,`hasAnnotation`: Byte,`stitchSpawns`: Long,`exposureRecencyAt`: Long,`engagementRecencyAt`: Long,`importance`: Double,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    fun uniffi_braird_core_fn_method_syncengine_enqueue_question(`ptr`: Pointer,`draft`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_braird_core_fn_method_syncengine_enqueue_question_note_override(`ptr`: Pointer,`draft`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_braird_core_fn_method_syncengine_export_snapshot(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_flush(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
@@ -957,6 +973,8 @@ internal interface UniffiLib : Library {
     fun uniffi_braird_core_fn_method_syncengine_get_book(`ptr`: Pointer,`id`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_get_note(`ptr`: Pointer,`id`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_get_question(`ptr`: Pointer,`id`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_idea_counts(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -971,6 +989,8 @@ internal interface UniffiLib : Library {
     fun uniffi_braird_core_fn_method_syncengine_list_lenses(`ptr`: Pointer,`limit`: Int,`offset`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_list_notes(`ptr`: Pointer,`bookId`: RustBuffer.ByValue,`limit`: Int,`offset`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_list_questions(`ptr`: Pointer,`limit`: Int,`offset`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_merge_books(`ptr`: Pointer,`survivorId`: RustBuffer.ByValue,`loserIds`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -988,6 +1008,8 @@ internal interface UniffiLib : Library {
     ): Int
     fun uniffi_braird_core_fn_method_syncengine_pull(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_question_notes(`ptr`: Pointer,`questionId`: RustBuffer.ByValue,`nowMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_ranked_search(`ptr`: Pointer,`query`: RustBuffer.ByValue,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_recent_note(`ptr`: Pointer,`nowMs`: Long,`seed`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -1003,6 +1025,8 @@ internal interface UniffiLib : Library {
     fun uniffi_braird_core_fn_method_syncengine_semantic_search(`ptr`: Pointer,`query`: RustBuffer.ByValue,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_set_access_token(`ptr`: Pointer,`jwt`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_braird_core_fn_method_syncengine_set_user_setting(`ptr`: Pointer,`key`: RustBuffer.ByValue,`value`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_similar_notes(`ptr`: Pointer,`noteId`: RustBuffer.ByValue,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1190,6 +1214,10 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_enqueue_note_signals(
     ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_enqueue_question(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_enqueue_question_note_override(
+    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_export_snapshot(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_flush(
@@ -1197,6 +1225,8 @@ internal interface UniffiLib : Library {
     fun uniffi_braird_core_checksum_method_syncengine_get_book(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_get_note(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_get_question(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_idea_counts(
     ): Short
@@ -1211,6 +1241,8 @@ internal interface UniffiLib : Library {
     fun uniffi_braird_core_checksum_method_syncengine_list_lenses(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_list_notes(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_list_questions(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_merge_books(
     ): Short
@@ -1228,6 +1260,8 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_pull(
     ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_question_notes(
+    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_ranked_search(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_recent_note(
@@ -1243,6 +1277,8 @@ internal interface UniffiLib : Library {
     fun uniffi_braird_core_checksum_method_syncengine_semantic_search(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_set_access_token(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_set_user_setting(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_similar_notes(
     ): Short
@@ -1347,6 +1383,12 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note_signals() != 65282.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_question() != 36841.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_question_note_override() != 50313.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_braird_core_checksum_method_syncengine_export_snapshot() != 42276.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1357,6 +1399,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_get_note() != 41812.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_get_question() != 18093.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_idea_counts() != 10262.toShort()) {
@@ -1378,6 +1423,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_list_notes() != 26133.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_list_questions() != 7468.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_merge_books() != 55148.toShort()) {
@@ -1404,6 +1452,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_pull() != 8960.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_question_notes() != 6988.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_braird_core_checksum_method_syncengine_ranked_search() != 46931.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1426,6 +1477,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_set_access_token() != 47386.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_set_user_setting() != 2882.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_similar_notes() != 52094.toShort()) {
@@ -2511,6 +2565,60 @@ public interface SyncEngineInterface {
     fun `enqueueNoteSignals`(`noteId`: kotlin.String, `sourcePrior`: kotlin.Double, `returnVisits`: kotlin.Long, `hasAnnotation`: kotlin.Boolean, `stitchSpawns`: kotlin.Long, `exposureRecencyAt`: kotlin.Long, `engagementRecencyAt`: kotlin.Long, `importance`: kotlin.Double, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
     
     /**
+     * Enqueue a question write or a metadata-only patch (SUR-1042) — the SUR-996 question log.
+     *
+     * SEAL AT WRITE, exactly as [`SyncEngine::enqueue_note`] does and for the same reason (ADR
+     * 0003): `plaintext: Some` is sealed HERE, while the plaintext is in hand, so the outbox and
+     * the local mirror hold only `enc:v2` ciphertext. The plaintext exists for the duration of this
+     * call and is never persisted, logged, or flushed. AAD is the question id, which binds the
+     * ciphertext to its row — a blob transplanted onto another question fails to open rather than
+     * silently decrypting under the wrong identity.
+     *
+     * `plaintext: None` is the metadata-only patch: no Vault call, and `text`/`created_at` are
+     * OMITTED so the stored ciphertext and birth time survive untouched. This is the common path —
+     * every state change after the first (check-in answered, resolved, dismissed) is metadata — so
+     * it must not re-seal. Like the note patch it REQUIRES an existing live row and returns
+     * [`SyncError::PatchTargetMissing`] otherwise: staged unconditionally it would insert a live
+     * row with NULL `text`, which reads back as a real question with no text and no failure flag.
+     *
+     * WHOLE-ROW LWW, ACCEPTED (founder, 2026-08-14). `status`/`tone` (the answer flow) and
+     * `checkin_at`/`checkin_response` (the check-in flow) live on ONE row under whole-row
+     * last-write-wins, so a dismiss on one device and a check-in on another inside the same window
+     * resolve to whichever `updated_at` is larger — the loser's field is discarded, not merged. The
+     * alternative (a check-in satellite row, the `note_signals`/migration-0047 precedent) was
+     * considered and rejected: v1 has ONE live question and both flows are user-initiated seconds
+     * apart at worst. Documented rather than engineered around, and pinned by a test so it stays a
+     * decision instead of becoming a discovery.
+     */
+    fun `enqueueQuestion`(`draft`: QuestionUpsert)
+    
+    /**
+     * Enqueue a question↔note curation override (SUR-1042), keyed by the DETERMINISTIC
+     * `question_id:note_id` ([`crate::store::override_id`]).
+     *
+     * THE RE-ADD FORK, and why it is not optional. A deterministic pk makes
+     * `include → remove → include` inside ONE un-flushed batch collapse onto a single outbox key,
+     * and the collapse makes `deleted` **sticky** across the group (SUR-724, "within a batch,
+     * delete wins"). So the re-add would flush as a tombstone: the local mirror reads correctly —
+     * the note still shows pinned — while push sends a delete, every other device drops it, and the
+     * next pull LWW-overwrites the local copy. A silent lost write whose local read masks it. This
+     * is the [`SyncEngine::enqueue_collection_membership`] class (SUR-940), and `store.rs`'s
+     * descriptor doc names this table as the case to extend the split for.
+     *
+     * So: a re-add (`deleted: false`) routes through `stage_local_write_resurrecting`, which drops
+     * any pending tombstone for this id and stages the live write in ONE transaction. A genuine
+     * soft-delete stays on the sticky path, because a delete SHOULD win. The tombstone arm also
+     * preserves the stored `created_at` — the server column is NOT NULL with no default and the
+     * pushed payload IS the outbox partial, so a reconstructed row would push a fresh timestamp
+     * over the real one.
+     *
+     * Both arms take ONE held store guard. A released-and-reacquired lock would let a concurrent
+     * re-add stage `deleted: false` between the lookup and the stage, with this tombstone landing
+     * after it and collapsing sticky-deleted — the same loss re-opened as a race.
+     */
+    fun `enqueueQuestionNoteOverride`(`draft`: QuestionNoteOverride)
+    
+    /**
      * Export a plaintext, PWA-compatible snapshot of every live synced row. Note ciphertext is
      * decrypted inside the core; a single decryption failure aborts the entire export so neither
      * ciphertext nor a partial archive can cross the FFI. Local-only tables are never included.
@@ -2537,6 +2645,11 @@ public interface SyncEngineInterface {
      * One note by id, decrypted, or `None` if absent or soft-deleted.
      */
     fun `getNote`(`id`: kotlin.String): NoteRecord?
+    
+    /**
+     * One question by id, or `None` if absent or soft-deleted.
+     */
+    fun `getQuestion`(`id`: kotlin.String): QuestionRecord?
     
     /**
      * Per-idea live-note counts (SUR-858) — the tree's counts, `{idea, count}` sorted by idea name,
@@ -2581,6 +2694,11 @@ public interface SyncEngineInterface {
      * that book's notes. `text` is decrypted plaintext, or `None` with `decrypt_failed = true`.
      */
     fun `listNotes`(`bookId`: kotlin.String?, `limit`: kotlin.UInt, `offset`: kotlin.UInt): List<NoteRecord>
+    
+    /**
+     * The SUR-996 question log, newest-first — every status, decrypted in core (SUR-1042).
+     */
+    fun `listQuestions`(`limit`: kotlin.UInt, `offset`: kotlin.UInt): List<QuestionRecord>
     
     /**
      * Merge duplicate source books into `survivor_id` (SUR-915): rehome the losers' notes, keep the
@@ -2650,6 +2768,14 @@ public interface SyncEngineInterface {
      * flush destroying a newer SERVER row before a pull can see it is the server's job, PR-3.)
      */
     fun `pull`(): PullSummary
+    
+    /**
+     * The effective note set of one question — `(auto ∪ includes) − excludes`, newest-first
+     * (SUR-1042). `now_ms` closes the active window of a question that has no `resolved_at`; the
+     * host supplies it so this stays a pure function of its inputs (see [`read::question_notes`]).
+     * An absent or soft-deleted question yields an empty set, never an error.
+     */
+    fun `questionNotes`(`questionId`: kotlin.String, `nowMs`: kotlin.Long): List<NoteRecord>
     
     /**
      * Hybrid ranked search (SUR-1019, ADR 0007 — the SUR-157 query path): ONE ranked
@@ -2829,6 +2955,30 @@ public interface SyncEngineInterface {
      * PostgREST calls with it; the `user_id` stamped on each row is the token's `sub` claim.
      */
     fun `setAccessToken`(`jwt`: kotlin.String)
+    
+    /**
+     * Write one synced user setting (SUR-1042) — braird's first synced settings, a per-user KV
+     * whose local pk is `key` (there is no `id` column).
+     *
+     * LWW lands per SETTING, not per settings-blob, which is the whole reason this is a standalone
+     * table rather than columns on `user_profiles`: one device changing prompt cadence cannot stomp
+     * another device's tone, and neither can stomp the server-authoritative quota/billing state on
+     * `user_profiles`. The rule going forward is that the server writes profiles and clients write
+     * settings.
+     *
+     * Untyped on purpose at this layer — `key` and `value` are strings, and SUR-1043 owns the typed
+     * `PromptSettings` façade (the key constants and the 72..=672 cadence clamp) on top. Putting the
+     * clamp here would split the settings vocabulary across two tickets for no gain.
+     * `value` is NOT optional, though the column is nullable. An `Option` here would have meant two
+     * different things depending on state: `insert_opt` omits a `None`, so on an existing setting
+     * the merge would keep the old value while bumping `updated_at` (a silent no-op), and on a new
+     * key it would create one with a NULL value. A `set` API whose effect depends on whether the row
+     * already exists is a trap. Clearing is not a use case — the two known keys (`prompt_cadence`,
+     * `prompt_tone`) always carry a value, and `deleted` already expresses removal — so the
+     * ambiguity is removed rather than defined. If a setting ever genuinely needs null-versus-absent,
+     * widen it then and write the `None` as an explicit JSON null, never as an omission.
+     */
+    fun `setUserSetting`(`key`: kotlin.String, `value`: kotlin.String)
     
     /**
      * Notes semantically nearest to `note_id` (SUR-997 item 4 → SUR-647/SUR-996's
@@ -3291,6 +3441,80 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
 
     
     /**
+     * Enqueue a question write or a metadata-only patch (SUR-1042) — the SUR-996 question log.
+     *
+     * SEAL AT WRITE, exactly as [`SyncEngine::enqueue_note`] does and for the same reason (ADR
+     * 0003): `plaintext: Some` is sealed HERE, while the plaintext is in hand, so the outbox and
+     * the local mirror hold only `enc:v2` ciphertext. The plaintext exists for the duration of this
+     * call and is never persisted, logged, or flushed. AAD is the question id, which binds the
+     * ciphertext to its row — a blob transplanted onto another question fails to open rather than
+     * silently decrypting under the wrong identity.
+     *
+     * `plaintext: None` is the metadata-only patch: no Vault call, and `text`/`created_at` are
+     * OMITTED so the stored ciphertext and birth time survive untouched. This is the common path —
+     * every state change after the first (check-in answered, resolved, dismissed) is metadata — so
+     * it must not re-seal. Like the note patch it REQUIRES an existing live row and returns
+     * [`SyncError::PatchTargetMissing`] otherwise: staged unconditionally it would insert a live
+     * row with NULL `text`, which reads back as a real question with no text and no failure flag.
+     *
+     * WHOLE-ROW LWW, ACCEPTED (founder, 2026-08-14). `status`/`tone` (the answer flow) and
+     * `checkin_at`/`checkin_response` (the check-in flow) live on ONE row under whole-row
+     * last-write-wins, so a dismiss on one device and a check-in on another inside the same window
+     * resolve to whichever `updated_at` is larger — the loser's field is discarded, not merged. The
+     * alternative (a check-in satellite row, the `note_signals`/migration-0047 precedent) was
+     * considered and rejected: v1 has ONE live question and both flows are user-initiated seconds
+     * apart at worst. Documented rather than engineered around, and pinned by a test so it stays a
+     * decision instead of becoming a discovery.
+     */
+    @Throws(SyncException::class)override fun `enqueueQuestion`(`draft`: QuestionUpsert)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_enqueue_question(
+        it, FfiConverterTypeQuestionUpsert.lower(`draft`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Enqueue a question↔note curation override (SUR-1042), keyed by the DETERMINISTIC
+     * `question_id:note_id` ([`crate::store::override_id`]).
+     *
+     * THE RE-ADD FORK, and why it is not optional. A deterministic pk makes
+     * `include → remove → include` inside ONE un-flushed batch collapse onto a single outbox key,
+     * and the collapse makes `deleted` **sticky** across the group (SUR-724, "within a batch,
+     * delete wins"). So the re-add would flush as a tombstone: the local mirror reads correctly —
+     * the note still shows pinned — while push sends a delete, every other device drops it, and the
+     * next pull LWW-overwrites the local copy. A silent lost write whose local read masks it. This
+     * is the [`SyncEngine::enqueue_collection_membership`] class (SUR-940), and `store.rs`'s
+     * descriptor doc names this table as the case to extend the split for.
+     *
+     * So: a re-add (`deleted: false`) routes through `stage_local_write_resurrecting`, which drops
+     * any pending tombstone for this id and stages the live write in ONE transaction. A genuine
+     * soft-delete stays on the sticky path, because a delete SHOULD win. The tombstone arm also
+     * preserves the stored `created_at` — the server column is NOT NULL with no default and the
+     * pushed payload IS the outbox partial, so a reconstructed row would push a fresh timestamp
+     * over the real one.
+     *
+     * Both arms take ONE held store guard. A released-and-reacquired lock would let a concurrent
+     * re-add stage `deleted: false` between the lookup and the stage, with this tombstone landing
+     * after it and collapsing sticky-deleted — the same loss re-opened as a race.
+     */
+    @Throws(SyncException::class)override fun `enqueueQuestionNoteOverride`(`draft`: QuestionNoteOverride)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_enqueue_question_note_override(
+        it, FfiConverterTypeQuestionNoteOverride.lower(`draft`),_status)
+}
+    }
+    
+    
+
+    
+    /**
      * Export a plaintext, PWA-compatible snapshot of every live synced row. Note ciphertext is
      * decrypted inside the core; a single decryption failure aborts the entire export so neither
      * ciphertext nor a partial archive can cross the FFI. Local-only tables are never included.
@@ -3354,6 +3578,22 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     callWithPointer {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_get_note(
+        it, FfiConverterString.lower(`id`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * One question by id, or `None` if absent or soft-deleted.
+     */
+    @Throws(SyncException::class)override fun `getQuestion`(`id`: kotlin.String): QuestionRecord? {
+            return FfiConverterOptionalTypeQuestionRecord.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_get_question(
         it, FfiConverterString.lower(`id`),_status)
 }
     }
@@ -3476,6 +3716,22 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_list_notes(
         it, FfiConverterOptionalString.lower(`bookId`),FfiConverterUInt.lower(`limit`),FfiConverterUInt.lower(`offset`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * The SUR-996 question log, newest-first — every status, decrypted in core (SUR-1042).
+     */
+    @Throws(SyncException::class)override fun `listQuestions`(`limit`: kotlin.UInt, `offset`: kotlin.UInt): List<QuestionRecord> {
+            return FfiConverterSequenceTypeQuestionRecord.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_list_questions(
+        it, FfiConverterUInt.lower(`limit`),FfiConverterUInt.lower(`offset`),_status)
 }
     }
     )
@@ -3633,6 +3889,25 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_pull(
         it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * The effective note set of one question — `(auto ∪ includes) − excludes`, newest-first
+     * (SUR-1042). `now_ms` closes the active window of a question that has no `resolved_at`; the
+     * host supplies it so this stays a pure function of its inputs (see [`read::question_notes`]).
+     * An absent or soft-deleted question yields an empty set, never an error.
+     */
+    @Throws(SyncException::class)override fun `questionNotes`(`questionId`: kotlin.String, `nowMs`: kotlin.Long): List<NoteRecord> {
+            return FfiConverterSequenceTypeNoteRecord.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_question_notes(
+        it, FfiConverterString.lower(`questionId`),FfiConverterLong.lower(`nowMs`),_status)
 }
     }
     )
@@ -3899,6 +4174,40 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_set_access_token(
         it, FfiConverterString.lower(`jwt`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Write one synced user setting (SUR-1042) — braird's first synced settings, a per-user KV
+     * whose local pk is `key` (there is no `id` column).
+     *
+     * LWW lands per SETTING, not per settings-blob, which is the whole reason this is a standalone
+     * table rather than columns on `user_profiles`: one device changing prompt cadence cannot stomp
+     * another device's tone, and neither can stomp the server-authoritative quota/billing state on
+     * `user_profiles`. The rule going forward is that the server writes profiles and clients write
+     * settings.
+     *
+     * Untyped on purpose at this layer — `key` and `value` are strings, and SUR-1043 owns the typed
+     * `PromptSettings` façade (the key constants and the 72..=672 cadence clamp) on top. Putting the
+     * clamp here would split the settings vocabulary across two tickets for no gain.
+     * `value` is NOT optional, though the column is nullable. An `Option` here would have meant two
+     * different things depending on state: `insert_opt` omits a `None`, so on an existing setting
+     * the merge would keep the old value while bumping `updated_at` (a silent no-op), and on a new
+     * key it would create one with a NULL value. A `set` API whose effect depends on whether the row
+     * already exists is a trap. Clearing is not a use case — the two known keys (`prompt_cadence`,
+     * `prompt_tone`) always carry a value, and `deleted` already expresses removal — so the
+     * ambiguity is removed rather than defined. If a setting ever genuinely needs null-versus-absent,
+     * widen it then and write the `None` as an explicit JSON null, never as an omission.
+     */
+    @Throws(SyncException::class)override fun `setUserSetting`(`key`: kotlin.String, `value`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_set_user_setting(
+        it, FfiConverterString.lower(`key`),FfiConverterString.lower(`value`),_status)
 }
     }
     
@@ -5621,6 +5930,242 @@ public object FfiConverterTypePullSummary: FfiConverterRustBuffer<PullSummary> {
 
 
 /**
+ * One question↔note curation override (SUR-996 R1) — the user pinning a note onto a question, or
+ * excluding one the active-window join offered.
+ *
+ * Plaintext id pair, the same trade-off as `collection_memberships`: the question's *text* is
+ * sealed, the fact that it relates to a note is not. Its row id is **derived**, not carried —
+ * [`crate::store::override_id`] makes it `question_id:note_id` so two devices curating the same
+ * pair converge on one row.
+ *
+ * A record by API shape rather than arm64 necessity (four fields is nowhere near the 8-slot limit
+ * the SUR-843 guard enforces): the pair + kind is one concept, and passing it as one argument
+ * keeps the call site readable and the field names on the wire. Deliberately NOT named
+ * `QuestionNoteOverrideUpsert` — there is no `…Record` read model to pair against, because the
+ * effective note set is exposed as notes ([`SyncEngine::question_notes`]), never as raw override
+ * rows. The ticket specifies this name.
+ */
+data class QuestionNoteOverride (
+    var `questionId`: kotlin.String, 
+    var `noteId`: kotlin.String, 
+    /**
+     * `include` (pin a note the window missed) or `exclude` (drop one it offered). Not validated
+     * here — same forward-extensible-vocabulary reasoning as [`QuestionUpsert::status`].
+     */
+    var `kind`: kotlin.String, 
+    /**
+     * Soft-delete the override, returning the pair to whatever the active-window join says.
+     */
+    var `deleted`: kotlin.Boolean
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeQuestionNoteOverride: FfiConverterRustBuffer<QuestionNoteOverride> {
+    override fun read(buf: ByteBuffer): QuestionNoteOverride {
+        return QuestionNoteOverride(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: QuestionNoteOverride) = (
+            FfiConverterString.allocationSize(value.`questionId`) +
+            FfiConverterString.allocationSize(value.`noteId`) +
+            FfiConverterString.allocationSize(value.`kind`) +
+            FfiConverterBoolean.allocationSize(value.`deleted`)
+    )
+
+    override fun write(value: QuestionNoteOverride, buf: ByteBuffer) {
+            FfiConverterString.write(value.`questionId`, buf)
+            FfiConverterString.write(value.`noteId`, buf)
+            FfiConverterString.write(value.`kind`, buf)
+            FfiConverterBoolean.write(value.`deleted`, buf)
+    }
+}
+
+
+
+/**
+ * One question from the SUR-996 log (SUR-1042). `text` is **plaintext**, decrypted in core through
+ * the same [`decrypt_note_text`] gate `notes` uses, or `None` when the row failed to decrypt
+ * (`decrypt_failed = true`) — a corrupt or foreign-AAD question never fails the whole page, and
+ * ciphertext never crosses the FFI in its `enc:` form.
+ *
+ * `status` is `active | resolved | dismissed`; `checkin_response` is `active | resolved | new`.
+ * Both are read defensively as `Option` (like [`LensRecord`]'s `combinator`) even though
+ * `enqueue_question` always writes a status: the vocabulary is client-authored with no server
+ * CHECK, so a row written by a newer client must not panic an older read.
+ *
+ * Deliberately NO note count or active-date-range field — those are Lexicon presentation shapes and
+ * belong to SUR-1044, which builds them on [`question_notes`] rather than beside it.
+ */
+data class QuestionRecord (
+    var `id`: kotlin.String, 
+    var `text`: kotlin.String?, 
+    var `decryptFailed`: kotlin.Boolean, 
+    var `status`: kotlin.String?, 
+    var `tone`: kotlin.String?, 
+    var `resolvedAt`: kotlin.Long?, 
+    var `checkinAt`: kotlin.Long?, 
+    var `checkinResponse`: kotlin.String?, 
+    var `createdAt`: kotlin.Long, 
+    var `updatedAt`: kotlin.Long
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeQuestionRecord: FfiConverterRustBuffer<QuestionRecord> {
+    override fun read(buf: ByteBuffer): QuestionRecord {
+        return QuestionRecord(
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalLong.read(buf),
+            FfiConverterOptionalLong.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterLong.read(buf),
+            FfiConverterLong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: QuestionRecord) = (
+            FfiConverterString.allocationSize(value.`id`) +
+            FfiConverterOptionalString.allocationSize(value.`text`) +
+            FfiConverterBoolean.allocationSize(value.`decryptFailed`) +
+            FfiConverterOptionalString.allocationSize(value.`status`) +
+            FfiConverterOptionalString.allocationSize(value.`tone`) +
+            FfiConverterOptionalLong.allocationSize(value.`resolvedAt`) +
+            FfiConverterOptionalLong.allocationSize(value.`checkinAt`) +
+            FfiConverterOptionalString.allocationSize(value.`checkinResponse`) +
+            FfiConverterLong.allocationSize(value.`createdAt`) +
+            FfiConverterLong.allocationSize(value.`updatedAt`)
+    )
+
+    override fun write(value: QuestionRecord, buf: ByteBuffer) {
+            FfiConverterString.write(value.`id`, buf)
+            FfiConverterOptionalString.write(value.`text`, buf)
+            FfiConverterBoolean.write(value.`decryptFailed`, buf)
+            FfiConverterOptionalString.write(value.`status`, buf)
+            FfiConverterOptionalString.write(value.`tone`, buf)
+            FfiConverterOptionalLong.write(value.`resolvedAt`, buf)
+            FfiConverterOptionalLong.write(value.`checkinAt`, buf)
+            FfiConverterOptionalString.write(value.`checkinResponse`, buf)
+            FfiConverterLong.write(value.`createdAt`, buf)
+            FfiConverterLong.write(value.`updatedAt`, buf)
+    }
+}
+
+
+
+/**
+ * A question upsert draft (SUR-1042) — the record form of [`SyncEngine::enqueue_question`]'s
+ * arguments, and the entry point to the SUR-996 question log.
+ *
+ * A record by MARGIN, not because the SUR-843 guard would have caught the positional form — worth
+ * stating precisely, since the guard's whole value is that its reasoning is checkable. Nine fields,
+ * seven of which lower to by-value `RustBuffer`s (`String` and every `Option<T>`; `created_at: i64`
+ * and `deleted: bool` ride as plain scalars). Counted the way `scripts/check-ffi-arg-slots.mjs`
+ * counts — one integer slot per parameter, receiver first — a positional signature would put its
+ * last `RustBuffer` (`checkin_response`) at slot 8: exactly AT x7's boundary, so the guard, which
+ * fires above 8, would have stayed silent. **One more optional field would trip it**, and the
+ * failure mode is jna#1259 — a mis-marshalled by-value struct on arm64 that x86-64 CI and the
+ * desktop `:core-roundtrip` jar are both structurally blind to. Collapsing now costs nothing and
+ * removes the cliff.
+ *
+ * `plaintext` is the only field the Vault ever sees — it is sealed here (enc:v2, AAD = the question
+ * id) and the outbox holds ciphertext only. Named to pair with the read model
+ * [`read::QuestionRecord`] — `QuestionUpsert` in, `QuestionRecord` out.
+ *
+ * `plaintext: Some` is a full write. `plaintext: None` is a **metadata-only patch** of an existing
+ * row — answering a check-in, resolving, dismissing — which makes NO Vault call and omits `text`
+ * and `created_at`, preserving the stored ciphertext byte-for-byte. That split matters more here
+ * than on notes: every state transition after the first is metadata-only, so the common path must
+ * never re-seal (a re-seal with the same key and a fresh IV is harmless, but a re-seal from a host
+ * that no longer has the plaintext would blank the question).
+ *
+ * `status` is `active | resolved | dismissed` and `checkin_response` is `active | resolved | new`
+ * (SUR-1042 vocabulary — `live` and `still_open` are retired). Neither is validated here: the
+ * server has no CHECK constraint on them by deliberate design, because the vocabulary is
+ * client-authored and forward-extensible, and a core that rejected a newer client's value would
+ * reintroduce exactly the coupling that decision avoided.
+ */
+data class QuestionUpsert (
+    var `id`: kotlin.String, 
+    /**
+     * The question text. `Some` → sealed here (enc:v2, AAD = [`id`]). `None` → metadata-only patch.
+     */
+    var `plaintext`: kotlin.String?, 
+    var `status`: kotlin.String?, 
+    var `tone`: kotlin.String?, 
+    var `resolvedAt`: kotlin.Long?, 
+    var `checkinAt`: kotlin.Long?, 
+    var `checkinResponse`: kotlin.String?, 
+    var `createdAt`: kotlin.Long, 
+    var `deleted`: kotlin.Boolean
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeQuestionUpsert: FfiConverterRustBuffer<QuestionUpsert> {
+    override fun read(buf: ByteBuffer): QuestionUpsert {
+        return QuestionUpsert(
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalLong.read(buf),
+            FfiConverterOptionalLong.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterLong.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: QuestionUpsert) = (
+            FfiConverterString.allocationSize(value.`id`) +
+            FfiConverterOptionalString.allocationSize(value.`plaintext`) +
+            FfiConverterOptionalString.allocationSize(value.`status`) +
+            FfiConverterOptionalString.allocationSize(value.`tone`) +
+            FfiConverterOptionalLong.allocationSize(value.`resolvedAt`) +
+            FfiConverterOptionalLong.allocationSize(value.`checkinAt`) +
+            FfiConverterOptionalString.allocationSize(value.`checkinResponse`) +
+            FfiConverterLong.allocationSize(value.`createdAt`) +
+            FfiConverterBoolean.allocationSize(value.`deleted`)
+    )
+
+    override fun write(value: QuestionUpsert, buf: ByteBuffer) {
+            FfiConverterString.write(value.`id`, buf)
+            FfiConverterOptionalString.write(value.`plaintext`, buf)
+            FfiConverterOptionalString.write(value.`status`, buf)
+            FfiConverterOptionalString.write(value.`tone`, buf)
+            FfiConverterOptionalLong.write(value.`resolvedAt`, buf)
+            FfiConverterOptionalLong.write(value.`checkinAt`, buf)
+            FfiConverterOptionalString.write(value.`checkinResponse`, buf)
+            FfiConverterLong.write(value.`createdAt`, buf)
+            FfiConverterBoolean.write(value.`deleted`, buf)
+    }
+}
+
+
+
+/**
  * One fused search result. The shape of [`SearchHit`] (same `kind`/`ref_id`/`title`/
  * `snippet` display fields, hydrated from the same decrypted corpus) plus the fusion
  * verdict: `score` is the reciprocal-rank-fusion (RRF) score — the per-engine raw scores are
@@ -6714,6 +7259,38 @@ public object FfiConverterOptionalTypeNoteRecord: FfiConverterRustBuffer<NoteRec
 /**
  * @suppress
  */
+public object FfiConverterOptionalTypeQuestionRecord: FfiConverterRustBuffer<QuestionRecord?> {
+    override fun read(buf: ByteBuffer): QuestionRecord? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeQuestionRecord.read(buf)
+    }
+
+    override fun allocationSize(value: QuestionRecord?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeQuestionRecord.allocationSize(value)
+        }
+    }
+
+    override fun write(value: QuestionRecord?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeQuestionRecord.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceFloat: FfiConverterRustBuffer<List<kotlin.Float>> {
     override fun read(buf: ByteBuffer): List<kotlin.Float> {
         val len = buf.getInt()
@@ -7040,6 +7617,34 @@ public object FfiConverterSequenceTypeNoteRecord: FfiConverterRustBuffer<List<No
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeNoteRecord.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeQuestionRecord: FfiConverterRustBuffer<List<QuestionRecord>> {
+    override fun read(buf: ByteBuffer): List<QuestionRecord> {
+        val len = buf.getInt()
+        return List<QuestionRecord>(len) {
+            FfiConverterTypeQuestionRecord.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<QuestionRecord>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeQuestionRecord.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<QuestionRecord>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeQuestionRecord.write(it, buf)
         }
     }
 }
