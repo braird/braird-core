@@ -63,10 +63,10 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   obligation — the database dies with the job — and nothing is ever written to `braird-staging`. The
   two legs now split cleanly: the introspection answers *is the migration applied there*, this
   answers *does the DDL actually work*.
-  Deliberately raw PostgREST rather than `enqueue_* → flush`: these tables are registered but not yet
-  wired (`table_schema()` and `synced_table_names()` exclude them until SUR-1042), so probing the wire
-  directly proves the cloud side **before** core code is built on top of it. SUR-1042 upgrades the
-  same assertions onto the real outbox path.
+  Deliberately raw PostgREST rather than `enqueue_* → flush`: at the time it was written these tables
+  were registered but not yet wired, so probing the wire directly proved the cloud side **before** core
+  code was built on top of it. SUR-1042, in this same release, wires them and adds the outbox-path
+  round-trip alongside it.
 
 - **A native-first schema registry, so a table core authors itself is under contract from its first
   commit (SUR-1048).** The SUR-723 guard could only cover tables *derived* from surfc: `sync-schema.json`
@@ -125,8 +125,9 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   `timestamp`/`timestamptz` column is now **rejected** rather than normalised to `int`: PostgREST sends
   those as ISO strings, which `ColType::Int`'s `as_i64()` turns into NULL on every sync, so equating them
   with an epoch bigint would have let that ship green.
-  Registration only — these tables are created and locked, but deliberately absent from `table_schema()`
-  and the pull scope until SUR-1042 defines their encryption boundary and sync legs.
+  Registration only, as landed: the tables were created and locked but held out of `table_schema()` and
+  the pull scope until an encryption boundary existed for them. SUR-1042 supplies it in this same
+  release, so **as shipped in v0.15.0 they are fully wired** — see the question-entity entry above.
   Note for SUR-1047: `user_settings` must carry `deleted` (pull's tombstone gate reads it generically
   on every table), which amends SUR-996's `(user_id, key, value, updated_at)` sketch.
 
@@ -157,10 +158,10 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   problem: `vendored/schema/native-manifest.json` already uses `backend: live` for a table's
   **migration lifecycle**, so a reader of these two files met one word meaning two unrelated things.
   `checkin_response` moves `still_open` → `active` for the same one-word-per-concept reason.
-  This is a **registry-only change** — `store::native_schema()`, both vendored fixtures, and the
-  SUR-1049 integration test's payloads. The tables are still deliberately absent from
-  `table_schema()` and `synced_table_names()`; the seal boundary and the sync legs remain SUR-1042's
-  next PRs, and `tests/schema_parity.rs`'s boundary test still guards that gap.
+  The rename itself was a **registry-only change** — `store::native_schema()`, both vendored fixtures,
+  and the SUR-1049 integration test's payloads — landed ahead of the wiring so the seal boundary could
+  be reviewed on its own commit. Both halves are in **this** release: **as shipped in v0.15.0 the three
+  tables resolve through `table_schema()` and are in the flush and pull scope.**
   **Paired with surfc migration `0056`, and the two are not independent.** This runs SUR-1048's
   handshake in the opposite direction from SUR-1047's: there, the cloud caught up with the registry
   and the manifest flipped `pending → live`; here the cloud moves *first*, so from the moment `0056`
