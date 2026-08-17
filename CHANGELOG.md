@@ -165,13 +165,13 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   **Paired with surfc migration `0056`, and the two are not independent.** This runs SUR-1048's
   handshake in the opposite direction from SUR-1047's: there, the cloud caught up with the registry
   and the manifest flipped `pending → live`; here the cloud moves *first*, so from the moment `0056`
-  is applied to braird-staging, `scripts/check-native-schema.mjs` fails on every core PR (finding
-  `questions` where the fixture still said `open_questions`) until this merges. That red window is
-  the coordination signal, but it is repo-wide CI — land this immediately after the staging apply,
-  and don't open it alongside an unrelated core PR.
-  Free exactly once: no shipped release contains these tables (`braird-core.lock` pins v0.14.0; they
-  landed after that tag), so no device has an `open_questions` table to migrate. After the sync legs
-  ship, the same rename is a coordinated three-repo data migration.
+  was applied to braird-staging, `scripts/check-native-schema.mjs` failed on every core PR (finding
+  `questions` where the fixture still said `open_questions`) until the registry caught up. That red
+  window was the coordination signal, and because it is repo-wide CI the two were landed back to back.
+  Free exactly once, and **v0.15.0 is the release that spends it**: no *earlier* release contained
+  these tables (`braird-core.lock` pinned v0.14.0 and they landed after that tag), so at rename time
+  no device had an `open_questions` table to migrate. From this release onward the same rename would
+  be a coordinated three-repo data migration.
 
 - **The three native-first tables are now `backend: live` — the staging DDL check runs against them
   for real (SUR-1047).** SUR-1047's migration has been applied to `braird-staging`, so
