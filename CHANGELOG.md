@@ -39,7 +39,10 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   to round-trip. Completeness of a release is judged PER CONSUMER, against the artifacts that
   consumer pins, rather than against a fixed asset count — the published set is 3, 5 and 7 assets
   across 27 releases because it grew with the product, so a fixed count would call nine historical
-  releases broken.
+  releases broken. The consumer config reaches the rules by SPREAD rather than being rebuilt field by
+  field, because rebuilding it silently dropped the asset requirements and left the rule dead in
+  production while the corpus — whose fixtures construct consumers by hand — went on passing. A
+  plumbing assertion now covers that seam directly.
   **The privileged and unprivileged halves are separate workflows**, and that split is a security
   boundary rather than tidiness. The staleness run reads a token for two private repositories from a
   public repo, so it is `schedule` + `workflow_dispatch` only and takes the token from an environment

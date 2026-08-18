@@ -393,12 +393,30 @@ function securityFirstSeenSince(tag) {
   return runStart === null ? null : git('log', '-1', '--format=%cI', runStart);
 }
 
+/**
+ * One `CONSUMERS` entry plus the contents of its pin file (or null when it could not be read) → the
+ * shape [`evaluate`] consumes.
+ *
+ * **Everything except the reading instructions is carried through by spread, deliberately.** An
+ * earlier version destructured `{ repo, file, tag }` and rebuilt the result field by field, which
+ * silently dropped `assets` — so the per-consumer completeness rule was dead in production while the
+ * corpus, whose fixtures build consumer objects by hand, went on passing. Spreading means a field
+ * added to `CONSUMERS` reaches `evaluate` without anyone remembering this function exists.
+ *
+ * Split out of the filesystem walk so the corpus can assert that, which is the only way to test a
+ * seam whose whole failure mode is losing a field between two halves that each work.
+ */
+export function consumerFromFile(config, contents) {
+  const { file, tag, ...carried } = config; // `carried` is repo + assets + anything added later
+  if (contents === null) return { ...carried, error: `${file} could not be read` };
+  const m = tag.exec(contents);
+  return m ? { ...carried, pinnedTag: m[1] } : { ...carried, error: `no tag line matched in ${file}` };
+}
+
 function readConsumers(dir) {
-  return CONSUMERS.map(({ repo, file, tag }) => {
-    const path = join(dir, repo, file);
-    if (!existsSync(path)) return { repo, error: `${file} not found under ${join(dir, repo)}` };
-    const m = tag.exec(readFileSync(path, 'utf8'));
-    return m ? { repo, pinnedTag: m[1] } : { repo, error: `no tag line matched in ${file}` };
+  return CONSUMERS.map((config) => {
+    const path = join(dir, config.repo, config.file);
+    return consumerFromFile(config, existsSync(path) ? readFileSync(path, 'utf8') : null);
   });
 }
 
@@ -584,8 +602,35 @@ const CORPUS = [
   },
 ];
 
+/**
+ * The corpus drives `evaluate` with hand-built consumer objects, so it can never notice the real
+ * `CONSUMERS` config losing a field on its way there. These assertions cover exactly that seam:
+ * every declared requirement must survive `consumerFromFile`, whatever the pin file said.
+ */
+function checkConsumerPlumbing() {
+  const problems = [];
+  for (const config of CONSUMERS) {
+    const cases = [
+      ['a pin it could read', consumerFromFile(config, `tag = v1.0.0\nBRAIRD_CORE_TAG=v1.0.0\n`)],
+      ['a pin it could not read', consumerFromFile(config, null)],
+      ['a pin with no tag line', consumerFromFile(config, 'nothing useful here')],
+    ];
+    for (const [what, got] of cases) {
+      if (got.repo !== config.repo) problems.push(`${config.repo}: ${what} lost \`repo\``);
+      if (!Array.isArray(got.assets) || got.assets.length !== config.assets.length) {
+        problems.push(`${config.repo}: ${what} lost \`assets\` — the completeness rule would be dead in production`);
+      }
+    }
+  }
+  return problems;
+}
+
 function selfCheck() {
   let failed = 0;
+  for (const problem of checkConsumerPlumbing()) {
+    failed += 1;
+    console.error(`  FAIL consumer plumbing — ${problem}`);
+  }
   for (const { name, input, expect, detail } of CORPUS) {
     const findings = evaluate({
       published: PUB,
@@ -608,7 +653,7 @@ function selfCheck() {
     console.error(`check-release-staleness: self-check FAILED (${failed}/${CORPUS.length})`);
     process.exit(1);
   }
-  console.log(`check-release-staleness: self-check OK (${CORPUS.length} cases)`);
+  console.log(`check-release-staleness: self-check OK (${CORPUS.length} cases + consumer plumbing)`);
 }
 
 // ── entry ─────────────────────────────────────────────────────────────────────
