@@ -9,23 +9,25 @@ use crate::CryptoError;
 const SENTINEL_V1: &str = "enc:v1:";
 const SENTINEL_V2: &str = "enc:v2:";
 
-/// Structural check: does this stored `text` carry an `enc:v1`/`enc:v2` sentinel? Mirrors the
-/// PWA's `isEncrypted()` — a prefix test only, it does NOT attempt decryption. The read API
-/// (SUR-744) uses it to decide whether a `notes.text` needs `decrypt_note` (ciphertext at rest)
-/// or is already plaintext/empty, so an unencrypted or empty note is never mislabelled a decrypt
-/// failure, and a genuine ciphertext value can never leak across the FFI undecrypted.
+/// Structural check for ANY sealed format, `enc:v1` or `enc:v2`.
+///
+/// **One legitimate caller: the snapshot export** ([`crate::sync::read::decrypt_note_text_for_archive`]).
+/// Do not reach for this on a display path. v1 carries no AAD, so [`decrypt_note`] opens a v1 payload
+/// under ANY id, and a read that renders the result cannot claim the content belongs to that row —
+/// the hole SUR-1070 closed. Use [`is_encrypted_v2`] anywhere the answer becomes visible text.
 pub fn is_encrypted(value: &str) -> bool {
     value.starts_with(SENTINEL_V1) || value.starts_with(SENTINEL_V2)
 }
 
-/// Structural check for the **AAD-bound** format specifically (SUR-1042). Narrower than
-/// [`is_encrypted`] on purpose: `enc:v1` carries no AAD, so [`decrypt_note`] opens a v1 payload
-/// under ANY id — the id argument is ignored entirely on that branch. For `notes` that is required
-/// legacy-read behaviour; for a surface with no legacy corpus it is a hole, because the
-/// transplant protection v2 exists to give is silently absent.
+/// Structural check for the AAD-bound format. `enc:v1` is deliberately NOT accepted: it carries no
+/// AAD, so [`decrypt_note`] opens a v1 payload under ANY id — the id argument is ignored entirely on
+/// that branch. Any caller asking "is this ciphertext bound to THIS row?" must gate on this.
 ///
-/// Callers that need "this ciphertext is bound to THIS row" must gate on this, not on
-/// [`is_encrypted`].
+/// There is no longer a looser `is_encrypted` companion. It existed to mirror the PWA's
+/// `isEncrypted()` and accepted v1 and, by omission, made the permissive read gate easy to write —
+/// which is the hole SUR-1070 closed. A helper whose only remaining use was the wrong one is worse
+/// than no helper. Reintroduce a v1-aware check only with a caller that genuinely needs v1, and name
+/// it so the difference is unmissable.
 pub fn is_encrypted_v2(value: &str) -> bool {
     value.starts_with(SENTINEL_V2)
 }

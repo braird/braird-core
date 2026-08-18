@@ -5,7 +5,7 @@ use serde_json::{json, Map, Value};
 use time::{macros::format_description, OffsetDateTime};
 
 use crate::store::Store;
-use crate::sync::read::decrypt_note_text;
+use crate::sync::read::decrypt_note_text_for_archive;
 use crate::sync::SyncError;
 use crate::vault::Vault;
 
@@ -187,7 +187,7 @@ fn map_fields(row: &Map<String, Value>, fields: &[(&str, &str)]) -> Value {
 }
 
 /// Map one live note row to its PWA shape, resolving `text` through the SAME rule the read path uses
-/// ([`decrypt_note_text`]) rather than a second, weaker copy of it (SUR-934).
+/// ([`decrypt_note_text_for_archive`]) rather than a second, weaker copy of it (SUR-934).
 ///
 /// Only ONE of that rule's four cases is a decryption. A `text` that is NULL, empty, or simply not
 /// sealed (no `enc:` sentinel — a supported legacy shape) has nothing to decrypt and must map straight
@@ -200,7 +200,7 @@ fn map_fields(row: &Map<String, Value>, fields: &[(&str, &str)]) -> Value {
 /// plaintext, and never a silently dropped row — see `docs/snapshots.md`.
 fn map_note(row: &Map<String, Value>, vault: &Vault) -> Result<Value, SyncError> {
     let id = row.get("id").and_then(Value::as_str).unwrap_or_default();
-    let (text, decrypt_failed) = decrypt_note_text(row, id, vault);
+    let (text, decrypt_failed) = decrypt_note_text_for_archive(row, id, vault);
     if decrypt_failed {
         return Err(SyncError::Store(
             "snapshot export note decryption failed".into(),
@@ -369,7 +369,7 @@ mod tests {
     }
 
     /// REGRESSION (SUR-934, found on-device by SUR-882): `map_note` used to decrypt `text`
-    /// unconditionally, so the three shapes `read.rs::decrypt_note_text` explicitly treats as
+    /// unconditionally, so the three shapes `read.rs::decrypt_note_text_for_archive` explicitly treats as
     /// NOT-a-failure each aborted the WHOLE export:
     ///
     /// - `text` NULL — `unwrap_or_default()` coerced it to `""`, then `decrypt("")` → Err

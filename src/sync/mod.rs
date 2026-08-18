@@ -4385,7 +4385,37 @@ mod tests {
     }
 
     #[test]
-    fn a_question_read_rejects_anything_that_is_not_enc_v2() {
+    fn the_archive_still_accepts_what_the_display_now_refuses() {
+        // The SUR-1070 asymmetry, pinned so it stays a decision. Tightening the shared gate for the
+        // export too would have turned one unsealed row into "this user cannot export at all" —
+        // re-creating the SUR-934 bug, where manufactured decrypt errors aborted an archive every
+        // screen could read. A display renders content as the user's own, so unbound text is an
+        // injection surface; an export copies the store as it stands, and dropping a row destroys
+        // data the user already holds.
+        let vault = Vault::generate();
+        let store = Store::open_in_memory().unwrap();
+        let v1 = vault.encrypt_note(None, "sealed under no id".into());
+
+        for (id, text) in [("n1", v1.as_str()), ("n2", "never sealed at all")] {
+            let row = json!({
+                "id": id, "text": text, "tags": [],
+                "created_at": 1, "updated_at": 1, "deleted": false
+            });
+            store.apply_row("notes", row.as_object().unwrap()).unwrap();
+
+            // Display refuses…
+            let shown = read::get_note(&store, &vault, id).unwrap().unwrap();
+            assert!(shown.decrypt_failed, "{id} must not display");
+
+            // …the archive does not, and above all does not abort.
+            let stored = store.get_row("notes", id).unwrap().unwrap();
+            let (archived, failed) = read::decrypt_note_text_for_archive(&stored, id, &vault);
+            assert!(!failed, "{id} must never fail the export");
+            assert!(archived.is_some(), "{id} must survive into the archive");
+        }
+    }
+    #[test]
+    fn note_and_question_reads_both_require_enc_v2() {
         // Codex P1. `decrypt_note_text` (the notes gate) accepts enc:v1, plaintext and empty —
         // all three unbindable to a question id. enc:v1 is the sharp one: `decrypt_note` passes
         // `aad: None` on that branch and IGNORES the id entirely, so a v1 blob lifted from anywhere
@@ -4415,18 +4445,43 @@ mod tests {
             );
         }
 
-        // …and the notes gate is deliberately NOT tightened: v1 is a real legacy corpus there.
-        let note_row = json!({
-            "id": "n1", "text": v1, "tags": [],
+        // NOTES take the same strict rule as of SUR-1070 (founder confirmed 2026-08-18 that neither
+        // a plaintext nor an enc:v1 notes corpus remains). v1 is the sharp case: it decrypts
+        // successfully but under NO id, so accepting it let an actor with server write access move
+        // one of the user's own notes onto a different note's id.
+        for (case, text) in [
+            ("enc:v1", v1.as_str()),
+            ("plaintext", "a legacy note stored as plaintext"),
+        ] {
+            let note_row = json!({
+                "id": "n1", "text": text, "tags": [],
+                "created_at": 1, "updated_at": 1, "deleted": false
+            });
+            store
+                .apply_row("notes", note_row.as_object().unwrap())
+                .unwrap();
+            let note = read::get_note(&store, &vault, "n1").unwrap().unwrap();
+            assert!(
+                note.decrypt_failed && note.text.is_none(),
+                "a {case} note must not render as the user's own text"
+            );
+        }
+
+        // The ONE note-only concession survives: `notes.text` carries `default ''` in surfc's
+        // schema, so an empty string is a degraded stored state, not a crypto defect. It discloses
+        // nothing and injects nothing. `questions.text` is NOT NULL with no default, which is why
+        // the empty case above fails there and passes here.
+        let empty_note = json!({
+            "id": "n2", "text": "", "tags": [],
             "created_at": 1, "updated_at": 1, "deleted": false
         });
         store
-            .apply_row("notes", note_row.as_object().unwrap())
+            .apply_row("notes", empty_note.as_object().unwrap())
             .unwrap();
-        let note = read::get_note(&store, &vault, "n1").unwrap().unwrap();
-        assert_eq!(note.text.as_deref(), Some("lifted from somewhere else"));
+        let note = read::get_note(&store, &vault, "n2").unwrap().unwrap();
+        assert_eq!(note.text.as_deref(), Some(""));
+        assert!(!note.decrypt_failed);
     }
-
     #[test]
     fn a_metadata_patch_for_a_question_that_was_never_created_is_rejected() {
         // Codex P2. Staged unconditionally this inserted a live row with NULL text, which read back
