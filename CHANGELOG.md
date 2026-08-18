@@ -61,6 +61,12 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   `[Unreleased]` heading is renamed away (the signal reads an empty string and never fires), a
   release whose `published_at` is in the future, and `--consumers` omitted, which disabled the
   pin signal entirely while still exiting 0. All three are now findings or hard errors.
+  The consumer lag range is derived from the PUBLISHED RELEASES rather than the CHANGELOG, since a
+  release published with a missing or misspelled heading is still one a consumer must pin — the
+  CHANGELOG supplies only severity, and an undocumented release takes the short deadline because
+  unknown severity must not buy the long one. Fenced blocks are excluded from section parsing so a
+  fenced example heading cannot steal an entry; HTML comments and exotic Markdown are an accepted
+  miss pinned by a corpus row, following the boundary `check-stale-release-markers.mjs` set.
   **The privileged and unprivileged halves are separate workflows**, and that split is a security
   boundary rather than tidiness. The staleness run reads a token for two private repositories from a
   public repo, so it is `schedule` + `workflow_dispatch` only and takes the token from an environment

@@ -62,6 +62,13 @@ const DAY_MS = 86_400_000;
 const MANIFEST_ASSET = 'SHA256SUMS.txt';
 
 /**
+ * Stand-in body for a published release with no CHANGELOG section. It reads as security work on
+ * purpose: unknown severity takes the short deadline, because the alternative lets a missing heading
+ * buy the long one.
+ */
+const UNKNOWN_SEVERITY = '### Security\n';
+
+/**
  * Days a stalled hop is allowed before this fails, by whether security work is caught in it.
  *
  * Compared with `>=`, not `>`. `ageDays` floors, so a strict comparison quietly bought an extra day:
@@ -104,9 +111,31 @@ const CONSUMERS = [
  *
  * The heading's date tail is kept, not discarded: it is the only thing that can date a section whose
  * release was never published, which is precisely the case signal (2) has to age.
+ *
+ * BOUNDARY, and it is the one `check-stale-release-markers.mjs` already argued out in this repo.
+ * Fenced blocks are excluded, because a fenced example of a heading is something maintainers write
+ * by accident. Indented code blocks, HTML comments and exotic Markdown are NOT, because resisting
+ * those means reimplementing a CommonMark renderer inside a release script — the road that file
+ * records as having no end (35 findings, each locally valid, the series divergent). The accepted
+ * miss is pinned as a corpus row rather than left as folklore.
  */
 export function parseChangelog(text) {
-  const parts = text.split(/^## \[([^\]]+)\]([^\n]*)$/m);
+  // Blank fenced blocks before splitting. A fenced example of a `## [1.2.0]` heading inside
+  // `[Unreleased]` would otherwise read as a real section boundary, filing everything after it —
+  // including a genuine `### Security` — under an already-released version, leaving two signals
+  // green. Fence markers themselves are kept so the toggling stays legible.
+  let fenced = false;
+  const outsideFences = text
+    .split('\n')
+    .map((line) => {
+      if (/^\s*(```|~~~)/.test(line)) {
+        fenced = !fenced;
+        return line;
+      }
+      return fenced ? '' : line;
+    })
+    .join('\n');
+  const parts = outsideFences.split(/^## \[([^\]]+)\]([^\n]*)$/m);
   // parts[0] is the preamble; thereafter [version, headingTail, body, version, headingTail, ...].
   const sections = [];
   for (let i = 1; i < parts.length; i += 3) {
@@ -304,6 +333,19 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
     }
   }
 
+  // A published release with no CHANGELOG section is reported in its own right. It is not itself a
+  // staleness state, but it is the condition that used to HIDE one: the pin range was derived from
+  // the CHANGELOG, so an undocumented release was invisible to it.
+  const documented = new Set(released.map((sec) => sec.version));
+  for (const version of [...published.keys()].sort()) {
+    if (!documented.has(version)) {
+      add(
+        'unpublished',
+        `release ${version} is published but has no CHANGELOG section — invisible to anything reading the CHANGELOG`,
+      );
+    }
+  }
+
   // (3) UNPINNED — a consumer trailing a published release.
   for (const { repo, pinnedTag, error, assets } of consumers) {
     if (error) {
@@ -331,11 +373,25 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
           'a clean build cannot fetch what it is pinned to',
       );
     }
-    const behind = releasesAfter(released, pinnedTag);
-    if (behind === null) {
+    // The behind-range comes from the PUBLISHED RELEASES, not from the CHANGELOG. A release
+    // published with a misspelled or missing heading is still a release a consumer can and should
+    // pin; deriving the range from CHANGELOG sections meant such a release never entered `behind`,
+    // so the consumer sat on an old version and was reported as current. The CHANGELOG is consulted
+    // only for SEVERITY, which is the one thing the release metadata does not carry.
+    const from = parseVersion(pinnedTag);
+    if (!from) {
       add('unpinned', `${repo}: unparseable pinned tag ${JSON.stringify(pinnedTag)}`);
       continue;
     }
+    const sectionFor = new Map(released.map((sec) => [sec.version, sec]));
+    const behind = [...published.keys()]
+      .filter((version) => {
+        const v = parseVersion(version);
+        return v && compareVersions(v, from) > 0;
+      })
+      // An UNDOCUMENTED release has unknown severity, so it takes the SHORT deadline. Fail-closed:
+      // the alternative lets a missing heading quietly buy an extra 23 days.
+      .map((version) => sectionFor.get(version) ?? { version, date: null, body: UNKNOWN_SEVERITY });
     // A release only counts against a consumer if it actually carries THAT consumer's artifacts. A
     // partial upload, or an asset deleted after the fact, must not become "you are behind, go pin
     // this" for a release with no AAR or no xcframework in it.
@@ -741,7 +797,11 @@ const CORPUS = [
   // ── self-audit: three more states this could have been silent in ──
   {
     name: 'a CHANGELOG with no [Unreleased] heading is reported, not read as "no security work"',
-    input: { changelog: '## [1.2.0] - 2026-01-01\n\n### Security\n- x\n', now: '2026-01-02T00:00:00Z' },
+    input: {
+      changelog: '## [1.2.0] - 2026-01-01\n\n### Security\n- x\n',
+      published: new Map(), // isolate the heading check from the undocumented-release check
+      now: '2026-01-02T00:00:00Z',
+    },
     expect: ['unreleased'],
   },
   {
@@ -753,6 +813,54 @@ const CORPUS = [
       now: '2026-01-15T00:00:00Z',
     },
     detail: /in the FUTURE/,
+  },
+  // ── the CHANGELOG is not the register of what EXISTS (Codex P2, seventh round) ──
+  {
+    name: 'a published release with a missing heading still counts against a consumer',
+    input: {
+      changelog: '## [Unreleased]\n\n### Fixed\n- x\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
+      published: PUB, // 1.2.0 is published but has no section
+      consumers: [{ ...APP, pinnedTag: 'v1.1.0' }],
+      now: '2026-06-01T00:00:00Z',
+    },
+    // Two findings: the undocumented release, and the consumer behind it that used to be invisible.
+    expect: ['unpublished', 'unpinned'],
+  },
+  {
+    name: 'an undocumented release takes the SHORT deadline — unknown severity is not "routine"',
+    input: {
+      changelog: '## [Unreleased]\n\n### Fixed\n- x\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
+      published: PUB,
+      consumers: [{ ...APP, pinnedTag: 'v1.1.0' }],
+      now: '2026-01-09T00:00:00Z', // 8 days: past 7, well inside 30
+    },
+    expect: ['unpublished', 'unpinned'],
+  },
+  // ── a fenced example is not a section boundary (Codex P2, seventh round) ──
+  {
+    name: 'a fenced example heading inside [Unreleased] does not steal the Security entry',
+    input: {
+      changelog:
+        '## [Unreleased]\n\n```\n## [1.1.0] - 2025-12-01\n```\n\n### Security\n- a real fix\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
+      published: new Map([['1.1.0', rel('1.1.0', '2025-12-01T00:00:00Z')]]),
+      unreleasedSecuritySince: '2026-01-01T00:00:00Z',
+      now: '2026-03-01T00:00:00Z',
+    },
+    expect: ['unreleased'],
+  },
+  {
+    // ACCEPTED MISS, pinned so the boundary is executable rather than folklore — the convention
+    // `check-stale-release-markers.mjs` set for exactly this argument. An HTML-comment example still
+    // fools the split, and resisting it means a CommonMark renderer.
+    name: 'accepted miss: an HTML-comment example heading is NOT excluded',
+    input: {
+      changelog:
+        '## [Unreleased]\n\n<!--\n## [1.1.0] - 2025-12-01\n-->\n\n### Security\n- a real fix\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
+      published: new Map([['1.1.0', rel('1.1.0', '2025-12-01T00:00:00Z')]]),
+      unreleasedSecuritySince: '2026-01-01T00:00:00Z',
+      now: '2026-03-01T00:00:00Z',
+    },
+    expect: [], // documented, not desired — see the boundary note on parseChangelog
   },
   // ── prerelease precedence (Codex P2 on PR #93) ──
   {
