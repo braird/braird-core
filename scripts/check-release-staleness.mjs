@@ -84,21 +84,31 @@ const DEADLINE_DAYS = { security: 7, routine: 30 };
  * `assets` is a FUNCTION OF THE VERSION, not a set of extension patterns. Release artifacts carry
  * the version in the filename (`braird-core-0.15.1.aar`), so an extension match would accept a
  * `v1.2.0` release that only contains a stale `braird-core-1.1.0.aar` — the checker would then tell
- * a consumer to pin a version whose downloads do not exist. `BrairdCore.swift` is genuinely
- * unversioned and is listed literally.
+ * a consumer to pin a version whose downloads do not exist. `BrairdCore.swift` and the canon pair
+ * are genuinely unversioned and are listed literally.
+ *
+ * The list is "what this lock file pins", not "what this platform builds" — that is the only
+ * definition that answers the question being asked. Both locks carry checksums for
+ * `great-ideas.json` and `idea-tree.yaml` (`ideaTreeYaml.sha256` / `BRAIRD_CORE_IDEA_TREE_SHA256`),
+ * so a release missing the canon pair cannot complete the documented pin flow even though its
+ * binary is present. Add a row here whenever a lock gains a checksum, or this drifts silently.
  */
+const CANON_ASSETS = ['great-ideas.json', 'idea-tree.yaml'];
+
 const CONSUMERS = [
   {
     repo: 'braird-android',
     file: 'gradle/braird-core.lock',
     tag: /^\s*tag\s*=\s*(v\S+)\s*$/m,
-    assets: (v) => [`braird-core-${v}.aar`, `braird-core-desktop-${v}.jar`],
+    checksum: /^\s*[A-Za-z]+\.sha256\s*=/gm,
+    assets: (v) => [`braird-core-${v}.aar`, `braird-core-desktop-${v}.jar`, ...CANON_ASSETS],
   },
   {
     repo: 'braird-ios',
     file: 'braird-core.lock',
     tag: /^\s*BRAIRD_CORE_TAG\s*=\s*(v\S+)\s*$/m,
-    assets: (v) => [`braird-core-${v}.xcframework.zip`, 'BrairdCore.swift'],
+    checksum: /^\s*[A-Z_]+_SHA256\s*=/gm,
+    assets: (v) => [`braird-core-${v}.xcframework.zip`, 'BrairdCore.swift', ...CANON_ASSETS],
   },
 ];
 
@@ -388,7 +398,7 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
   }
 
   // (3) UNPINNED — a consumer trailing a published release.
-  for (const { repo, pinnedTag, error, assets } of consumers) {
+  for (const { repo, pinnedTag, error, assets, checksumCount } of consumers) {
     if (error) {
       add('unpinned', `${repo}: pin could not be read (${error})`);
       continue;
@@ -397,6 +407,16 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
     // pin written ahead of the release it expects — parses fine and sorts above every section, so
     // `behind` comes back empty and the consumer reads as perfectly current forever. Silence is the
     // one answer this checker must never give by accident.
+    // The lock is the authority on what this consumer fetches. If it pins more checksums than this
+    // script knows to require, the extra artifacts are unwatched — and nothing else would say so.
+    const required = typeof assets === 'function' ? assets('0.0.0').length : 0;
+    if (checksumCount !== undefined && checksumCount !== required) {
+      add(
+        'unpinned',
+        `${repo}: its lock pins ${checksumCount} checksums but this checker requires ${required} ` +
+          'assets — the difference is unwatched; update CONSUMERS in check-release-staleness.mjs',
+      );
+    }
     const pinnedVersion = String(pinnedTag).replace(/^v/, '');
     if (!published.has(pinnedVersion)) {
       add('unpinned', `${repo}: pins ${pinnedTag}, which is not a published release — it cannot be fetched`);
@@ -579,10 +599,14 @@ function securityFirstSeenSince(tag) {
  * seam whose whole failure mode is losing a field between two halves that each work.
  */
 export function consumerFromFile(config, contents) {
-  const { file, tag, ...carried } = config; // `carried` is repo + assets + anything added later
+  const { file, tag, checksum, ...carried } = config; // `carried` is repo + assets + later additions
   if (contents === null) return { ...carried, error: `${file} could not be read` };
   const m = tag.exec(contents);
-  return m ? { ...carried, pinnedTag: m[1] } : { ...carried, error: `no tag line matched in ${file}` };
+  if (!m) return { ...carried, error: `no tag line matched in ${file}` };
+  // How many artifacts the lock ACTUALLY pins, read from the lock rather than assumed. The `assets`
+  // list above is hand-maintained, and a comment telling the next person to update it is not a
+  // check — review found the canon pair missing from it exactly that way.
+  return { ...carried, pinnedTag: m[1], checksumCount: (contents.match(checksum) ?? []).length };
 }
 
 function readConsumers(dir) {
@@ -854,6 +878,31 @@ const CORPUS = [
       now: '2026-01-15T00:00:00Z',
     },
     detail: /in the FUTURE/,
+  },
+  // ── the LOCK is the authority on what a consumer fetches, not this file's config ──
+  {
+    name: 'a lock pinning more checksums than the config requires is reported as unwatched',
+    input: {
+      changelog: CL.quiet,
+      consumers: [{ ...APP, pinnedTag: 'v1.2.0', checksumCount: 4 }], // APP requires 1 asset
+      now: '2026-01-02T00:00:00Z',
+    },
+    detail: /pins 4 checksums but this checker requires 1/,
+  },
+  // ── a consumer needs every asset its LOCK pins, binary or not (Codex P2, tenth round) ──
+  {
+    name: 'a release with the binary but not the canon pair is not pinnable',
+    input: {
+      changelog: CL.quiet,
+      published: new Map([
+        ['1.1.0', rel('1.1.0', '2025-12-01T00:00:00Z', ['SHA256SUMS.txt', 'app-1.1.0.bin', 'canon.json'])],
+        // Binary present, canon deleted — the documented pin flow cannot complete.
+        ['1.2.0', rel('1.2.0', '2026-01-01T00:00:00Z', ['SHA256SUMS.txt', 'app-1.2.0.bin'])],
+      ]),
+      consumers: [{ repo: 'app', assets: (v) => [`app-${v}.bin`, 'canon.json'], pinnedTag: 'v1.1.0' }],
+      now: '2026-06-01T00:00:00Z',
+    },
+    detail: /published but incomplete/,
   },
   // ── two [Unreleased] headings hide everything under the second (Codex P2, ninth round) ──
   {
