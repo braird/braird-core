@@ -276,6 +276,14 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
       add('unpinned', `${repo}: pin could not be read (${error})`);
       continue;
     }
+    // A pin must name a release that EXISTS before its lag means anything. `v9.9.9` — a typo, or a
+    // pin written ahead of the release it expects — parses fine and sorts above every section, so
+    // `behind` comes back empty and the consumer reads as perfectly current forever. Silence is the
+    // one answer this checker must never give by accident.
+    if (!published.has(String(pinnedTag).replace(/^v/, ''))) {
+      add('unpinned', `${repo}: pins ${pinnedTag}, which is not a published release — it cannot be fetched`);
+      continue;
+    }
     const behind = releasesAfter(released, pinnedTag);
     if (behind === null) {
       add('unpinned', `${repo}: unparseable pinned tag ${JSON.stringify(pinnedTag)}`);
@@ -634,6 +642,17 @@ const CORPUS = [
       now: '2026-06-01T00:00:00Z',
     },
     detail: /published but incomplete/,
+  },
+  // ── a pin must name a release that exists (Codex P2, fourth round) ──
+  {
+    name: 'a pin to a nonexistent release is reported, not treated as ahead of everything',
+    input: { changelog: CL.quiet, consumers: [{ ...APP, pinnedTag: 'v9.9.9' }], now: '2030-01-01T00:00:00Z' },
+    expect: ['unpinned'],
+  },
+  {
+    name: 'and the message says why, rather than reporting a lag it cannot compute',
+    input: { changelog: CL.quiet, consumers: [{ ...APP, pinnedTag: 'v9.9.9' }], now: '2030-01-01T00:00:00Z' },
+    detail: /not a published release/,
   },
   // ── prerelease precedence (Codex P2 on PR #93) ──
   {
