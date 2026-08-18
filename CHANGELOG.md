@@ -6,6 +6,17 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Fixed
+- **A server-supplied note could tombstone a healthy one through the duplicate-collapse pass
+  (SUR-1070).** `reconcile_content_dupes` groups live notes by their STORED `content_tag` and never
+  decrypts, so it could not tell a tag the account key derived from one COPIED off another row —
+  and copying needs no HMAC key, only the ability to write the row. A planted row therefore joined a
+  real note's cluster, won the survivor sort trivially (it controls `tags`, `created_at` and `id`,
+  which ARE the ordering), and tombstoned the genuine note. The enc:v2 read gate could not help,
+  because this path never reads the text — which is why the guard sits in the pass: a note whose
+  `text` is not `enc:v2` no longer joins a fingerprint cluster at all. Found by review while
+  documenting the posture below, which had claimed the read gate covered everything.
+
 ### Changed
 - **Documented, not code: pulled rows are stored without content validation, and that is now an
   accepted decision rather than an unexamined gap (SUR-1070).** `Store::apply_row` writes whatever it
@@ -13,14 +24,18 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   accepted. It discloses nothing — the server holds no key, so anything it supplies was never the
   user's plaintext. It cannot be shown — since the preceding change, a read renders `text` only when
   it is `enc:v2` and opens under that row's own id, so an unbound value reaches no screen, no search
-  index, no embedding queue and no content tag. And **rejecting the row on arrival would be worse
-  than storing it**: `pull_table` advances its `change_seq` watermark for every processed row before
-  any merge decision, so a rejected row is never re-delivered and the device diverges permanently,
-  silently, with no retry — a real reject needs a quarantine and a retry rule, not a guard.
+  index and no embedding queue. Columns consumed WITHOUT decryption sit outside that gate and are
+  guarded individually — `content_tag` was the one such case, fixed above. And **rejecting the row on
+  arrival would be worse than storing it, in both possible shapes**: a guard that SKIPS loses the row
+  for good (the watermark advances per row, before any merge decision), while a guard that ERRORS
+  keeps it (the `?` exits before `set_seq_cursor`) but fails that table on every pull, which
+  `pull_then_flush` turns into a flush abort for every table — one malformed row wedges the account's
+  entire sync. A real reject needs a quarantine and a retry rule, not a guard.
   Recorded in three places on purpose: the README's security model (the posture), `apply_row`'s doc
   (the choke point, where someone would notice the absence), and the watermark-advance comment in
-  `pull.rs` (the trap, where someone would reach for the fix). The decision's safety rests entirely
-  on the read gate, and both code comments say so — loosen that gate and these notes stop being true.
+  `pull.rs` (the trap, where someone would reach for the fix). Both code comments now state what the
+  read gate does and does NOT buy, so the next person adding a consumer of a pulled column asks the
+  right question: does this read through the gate?
 
 ### Security
 - **A note read now requires `enc:v2`, so ciphertext that is not bound to its own row can no longer

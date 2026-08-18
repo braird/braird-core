@@ -907,14 +907,21 @@ impl Store {
     ///   - it cannot be shown. [`crate::sync::read`] renders `text` only when it is `enc:v2` AND
     ///     opens under that row's own id, so an unbound value reaches no screen, no search index,
     ///     no embedding queue and no content tag;
-    ///   - **rejecting the row here would be worse than storing it.** `pull_table` advances its
-    ///     `change_seq` watermark for EVERY processed row, BEFORE any merge decision, so a rejected
-    ///     row is never re-delivered: the device diverges permanently, with no error and no retry.
-    ///     A real reject needs somewhere to put the row and a rule for retrying it — a quarantine
-    ///     table, not a guard in this function.
+    ///   - **both shapes of "reject" are worse than storing it, for DIFFERENT reasons.** A guard that
+    ///     SKIPS the row loses it: `pull_table` bumps its `change_seq` watermark for every processed
+    ///     row before any merge decision, so a skipped row is never re-delivered and the device
+    ///     diverges permanently and silently. A guard that ERRORS does not lose it — the `?` exits
+    ///     before `set_seq_cursor`, so the cursor is not persisted and the row returns next pull —
+    ///     but then that table fails on every pull, and `pull_then_flush` aborts the FLUSH for every
+    ///     table when any one fails. One malformed row, written by whoever can write rows, wedges
+    ///     the account's entire sync indefinitely. A real reject needs a quarantine and a retry
+    ///     rule, not a guard in this function.
     ///
-    /// The property that makes the whole thing safe lives in the READ gate, not here. If that gate
-    /// is ever loosened, this comment stops being true.
+    /// **What the read gate does and does not buy.** It stops an unbound value being SHOWN — no
+    /// screen, no search index, no embedding queue, no content-tag re-derivation. It does NOT make
+    /// every pulled column inert: a column consumed WITHOUT decryption is outside its reach, and
+    /// `content_tag` was exactly that until SUR-1070 gated `reconcile_content_dupes` on `enc:v2`
+    /// too. Before adding a consumer of a pulled column, ask whether it reads through the gate.
     pub fn apply_row(&self, table: &str, row: &Map<String, Value>) -> rusqlite::Result<()> {
         let schema = schema_or_err(table)?;
         let cols: Vec<&str> = schema.columns.iter().map(|(n, _)| *n).collect();

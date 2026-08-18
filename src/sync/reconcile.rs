@@ -92,6 +92,7 @@ use super::http::{CoverEgress, PostgrestSink};
 use super::outbox::resolve_book_id;
 use super::read::decrypt_note_text;
 use super::SyncEngine;
+use crate::note_encryption::is_encrypted_v2;
 use crate::store::Store;
 use crate::vault::Vault;
 
@@ -664,8 +665,23 @@ fn reconcile_content_dupes(store: &Store) -> Result<usize, String> {
 
     // Group live notes by their stored content_tag. A note with no content_tag can't be
     // fingerprint-matched without decrypting + re-deriving (out of scope) — skip it.
+    //
+    // A note whose `text` is not `enc:v2` is skipped too (SUR-1070). `content_tag` is an OPAQUE
+    // stored string: this pass never decrypts, so it cannot tell a tag the account key derived from
+    // one copied off another row — and copying needs no HMAC key, only the ability to write the row.
+    // Without this guard a server-supplied row could join a real note's cluster, win the survivor
+    // sort (it controls `tags`, `created_at` and `id`, which are the whole ordering), and tombstone
+    // the genuine note. The enc:v2 READ gate does not cover this path, because this path never reads
+    // the text — which is exactly why the guard has to be here rather than there.
     let mut by_tag: BTreeMap<String, Vec<Map<String, Value>>> = BTreeMap::new();
     for row in &notes {
+        let bound = row
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(is_encrypted_v2);
+        if !bound {
+            continue;
+        }
         match row.get("content_tag").and_then(Value::as_str) {
             Some(tag) if !tag.is_empty() => {
                 by_tag.entry(tag.to_string()).or_default().push(row.clone())
@@ -1591,6 +1607,47 @@ pub fn merge_content_duplicates(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_unbound_note_cannot_join_a_content_tag_cluster() {
+        // SUR-1070. `content_tag` is an OPAQUE stored string and this pass never decrypts, so it
+        // cannot tell a tag the account key derived from one COPIED off another row — and copying
+        // needs no HMAC key, only the ability to write the row. Left ungated, a server-supplied row
+        // wins the survivor sort trivially (it controls `tags`, `created_at` and `id`, which ARE the
+        // ordering) and tombstones the genuine note. The enc:v2 read gate cannot help: this path
+        // never looks at the text.
+        let store = Store::open_in_memory().unwrap();
+        let vault = crate::Vault::generate();
+
+        // The user's real note: sealed, one tag, created later, higher id.
+        let genuine = json!({
+            "id": "z-genuine",
+            "text": vault.encrypt_note(Some("z-genuine".into()), "the real passage".into()),
+            "content_tag": "SHARED_TAG", "tags": ["idea"],
+            "created_at": 500, "updated_at": 500, "deleted": false
+        });
+        // The planted row: same tag, NOT enc:v2, and shaped to win every tiebreak.
+        let planted = json!({
+            "id": "a-planted", "text": "never sealed",
+            "content_tag": "SHARED_TAG", "tags": ["idea", "extra", "more"],
+            "created_at": 1, "updated_at": 900, "deleted": false
+        });
+        store
+            .apply_row("notes", genuine.as_object().unwrap())
+            .unwrap();
+        store
+            .apply_row("notes", planted.as_object().unwrap())
+            .unwrap();
+
+        let collapsed = reconcile_content_dupes(&store).unwrap();
+
+        assert_eq!(collapsed, 0, "an unbound row must not drive a collapse");
+        assert_eq!(
+            store.get_row("notes", "z-genuine").unwrap().unwrap()["deleted"],
+            json!(false),
+            "the user's real note must not be tombstoned by a planted fingerprint"
+        );
+    }
     use super::*;
     use crate::sync::http::CoverSearchHit;
     use std::cell::RefCell;
