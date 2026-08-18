@@ -48,7 +48,9 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   let 7 days 23 hours read as 7 and stay quiet, pushing an advertised 7-day deadline out to nearly
   9 on a daily schedule. And a pin naming no published release — `v9.9.9`, from a typo or a pin
   written ahead of its release — is reported rather than sorting above every section and reading
-  as permanently current.
+  as permanently current, and the release a consumer is ALREADY ON is checked for that consumer's
+  artifacts too — an asset deleted from the pinned release left nothing to compare, so a clean
+  build that could no longer fetch its own dependency produced a green run.
   **The privileged and unprivileged halves are separate workflows**, and that split is a security
   boundary rather than tidiness. The staleness run reads a token for two private repositories from a
   public repo, so it is `schedule` + `workflow_dispatch` only and takes the token from an environment

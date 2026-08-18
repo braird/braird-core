@@ -196,6 +196,19 @@ export function parseCalendarDate(ymd) {
   return roundTrips ? at.toISOString() : null;
 }
 
+/**
+ * The artifacts a consumer needs from a given release, that the release does not have.
+ *
+ * One rule, two callers, on purpose: the release a consumer might MOVE TO and the release it is
+ * ALREADY ON have to be judged identically. They were not, and the gap was invisible — an asset
+ * deleted from the pinned release left `behind` empty, so nothing looked at it and the run went
+ * green while a clean build could no longer fetch its own dependency.
+ */
+function missingAssets(release, assets, version) {
+  const required = typeof assets === 'function' ? assets(version) : [];
+  return required.filter((name) => !release.assets.includes(name));
+}
+
 function ageDays(now, since) {
   const [a, b] = [Date.parse(now), Date.parse(since)];
   if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
@@ -280,28 +293,39 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
     // pin written ahead of the release it expects — parses fine and sorts above every section, so
     // `behind` comes back empty and the consumer reads as perfectly current forever. Silence is the
     // one answer this checker must never give by accident.
-    if (!published.has(String(pinnedTag).replace(/^v/, ''))) {
+    const pinnedVersion = String(pinnedTag).replace(/^v/, '');
+    if (!published.has(pinnedVersion)) {
       add('unpinned', `${repo}: pins ${pinnedTag}, which is not a published release — it cannot be fetched`);
       continue;
+    }
+    // THE PINNED RELEASE ITSELF has to still carry this consumer's artifacts. If one is deleted from
+    // the release a consumer is already on, `behind` is empty and every later check skips it — so a
+    // clean build that can no longer fetch its own pinned AAR produced a green run. Checking only
+    // what a consumer might MOVE TO leaves what it currently DEPENDS ON unwatched.
+    const missingFromPin = missingAssets(published.get(pinnedVersion), assets, pinnedVersion);
+    if (missingFromPin.length > 0) {
+      add(
+        'unpinned',
+        `${repo}: its pinned release ${pinnedTag} no longer carries ${missingFromPin.join(', ')} — ` +
+          'a clean build cannot fetch what it is pinned to',
+      );
     }
     const behind = releasesAfter(released, pinnedTag);
     if (behind === null) {
       add('unpinned', `${repo}: unparseable pinned tag ${JSON.stringify(pinnedTag)}`);
       continue;
     }
-    // Only a release a consumer could actually take counts against it.
-    // A release only counts against a consumer if it actually carries THAT consumer's artifacts.
-    // A partial upload, or an asset deleted after the fact, must not become "you are behind, go pin
+    // A release only counts against a consumer if it actually carries THAT consumer's artifacts. A
+    // partial upload, or an asset deleted after the fact, must not become "you are behind, go pin
     // this" for a release with no AAR or no xcframework in it.
     const incomplete = [];
     const fetchable = oldestFirst(
       behind.filter((s) => {
         const rel = published.get(s.version);
         if (!rel) return false;
-        const required = typeof assets === 'function' ? assets(s.version) : [];
-        const missing = required.filter((name) => !rel.assets.includes(name));
+        const missing = missingAssets(rel, assets, s.version);
         if (missing.length === 0) return true;
-        incomplete.push(`${s.version} (no asset matching ${missing.join(', ')})`);
+        incomplete.push(`${s.version} (missing ${missing.join(', ')})`);
         return false;
       }),
     );
@@ -653,6 +677,20 @@ const CORPUS = [
     name: 'and the message says why, rather than reporting a lag it cannot compute',
     input: { changelog: CL.quiet, consumers: [{ ...APP, pinnedTag: 'v9.9.9' }], now: '2030-01-01T00:00:00Z' },
     detail: /not a published release/,
+  },
+  // ── the release a consumer is ALREADY ON is watched too (Codex P2, fifth round) ──
+  {
+    name: 'an artifact deleted from the release a consumer already pins is reported',
+    input: {
+      changelog: CL.quiet,
+      published: new Map([
+        // 1.2.0 is current, but its artifact has been removed after the fact.
+        ['1.2.0', rel('1.2.0', '2026-01-01T00:00:00Z', ['SHA256SUMS.txt'])],
+      ]),
+      consumers: [{ ...APP, pinnedTag: 'v1.2.0' }],
+      now: '2026-01-02T00:00:00Z', // no lag at all — only the pinned release is wrong
+    },
+    detail: /no longer carries app-1\.2\.0\.bin/,
   },
   // ── prerelease precedence (Codex P2 on PR #93) ──
   {
