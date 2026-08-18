@@ -206,6 +206,15 @@ The bump is **one hand-made PR in the app repo** — and that PR *is* the integr
    JVM-against-desktop-jar suite run against the new core. Green means the new binding+native pair
    works end to end. That PR is where a core upgrade is reviewed and gated — nothing auto-updates.
 
+Both steps are manual on purpose, and both are therefore places work can simply stop. Nothing in
+this repo used to notice: `[Unreleased]` reads the same for a typo and for a security fix, and a
+published tag no consumer has pinned looks identical to one every consumer has taken.
+`.github/workflows/release-staleness.yml` runs daily and puts a clock on each hop — it reports when
+security work has sat unreleased, or when a consumer's pin trails a release, past a deadline set by
+whether the stalled range contains a `### Security` section (7 days if it does, 30 if it does not).
+It reports; it never opens a PR and never blocks a merge, because not having shipped something yet
+is not a reason to reject the next commit.
+
 ## Scope
 
 Android AAR + desktop jar (SUR-760), the iOS xcframework + Swift wrapper (SUR-745), and the

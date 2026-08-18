@@ -6,6 +6,27 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **A daily check that fails when finished work has stopped moving toward a device (SUR-1070
+  follow-up).** braird-core reaches a phone through two deliberately manual hops — merge to a
+  release tag, then release tag to `braird-core.lock` in each app repo — and nothing watched either.
+  Every existing gate asks whether the tree is CONSISTENT; none asked whether consistent work was
+  STUCK, and `[Unreleased]` reads identically for a typo and for a security fix. SUR-1070's
+  note-tombstoning fix merged, then was released, and the only thing that surfaced "this is still not
+  on a phone" was somebody asking.
+  `scripts/check-release-staleness.mjs` reports two signals, because there are two ways to stall and
+  neither implies the other: security work sitting in `[Unreleased]`, and a consumer pin trailing a
+  published release. A fix that merges but is never released is invisible to the second — with no new
+  tag, every consumer agrees with the newest one and looks current.
+  **Severity sets the deadline, and that is what makes it usable rather than noise:** a stalled range
+  containing a `### Security` section is due in 7 days, anything else in 30, so a routine patch can
+  wait for the next feature pin without anyone hearing about it. The unreleased signal is dated from
+  when the entry FIRST appeared, not from the previous tag — dating it from the tag would accuse a
+  fix merged this morning of being weeks late, which is how a gate earns being switched off.
+  It runs on a schedule with **no `pull_request` trigger**: "you have not shipped this yet" is never
+  a reason to reject the next commit. A consumer whose pin cannot be read is REPORTED, never skipped
+  — a clone that failed must not read as "nothing to pin".
+
 ## [0.15.1] - 2026-08-18
 
 ### Changed

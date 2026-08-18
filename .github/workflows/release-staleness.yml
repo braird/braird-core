@@ -1,0 +1,62 @@
+name: Release staleness check
+
+# SUR-1070 follow-up. Every other gate in this repo asks whether the tree is CONSISTENT. None asks
+# whether consistent, finished work is STUCK — and braird-core ships through two hops that are both
+# manual on purpose: merge → release tag, then release tag → `braird-core.lock` in each app repo.
+# No floating versions in a crypto core, and the pin PR is the integration gate (docs/pinning.md).
+# Both hops are right; neither had a clock on it. SUR-1070's note-tombstoning fix merged, was
+# released, and the only thing that surfaced "this is still not on a phone" was a human asking.
+#
+# `scripts/check-release-staleness.mjs` carries the rules and the reasoning; this file only feeds it.
+#
+# NOT a merge-path gate, deliberately — there is no `pull_request` trigger. "You have not shipped
+# this yet" is never a reason to reject the next commit, so this runs on a clock and reports.
+#
+# Daily, unlike the Monday drift checks. Its tightest deadline is 7 days, and a weekly cadence would
+# make that up to 14 in practice — a deadline the schedule cannot actually enforce is decoration.
+# Cost is one Node run plus two shallow clones.
+
+on:
+  schedule:
+    - cron: '0 9 * * *' # daily 09:00 UTC
+  # A change to the checker or this workflow exercises it immediately, matching the other drift
+  # checks — the rules are only trustworthy if editing them runs them.
+  push:
+    paths:
+      - 'scripts/check-release-staleness.mjs'
+      - '.github/workflows/release-staleness.yml'
+  workflow_dispatch:
+
+jobs:
+  staleness:
+    runs-on: ubuntu-latest
+    steps:
+      # Full history + tags: the checker dates the last release from its tag, and dates unreleased
+      # security work by walking the CHANGELOG commits since that tag. A shallow clone has neither.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.15.0'
+
+      - name: Self-check the rules before applying them
+        run: node scripts/check-release-staleness.mjs --self-check
+
+      # Read-only, and the checker needs exactly one file from each. `|| true` is deliberate: a
+      # clone that fails (revoked PAT, missing scope, outage) must surface as a FINDING from the
+      # checker — "pin could not be read" — not as a green run that silently checked nothing.
+      - name: Fetch the consumer pins
+        env:
+          PAT: ${{ secrets.SURFC_READ_PAT }}
+        run: |
+          mkdir -p /tmp/consumers
+          for repo in braird-android braird-ios; do
+            git clone --depth 1 --quiet \
+              "https://x-access-token:${PAT}@github.com/braird/${repo}.git" \
+              "/tmp/consumers/${repo}" || echo "::warning::could not clone ${repo} — the checker will report it"
+          done
+
+      - name: Assert nothing finished is stuck
+        run: node scripts/check-release-staleness.mjs --consumers /tmp/consumers
