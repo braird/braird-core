@@ -42,7 +42,11 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   releases broken. The consumer config reaches the rules by SPREAD rather than being rebuilt field by
   field, because rebuilding it silently dropped the asset requirements and left the rule dead in
   production while the corpus — whose fixtures construct consumers by hand — went on passing. A
-  plumbing assertion now covers that seam directly.
+  plumbing assertion now covers that seam directly, and the required artifacts are named for the
+  release's OWN version, since a match on extension alone would accept a release carrying only the
+  previous version's file. Deadlines compare with `>=`: `ageDays` floors, so a strict comparison
+  let 7 days 23 hours read as 7 and stay quiet, pushing an advertised 7-day deadline out to nearly
+  9 on a daily schedule.
   **The privileged and unprivileged halves are separate workflows**, and that split is a security
   boundary rather than tidiness. The staleness run reads a token for two private repositories from a
   public repo, so it is `schedule` + `workflow_dispatch` only and takes the token from an environment
