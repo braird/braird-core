@@ -90,7 +90,10 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   it also closed a miss recorded as accepted: HTML-comment example headings are masked too, and a
   backtick fence's info string may not itself contain a backtick, so an ordinary line cannot open
   a block that masks the rest of the file. Heading detection tolerates up to three leading spaces
-  everywhere, `### Security` included — an exact-column match made an indented one invisible. Both
+  everywhere, `### Security` included, along with an optional ATX closing hash run — an
+  exact-column match made an indented or `### Security ###` heading invisible. The release list is
+  fully paginated rather than capped at one page: a silently exceeded ceiling turns every omitted
+  release into a false finding and fails the check permanently. Both
   scripts import the shared module — the release gate was refactored onto it rather than left
   with its own copy — and `release.yml` stages both files, since the judge it copies out of the
   workflow revision is now two files rather than one.

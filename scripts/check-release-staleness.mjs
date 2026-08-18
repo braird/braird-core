@@ -186,10 +186,11 @@ export function parseChangelog(text) {
 
 /** Keep a Changelog puts security work under its own heading. That heading IS the severity signal. */
 export function hasSecuritySection(body) {
-  // Up to three leading spaces, matching the version-heading rule and CommonMark. An exact-column
-  // match made ` ### Security` invisible, which silences the unreleased signal outright and quietly
-  // demotes a release from the 7-day deadline to the 30-day one.
-  return /^ {0,3}###\s+Security\s*$/m.test(body);
+  // ATX heading rules, and each clause is a finding this has already had: up to three leading
+  // spaces, and an optional closing hash run (`### Security ###`). Both make a real heading
+  // invisible, which silences the unreleased signal outright and quietly demotes a release from the
+  // 7-day deadline to the 30-day one.
+  return /^ {0,3}###\s+Security\s*(?:#+[ 	]*)?$/m.test(body);
 }
 
 /**
@@ -572,7 +573,12 @@ const git = (...args) => execFileSync('git', args, { encoding: 'utf8' }).trim();
  */
 export function publishedReleases(json) {
   const map = new Map();
-  for (const r of json) {
+  // `gh api --paginate --slurp` yields an ARRAY OF PAGES; a single unpaginated call yields a flat
+  // array. Accept both rather than pinning the workflow to one invocation — a page ceiling that is
+  // silently exceeded turns every missing release into a false "unpublished" finding, and the check
+  // then fails permanently for a reason that has nothing to do with staleness.
+  const flat = Array.isArray(json[0]) ? json.flat() : json;
+  for (const r of flat) {
     if (r.draft) continue;
     const names = Array.isArray(r.assets) ? r.assets.map((a) => a.name) : [];
     if (!names.includes(MANIFEST_ASSET)) continue;
@@ -925,6 +931,17 @@ const CORPUS = [
       now: '2026-01-15T00:00:00Z',
     },
     detail: /in the FUTURE/,
+  },
+  // ── ATX closing hashes are decoration, not part of the title (Codex P2, fourteenth round) ──
+  {
+    name: 'a ### Security ### heading with closing hashes is still seen',
+    input: {
+      changelog: '## [Unreleased]\n\n### Security ###\n- a real fix\n',
+      published: new Map(),
+      unreleasedSecuritySince: '2026-01-01T00:00:00Z',
+      now: '2026-03-01T00:00:00Z',
+    },
+    expect: ['unreleased'],
   },
   // ── an indented heading is still a heading (Codex P2, thirteenth round) ──
   {

@@ -82,12 +82,16 @@ jobs:
       # A TAG IS NOT A RELEASE (Codex on PR #93). `release.yml` publishes create-only at the END of
       # its job DAG, so a tag whose build failed leaves a tag with no release behind it. The checker
       # judges every version against THIS list, never against `git tag`, so that state is reported
-      # instead of silently reading as shipped. One page of 100 is the ceiling and is ~4x the
-      # release history; paginate here if that ever stops being true.
+      # instead of silently reading as shipped.
+      #
+      # FULLY paginated, not a fixed page. A ceiling that is silently exceeded does not degrade
+      # gracefully here: every omitted release becomes a false "published but no CHANGELOG section"
+      # finding, and the check fails permanently for a reason unrelated to staleness. `--slurp`
+      # emits an array of page arrays, which the checker accepts alongside a flat one.
       - name: Fetch the published releases
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh api "repos/${{ github.repository }}/releases?per_page=100" > /tmp/releases.json
+        run: gh api --paginate --slurp "repos/${{ github.repository }}/releases?per_page=100" > /tmp/releases.json
 
       # Read-only, and the checker needs exactly one file from each. Tolerating a failed clone is
       # deliberate: a clone that fails (revoked PAT, missing scope, outage) must surface as a
