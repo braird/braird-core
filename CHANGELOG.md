@@ -33,8 +33,13 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   fix merged this morning of being weeks late, which is how a gate earns being switched off.
   It runs on a schedule and never in the merge path: "you have not shipped this yet" is never a
   reason to reject the next commit. A consumer whose pin cannot be read is REPORTED, never skipped —
-  a clone that failed must not read as "nothing to pin". An unparseable date is reported too, because
-  `NaN > limit` is false and a date typo would otherwise disable the signal it feeds silently.
+  a clone that failed must not read as "nothing to pin". A date that is not a real calendar date is
+  reported too: `NaN > limit` is false, so `2026-13-01` would have disabled the signal it feeds, and
+  `Date.parse` NORMALISES `2026-02-30` to 2026-03-02 rather than rejecting it, so the components have
+  to round-trip. Completeness of a release is judged PER CONSUMER, against the artifacts that
+  consumer pins, rather than against a fixed asset count — the published set is 3, 5 and 7 assets
+  across 27 releases because it grew with the product, so a fixed count would call nine historical
+  releases broken.
   **The privileged and unprivileged halves are separate workflows**, and that split is a security
   boundary rather than tidiness. The staleness run reads a token for two private repositories from a
   public repo, so it is `schedule` + `workflow_dispatch` only and takes the token from an environment

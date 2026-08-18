@@ -55,13 +55,29 @@ import { fileURLToPath } from 'node:url';
 
 const DAY_MS = 86_400_000;
 
+/**
+ * The one asset every release has carried, across all 27 of them. It is the checksum manifest the
+ * whole pinning contract rests on, so a release without it is not pinnable and not a release.
+ */
+const MANIFEST_ASSET = 'SHA256SUMS.txt';
+
 /** Days a stalled hop is allowed before this fails, by whether security work is caught in it. */
 const DEADLINE_DAYS = { security: 7, routine: 30 };
 
 /** Every repo that pins braird-core, and where its pinned tag lives. */
 const CONSUMERS = [
-  { repo: 'braird-android', file: 'gradle/braird-core.lock', tag: /^\s*tag\s*=\s*(v\S+)\s*$/m },
-  { repo: 'braird-ios', file: 'braird-core.lock', tag: /^\s*BRAIRD_CORE_TAG\s*=\s*(v\S+)\s*$/m },
+  {
+    repo: 'braird-android',
+    file: 'gradle/braird-core.lock',
+    tag: /^\s*tag\s*=\s*(v\S+)\s*$/m,
+    assets: [/\.aar$/, /-desktop-.*\.jar$/],
+  },
+  {
+    repo: 'braird-ios',
+    file: 'braird-core.lock',
+    tag: /^\s*BRAIRD_CORE_TAG\s*=\s*(v\S+)\s*$/m,
+    assets: [/\.xcframework\.zip$/, /^BrairdCore\.swift$/],
+  },
 ];
 
 // ── pure core ─────────────────────────────────────────────────────────────────
@@ -148,6 +164,23 @@ export function releasesAfter(released, pinned) {
  * `release.yml` only checks a CHANGELOG date's SHAPE (`[0-9]{4}-[0-9]{2}-[0-9]{2}`), so `2026-13-01`
  * reaches this function in the ordinary course of a typo, not only under attack.
  */
+/**
+ * `YYYY-MM-DD` -> an ISO instant, or null when it is not a real calendar date.
+ *
+ * `Date.parse` is not a validator and review was right to say so: `2026-13-01` is NaN, but
+ * `2026-02-30` NORMALISES to 2026-03-02 and `2025-02-29` to 2025-03-01. A day-overflow typo would
+ * therefore silently shift a deadline instead of being reported. `release.yml` checks only the SHAPE
+ * of this field, so both kinds arrive by ordinary typo. The components have to round-trip.
+ */
+export function parseCalendarDate(ymd) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd ?? ''));
+  if (!m) return null;
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const at = new Date(Date.UTC(y, mo - 1, d));
+  const roundTrips = at.getUTCFullYear() === y && at.getUTCMonth() + 1 === mo && at.getUTCDate() === d;
+  return roundTrips ? at.toISOString() : null;
+}
+
 function ageDays(now, since) {
   const [a, b] = [Date.parse(now), Date.parse(since)];
   if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
@@ -204,7 +237,7 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
       continue;
     }
     const limit = hasSecuritySection(s.body) ? DEADLINE_DAYS.security : DEADLINE_DAYS.routine;
-    const age = ageDays(now, `${s.date}T00:00:00Z`);
+    const age = ageDays(now, parseCalendarDate(s.date));
     if (age === null) {
       add(
         'unpublished',
@@ -223,7 +256,7 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
   }
 
   // (3) UNPINNED — a consumer trailing a published release.
-  for (const { repo, pinnedTag, error } of consumers) {
+  for (const { repo, pinnedTag, error, assets } of consumers) {
     if (error) {
       add('unpinned', `${repo}: pin could not be read (${error})`);
       continue;
@@ -234,7 +267,25 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
       continue;
     }
     // Only a release a consumer could actually take counts against it.
-    const fetchable = oldestFirst(behind.filter((s) => published.has(s.version)));
+    // A release only counts against a consumer if it actually carries THAT consumer's artifacts.
+    // A partial upload, or an asset deleted after the fact, must not become "you are behind, go pin
+    // this" for a release with no AAR or no xcframework in it.
+    const incomplete = [];
+    const fetchable = oldestFirst(
+      behind.filter((s) => {
+        const rel = published.get(s.version);
+        if (!rel) return false;
+        const missing = (assets ?? []).filter((re) => !rel.assets.some((n) => re.test(n)));
+        if (missing.length === 0) return true;
+        incomplete.push(`${s.version} (no asset matching ${missing.join(', ')})`);
+        return false;
+      }),
+    );
+    // Reported, never silently dropped - an incomplete release is a broken release, and staying
+    // quiet about it is how the publication hole worked in the first place.
+    if (incomplete.length > 0) {
+      add('unpublished', `${repo} cannot pin ${incomplete.join('; ')} - the release is published but incomplete`);
+    }
     if (fetchable.length === 0) continue;
 
     // The clock starts at the OLDEST stalled release, never the newest — otherwise every new tag
@@ -243,9 +294,9 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
     const securities = fetchable.filter((s) => hasSecuritySection(s.body));
     const clock = securities[0] ?? fetchable[0];
     const limit = securities.length > 0 ? DEADLINE_DAYS.security : DEADLINE_DAYS.routine;
-    const age = ageDays(now, published.get(clock.version));
+    const age = ageDays(now, published.get(clock.version).publishedAt);
     if (age === null) {
-      add('unpinned', `${repo}: release ${clock.version} has an unparseable published_at (${published.get(clock.version)})`);
+      add('unpinned', `${repo}: release ${clock.version} has an unparseable published_at`);
       continue;
     }
     if (age > limit) {
@@ -266,18 +317,29 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
 const git = (...args) => execFileSync('git', args, { encoding: 'utf8' }).trim();
 
 /**
- * version → `published_at`, for releases a consumer can actually fetch.
+ * version → `{ publishedAt, assets }`, for releases that are a release at all.
  *
- * A draft is not consumable, and neither is a release with no assets — `release.yml` attaches every
- * artifact in the same create-only step, so an assetless release means that step did not finish.
+ * A draft is not one. Neither is a release without `SHA256SUMS.txt`: that manifest is what makes a
+ * release checksum-pinnable, which is the entire pinning contract (docs/pinning.md), and
+ * `release.yml` writes it in the same create-only step as the payloads — so its absence means that
+ * step did not finish.
+ *
+ * **Deliberately not "has all seven named assets", which review proposed and the history refutes.**
+ * The published set is 3, 5 and 7 assets across 27 releases: it GREW as the product did, with the
+ * iOS xcframework and wrapper arriving at SUR-745. Requiring today's seven would mark nine
+ * historical releases unpublished — false, since each was complete for its time, and a flood of
+ * findings is how a gate gets muted. Completeness is instead judged PER CONSUMER, against the
+ * artifacts that consumer actually pins ([`CONSUMERS`]), which is both the real question ("is there
+ * an AAR in there for me?") and self-maintaining as the set changes again.
  */
 export function publishedReleases(json) {
   const map = new Map();
   for (const r of json) {
     if (r.draft) continue;
-    if (!Array.isArray(r.assets) || r.assets.length === 0) continue;
+    const names = Array.isArray(r.assets) ? r.assets.map((a) => a.name) : [];
+    if (!names.includes(MANIFEST_ASSET)) continue;
     const v = parseVersion(r.tag_name);
-    if (v) map.set(String(r.tag_name).replace(/^v/, ''), r.published_at);
+    if (v) map.set(String(r.tag_name).replace(/^v/, ''), { publishedAt: r.published_at, assets: names });
   }
   return map;
 }
@@ -359,14 +421,18 @@ const CL = {
     '## [Unreleased]\n\n### Fixed\n- x\n\n## [1.3.0] - 2026-05-01\n\n### Added\n- routine\n\n## [1.2.0] - 2026-01-20\n\n### Security\n- never pinned\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
 };
 
+/** A complete release: the manifest plus every artifact both consumers pin. */
+const FULL = ['SHA256SUMS.txt', 'braird-core-x.aar', 'braird-core-desktop-x.jar', 'braird-core-x.xcframework.zip', 'BrairdCore.swift'];
+const rel = (publishedAt, assets = FULL) => ({ publishedAt, assets });
+
 const PUB = new Map([
-  ['1.1.0', '2025-12-01T00:00:00Z'],
-  ['1.2.0', '2026-01-01T00:00:00Z'],
+  ['1.1.0', rel('2025-12-01T00:00:00Z')],
+  ['1.2.0', rel('2026-01-01T00:00:00Z')],
 ]);
 const PUB_P1 = new Map([
-  ['1.1.0', '2025-12-01T00:00:00Z'],
-  ['1.2.0', '2026-01-20T00:00:00Z'],
-  ['1.3.0', '2026-05-01T00:00:00Z'],
+  ['1.1.0', rel('2025-12-01T00:00:00Z')],
+  ['1.2.0', rel('2026-01-20T00:00:00Z')],
+  ['1.3.0', rel('2026-05-01T00:00:00Z')],
 ]);
 
 const CORPUS = [
@@ -387,22 +453,22 @@ const CORPUS = [
   },
   {
     name: 'a consumer trailing a SECURITY release is reported after 7 days',
-    input: { changelog: CL.shippedSecurity, consumers: [{ repo: 'app', pinnedTag: 'v1.1.0' }], now: '2026-01-15T00:00:00Z' },
+    input: { changelog: CL.shippedSecurity, consumers: [{ repo: 'app', assets: [/\.aar$/], pinnedTag: 'v1.1.0' }], now: '2026-01-15T00:00:00Z' },
     expect: ['unpinned'],
   },
   {
     name: 'a consumer trailing a ROUTINE release is quiet at 14 days',
-    input: { changelog: CL.quiet, consumers: [{ repo: 'app', pinnedTag: 'v1.1.0' }], now: '2026-01-15T00:00:00Z' },
+    input: { changelog: CL.quiet, consumers: [{ repo: 'app', assets: [/\.aar$/], pinnedTag: 'v1.1.0' }], now: '2026-01-15T00:00:00Z' },
     expect: [],
   },
   {
     name: 'the same routine lag IS reported once it passes 30 days',
-    input: { changelog: CL.quiet, consumers: [{ repo: 'app', pinnedTag: 'v1.1.0' }], now: '2026-02-15T00:00:00Z' },
+    input: { changelog: CL.quiet, consumers: [{ repo: 'app', assets: [/\.aar$/], pinnedTag: 'v1.1.0' }], now: '2026-02-15T00:00:00Z' },
     expect: ['unpinned'],
   },
   {
     name: 'a current consumer is quiet',
-    input: { changelog: CL.quiet, consumers: [{ repo: 'app', pinnedTag: 'v1.2.0' }], now: '2027-01-01T00:00:00Z' },
+    input: { changelog: CL.quiet, consumers: [{ repo: 'app', assets: [/\.aar$/], pinnedTag: 'v1.2.0' }], now: '2027-01-01T00:00:00Z' },
     expect: [],
   },
   {
@@ -412,7 +478,7 @@ const CORPUS = [
   },
   {
     name: 'a garbled pinned tag is reported, never ranked as current',
-    input: { changelog: CL.quiet, consumers: [{ repo: 'app', pinnedTag: 'latest' }], now: '2026-01-15T00:00:00Z' },
+    input: { changelog: CL.quiet, consumers: [{ repo: 'app', assets: [/\.aar$/], pinnedTag: 'latest' }], now: '2026-01-15T00:00:00Z' },
     expect: ['unpinned'],
   },
   // ── the deadline runs from the OLDEST stalled release (Codex P1 on PR #93) ──
@@ -421,7 +487,7 @@ const CORPUS = [
     input: {
       changelog: CL.securityThenRoutine,
       published: PUB_P1,
-      consumers: [{ repo: 'app', pinnedTag: 'v1.1.0' }],
+      consumers: [{ repo: 'app', assets: [/\.aar$/], pinnedTag: 'v1.1.0' }],
       now: '2026-05-01T00:00:00Z', // 1.3.0 published TODAY; 1.2.0 security is 101 days old
     },
     expect: ['unpinned'],
@@ -431,7 +497,7 @@ const CORPUS = [
     input: {
       changelog: CL.securityThenRoutine,
       published: PUB_P1,
-      consumers: [{ repo: 'app', pinnedTag: 'v1.1.0' }],
+      consumers: [{ repo: 'app', assets: [/\.aar$/], pinnedTag: 'v1.1.0' }],
       now: '2026-05-01T00:00:00Z',
     },
     detail: /oldest unpinned security release 1\.2\.0 published 101 days ago/,
@@ -439,25 +505,25 @@ const CORPUS = [
   // ── a tag is not a release (Codex P2 on PR #93) ──
   {
     name: 'a CHANGELOG section with no published release is reported once it ages past the limit',
-    input: { changelog: CL.quiet, published: new Map([['1.1.0', '2025-12-01T00:00:00Z']]), now: '2026-03-01T00:00:00Z' },
+    input: { changelog: CL.quiet, published: new Map([['1.1.0', rel('2025-12-01T00:00:00Z')]]), now: '2026-03-01T00:00:00Z' },
     expect: ['unpublished'],
   },
   {
     name: 'a section awaiting its tag during a release PR is NOT reported inside the grace period',
-    input: { changelog: CL.quiet, published: new Map([['1.1.0', '2025-12-01T00:00:00Z']]), now: '2026-01-10T00:00:00Z' },
+    input: { changelog: CL.quiet, published: new Map([['1.1.0', rel('2025-12-01T00:00:00Z')]]), now: '2026-01-10T00:00:00Z' },
     expect: [],
   },
   {
     name: 'an unpublished SECURITY section takes the SHORT deadline',
-    input: { changelog: CL.shippedSecurity, published: new Map([['1.1.0', '2025-12-01T00:00:00Z']]), now: '2026-01-15T00:00:00Z' },
+    input: { changelog: CL.shippedSecurity, published: new Map([['1.1.0', rel('2025-12-01T00:00:00Z')]]), now: '2026-01-15T00:00:00Z' },
     expect: ['unpublished'],
   },
   {
     name: 'a consumer is never told to pin a version that has no published release',
     input: {
       changelog: CL.quiet,
-      published: new Map([['1.1.0', '2025-12-01T00:00:00Z']]), // 1.2.0 tagged but never published
-      consumers: [{ repo: 'app', pinnedTag: 'v1.1.0' }],
+      published: new Map([['1.1.0', rel('2025-12-01T00:00:00Z')]]), // 1.2.0 tagged but never published
+      consumers: [{ repo: 'app', assets: [/\.aar$/], pinnedTag: 'v1.1.0' }],
       now: '2026-01-15T00:00:00Z',
     },
     expect: [], // quiet on the pin; the unpublished signal owns this state (and is inside its grace)
@@ -483,13 +549,35 @@ const CORPUS = [
     },
     expect: ['unreleased'],
   },
+  // ── a normalising calendar date is still an invalid one (Codex P2, second round) ──
+  // `Date.parse` is not a validator: 2026-13-01 is NaN, but 2026-02-30 silently becomes 2026-03-02.
+  {
+    name: 'a day-overflow date that Date.parse NORMALISES is reported, not quietly shifted',
+    input: {
+      changelog: '## [Unreleased]\n\n### Fixed\n- x\n\n## [1.2.0] - 2026-02-30\n\n### Added\n- x\n',
+      published: new Map(),
+      now: '2027-01-01T00:00:00Z',
+    },
+    detail: /is not a real date/,
+  },
+  // ── a release must carry the artifacts the consumer pins (Codex P2, second round) ──
+  {
+    name: 'a consumer is never told to pin a release that has no artifact for it',
+    input: {
+      changelog: CL.quiet,
+      published: new Map([['1.1.0', rel('2025-12-01T00:00:00Z')], ['1.2.0', rel('2026-01-01T00:00:00Z', ['SHA256SUMS.txt', 'BrairdCore.swift'])]]),
+      consumers: [{ repo: 'app', assets: [/\.aar$/], pinnedTag: 'v1.1.0' }],
+      now: '2026-06-01T00:00:00Z', // long past the routine deadline
+    },
+    detail: /published but incomplete/,
+  },
   // ── prerelease precedence (Codex P2 on PR #93) ──
   {
     name: 'a consumer stuck on a release candidate is NOT counted as current once the release ships',
     input: {
       changelog: '## [Unreleased]\n\n### Fixed\n- x\n\n## [1.2.0] - 2026-01-01\n\n### Security\n- shipped\n',
-      published: new Map([['1.2.0', '2026-01-01T00:00:00Z']]),
-      consumers: [{ repo: 'app', pinnedTag: 'v1.2.0-rc1' }],
+      published: new Map([['1.2.0', rel('2026-01-01T00:00:00Z')]]),
+      consumers: [{ repo: 'app', assets: [/\.aar$/], pinnedTag: 'v1.2.0-rc1' }],
       now: '2026-01-15T00:00:00Z',
     },
     expect: ['unpinned'],
