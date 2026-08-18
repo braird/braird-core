@@ -142,13 +142,21 @@ export function parseChangelog(text) {
     const date = /-\s*(\d{4}-\d{2}-\d{2})/.exec(parts[i + 1] ?? '')?.[1] ?? null;
     sections.push({ version: parts[i], date, body: parts[i + 2] ?? '' });
   }
-  const unreleasedSection = sections.find((s) => s.version === 'Unreleased');
+  // MERGE HAPPENS HERE, ONCE, FOR EVERY VERSION — `[Unreleased]` included. A previous revision
+  // merged duplicate RELEASED headings at the call site and left `[Unreleased]` on `find()`, so two
+  // `## [Unreleased]` headings (a merge conflict resolved badly) hid every entry under the second
+  // one from both signals. Fixing the instance and not the class is what produced that gap; doing
+  // the merge in the parser means no caller can be the one that forgot.
+  const merged = sectionsByVersion(sections);
+  const duplicates = [...merged.values()].filter((s) => s.count > 1).map((s) => s.version);
+  const unreleasedSection = merged.get('Unreleased');
   return {
     unreleased: unreleasedSection?.body ?? '',
     // Reported separately from its body: an ABSENT heading and an EMPTY one are the same string but
     // not the same fact, and only one of them means the signal still works.
     hasUnreleasedHeading: unreleasedSection !== undefined,
-    released: sections.filter((s) => s.version !== 'Unreleased'),
+    released: [...merged.values()].filter((s) => s.version !== 'Unreleased'),
+    duplicates,
   };
 }
 
@@ -258,14 +266,15 @@ function ageDays(now, since) {
  * security work. The earliest date wins for the same reason — the conservative end of an ambiguity
  * this function cannot resolve.
  */
-export function sectionsByVersion(released) {
+export function sectionsByVersion(sections) {
   const byVersion = new Map();
-  for (const sec of released) {
+  for (const sec of sections) {
     const prior = byVersion.get(sec.version);
     if (!prior) {
-      byVersion.set(sec.version, { ...sec });
+      byVersion.set(sec.version, { ...sec, count: 1 });
       continue;
     }
+    prior.count += 1;
     prior.body += `\n${sec.body}`;
     if (sec.date && (!prior.date || sec.date < prior.date)) prior.date = sec.date;
   }
@@ -289,7 +298,7 @@ function oldestFirst(sections) {
  * kind of false alarm that gets a gate switched off.
  */
 export function evaluate({ changelog, published, unreleasedSecuritySince, consumers, now }) {
-  const { unreleased, released, hasUnreleasedHeading } = parseChangelog(changelog);
+  const { unreleased, released, hasUnreleasedHeading, duplicates } = parseChangelog(changelog);
   const findings = [];
   const add = (signal, detail) => findings.push({ signal, detail });
 
@@ -357,20 +366,18 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
     }
   }
 
-  // A duplicated version heading is reported as well as merged. Merging keeps the deadline correct;
-  // saying so keeps the CHANGELOG honest, since the duplicate is a mistake either way.
-  const seen = new Set();
-  for (const sec of released) {
-    if (seen.has(sec.version)) {
-      add('unpublished', `CHANGELOG has more than one [${sec.version}] section — their severities are merged, but one of them is wrong`);
-    }
-    seen.add(sec.version);
+  // A duplicated heading is reported as well as merged. Merging keeps the deadline correct; saying
+  // so keeps the CHANGELOG honest, since the duplicate is a mistake either way. `[Unreleased]`
+  // counts — two of those is a badly resolved merge conflict, and the entries under the second one
+  // used to be read by neither signal.
+  for (const version of duplicates) {
+    add('unpublished', `CHANGELOG has more than one [${version}] section — their contents are merged, but one of them is wrong`);
   }
 
   // A published release with no CHANGELOG section is reported in its own right. It is not itself a
   // staleness state, but it is the condition that used to HIDE one: the pin range was derived from
   // the CHANGELOG, so an undocumented release was invisible to it.
-  const documented = seen;
+  const documented = new Set(released.map((sec) => sec.version));
   for (const version of [...published.keys()].sort()) {
     if (!documented.has(version)) {
       add(
@@ -417,7 +424,7 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
       add('unpinned', `${repo}: unparseable pinned tag ${JSON.stringify(pinnedTag)}`);
       continue;
     }
-    const sectionFor = sectionsByVersion(released);
+    const sectionFor = new Map(released.map((sec) => [sec.version, sec])); // already merged by the parser
     const behind = [...published.keys()]
       .filter((version) => {
         const v = parseVersion(version);
@@ -847,6 +854,20 @@ const CORPUS = [
       now: '2026-01-15T00:00:00Z',
     },
     detail: /in the FUTURE/,
+  },
+  // ── two [Unreleased] headings hide everything under the second (Codex P2, ninth round) ──
+  {
+    name: 'security work under a SECOND [Unreleased] heading is still seen',
+    input: {
+      // A badly resolved merge conflict. `find()` took the first body and the filter dropped both
+      // headings from `released`, so this entry was read by neither signal.
+      changelog: '## [Unreleased]\n\n### Fixed\n- x\n\n## [Unreleased]\n\n### Security\n- the real one\n',
+      published: new Map(),
+      unreleasedSecuritySince: '2026-01-01T00:00:00Z',
+      now: '2026-03-01T00:00:00Z',
+    },
+    // The security work it was hiding, and the duplicate heading that hid it.
+    expect: ['unreleased', 'unpublished'],
   },
   // ── a duplicated heading must not downgrade severity (Codex P2, eighth round) ──
   {

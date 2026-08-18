@@ -69,7 +69,10 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   miss pinned by a corpus row, following the boundary `check-stale-release-markers.mjs` set. A
   version heading written twice has its severities MERGED rather than overwritten — a plain map
   keeps the last section, so a security entry written first was silently downgraded to the 30-day
-  deadline — and the duplicate is reported as well as merged.
+  deadline — and the duplicate is reported as well as merged. The merge happens once in the parser,
+  for EVERY version including `[Unreleased]`: doing it at the call site left two `## [Unreleased]`
+  headings (a badly resolved merge conflict) hiding everything under the second one from both
+  signals.
   **The privileged and unprivileged halves are separate workflows**, and that split is a security
   boundary rather than tidiness. The staleness run reads a token for two private repositories from a
   public repo, so it is `schedule` + `workflow_dispatch` only and takes the token from an environment
