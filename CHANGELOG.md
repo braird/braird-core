@@ -78,7 +78,12 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   release missing them cannot complete the documented pin flow. And the hand-maintained list is
   cross-checked against each lock at run time: if a lock pins more checksums than this script
   requires assets, the difference is reported as unwatched rather than left to a comment asking
-  the next person to remember.
+  the next person to remember — by CHECKSUM KEY rather than by count, since a renamed artifact
+  leaves the cardinality unchanged. Every timestamp the checker ages goes through one helper that
+  reports unparseable and future dates alike, because the three sources (a CHANGELOG heading, a
+  release's `published_at`, and a git committer timestamp) were each guarded separately and the
+  third was missed twice. Fence tracking follows CommonMark's rule that a block closes only on
+  its own delimiter, so a backtick line inside a tilde block cannot expose an example heading.
   **The privileged and unprivileged halves are separate workflows**, and that split is a security
   boundary rather than tidiness. The staleness run reads a token for two private repositories from a
   public repo, so it is `schedule` + `workflow_dispatch` only and takes the token from an environment

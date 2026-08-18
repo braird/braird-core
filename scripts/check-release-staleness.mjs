@@ -81,36 +81,49 @@ const DEADLINE_DAYS = { security: 7, routine: 30 };
 /**
  * Every repo that pins braird-core, where its pinned tag lives, and the assets it needs to exist.
  *
- * `assets` is a FUNCTION OF THE VERSION, not a set of extension patterns. Release artifacts carry
- * the version in the filename (`braird-core-0.15.1.aar`), so an extension match would accept a
- * `v1.2.0` release that only contains a stale `braird-core-1.1.0.aar` — the checker would then tell
- * a consumer to pin a version whose downloads do not exist. `BrairdCore.swift` and the canon pair
- * are genuinely unversioned and are listed literally.
- *
- * The list is "what this lock file pins", not "what this platform builds" — that is the only
- * definition that answers the question being asked. Both locks carry checksums for
- * `great-ideas.json` and `idea-tree.yaml` (`ideaTreeYaml.sha256` / `BRAIRD_CORE_IDEA_TREE_SHA256`),
- * so a release missing the canon pair cannot complete the documented pin flow even though its
- * binary is present. Add a row here whenever a lock gains a checksum, or this drifts silently.
+ * `pins` maps each CHECKSUM KEY in the lock to the release asset it covers, and that shape is the
+ * point. Three weaker versions were tried and each failed differently:
+ *   - extension patterns (`/\.aar$/`) accepted a `v1.2.0` release carrying only a stale
+ *     `braird-core-1.1.0.aar`, so the asset name is a function of the version;
+ *   - a flat list described what each platform BUILDS rather than what its lock PINS, which left
+ *     the canon pair unwatched even though both locks checksum it;
+ *   - a COUNT cross-check caught a lock gaining a checksum, but not one being renamed, since the
+ *     cardinality is unchanged.
+ * Keying on the lock's own identifiers closes all three: `consumerFromFile` reads the keys actually
+ * present and any disagreement with this table is reported, so the table is verified against the
+ * lock every run instead of maintained by memory.
  */
-const CANON_ASSETS = ['great-ideas.json', 'idea-tree.yaml'];
-
 const CONSUMERS = [
   {
     repo: 'braird-android',
     file: 'gradle/braird-core.lock',
     tag: /^\s*tag\s*=\s*(v\S+)\s*$/m,
-    checksum: /^\s*[A-Za-z]+\.sha256\s*=/gm,
-    assets: (v) => [`braird-core-${v}.aar`, `braird-core-desktop-${v}.jar`, ...CANON_ASSETS],
+    checksum: /^\s*([A-Za-z]+\.sha256)\s*=/gm,
+    pins: {
+      'aar.sha256': (v) => `braird-core-${v}.aar`,
+      'desktopJar.sha256': (v) => `braird-core-desktop-${v}.jar`,
+      'ideaTreeYaml.sha256': () => 'idea-tree.yaml',
+      'greatIdeasJson.sha256': () => 'great-ideas.json',
+    },
   },
   {
     repo: 'braird-ios',
     file: 'braird-core.lock',
     tag: /^\s*BRAIRD_CORE_TAG\s*=\s*(v\S+)\s*$/m,
-    checksum: /^\s*[A-Z_]+_SHA256\s*=/gm,
-    assets: (v) => [`braird-core-${v}.xcframework.zip`, 'BrairdCore.swift', ...CANON_ASSETS],
+    checksum: /^\s*([A-Z_]+_SHA256)\s*=/gm,
+    pins: {
+      BRAIRD_CORE_XCFRAMEWORK_SHA256: (v) => `braird-core-${v}.xcframework.zip`,
+      BRAIRD_CORE_WRAPPER_SHA256: () => 'BrairdCore.swift',
+      BRAIRD_CORE_IDEA_TREE_SHA256: () => 'idea-tree.yaml',
+      BRAIRD_CORE_GREAT_IDEAS_SHA256: () => 'great-ideas.json',
+    },
   },
 ];
+
+/** The release assets a consumer needs, derived from the checksums its lock declares. */
+function requiredAssets(pins, version) {
+  return Object.values(pins).map((name) => name(version));
+}
 
 // ── pure core ─────────────────────────────────────────────────────────────────
 // Everything below takes data and returns findings. The git, filesystem and API reads live at the
@@ -134,15 +147,28 @@ export function parseChangelog(text) {
   // `[Unreleased]` would otherwise read as a real section boundary, filing everything after it —
   // including a genuine `### Security` — under an already-released version, leaving two signals
   // green. Fence markers themselves are kept so the toggling stays legible.
-  let fenced = false;
+  // A fence closes only on the SAME character, at least as long as the one that opened it. A plain
+  // boolean let a ``` line inside a ~~~ block act as the close, so the block's contents were parsed
+  // as real and the true ~~~ re-opened the fence over the entry that followed — blanking a genuine
+  // `### Security`. CommonMark's rule, applied to the one part of it this parser depends on.
+  let fence = null; // { char, length }
   const outsideFences = text
     .split('\n')
     .map((line) => {
-      if (/^\s*(```|~~~)/.test(line)) {
-        fenced = !fenced;
-        return line;
+      const m = /^\s*(`{3,}|~{3,})/.exec(line);
+      if (m) {
+        const [char, length] = [m[1][0], m[1].length];
+        if (fence === null) {
+          fence = { char, length };
+          return line;
+        }
+        if (char === fence.char && length >= fence.length) {
+          fence = null;
+          return line;
+        }
+        return ''; // a foreign fence marker is just content inside the open block
       }
-      return fenced ? '' : line;
+      return fence ? '' : line;
     })
     .join('\n');
   const parts = outsideFences.split(/^## \[([^\]]+)\]([^\n]*)$/m);
@@ -255,15 +281,36 @@ export function parseCalendarDate(ymd) {
  * deleted from the pinned release left `behind` empty, so nothing looked at it and the run went
  * green while a clean build could no longer fetch its own dependency.
  */
-function missingAssets(release, assets, version) {
-  const required = typeof assets === 'function' ? assets(version) : [];
-  return required.filter((name) => !release.assets.includes(name));
+function missingAssets(release, pins, version) {
+  return requiredAssets(pins ?? {}, version).filter((name) => !release.assets.includes(name));
 }
 
 function ageDays(now, since) {
   const [a, b] = [Date.parse(now), Date.parse(since)];
   if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
   return Math.floor((a - b) / DAY_MS);
+}
+
+/**
+ * Age in days, or WHY there isn't one — `{ age }` | `{ bad: 'unparseable' }` | `{ bad: 'future', days }`.
+ *
+ * One helper for every timestamp this checker ages, because doing it per site is how the class kept
+ * escaping. A future date and an unparseable one both make `age > limit` false forever, so both
+ * silently disable whatever deadline they feed; there are three sources (a CHANGELOG heading, a
+ * release's `published_at`, and a git committer timestamp) and each was fixed separately, one round
+ * apart, with the third missed twice. A rule that must hold for a set belongs where the set is
+ * consumed, not at each member.
+ *
+ * `FUTURE_SLACK_DAYS` of tolerance: a CHANGELOG date is a bare day, and a maintainer east of UTC
+ * writing "today" is legitimately a few hours ahead of it.
+ */
+const FUTURE_SLACK_DAYS = 1;
+
+function describeAge(now, since) {
+  const age = ageDays(now, since);
+  if (age === null) return { bad: 'unparseable' };
+  if (age < -FUTURE_SLACK_DAYS) return { bad: 'future', days: -age };
+  return { age };
 }
 
 /**
@@ -324,9 +371,13 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
     if (unreleasedSecuritySince === null) {
       add('unreleased', 'CHANGELOG [Unreleased] has a ### Security section but its first commit could not be dated');
     } else {
-      const age = ageDays(now, unreleasedSecuritySince);
-      if (age === null) {
+      const { age, bad, days } = describeAge(now, unreleasedSecuritySince);
+      if (bad === 'unparseable') {
         add('unreleased', `CHANGELOG [Unreleased] has a ### Security section dated unparseably (${unreleasedSecuritySince})`);
+      } else if (bad === 'future') {
+        // git accepts a future committer timestamp, so a wrong workstation clock would otherwise
+        // postpone this signal to that date plus seven days.
+        add('unreleased', `the commit introducing the ### Security section is dated ${days} days in the FUTURE (${unreleasedSecuritySince})`);
       } else if (age >= DEADLINE_DAYS.security) {
         add(
           'unreleased',
@@ -348,23 +399,22 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
       continue;
     }
     const limit = hasSecuritySection(s.body) ? DEADLINE_DAYS.security : DEADLINE_DAYS.routine;
-    const age = ageDays(now, parseCalendarDate(s.date));
-    if (age === null) {
+    const { age, bad, days } = describeAge(now, parseCalendarDate(s.date));
+    if (bad === 'unparseable') {
       add(
         'unpublished',
         `CHANGELOG section [${s.version}] has no published release and its date ${s.date} is not a real ` +
           'date — release.yml checks the SHAPE of this field, not its validity, so a typo here would ' +
           'otherwise disable this signal silently',
       );
-    } else if (age < -1) {
+    } else if (bad === 'future') {
       // A future date is not "young", it is wrong — and left alone it postpones the alarm by however
       // far into the future the typo reaches. `2099-01-01` would silence a failed SECURITY release
-      // for seventy years. One day of slack, because a CHANGELOG date is a bare day and a maintainer
-      // writing "today" east of UTC can legitimately be a few hours ahead of it.
+      // for seventy years.
       add(
         'unpublished',
         `CHANGELOG section [${s.version}] has no published release and is dated ${s.date}, ` +
-          `${-age} days in the FUTURE — a future date postpones this signal instead of raising it`,
+          `${days} days in the FUTURE — a future date postpones this signal instead of raising it`,
       );
     } else if (age >= limit) {
       add(
@@ -398,7 +448,7 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
   }
 
   // (3) UNPINNED — a consumer trailing a published release.
-  for (const { repo, pinnedTag, error, assets, checksumCount } of consumers) {
+  for (const { repo, pinnedTag, error, pins, lockKeys } of consumers) {
     if (error) {
       add('unpinned', `${repo}: pin could not be read (${error})`);
       continue;
@@ -407,15 +457,22 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
     // pin written ahead of the release it expects — parses fine and sorts above every section, so
     // `behind` comes back empty and the consumer reads as perfectly current forever. Silence is the
     // one answer this checker must never give by accident.
-    // The lock is the authority on what this consumer fetches. If it pins more checksums than this
-    // script knows to require, the extra artifacts are unwatched — and nothing else would say so.
-    const required = typeof assets === 'function' ? assets('0.0.0').length : 0;
-    if (checksumCount !== undefined && checksumCount !== required) {
-      add(
-        'unpinned',
-        `${repo}: its lock pins ${checksumCount} checksums but this checker requires ${required} ` +
-          'assets — the difference is unwatched; update CONSUMERS in check-release-staleness.mjs',
-      );
+    // The lock is the authority on what this consumer fetches; `pins` is this script's CLAIM about
+    // it, verified here every run. A key in one and not the other means an artifact nobody is
+    // watching, or a rule watching an artifact that no longer exists.
+    if (lockKeys) {
+      const known = new Set(Object.keys(pins ?? {}));
+      const unwatched = lockKeys.filter((k) => !known.has(k));
+      const vanished = [...known].filter((k) => !lockKeys.includes(k));
+      if (unwatched.length > 0 || vanished.length > 0) {
+        add(
+          'unpinned',
+          `${repo}: its lock and this checker disagree about what it pins` +
+            (unwatched.length ? ` — unwatched in the lock: ${unwatched.join(', ')}` : '') +
+            (vanished.length ? ` — required here but absent from the lock: ${vanished.join(', ')}` : '') +
+            '; update CONSUMERS in check-release-staleness.mjs',
+        );
+      }
     }
     const pinnedVersion = String(pinnedTag).replace(/^v/, '');
     if (!published.has(pinnedVersion)) {
@@ -426,7 +483,7 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
     // the release a consumer is already on, `behind` is empty and every later check skips it — so a
     // clean build that can no longer fetch its own pinned AAR produced a green run. Checking only
     // what a consumer might MOVE TO leaves what it currently DEPENDS ON unwatched.
-    const missingFromPin = missingAssets(published.get(pinnedVersion), assets, pinnedVersion);
+    const missingFromPin = missingAssets(published.get(pinnedVersion), pins, pinnedVersion);
     if (missingFromPin.length > 0) {
       add(
         'unpinned',
@@ -461,7 +518,7 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
       behind.filter((s) => {
         const rel = published.get(s.version);
         if (!rel) return false;
-        const missing = missingAssets(rel, assets, s.version);
+        const missing = missingAssets(rel, pins, s.version);
         if (missing.length === 0) return true;
         incomplete.push(`${s.version} (missing ${missing.join(', ')})`);
         return false;
@@ -480,15 +537,13 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
     const securities = fetchable.filter((s) => hasSecuritySection(s.body));
     const clock = securities[0] ?? fetchable[0];
     const limit = securities.length > 0 ? DEADLINE_DAYS.security : DEADLINE_DAYS.routine;
-    const age = ageDays(now, published.get(clock.version).publishedAt);
-    if (age === null) {
+    const { age, bad, days } = describeAge(now, published.get(clock.version).publishedAt);
+    if (bad === 'unparseable') {
       add('unpinned', `${repo}: release ${clock.version} has an unparseable published_at`);
       continue;
     }
-    if (age < -1) {
-      // Same trap as a future CHANGELOG date, on the other date source: a negative age satisfies no
-      // deadline, so the lag would go unreported for as long as the timestamp is wrong.
-      add('unpinned', `${repo}: release ${clock.version} claims to be published ${-age} days in the FUTURE`);
+    if (bad === 'future') {
+      add('unpinned', `${repo}: release ${clock.version} claims to be published ${days} days in the FUTURE`);
       continue;
     }
     if (age >= limit) {
@@ -599,14 +654,15 @@ function securityFirstSeenSince(tag) {
  * seam whose whole failure mode is losing a field between two halves that each work.
  */
 export function consumerFromFile(config, contents) {
-  const { file, tag, checksum, ...carried } = config; // `carried` is repo + assets + later additions
+  const { file, tag, checksum, ...carried } = config; // `carried` is repo + pins + later additions
   if (contents === null) return { ...carried, error: `${file} could not be read` };
   const m = tag.exec(contents);
   if (!m) return { ...carried, error: `no tag line matched in ${file}` };
-  // How many artifacts the lock ACTUALLY pins, read from the lock rather than assumed. The `assets`
-  // list above is hand-maintained, and a comment telling the next person to update it is not a
-  // check — review found the canon pair missing from it exactly that way.
-  return { ...carried, pinnedTag: m[1], checksumCount: (contents.match(checksum) ?? []).length };
+  // The checksum KEYS the lock actually declares, read from the lock rather than assumed. Identities,
+  // not a count: a renamed artifact leaves the cardinality unchanged, so counting would have called
+  // a lock describing an entirely different payload set "in agreement".
+  const keys = [...contents.matchAll(checksum)].map(([, key]) => key);
+  return { ...carried, pinnedTag: m[1], lockKeys: keys };
 }
 
 function readConsumers(dir) {
@@ -640,7 +696,7 @@ const CL = {
 const full = (version) => ['SHA256SUMS.txt', `app-${version}.bin`];
 const rel = (version, publishedAt, assets = full(version)) => ({ publishedAt, assets });
 /** The fixture consumer, declaring its requirement the same way the real ones do. */
-const APP = { repo: 'app', assets: (v) => [`app-${v}.bin`] };
+const APP = { repo: 'app', pins: { 'app.sha256': (v) => `app-${v}.bin` } };
 
 const PUB = new Map([
   ['1.1.0', rel('1.1.0', '2025-12-01T00:00:00Z')],
@@ -879,15 +935,51 @@ const CORPUS = [
     },
     detail: /in the FUTURE/,
   },
+  // ── a fence closes only on its OWN delimiter (Codex P2, eleventh round) ──
+  {
+    name: 'a backtick line inside a tilde fence does not close it and expose the example heading',
+    input: {
+      // Under a boolean toggle the ``` closed the block, the example heading parsed as real, and
+      // the closing ~~~ re-opened the fence over the genuine Security entry — blanking it.
+      changelog: '## [Unreleased]\n\n~~~\n```\n## [1.1.0] - 2025-12-01\n~~~\n\n### Security\n- a real fix\n',
+      published: new Map(),
+      unreleasedSecuritySince: '2026-01-01T00:00:00Z',
+      now: '2026-03-01T00:00:00Z',
+    },
+    expect: ['unreleased'],
+  },
+  // ── a future GIT timestamp is the third date source, and it was missed twice ──
+  {
+    name: 'a future committer timestamp on the security commit is reported, not given a grace period',
+    input: {
+      changelog: CL.unreleasedSecurity,
+      published: new Map(),
+      unreleasedSecuritySince: '2099-01-01T00:00:00Z', // a wrong workstation clock
+      now: '2026-01-01T00:00:00Z',
+    },
+    detail: /in the FUTURE/,
+  },
   // ── the LOCK is the authority on what a consumer fetches, not this file's config ──
   {
-    name: 'a lock pinning more checksums than the config requires is reported as unwatched',
+    name: 'a lock pinning a checksum this checker does not know about is reported as unwatched',
     input: {
       changelog: CL.quiet,
-      consumers: [{ ...APP, pinnedTag: 'v1.2.0', checksumCount: 4 }], // APP requires 1 asset
+      // The lock declares two artifacts; APP's table knows one. A COUNT check would also catch
+      // this — the next row is the one it would not.
+      consumers: [{ ...APP, pinnedTag: 'v1.2.0', lockKeys: ['app.sha256', 'canon.sha256'] }],
       now: '2026-01-02T00:00:00Z',
     },
-    detail: /pins 4 checksums but this checker requires 1/,
+    detail: /unwatched in the lock: canon\.sha256/,
+  },
+  {
+    name: 'a RENAMED checksum is reported too — same count, different payload set',
+    input: {
+      changelog: CL.quiet,
+      // One key in, one key out: cardinality is unchanged, so only identities catch it.
+      consumers: [{ ...APP, pinnedTag: 'v1.2.0', lockKeys: ['renamedApp.sha256'] }],
+      now: '2026-01-02T00:00:00Z',
+    },
+    detail: /unwatched in the lock: renamedApp\.sha256.*absent from the lock: app\.sha256/,
   },
   // ── a consumer needs every asset its LOCK pins, binary or not (Codex P2, tenth round) ──
   {
@@ -899,7 +991,7 @@ const CORPUS = [
         // Binary present, canon deleted — the documented pin flow cannot complete.
         ['1.2.0', rel('1.2.0', '2026-01-01T00:00:00Z', ['SHA256SUMS.txt', 'app-1.2.0.bin'])],
       ]),
-      consumers: [{ repo: 'app', assets: (v) => [`app-${v}.bin`, 'canon.json'], pinnedTag: 'v1.1.0' }],
+      consumers: [{ repo: 'app', pins: { 'app.sha256': (v) => `app-${v}.bin`, 'canon.sha256': () => 'canon.json' }, pinnedTag: 'v1.1.0' }],
       now: '2026-06-01T00:00:00Z',
     },
     detail: /published but incomplete/,
@@ -1015,8 +1107,8 @@ function checkConsumerPlumbing() {
     ];
     for (const [what, got] of cases) {
       if (got.repo !== config.repo) problems.push(`${config.repo}: ${what} lost \`repo\``);
-      if (typeof got.assets !== 'function' || got.assets('9.9.9').length !== config.assets('9.9.9').length) {
-        problems.push(`${config.repo}: ${what} lost \`assets\` — the completeness rule would be dead in production`);
+      if (!got.pins || Object.keys(got.pins).length !== Object.keys(config.pins).length) {
+        problems.push(`${config.repo}: ${what} lost \`pins\` — the completeness rule would be dead in production`);
       }
     }
   }
