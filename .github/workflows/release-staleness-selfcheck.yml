@@ -20,12 +20,17 @@ on:
   pull_request:
     paths:
       - 'scripts/check-release-staleness.mjs'
+      # The shared parser decides which lines are sections and which are prose, so a change here can
+      # break every signal without touching the checker itself. Omitting it meant a parser-only PR
+      # merged without the corpus ever running.
+      - 'scripts/lib/changelog-structure.mjs'
       - '.github/workflows/release-staleness.yml'
       - '.github/workflows/release-staleness-selfcheck.yml'
   push:
     branches: [main]
     paths:
       - 'scripts/check-release-staleness.mjs'
+      - 'scripts/lib/changelog-structure.mjs'
 
 jobs:
   self-check:

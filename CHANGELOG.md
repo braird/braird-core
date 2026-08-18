@@ -87,7 +87,10 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   (`scripts/lib/changelog-structure.mjs`) rather than reimplemented — three progressively better
   copies had grown in the new script while a complete implementation sat one directory away, and
   two copies of one rule fail open because the newer is always the one missing a case. Adopting
-  it also closed a miss recorded as accepted: HTML-comment example headings are masked too.
+  it also closed a miss recorded as accepted: HTML-comment example headings are masked too. Both
+  scripts import the shared module — the release gate was refactored onto it rather than left
+  with its own copy — and `release.yml` stages both files, since the judge it copies out of the
+  workflow revision is now two files rather than one.
   **The privileged and unprivileged halves are separate workflows**, and that split is a security
   boundary rather than tidiness. The staleness run reads a token for two private repositories from a
   public repo, so it is `schedule` + `workflow_dispatch` only and takes the token from an environment

@@ -80,7 +80,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - run: cp scripts/check-stale-release-markers.mjs "$RUNNER_TEMP"/
+      # The checker imports scripts/lib/changelog-structure.mjs, so the judge is TWO files now and
+      # both must come from the workflow revision. Copying only the entry point would fail at import
+      # under the existing-tag recovery path, or worse, silently pick up a different copy.
+      - run: |
+          mkdir -p "$RUNNER_TEMP"/lib
+          cp scripts/check-stale-release-markers.mjs "$RUNNER_TEMP"/
+          cp scripts/lib/changelog-structure.mjs "$RUNNER_TEMP"/lib/
 
       - name: Check out validated tag without persisting credentials
         uses: actions/checkout@v4
