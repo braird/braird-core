@@ -186,7 +186,10 @@ export function parseChangelog(text) {
 
 /** Keep a Changelog puts security work under its own heading. That heading IS the severity signal. */
 export function hasSecuritySection(body) {
-  return /^### Security\s*$/m.test(body);
+  // Up to three leading spaces, matching the version-heading rule and CommonMark. An exact-column
+  // match made ` ### Security` invisible, which silences the unreleased signal outright and quietly
+  // demotes a release from the 7-day deadline to the 30-day one.
+  return /^ {0,3}###\s+Security\s*$/m.test(body);
 }
 
 /**
@@ -922,6 +925,41 @@ const CORPUS = [
       now: '2026-01-15T00:00:00Z',
     },
     detail: /in the FUTURE/,
+  },
+  // ── an indented heading is still a heading (Codex P2, thirteenth round) ──
+  {
+    name: 'a ### Security heading indented up to three spaces is still seen',
+    input: {
+      changelog: '## [Unreleased]\n\n   ### Security\n- a real fix\n',
+      published: new Map(),
+      unreleasedSecuritySince: '2026-01-01T00:00:00Z',
+      now: '2026-03-01T00:00:00Z',
+    },
+    expect: ['unreleased'],
+  },
+  // ── a backtick fence's info string may not contain a backtick (Codex P2, thirteenth round) ──
+  {
+    name: 'an ordinary line with backticks after ``` does not open a fence that swallows the file',
+    input: {
+      // Not a fence opener under CommonMark. Treated as one, it never closed, and everything after
+      // it — including the Security entry — was masked through EOF.
+      changelog: '## [Unreleased]\n\n```see `foo` here\n\n### Security\n- a real fix\n',
+      published: new Map(),
+      unreleasedSecuritySince: '2026-01-01T00:00:00Z',
+      now: '2026-03-01T00:00:00Z',
+    },
+    expect: ['unreleased'],
+  },
+  {
+    name: 'but a TILDE fence may carry backticks in its info string, and still fences',
+    input: {
+      changelog:
+        '## [Unreleased]\n\n~~~`x\n## [1.1.0] - 2025-12-01\n~~~\n\n### Security\n- a real fix\n',
+      published: new Map(),
+      unreleasedSecuritySince: '2026-01-01T00:00:00Z',
+      now: '2026-03-01T00:00:00Z',
+    },
+    expect: ['unreleased'], // the example heading stays fenced; the Security entry survives
   },
   // ── a CLOSER carries nothing but whitespace (Codex P2, twelfth round) ──
   {

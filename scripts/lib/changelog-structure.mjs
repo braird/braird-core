@@ -53,7 +53,14 @@ export function classifyChangelogLines(text) {
   return probe.map((line) => {
     const f = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
     if (f) {
-      if (!fence) fence = f[1];
+      // A BACKTICK fence's info string may not contain a backtick — CommonMark, and the rule that
+      // stops an ordinary line like ``` `foo` ``` from opening a block that then masks everything
+      // to EOF, including a real `### Security`. Tilde fences have no such restriction.
+      const opensAFence = f[1][0] !== '`' || !f[2].includes('`');
+      if (!fence) {
+        if (opensAFence) fence = f[1];
+        return { insideFence: false, heading: null };
+      }
       else if (f[1][0] === fence[0] && f[1].length >= fence.length && f[2].trim() === '') fence = null;
       return { insideFence: true, heading: null }; // the delimiter line itself is never a heading
     }

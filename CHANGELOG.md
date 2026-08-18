@@ -87,7 +87,10 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   (`scripts/lib/changelog-structure.mjs`) rather than reimplemented — three progressively better
   copies had grown in the new script while a complete implementation sat one directory away, and
   two copies of one rule fail open because the newer is always the one missing a case. Adopting
-  it also closed a miss recorded as accepted: HTML-comment example headings are masked too. Both
+  it also closed a miss recorded as accepted: HTML-comment example headings are masked too, and a
+  backtick fence's info string may not itself contain a backtick, so an ordinary line cannot open
+  a block that masks the rest of the file. Heading detection tolerates up to three leading spaces
+  everywhere, `### Security` included — an exact-column match made an indented one invisible. Both
   scripts import the shared module — the release gate was refactored onto it rather than left
   with its own copy — and `release.yml` stages both files, since the judge it copies out of the
   workflow revision is now two files rather than one.
