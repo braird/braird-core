@@ -89,7 +89,10 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   two copies of one rule fail open because the newer is always the one missing a case. Adopting
   it also closed a miss recorded as accepted: HTML-comment example headings are masked too, and a
   backtick fence's info string may not itself contain a backtick, so an ordinary line cannot open
-  a block that masks the rest of the file. Heading detection tolerates up to three leading spaces
+  a block that masks the rest of the file. Fence and comment state are resolved in ONE interleaved
+  pass, because each can hide the other's syntax: blanking comments first let a `<!--` inside a
+  fenced example swallow that fence's closing delimiter, after which every following line was
+  masked to end of file. Heading detection tolerates up to three leading spaces
   everywhere, `### Security` included, along with an optional ATX closing hash run — an
   exact-column match made an indented or `### Security ###` heading invisible. The release list is
   fully paginated rather than capped at one page: a silently exceeded ceiling turns every omitted

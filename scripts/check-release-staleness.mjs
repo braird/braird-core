@@ -932,6 +932,20 @@ const CORPUS = [
     },
     detail: /in the FUTURE/,
   },
+  // ── comment syntax is literal INSIDE a fence (Codex P2, fifteenth round) ──
+  {
+    name: 'a comment marker inside a fenced example does not swallow the fence closer',
+    input: {
+      // Blanking comments before knowing about fences erased the closing ```, so the block never
+      // closed and everything after it — the Security entry included — was masked to EOF.
+      changelog:
+        '## [Unreleased]\n\n```\n<!--\n## [1.1.0] - 2025-12-01\n-->\n```\n\n### Security\n- a real fix\n',
+      published: new Map(),
+      unreleasedSecuritySince: '2026-01-01T00:00:00Z',
+      now: '2026-03-01T00:00:00Z',
+    },
+    expect: ['unreleased'],
+  },
   // ── ATX closing hashes are decoration, not part of the title (Codex P2, fourteenth round) ──
   {
     name: 'a ### Security ### heading with closing hashes is still seen',
