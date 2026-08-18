@@ -2,30 +2,51 @@ name: Release staleness check
 
 # SUR-1070 follow-up. Every other gate in this repo asks whether the tree is CONSISTENT. None asks
 # whether consistent, finished work is STUCK — and braird-core ships through two hops that are both
-# manual on purpose: merge → release tag, then release tag → `braird-core.lock` in each app repo.
-# No floating versions in a crypto core, and the pin PR is the integration gate (docs/pinning.md).
-# Both hops are right; neither had a clock on it. SUR-1070's note-tombstoning fix merged, was
-# released, and the only thing that surfaced "this is still not on a phone" was a human asking.
+# manual on purpose: merge → release, then release → `braird-core.lock` in each app repo. No floating
+# versions in a crypto core, and the pin PR is the integration gate (docs/pinning.md). Both hops are
+# right; neither had a clock on it. SUR-1070's note-tombstoning fix merged, was released, and the
+# only thing that surfaced "this is still not on a phone" was a human asking.
 #
 # `scripts/check-release-staleness.mjs` carries the rules and the reasoning; this file only feeds it.
 #
-# NOT a merge-path gate, deliberately — there is no `pull_request` trigger. "You have not shipped
-# this yet" is never a reason to reject the next commit, so this runs on a clock and reports.
+# NOT a merge-path gate, deliberately. "You have not shipped this yet" is never a reason to reject
+# the next commit, so this runs on a clock and reports. The script's own self-check runs per-PR from
+# `release-staleness-selfcheck.yml`, which is a separate file precisely because it must hold NO
+# secret — see below.
 #
 # Daily, unlike the Monday drift checks. Its tightest deadline is 7 days, and a weekly cadence would
 # make that up to 14 in practice — a deadline the schedule cannot actually enforce is decoration.
-# Cost is one Node run plus two shallow clones.
 #
-# REQUIRES the `CONSUMER_PINS_READ_PAT` secret: a read-only PAT with `contents: read` on
-# braird/braird-android and braird/braird-ios, which are PRIVATE. Deliberately NOT `SURFC_READ_PAT`
-# — that one is scoped to braird/surfc, and widening it would extend an unrelated workflow's reach
-# to two more repositories to save creating one secret. Each cross-repo reader gets its own.
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# THIS FILE IS PRIVILEGED. It reads `CONSUMER_PINS_READ_PAT`, a token for two PRIVATE repositories,
+# and braird-core is PUBLIC. Two earlier revisions of this comment claimed protections that did not
+# hold, so the reasoning is spelled out rather than implied.
 #
-# braird-core is a PUBLIC repository, so holding a PAT for private repos here deserves a sentence.
-# Secrets are not exposed to workflows triggered from forks, and this workflow has no
-# `pull_request` trigger at all — chosen above for a different reason, but it also means no
-# fork-controlled run can ever reach this secret. Keep it that way: adding a `pull_request` trigger
-# here would change the security posture, not just the cadence.
+# WRONG (v1): "no `pull_request` trigger, so the secret is safe." That closes the fork vector and
+# nothing else.
+# WRONG (v2): "filter `push` to main / guard the steps on `github.ref`." Neither binds, because on a
+# `push` GitHub runs THE PUSHED BRANCH'S COPY of this file — an attacker rewrites the filter and the
+# guard in the same commit that adds the exfiltration step. A control a branch can edit is not a
+# control. Every run of this workflow before this fix was a push on a non-default branch, which is
+# exactly the attack shape.
+#
+# What actually holds, because GitHub enforces it OUTSIDE this file:
+#   - NO `push` trigger at all. `schedule` always runs the DEFAULT BRANCH's revision, whatever
+#     branches exist, so the scheduled run cannot be redirected by pushing anything.
+#   - `environment: consumer-pins`, whose deployment-branch policy is `main` and which is where the
+#     PAT is STORED (an environment secret, not a repository secret). A `workflow_dispatch` against
+#     any other ref cannot reach the environment, so it cannot reach the token — and that decision
+#     lives in repository settings, where a branch push cannot touch it.
+#
+# SETUP, required, and the workflow fails closed without it: create an environment named
+# `consumer-pins`, set its deployment branch rule to `main` only, and store
+# `CONSUMER_PINS_READ_PAT` INSIDE it (a read-only PAT with `contents: read` on braird-android and
+# braird-ios). A repository-level secret of the same name is not equivalent and should be removed —
+# repository secrets are readable from any branch's workflow revision, which is the hole above.
+#
+# Deliberately NOT `SURFC_READ_PAT`: that one is scoped to braird/surfc, and widening it would
+# extend an unrelated workflow's reach to two more repositories to save creating one secret.
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
 
 # CodeQL (actions/missing-workflow-permissions) on PR #93: pin the GITHUB_TOKEN down rather than
 # inheriting the repository default. `contents: read` is the whole requirement — the checkout, and
@@ -36,20 +57,17 @@ permissions:
 on:
   schedule:
     - cron: '0 9 * * *' # daily 09:00 UTC
-  # A change to the checker or this workflow exercises it immediately, matching the other drift
-  # checks — the rules are only trustworthy if editing them runs them.
-  push:
-    paths:
-      - 'scripts/check-release-staleness.mjs'
-      - '.github/workflows/release-staleness.yml'
   workflow_dispatch:
 
 jobs:
   staleness:
     runs-on: ubuntu-latest
+    # The branch policy on this environment is the ONLY thing standing between a non-main revision
+    # of this file and the token. Keep the PAT stored here, not at repository level.
+    environment: consumer-pins
     steps:
-      # Full history + tags: the checker dates the last release from its tag, and dates unreleased
-      # security work by walking the CHANGELOG commits since that tag. A shallow clone has neither.
+      # Full history + tags: the checker dates unreleased security work by walking the CHANGELOG
+      # commits since the newest published release. A shallow clone has none of that.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -64,24 +82,24 @@ jobs:
       # A TAG IS NOT A RELEASE (Codex on PR #93). `release.yml` publishes create-only at the END of
       # its job DAG, so a tag whose build failed leaves a tag with no release behind it. The checker
       # judges every version against THIS list, never against `git tag`, so that state is reported
-      # instead of silently reading as shipped. One page of 100 is the ceiling and is ~6x the
+      # instead of silently reading as shipped. One page of 100 is the ceiling and is ~4x the
       # release history; paginate here if that ever stops being true.
       - name: Fetch the published releases
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh api "repos/${{ github.repository }}/releases?per_page=100" > /tmp/releases.json
 
-      # Read-only, and the checker needs exactly one file from each. `|| true` is deliberate: a
-      # clone that fails (revoked PAT, missing scope, outage) must surface as a FINDING from the
-      # checker — "pin could not be read" — not as a green run that silently checked nothing.
+      # Read-only, and the checker needs exactly one file from each. Tolerating a failed clone is
+      # deliberate: a clone that fails (revoked PAT, missing scope, outage) must surface as a
+      # FINDING from the checker — "pin could not be read" — not as a green run that checked nothing.
       - name: Fetch the consumer pins
         env:
           PAT: ${{ secrets.CONSUMER_PINS_READ_PAT }}
         run: |
           mkdir -p /tmp/consumers
           if [ -z "$PAT" ]; then
-            echo "::error::CONSUMER_PINS_READ_PAT is not set — the consumer-pin signal cannot run."
-            echo "::error::Create a read-only PAT with contents:read on braird-android + braird-ios."
+            echo "::error::CONSUMER_PINS_READ_PAT is not readable from the consumer-pins environment."
+            echo "::error::Store it as an ENVIRONMENT secret there (branch policy: main), not at repo level."
           fi
           for repo in braird-android braird-ios; do
             git clone --depth 1 --quiet \

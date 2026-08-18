@@ -220,11 +220,21 @@ It reports; it never opens a PR and never blocks a merge, because not having shi
 is not a reason to reject the next commit.
 
 The consumer-pin half reads `braird-core.lock` from braird-android and braird-ios, both private, so
-it needs a `CONSUMER_PINS_READ_PAT` secret — a read-only PAT with `contents: read` on those two
+it needs a `CONSUMER_PINS_READ_PAT` — a read-only PAT with `contents: read` on those two
 repositories. Without it the check reports "pin could not be read" and fails, which is the intended
 behaviour: a reader that cannot see the consumers has not confirmed they are current. It is a
-separate secret from `SURFC_READ_PAT` on purpose — that one is scoped to surfc, and widening it
+separate credential from `SURFC_READ_PAT` on purpose — that one is scoped to surfc, and widening it
 would extend an unrelated workflow's reach to save creating one secret.
+
+**Store it as an ENVIRONMENT secret in an environment named `consumer-pins`, with a deployment
+branch policy of `main` only — not as a repository secret.** braird-core is public and that token
+reads two private repositories, so where it lives is a security boundary rather than a preference. A
+repository secret is readable by any branch's revision of a workflow, and on a `push` GitHub runs
+the *pushed* revision — so a filter or an `if:` guard written inside the workflow can be deleted by
+the same commit that adds an exfiltration step. The environment's branch policy is enforced in
+repository settings, where a branch push cannot reach it, which is why it is the control that holds.
+The privileged workflow is correspondingly `schedule` + `workflow_dispatch` only; the script's own
+rule self-check lives in a separate, secret-free workflow so it can still run on every PR.
 
 ## Scope
 

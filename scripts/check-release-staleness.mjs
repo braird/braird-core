@@ -140,8 +140,18 @@ export function releasesAfter(released, pinned) {
   });
 }
 
+/**
+ * Age in whole days, or null when either end is unparseable.
+ *
+ * Returning null rather than NaN is the point. `NaN > limit` is FALSE, so an invalid timestamp used
+ * to make every deadline pass forever — a date typo silently disabled the signal it was feeding.
+ * `release.yml` only checks a CHANGELOG date's SHAPE (`[0-9]{4}-[0-9]{2}-[0-9]{2}`), so `2026-13-01`
+ * reaches this function in the ordinary course of a typo, not only under attack.
+ */
 function ageDays(now, since) {
-  return Math.floor((Date.parse(now) - Date.parse(since)) / DAY_MS);
+  const [a, b] = [Date.parse(now), Date.parse(since)];
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
+  return Math.floor((a - b) / DAY_MS);
 }
 
 /** Oldest first, so "the one whose clock started earliest" is just `[0]`. */
@@ -171,7 +181,9 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
       add('unreleased', 'CHANGELOG [Unreleased] has a ### Security section but its first commit could not be dated');
     } else {
       const age = ageDays(now, unreleasedSecuritySince);
-      if (age > DEADLINE_DAYS.security) {
+      if (age === null) {
+        add('unreleased', `CHANGELOG [Unreleased] has a ### Security section dated unparseably (${unreleasedSecuritySince})`);
+      } else if (age > DEADLINE_DAYS.security) {
         add(
           'unreleased',
           `security work has sat in CHANGELOG [Unreleased] for ${age} days (limit ` +
@@ -193,7 +205,14 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
     }
     const limit = hasSecuritySection(s.body) ? DEADLINE_DAYS.security : DEADLINE_DAYS.routine;
     const age = ageDays(now, `${s.date}T00:00:00Z`);
-    if (age > limit) {
+    if (age === null) {
+      add(
+        'unpublished',
+        `CHANGELOG section [${s.version}] has no published release and its date ${s.date} is not a real ` +
+          'date — release.yml checks the SHAPE of this field, not its validity, so a typo here would ' +
+          'otherwise disable this signal silently',
+      );
+    } else if (age > limit) {
       add(
         'unpublished',
         `CHANGELOG section [${s.version}] (${s.date}, ${age} days old, limit ${limit}) has NO published ` +
@@ -225,6 +244,10 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
     const clock = securities[0] ?? fetchable[0];
     const limit = securities.length > 0 ? DEADLINE_DAYS.security : DEADLINE_DAYS.routine;
     const age = ageDays(now, published.get(clock.version));
+    if (age === null) {
+      add('unpinned', `${repo}: release ${clock.version} has an unparseable published_at (${published.get(clock.version)})`);
+      continue;
+    }
     if (age > limit) {
       add(
         'unpinned',
@@ -270,12 +293,18 @@ function newestPublished(published) {
 }
 
 /**
- * When `### Security` first showed up under `[Unreleased]` after the newest published release.
+ * When the `### Security` heading CURRENTLY under `[Unreleased]` got there — the start of the
+ * unbroken run of commits carrying it, NOT the first time one ever did.
  *
- * Walks the commits that touched CHANGELOG.md since that release's tag, oldest first, and stops at
- * the first whose `[Unreleased]` already carried the heading. Bounded by one release window, so it
- * stays cheap. Returns null when nothing since then has it — also the answer when the section
- * arrived and then left again.
+ * That distinction is the whole function. A heading can be added, then removed or reclassified, then
+ * added again by UNRELATED work before any release intervenes. Returning the first historical
+ * sighting would hand the new fix the old one's age and fail it on arrival — and a gate that
+ * accuses you of being late on the day you commit is a gate that gets switched off. So this finds
+ * the most recent absent→present transition: walk the range oldest first, reset on every commit
+ * WITHOUT the heading, and date from the first commit of the run that survives to HEAD.
+ *
+ * Bounded by one release window, so reading every commit's CHANGELOG in the range stays cheap.
+ * Returns null when no commit in the range carries it, and when the range cannot be walked at all.
  */
 function securityFirstSeenSince(tag) {
   const range = tag ? `${tag}..HEAD` : 'HEAD';
@@ -285,16 +314,21 @@ function securityFirstSeenSince(tag) {
   } catch {
     return null; // the tag is not present locally (shallow clone) — reported by the caller's grace
   }
+  let runStart = null; // first commit of the CURRENT unbroken run of commits carrying the heading
   for (const sha of shas) {
-    let text;
+    let present;
     try {
-      text = git('show', `${sha}:CHANGELOG.md`);
+      present = hasSecuritySection(parseChangelog(git('show', `${sha}:CHANGELOG.md`)).unreleased);
     } catch {
-      continue; // the file did not exist at that commit
+      continue; // the file did not exist at that commit — neither present nor a break
     }
-    if (hasSecuritySection(parseChangelog(text).unreleased)) return git('log', '-1', '--format=%cI', sha);
+    if (present) {
+      if (runStart === null) runStart = sha;
+    } else {
+      runStart = null; // the heading went away: any later one starts a NEW interval
+    }
   }
-  return null;
+  return runStart === null ? null : git('log', '-1', '--format=%cI', runStart);
 }
 
 function readConsumers(dir) {
@@ -427,6 +461,27 @@ const CORPUS = [
       now: '2026-01-15T00:00:00Z',
     },
     expect: [], // quiet on the pin; the unpublished signal owns this state (and is inside its grace)
+  },
+  // ── an unparseable date is a FINDING, never a silent pass (Codex P2 on PR #93) ──
+  // `NaN > limit` is false, so before this an invalid date disabled the signal it was feeding — and
+  // release.yml validates only the SHAPE of a CHANGELOG date, so `2026-13-01` gets there by typo.
+  {
+    name: 'an invalid date on an unpublished section is REPORTED, not aged to NaN and ignored',
+    input: {
+      changelog: '## [Unreleased]\n\n### Fixed\n- x\n\n## [1.2.0] - 2026-13-01\n\n### Added\n- x\n',
+      published: new Map(),
+      now: '2027-01-01T00:00:00Z',
+    },
+    detail: /is not a real date/,
+  },
+  {
+    name: 'an invalid unreleased-security date is REPORTED rather than passing every deadline',
+    input: {
+      changelog: CL.unreleasedSecurity,
+      unreleasedSecuritySince: 'not-a-date',
+      now: '2027-01-01T00:00:00Z',
+    },
+    expect: ['unreleased'],
   },
   // ── prerelease precedence (Codex P2 on PR #93) ──
   {

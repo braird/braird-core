@@ -31,9 +31,17 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   wait for the next feature pin without anyone hearing about it. The unreleased signal is dated from
   when the entry FIRST appeared, not from the previous tag — dating it from the tag would accuse a
   fix merged this morning of being weeks late, which is how a gate earns being switched off.
-  It runs on a schedule with **no `pull_request` trigger**: "you have not shipped this yet" is never
-  a reason to reject the next commit. A consumer whose pin cannot be read is REPORTED, never skipped
-  — a clone that failed must not read as "nothing to pin".
+  It runs on a schedule and never in the merge path: "you have not shipped this yet" is never a
+  reason to reject the next commit. A consumer whose pin cannot be read is REPORTED, never skipped —
+  a clone that failed must not read as "nothing to pin". An unparseable date is reported too, because
+  `NaN > limit` is false and a date typo would otherwise disable the signal it feeds silently.
+  **The privileged and unprivileged halves are separate workflows**, and that split is a security
+  boundary rather than tidiness. The staleness run reads a token for two private repositories from a
+  public repo, so it is `schedule` + `workflow_dispatch` only and takes the token from an environment
+  whose branch policy GitHub enforces outside the workflow file — on a `push`, GitHub runs the pushed
+  branch's revision, so any filter or `if:` guard written in the file can be deleted by the same
+  commit that adds an exfiltration step. The rule self-check holds no secret and therefore runs on
+  every PR.
 
 ## [0.15.1] - 2026-08-18
 
