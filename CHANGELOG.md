@@ -6,6 +6,8 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-08-17
+
 ### Added
 - **The SUR-996 question entity: sealed at write, synced end to end (SUR-1042).** `enqueue_question`
   seals `text` as `enc:v2` with the question id as AAD — the same boundary `enqueue_note` has held
@@ -45,30 +47,6 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   counterpart to interchange with, and that exclusion is now asserted against `synced_schema()` so it
   stays a stated scope rather than an artifact of a hardcoded field list.
 
-### Changed
-- **`open_questions` is now `questions`, and its `status` vocabulary is `active` rather than `live`
-  (SUR-1042).** SUR-1042 exports this entity over UniFFI, and deriving the API name from the table
-  exposed the misnomer: the table holds the *whole* question log — active, resolved and dismissed
-  alike — so `open_questions` named a subset of its own contents. `live` had a second and worse
-  problem: `vendored/schema/native-manifest.json` already uses `backend: live` for a table's
-  **migration lifecycle**, so a reader of these two files met one word meaning two unrelated things.
-  `checkin_response` moves `still_open` → `active` for the same one-word-per-concept reason.
-  This is a **registry-only change** — `store::native_schema()`, both vendored fixtures, and the
-  SUR-1049 integration test's payloads. The tables are still deliberately absent from
-  `table_schema()` and `synced_table_names()`; the seal boundary and the sync legs remain SUR-1042's
-  next PRs, and `tests/schema_parity.rs`'s boundary test still guards that gap.
-  **Paired with surfc migration `0056`, and the two are not independent.** This runs SUR-1048's
-  handshake in the opposite direction from SUR-1047's: there, the cloud caught up with the registry
-  and the manifest flipped `pending → live`; here the cloud moves *first*, so from the moment `0056`
-  is applied to braird-staging, `scripts/check-native-schema.mjs` fails on every core PR (finding
-  `questions` where the fixture still said `open_questions`) until this merges. That red window is
-  the coordination signal, but it is repo-wide CI — land this immediately after the staging apply,
-  and don't open it alongside an unrelated core PR.
-  Free exactly once: no shipped release contains these tables (`braird-core.lock` pins v0.14.0; they
-  landed after that tag), so no device has an `open_questions` table to migrate. After the sync legs
-  ship, the same rename is a coordinated three-repo data migration.
-
-### Added
 - **A behavioural round-trip against the native-first cloud tables, because the schema check can only
   ever prove a thing EXISTS (SUR-1049).** `scripts/check-native-schema.mjs` reads catalogues, and
   across five review rounds it accumulated thirteen findings of a single shape: a column is present
@@ -85,40 +63,11 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   obligation — the database dies with the job — and nothing is ever written to `braird-staging`. The
   two legs now split cleanly: the introspection answers *is the migration applied there*, this
   answers *does the DDL actually work*.
-  Deliberately raw PostgREST rather than `enqueue_* → flush`: these tables are registered but not yet
-  wired (`table_schema()` and `synced_table_names()` exclude them until SUR-1042), so probing the wire
-  directly proves the cloud side **before** core code is built on top of it. SUR-1042 upgrades the
-  same assertions onto the real outbox path.
+  Deliberately raw PostgREST rather than `enqueue_* → flush`: at the time it was written these tables
+  were registered but not yet wired, so probing the wire directly proved the cloud side **before** core
+  code was built on top of it. SUR-1042, in this same release, wires them and adds the outbox-path
+  round-trip alongside it.
 
-### Fixed
-- **Three staging-DDL checks that could not fail, or could pass a broken table (SUR-1048).** All
-  three were unreachable while the SUR-996 tables were `backend: pending`, so they are fixed now that
-  the flip has made them live. (1) `change_seq` and `user_id` were type-checked only against the
-  logical vocabulary, which the fixture-driven guards never reach for them — an `integer` `change_seq`
-  passed, and it is a monotonically increasing watermark, so it would overflow and then reject every
-  subsequent write. Both now pin the physical type (`bigint`, `uuid`). (2) RLS command coverage counted
-  policies granted to any role, so a table whose only SELECT/INSERT/UPDATE policies belonged to
-  `service_role` reported covered — while `service_role` bypasses RLS entirely and PostgREST arrives as
-  `authenticated`, which RLS would still deny. Coverage now counts client-applicable roles only, and
-  names the backend-only policies it found. (3) The NOT NULL cloud-only column check accepted *any*
-  trigger on the table as evidence the column gets populated — and since every valid table carries the
-  `change_seq` trigger, the check could never fire. That escape hatch is gone; proving a specific
-  trigger assigns a specific column needs execution, not catalogue introspection (SUR-1049).
-
-### Changed
-- **The three native-first tables are now `backend: live` — the staging DDL check runs against them
-  for real (SUR-1047).** SUR-1047's migration has been applied to `braird-staging`, so
-  `open_questions`, `question_note_overrides` and `user_settings` move from `backend: pending` (skip
-  the DDL leg, and fail if the table is found present anyway) to `live`. This is the second half of
-  the SUR-1048 handshake, and it is deliberately a separate commit: the check fails between the
-  migration landing and this flip, which is the signal that the migration landed at all.
-  From here `scripts/check-native-schema.mjs` asserts, per table and on every PR plus the weekly
-  cron, that the applied DDL still matches the locked fixture — column set and logical types, the
-  key constraint, RLS enablement and policies, the `change_seq` stamping trigger, and the
-  server-side `user_id`/`change_seq` columns. Nothing about the fixture or the descriptor changes;
-  this only opens the code path that validates them against the cloud.
-
-### Added
 - **A native-first schema registry, so a table core authors itself is under contract from its first
   commit (SUR-1048).** The SUR-723 guard could only cover tables *derived* from surfc: `sync-schema.json`
   is re-derived by `scripts/extract-sync-schema.mjs`, which is what makes an exact-equality assertion
@@ -176,12 +125,81 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   `timestamp`/`timestamptz` column is now **rejected** rather than normalised to `int`: PostgREST sends
   those as ISO strings, which `ColType::Int`'s `as_i64()` turns into NULL on every sync, so equating them
   with an epoch bigint would have let that ship green.
-  Registration only — these tables are created and locked, but deliberately absent from `table_schema()`
-  and the pull scope until SUR-1042 defines their encryption boundary and sync legs.
+  Registration only, as landed: the tables were created and locked but held out of `table_schema()` and
+  the pull scope until an encryption boundary existed for them. SUR-1042 supplies it in this same
+  release, so **as shipped in v0.15.0 they are fully wired** — see the question-entity entry above.
   Note for SUR-1047: `user_settings` must carry `deleted` (pull's tombstone gate reads it generically
   on every table), which amends SUR-996's `(user_id, key, value, updated_at)` sketch.
 
+- **The release now fails on documentation that contradicts it (`scripts/check-stale-release-markers.mjs`).**
+  Cutting v0.14.0 exposed a gap with no owner: `release.yml` verifies the tag, the crate version and
+  the CHANGELOG *section heading*, but nothing reads the prose beneath them, so a bad merge shipped
+  three files that each recorded a measured constant while instructing maintainers to re-derive it
+  before the very release containing it. The new check runs once in `validate` and fails on a small
+  set of literal deferral markers, matched the way maintainers honestly write them: wrapped across
+  `///` doc-comment lines, sentence-capitalized, decorated in house style (inline code, bold, plain
+  links, tables). Its threat model is **accidental staleness, not adversarial concealment** — a
+  marker hidden behind exotic Markdown is out of scope by design (anyone hiding from the gate can
+  simply not write the marker), and the accepted misses are pinned as explicit `--self-check` rows
+  so that boundary is executable. Scope: `src/**.rs` plus release-facing Markdown, excluding
+  historical records (`docs/plans`, `docs/learnings`, `docs/superpowers`), with the changelog
+  scanned only in `[Unreleased]` and the section being cut — shipped entries are immutable history.
+  Markers fail closed (descriptive prose trips too); a legitimate use keeps a one-line
+  `stale-marker-allow` exemption, visible in review where a silent miss is not. `--self-check` runs
+  in CI ahead of the scan, every behaviour is mutation-pinned, and the checker is replayed against
+  the incident commit, which it catches in full. `TODO`/`FIXME` are deliberately not checked: a
+  gate that fires on things people reasonably ship is a gate people learn to bypass.
+
+### Changed
+- **`open_questions` is now `questions`, and its `status` vocabulary is `active` rather than `live`
+  (SUR-1042).** SUR-1042 exports this entity over UniFFI, and deriving the API name from the table
+  exposed the misnomer: the table holds the *whole* question log — active, resolved and dismissed
+  alike — so `open_questions` named a subset of its own contents. `live` had a second and worse
+  problem: `vendored/schema/native-manifest.json` already uses `backend: live` for a table's
+  **migration lifecycle**, so a reader of these two files met one word meaning two unrelated things.
+  `checkin_response` moves `still_open` → `active` for the same one-word-per-concept reason.
+  The rename itself was a **registry-only change** — `store::native_schema()`, both vendored fixtures,
+  and the SUR-1049 integration test's payloads — landed ahead of the wiring so the seal boundary could
+  be reviewed on its own commit. Both halves are in **this** release: **as shipped in v0.15.0 the three
+  tables resolve through `table_schema()` and are in the flush and pull scope.**
+  **Paired with surfc migration `0056`, and the two are not independent.** This runs SUR-1048's
+  handshake in the opposite direction from SUR-1047's: there, the cloud caught up with the registry
+  and the manifest flipped `pending → live`; here the cloud moves *first*, so from the moment `0056`
+  was applied to braird-staging, `scripts/check-native-schema.mjs` failed on every core PR (finding
+  `questions` where the fixture still said `open_questions`) until the registry caught up. That red
+  window was the coordination signal, and because it is repo-wide CI the two were landed back to back.
+  Free exactly once, and **v0.15.0 is the release that spends it**: no *earlier* release contained
+  these tables (`braird-core.lock` pinned v0.14.0 and they landed after that tag), so at rename time
+  no device had an `open_questions` table to migrate. From this release onward the same rename would
+  be a coordinated three-repo data migration.
+
+- **The three native-first tables are now `backend: live` — the staging DDL check runs against them
+  for real (SUR-1047).** SUR-1047's migration has been applied to `braird-staging`, so
+  `open_questions`, `question_note_overrides` and `user_settings` move from `backend: pending` (skip
+  the DDL leg, and fail if the table is found present anyway) to `live`. This is the second half of
+  the SUR-1048 handshake, and it is deliberately a separate commit: the check fails between the
+  migration landing and this flip, which is the signal that the migration landed at all.
+  From here `scripts/check-native-schema.mjs` asserts, per table and on every PR plus the weekly
+  cron, that the applied DDL still matches the locked fixture — column set and logical types, the
+  key constraint, RLS enablement and policies, the `change_seq` stamping trigger, and the
+  server-side `user_id`/`change_seq` columns. Nothing about the fixture or the descriptor changes;
+  this only opens the code path that validates them against the cloud.
+
 ### Fixed
+- **Three staging-DDL checks that could not fail, or could pass a broken table (SUR-1048).** All
+  three were unreachable while the SUR-996 tables were `backend: pending`, so they are fixed now that
+  the flip has made them live. (1) `change_seq` and `user_id` were type-checked only against the
+  logical vocabulary, which the fixture-driven guards never reach for them — an `integer` `change_seq`
+  passed, and it is a monotonically increasing watermark, so it would overflow and then reject every
+  subsequent write. Both now pin the physical type (`bigint`, `uuid`). (2) RLS command coverage counted
+  policies granted to any role, so a table whose only SELECT/INSERT/UPDATE policies belonged to
+  `service_role` reported covered — while `service_role` bypasses RLS entirely and PostgREST arrives as
+  `authenticated`, which RLS would still deny. Coverage now counts client-applicable roles only, and
+  names the backend-only policies it found. (3) The NOT NULL cloud-only column check accepted *any*
+  trigger on the table as evidence the column gets populated — and since every valid table carries the
+  `change_seq` trigger, the check could never fire. That escape hatch is gone; proving a specific
+  trigger assigns a specific column needs execution, not catalogue introspection (SUR-1049).
+
 - **A per-table pull failure now carries its underlying error instead of a bare table name
   (SUR-1031).** `pull::pull`'s isolation arm discarded the error it isolated (`Err(_)`) and its
   `eprintln!` named only the table — which on Android reaches nothing anyway (stderr never hits
@@ -213,26 +231,6 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   preflight's validation failures fail CLOSED, never re-fetched (a malformed page gets no second
   chance; the sanitizer preserves the transport/application classification while still dropping
   every server body). Mid-pagination isolation semantics are pinned unchanged by the tests.
-
-### Added
-- **The release now fails on documentation that contradicts it (`scripts/check-stale-release-markers.mjs`).**
-  Cutting v0.14.0 exposed a gap with no owner: `release.yml` verifies the tag, the crate version and
-  the CHANGELOG *section heading*, but nothing reads the prose beneath them, so a bad merge shipped
-  three files that each recorded a measured constant while instructing maintainers to re-derive it
-  before the very release containing it. The new check runs once in `validate` and fails on a small
-  set of literal deferral markers, matched the way maintainers honestly write them: wrapped across
-  `///` doc-comment lines, sentence-capitalized, decorated in house style (inline code, bold, plain
-  links, tables). Its threat model is **accidental staleness, not adversarial concealment** — a
-  marker hidden behind exotic Markdown is out of scope by design (anyone hiding from the gate can
-  simply not write the marker), and the accepted misses are pinned as explicit `--self-check` rows
-  so that boundary is executable. Scope: `src/**.rs` plus release-facing Markdown, excluding
-  historical records (`docs/plans`, `docs/learnings`, `docs/superpowers`), with the changelog
-  scanned only in `[Unreleased]` and the section being cut — shipped entries are immutable history.
-  Markers fail closed (descriptive prose trips too); a legitimate use keeps a one-line
-  `stale-marker-allow` exemption, visible in review where a silent miss is not. `--self-check` runs
-  in CI ahead of the scan, every behaviour is mutation-pinned, and the checker is replayed against
-  the incident commit, which it catches in full. `TODO`/`FIXME` are deliberately not checked: a
-  gate that fires on things people reasonably ship is a gate people learn to bypass.
 
 ## [0.14.0] - 2026-07-29
 
