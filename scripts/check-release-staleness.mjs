@@ -273,6 +273,16 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
           'date — release.yml checks the SHAPE of this field, not its validity, so a typo here would ' +
           'otherwise disable this signal silently',
       );
+    } else if (age < -1) {
+      // A future date is not "young", it is wrong — and left alone it postpones the alarm by however
+      // far into the future the typo reaches. `2099-01-01` would silence a failed SECURITY release
+      // for seventy years. One day of slack, because a CHANGELOG date is a bare day and a maintainer
+      // writing "today" east of UTC can legitimately be a few hours ahead of it.
+      add(
+        'unpublished',
+        `CHANGELOG section [${s.version}] has no published release and is dated ${s.date}, ` +
+          `${-age} days in the FUTURE — a future date postpones this signal instead of raising it`,
+      );
     } else if (age >= limit) {
       add(
         'unpublished',
@@ -691,6 +701,25 @@ const CORPUS = [
       now: '2026-01-02T00:00:00Z', // no lag at all — only the pinned release is wrong
     },
     detail: /no longer carries app-1\.2\.0\.bin/,
+  },
+  // ── a future date postpones the alarm; that is not a grace period (Codex P2, sixth round) ──
+  {
+    name: 'a far-future section date is reported, not treated as work still inside its grace period',
+    input: {
+      changelog: '## [Unreleased]\n\n### Fixed\n- x\n\n## [1.2.0] - 2099-01-01\n\n### Security\n- a failed release\n',
+      published: new Map(),
+      now: '2026-01-01T00:00:00Z',
+    },
+    detail: /in the FUTURE/,
+  },
+  {
+    name: 'but a date one day ahead is tolerated — a maintainer east of UTC writing today',
+    input: {
+      changelog: '## [Unreleased]\n\n### Fixed\n- x\n\n## [1.2.0] - 2026-01-02\n\n### Added\n- x\n',
+      published: new Map(),
+      now: '2026-01-01T00:00:00Z',
+    },
+    expect: [],
   },
   // ── prerelease precedence (Codex P2 on PR #93) ──
   {

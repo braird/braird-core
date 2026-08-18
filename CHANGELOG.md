@@ -50,7 +50,11 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   written ahead of its release — is reported rather than sorting above every section and reading
   as permanently current, and the release a consumer is ALREADY ON is checked for that consumer's
   artifacts too — an asset deleted from the pinned release left nothing to compare, so a clean
-  build that could no longer fetch its own dependency produced a green run.
+  build that could no longer fetch its own dependency produced a green run. A section dated in the
+  FUTURE is reported rather than read as young: a mistyped `2099-01-01` would otherwise postpone
+  the failed-release alarm by seventy years, and postponement is indistinguishable from a grace
+  period. One day of slack, since a maintainer east of UTC writing "today" is legitimately ahead
+  of it.
   **The privileged and unprivileged halves are separate workflows**, and that split is a security
   boundary rather than tidiness. The staleness run reads a token for two private repositories from a
   public repo, so it is `schedule` + `workflow_dispatch` only and takes the token from an environment
