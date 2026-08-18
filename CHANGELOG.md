@@ -6,6 +6,37 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Security
+- **A note read now requires `enc:v2`, so ciphertext that is not bound to its own row can no longer
+  render as the user's text (SUR-1070).** `decrypt_note_text` accepted three things it should not
+  have. `enc:v1` is the sharp one: it carries no AAD, so `decrypt_note` passes `aad: None` and
+  **ignores the id argument entirely** — a v1 payload opens under ANY row, which let an actor with
+  server write access move one of the user's own notes onto a different note's id. Plaintext
+  passthrough was the other: a `text` that never went through the Vault was rendered verbatim, so an
+  actor able to write a row could inject text that reads as the user's own note. Sealing garbage only
+  ever produced a decrypt failure, so the passthrough branch is what made injection *legible*.
+  Both branches existed for a legacy corpus, and the founder confirmed on 2026-08-18 that neither a
+  plaintext nor an `enc:v1` `notes` corpus remains in the fleet — so the compatibility they bought is
+  gone and only the exposure was left. Notes and questions now share one strict rule
+  (`decrypt_v2_bound`), which is also what stops the two gates drifting apart again: SUR-1042 had to
+  add a second, stricter gate for questions precisely because the shared one was too permissive to
+  reuse.
+  `note_encryption::decrypt_note` is **unchanged** and still opens v1 — it is a crypto primitive
+  mirroring surfc and pinned by the parity vectors. Only the read gate narrows.
+  **The snapshot export does not abort, and does not launder** (`decrypt_note_text_for_archive`).
+  Export treats a decrypt failure as fatal to the whole archive, so feeding it the strict rule would
+  turn a single unsealed row into "this user cannot export at all" — re-creating the SUR-934 bug
+  where manufactured decryption errors aborted an archive every screen could read. But copying the
+  unbound value through was worse: the archive stores decrypted plaintext and `import_merge` re-seals
+  every archived string as fresh `enc:v2` bound to that row id, so a normal export→restore cycle
+  turned content the display had refused into a valid, displayable blob — SUR-1070 bypassed by an
+  ordinary user action. Import cannot defend itself, because every archived string looks alike to it.
+  So an unbound note now exports as a ROW with `text: null`: it does not abort (SUR-934 holds), it is
+  not dropped (SUR-934 holds), and there is nothing for an import to bless. An end-to-end test walks
+  `build_snapshot_at` → `parse_import_at` for both the plaintext and `enc:v1` shapes. One note-only concession also survives on the display path: `notes.text` carries `default ''`
+  in surfc's schema, so an empty string stays a degraded-but-valid state rather than a crypto defect
+  — `questions.text` is NOT NULL with no default, which is why the same input fails there.
+
 ## [0.15.0] - 2026-08-17
 
 ### Added

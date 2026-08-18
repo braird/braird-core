@@ -6,7 +6,7 @@
 //! crypto-reviewer gate protects:
 //!
 //! 1. **Ciphertext never crosses the FFI for display.** `NoteRecord.text` is plaintext, produced
-//!    by `Vault::decrypt_note`. A `notes.text` that structurally looks encrypted (`is_encrypted`)
+//!    by `Vault::decrypt_note`. A `notes.text` that carries an `enc:v2` payload (`is_encrypted_v2`)
 //!    is decrypted; on failure the row surfaces as `text: None, decrypt_failed: true` and is
 //!    dropped from the search index — it never fails the whole page (AC #2/#3, mirrors the PWA's
 //!    `decryptError` skip).
@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
-use crate::note_encryption::{is_encrypted, is_encrypted_v2};
+use crate::note_encryption::is_encrypted_v2;
 use crate::search::{SearchDoc, SearchDocKind};
 use crate::store::Store;
 use crate::vault::Vault;
@@ -705,7 +705,7 @@ fn note_record(row: &Map<String, Value>, vault: &Vault) -> NoteRecord {
 
 fn question_record(row: &Map<String, Value>, vault: &Vault) -> QuestionRecord {
     let id = string_field(row, "id").unwrap_or_default();
-    let (text, decrypt_failed) = decrypt_question_text(row, &id, vault);
+    let (text, decrypt_failed) = decrypt_v2_bound(row, &id, vault);
     QuestionRecord {
         text,
         decrypt_failed,
@@ -772,21 +772,92 @@ fn page_take(limit: i64) -> usize {
         limit as usize
     }
 }
-
-/// Decrypt a `notes.text` on the way out. `(plaintext, decrypt_failed)`:
-/// - absent → `(None, false)`; empty → `(Some(""), false)` (not a failure);
-/// - looks encrypted → `Vault::decrypt_note`; `Ok` → `(Some(plaintext), false)`, `Err` →
-///   `(None, true)` (foreign/corrupt AAD, wrong key, malformed — never distinguished, never
-///   fails the page);
-/// - already plaintext (defensive; the core assumes encrypted users) → passed through.
+/// The rule BOTH note and question reads share (SUR-1070): only an `enc:v2` payload — AAD-bound to
+/// the row's own id — can become displayable text. Everything else is a decryption failure.
 ///
-/// A successfully stored ciphertext therefore never crosses the FFI in its `enc:` form (AC #2):
-/// it is either decrypted plaintext or `None`.
+/// The permissive alternative it replaces accepted three things, and each was a hole:
+///   - **`enc:v1`** — carries no AAD, so [`crate::note_encryption::decrypt_note`] passes `aad: None`
+///     and **ignores the id argument entirely**. A v1 payload therefore opens under ANY row, which
+///     lets an actor with server write access move one of the user's own notes onto a different
+///     note's id. Not disclosure — misattribution — but exactly the binding v2 exists to provide;
+///   - **plaintext passthrough** — a `text` that never went through the Vault was rendered verbatim,
+///     so an actor able to write a row could inject text that reads as the user's own note. Sealing
+///     garbage only ever produced a decrypt failure; the passthrough branch is what made injection
+///     *legible*;
+///   - **an unrecognised sentinel** — same as plaintext, one step less obvious.
+///
+/// Both branches existed for a legacy corpus. Founder confirmed 2026-08-18 that neither a plaintext
+/// nor an `enc:v1` `notes` corpus remains in the fleet, so the compatibility they bought is gone and
+/// only the exposure is left.
+///
+/// **This does NOT change [`crate::note_encryption::decrypt_note`]**, which still opens v1. That is a
+/// crypto primitive mirroring surfc and pinned by the parity vectors; the READ GATE is what narrows.
+///
+/// An ABSENT `text` still yields `(None, false)` — a column making no claim differs from a column
+/// making an unverifiable one.
+fn decrypt_v2_bound(row: &Map<String, Value>, id: &str, vault: &Vault) -> (Option<String>, bool) {
+    match string_field(row, "text") {
+        None => (None, false),
+        Some(t) if is_encrypted_v2(&t) => match vault.decrypt_note(Some(id.to_string()), t) {
+            Ok(plaintext) => (Some(plaintext), false),
+            Err(_) => (None, true),
+        },
+        Some(_) => (None, true),
+    }
+}
+
+/// Decrypt a `notes.text` on the way out — [`decrypt_v2_bound`] plus ONE note-only concession.
+///
+/// `notes.text` carries `default ''` in surfc's schema, so an empty string is a legitimate (if
+/// degraded) stored state rather than a crypto defect: it renders as an empty note, which discloses
+/// nothing and injects nothing. `questions.text` is NOT NULL with **no** default precisely so
+/// "sealed nothing" cannot exist there, which is why questions take the shared rule unmodified.
+/// The difference is the two columns' own DDL, not a preference.
 ///
 /// `pub(super)` so the content-tag self-heal ([`super::reconcile::reconcile_heal_content_tags`],
-/// SUR-884) re-derives a missing tag through the EXACT same decrypt gate the display path uses —
-/// one source for the `decryptError` skip, so the two paths can't drift.
+/// SUR-884) re-derives a missing tag through the EXACT same gate the display path uses — one source
+/// for the skip rule, so the two paths cannot drift. Four other call sites share it: the search-doc
+/// build, the note read model, the snapshot export, and the margin read.
 pub(super) fn decrypt_note_text(
+    row: &Map<String, Value>,
+    id: &str,
+    vault: &Vault,
+) -> (Option<String>, bool) {
+    match string_field(row, "text") {
+        Some(t) if t.is_empty() => (Some(String::new()), false),
+        _ => decrypt_v2_bound(row, id, vault),
+    }
+}
+
+/// Decrypt a `notes.text` for the SNAPSHOT EXPORT. It differs from [`decrypt_note_text`] in exactly
+/// one way, and the difference is narrower than it first looks: what a display and an archive do
+/// with an UNBOUND value.
+///
+/// The archive format stores **decrypted plaintext**, and `import_merge` re-seals every archived
+/// string as fresh `enc:v2` bound to that row's id (`merge.rs::prepare_write`). Import therefore
+/// cannot tell a legitimate restored note from a laundered one — every archived string looks the
+/// same to it. So if the export copied an unbound value through as plaintext, a normal
+/// export→restore cycle would turn content the display had refused into a valid, AAD-bound blob the
+/// display accepts. **The defence has to sit at export**, because import has no signal to act on.
+///
+/// The rule that satisfies both constraints:
+///   - **absent** → `(None, false)` — exports `text: null`;
+///   - **empty** → `(Some(""), false)` — `notes.text` carries `default ''`, and empty launders
+///     nothing;
+///   - **`enc:v2` that opens** → the plaintext, as always;
+///   - **`enc:v2` that does NOT open** → `(None, true)`, which fails the WHOLE export. This is the
+///     one fail-closed case SUR-934 kept, and it is right: a sealed-but-unreadable note is genuine
+///     corruption, and a silently truncated archive would hide it;
+///   - **anything else** (`enc:v1`, plaintext, an unrecognised sentinel) → `(None, false)`. The row
+///     still exports, with `text: null`.
+///
+/// That last line is the SUR-1070 fix and it threads the needle. SUR-934 requires that a
+/// nothing-to-decrypt note must not abort the archive and must not be silently dropped — the row is
+/// still there. SUR-1070 requires that unbound content is never blessed — there is no content to
+/// bless. What is lost is a value that was, by construction, not attributable to the user: no
+/// plaintext or `enc:v1` `notes` corpus remains in the fleet (founder, 2026-08-18), so anything
+/// reaching this branch arrived from somewhere other than the user's own writes.
+pub(super) fn decrypt_note_text_for_archive(
     row: &Map<String, Value>,
     id: &str,
     vault: &Vault,
@@ -794,47 +865,12 @@ pub(super) fn decrypt_note_text(
     match string_field(row, "text") {
         None => (None, false),
         Some(t) if t.is_empty() => (Some(String::new()), false),
-        Some(t) if is_encrypted(&t) => match vault.decrypt_note(Some(id.to_string()), t) {
-            Ok(plaintext) => (Some(plaintext), false),
-            Err(_) => (None, true),
-        },
-        Some(t) => (Some(t), false),
-    }
-}
-
-/// Decrypt a `questions.text` on the way out — **stricter than [`decrypt_note_text`], deliberately**
-/// (SUR-1042). Anything that is not `enc:v2` is a decryption FAILURE here, where the notes gate
-/// would accept it.
-///
-/// Sharing the notes gate was the original implementation and it was wrong. `decrypt_note_text`
-/// accepts three things a question must refuse:
-///   - **`enc:v1`** — no AAD at all, so `decrypt_note` ignores the id argument entirely and the blob
-///     opens under ANY row. A v1 ciphertext lifted from anywhere would render as this question's
-///     text, which is precisely the transplant the AAD binding exists to prevent;
-///   - **plaintext passthrough** — a `text` that never went through the Vault would be displayed
-///     verbatim as the question;
-///   - **empty string** — read as "sealed nothing" rather than as the crypto defect it is.
-///
-/// `notes` must keep accepting all three: v1 is a real legacy corpus, and a plaintext-era note is a
-/// degraded row, not an attack. `questions` has no legacy corpus — the table was created sealed —
-/// so the only thing it can legitimately hold is v2, and surfc `0055` says as much in its own words
-/// ("a question row without ciphertext is a crypto defect, not a degraded row").
-///
-/// An ABSENT `text` still yields `(None, false)`: the column making no claim is different from the
-/// column making an unverifiable one.
-fn decrypt_question_text(
-    row: &Map<String, Value>,
-    id: &str,
-    vault: &Vault,
-) -> (Option<String>, bool) {
-    match string_field(row, "text") {
-        None => (None, false),
         Some(t) if is_encrypted_v2(&t) => match vault.decrypt_note(Some(id.to_string()), t) {
             Ok(plaintext) => (Some(plaintext), false),
             Err(_) => (None, true),
         },
-        // v1, plaintext, empty, or garbage — all unbindable to this question.
-        Some(_) => (None, true),
+        // Unbound: exported as a row with no text, never as text an import would re-seal.
+        Some(_) => (None, false),
     }
 }
 

@@ -9,23 +9,15 @@ use crate::CryptoError;
 const SENTINEL_V1: &str = "enc:v1:";
 const SENTINEL_V2: &str = "enc:v2:";
 
-/// Structural check: does this stored `text` carry an `enc:v1`/`enc:v2` sentinel? Mirrors the
-/// PWA's `isEncrypted()` — a prefix test only, it does NOT attempt decryption. The read API
-/// (SUR-744) uses it to decide whether a `notes.text` needs `decrypt_note` (ciphertext at rest)
-/// or is already plaintext/empty, so an unencrypted or empty note is never mislabelled a decrypt
-/// failure, and a genuine ciphertext value can never leak across the FFI undecrypted.
-pub fn is_encrypted(value: &str) -> bool {
-    value.starts_with(SENTINEL_V1) || value.starts_with(SENTINEL_V2)
-}
-
-/// Structural check for the **AAD-bound** format specifically (SUR-1042). Narrower than
-/// [`is_encrypted`] on purpose: `enc:v1` carries no AAD, so [`decrypt_note`] opens a v1 payload
-/// under ANY id — the id argument is ignored entirely on that branch. For `notes` that is required
-/// legacy-read behaviour; for a surface with no legacy corpus it is a hole, because the
-/// transplant protection v2 exists to give is silently absent.
+/// Structural check for the AAD-bound format — the ONLY sentinel check in the crate, deliberately.
+/// `enc:v1` is not accepted: it carries no AAD, so [`decrypt_note`] opens a v1 payload under ANY id — the id argument is ignored entirely on
+/// that branch. Any caller asking "is this ciphertext bound to THIS row?" must gate on this.
 ///
-/// Callers that need "this ciphertext is bound to THIS row" must gate on this, not on
-/// [`is_encrypted`].
+/// The looser `is_encrypted` companion is GONE. It mirrored the PWA's `isEncrypted()`, accepted v1,
+/// and by being the obvious thing to reach for it is what made the permissive read gate easy to
+/// write — the hole SUR-1070 closed. Both paths that briefly seemed to need it (the read gate, then
+/// the archive gate) turned out to need the strict check instead. Reintroduce a v1-aware helper only
+/// with a caller that genuinely needs v1, and name it so the difference is unmissable.
 pub fn is_encrypted_v2(value: &str) -> bool {
     value.starts_with(SENTINEL_V2)
 }
