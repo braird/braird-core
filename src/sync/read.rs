@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
-use crate::note_encryption::{is_encrypted, is_encrypted_v2};
+use crate::note_encryption::is_encrypted_v2;
 use crate::search::{SearchDoc, SearchDocKind};
 use crate::store::Store;
 use crate::vault::Vault;
@@ -829,24 +829,34 @@ pub(super) fn decrypt_note_text(
     }
 }
 
-/// Decrypt a `notes.text` for the SNAPSHOT EXPORT — deliberately more permissive than
-/// [`decrypt_note_text`], and the one place that difference is correct.
+/// Decrypt a `notes.text` for the SNAPSHOT EXPORT. It differs from [`decrypt_note_text`] in exactly
+/// one way, and the difference is narrower than it first looks: what a display and an archive do
+/// with an UNBOUND value.
 ///
-/// Export treats `decrypt_failed` as **fatal to the whole archive** (`map_note`), because SUR-934
-/// ruled that an archive is all-or-nothing: never partial, never ciphertext standing in for
-/// plaintext, never a silently dropped row. Feeding it the strict read gate would therefore turn a
-/// single unsealed or `enc:v1` row into "this user cannot export at all" — re-creating exactly the
-/// bug SUR-934 fixed, where manufactured decryption errors aborted an archive that every screen
-/// could read.
+/// The archive format stores **decrypted plaintext**, and `import_merge` re-seals every archived
+/// string as fresh `enc:v2` bound to that row's id (`merge.rs::prepare_write`). Import therefore
+/// cannot tell a legitimate restored note from a laundered one — every archived string looks the
+/// same to it. So if the export copied an unbound value through as plaintext, a normal
+/// export→restore cycle would turn content the display had refused into a valid, AAD-bound blob the
+/// display accepts. **The defence has to sit at export**, because import has no signal to act on.
 ///
-/// So the archive keeps the old rule: decrypt anything sealed (v1 included), pass through anything
-/// that was never sealed, and fail only on sealed-but-unreadable — which is a genuine corruption
-/// signal worth stopping for.
+/// The rule that satisfies both constraints:
+///   - **absent** → `(None, false)` — exports `text: null`;
+///   - **empty** → `(Some(""), false)` — `notes.text` carries `default ''`, and empty launders
+///     nothing;
+///   - **`enc:v2` that opens** → the plaintext, as always;
+///   - **`enc:v2` that does NOT open** → `(None, true)`, which fails the WHOLE export. This is the
+///     one fail-closed case SUR-934 kept, and it is right: a sealed-but-unreadable note is genuine
+///     corruption, and a silently truncated archive would hide it;
+///   - **anything else** (`enc:v1`, plaintext, an unrecognised sentinel) → `(None, false)`. The row
+///     still exports, with `text: null`.
 ///
-/// The asymmetry with the display path is intentional and narrow. A display renders content as the
-/// user's own, so unbound text is an injection surface; an export copies the store as it stands, and
-/// dropping a row would destroy data the user already holds. Both are "fail safe" — they just have
-/// different things to keep safe.
+/// That last line is the SUR-1070 fix and it threads the needle. SUR-934 requires that a
+/// nothing-to-decrypt note must not abort the archive and must not be silently dropped — the row is
+/// still there. SUR-1070 requires that unbound content is never blessed — there is no content to
+/// bless. What is lost is a value that was, by construction, not attributable to the user: no
+/// plaintext or `enc:v1` `notes` corpus remains in the fleet (founder, 2026-08-18), so anything
+/// reaching this branch arrived from somewhere other than the user's own writes.
 pub(super) fn decrypt_note_text_for_archive(
     row: &Map<String, Value>,
     id: &str,
@@ -855,11 +865,12 @@ pub(super) fn decrypt_note_text_for_archive(
     match string_field(row, "text") {
         None => (None, false),
         Some(t) if t.is_empty() => (Some(String::new()), false),
-        Some(t) if is_encrypted(&t) => match vault.decrypt_note(Some(id.to_string()), t) {
+        Some(t) if is_encrypted_v2(&t) => match vault.decrypt_note(Some(id.to_string()), t) {
             Ok(plaintext) => (Some(plaintext), false),
             Err(_) => (None, true),
         },
-        Some(t) => (Some(t), false),
+        // Unbound: exported as a row with no text, never as text an import would re-seal.
+        Some(_) => (None, false),
     }
 }
 

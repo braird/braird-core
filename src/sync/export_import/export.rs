@@ -443,6 +443,54 @@ mod tests {
         assert_eq!(parsed.notes.len(), 2, "both notes survive the round-trip");
     }
 
+    /// SUR-1070's laundering guard, walked end to end on the REAL path
+    /// (`build_snapshot_at` → `parse_import_at` → `prepare_write`), because the defect it pins only
+    /// appears when the two halves are composed.
+    ///
+    /// The archive stores decrypted plaintext, and `prepare_write` re-seals every archived string as
+    /// fresh `enc:v2` bound to that row's id. Import therefore cannot tell a legitimate restored note
+    /// from an injected one — every archived string looks identical to it. So while the export copied
+    /// an unbound value through as plaintext, a normal export→restore cycle laundered content the
+    /// display had refused into a valid, AAD-bound blob the display accepts, and SUR-1070's read gate
+    /// was bypassed by an ordinary user action.
+    ///
+    /// The row still round-trips (SUR-934: never a dropped row). Its text does not.
+    #[test]
+    fn an_unbound_note_cannot_be_laundered_by_an_export_import_cycle() {
+        for (case, stored) in [
+            ("plaintext", json!("injected by whoever wrote the row")),
+            (
+                "enc:v1",
+                json!(Vault::generate().encrypt_note(None, "sealed under no id".into())),
+            ),
+        ] {
+            let store = Store::open_in_memory().unwrap();
+            let vault = Vault::generate();
+            put(&store, "notes", raw_note_row("unbound", stored, 1));
+
+            let snapshot =
+                super::build_snapshot_at(&store, &vault, 0).expect("export must survive");
+            let root: Value = serde_json::from_str(&snapshot).unwrap();
+            let exported = root["notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["id"] == "unbound")
+                .unwrap()
+                .clone();
+
+            assert_eq!(
+                exported["text"],
+                Value::Null,
+                "{case}: the archive must carry no content an import could bless"
+            );
+
+            // The row itself still survives the round-trip — SUR-934's requirement is untouched.
+            let parsed = crate::sync::export_import::import::parse_import_at(&snapshot, 0)
+                .expect("the core must be able to re-import its own export");
+            assert_eq!(parsed.notes.len(), 1, "{case}: the row still round-trips");
+        }
+    }
     /// The sealed note must still survive an export that also contains an unsealed one — a partial
     /// archive is never acceptable, so the fix must skip decryption for the unsealed row, not the export.
     #[test]
@@ -473,8 +521,8 @@ mod tests {
         );
         assert_eq!(
             by_id("unsealed")["text"],
-            "a plaintext body",
-            "unsealed text passes through verbatim"
+            Value::Null,
+            "unsealed text exports as null — the ROW survives (SUR-934), but there is no unbound \n             content for an import to re-seal into a displayable note (SUR-1070)"
         );
     }
 

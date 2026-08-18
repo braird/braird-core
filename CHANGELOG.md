@@ -23,13 +23,17 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   reuse.
   `note_encryption::decrypt_note` is **unchanged** and still opens v1 — it is a crypto primitive
   mirroring surfc and pinned by the parity vectors. Only the read gate narrows.
-  **The snapshot export deliberately does not narrow** (`decrypt_note_text_for_archive`). Export
-  treats a decrypt failure as fatal to the whole archive, so feeding it the strict rule would turn a
-  single unsealed row into "this user cannot export at all" — re-creating the SUR-934 bug where
-  manufactured decryption errors aborted an archive every screen could read. A display renders
-  content as the user's own, so unbound text is an injection surface; an export copies the store as
-  it stands, and dropping a row destroys data the user already holds. The asymmetry is pinned by a
-  test. One note-only concession also survives on the display path: `notes.text` carries `default ''`
+  **The snapshot export does not abort, and does not launder** (`decrypt_note_text_for_archive`).
+  Export treats a decrypt failure as fatal to the whole archive, so feeding it the strict rule would
+  turn a single unsealed row into "this user cannot export at all" — re-creating the SUR-934 bug
+  where manufactured decryption errors aborted an archive every screen could read. But copying the
+  unbound value through was worse: the archive stores decrypted plaintext and `import_merge` re-seals
+  every archived string as fresh `enc:v2` bound to that row id, so a normal export→restore cycle
+  turned content the display had refused into a valid, displayable blob — SUR-1070 bypassed by an
+  ordinary user action. Import cannot defend itself, because every archived string looks alike to it.
+  So an unbound note now exports as a ROW with `text: null`: it does not abort (SUR-934 holds), it is
+  not dropped (SUR-934 holds), and there is nothing for an import to bless. An end-to-end test walks
+  `build_snapshot_at` → `parse_import_at` for both the plaintext and `enc:v1` shapes. One note-only concession also survives on the display path: `notes.text` carries `default ''`
   in surfc's schema, so an empty string stays a degraded-but-valid state rather than a crypto defect
   — `questions.text` is NOT NULL with no default, which is why the same input fails there.
 

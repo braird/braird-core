@@ -4385,36 +4385,6 @@ mod tests {
     }
 
     #[test]
-    fn the_archive_still_accepts_what_the_display_now_refuses() {
-        // The SUR-1070 asymmetry, pinned so it stays a decision. Tightening the shared gate for the
-        // export too would have turned one unsealed row into "this user cannot export at all" —
-        // re-creating the SUR-934 bug, where manufactured decrypt errors aborted an archive every
-        // screen could read. A display renders content as the user's own, so unbound text is an
-        // injection surface; an export copies the store as it stands, and dropping a row destroys
-        // data the user already holds.
-        let vault = Vault::generate();
-        let store = Store::open_in_memory().unwrap();
-        let v1 = vault.encrypt_note(None, "sealed under no id".into());
-
-        for (id, text) in [("n1", v1.as_str()), ("n2", "never sealed at all")] {
-            let row = json!({
-                "id": id, "text": text, "tags": [],
-                "created_at": 1, "updated_at": 1, "deleted": false
-            });
-            store.apply_row("notes", row.as_object().unwrap()).unwrap();
-
-            // Display refuses…
-            let shown = read::get_note(&store, &vault, id).unwrap().unwrap();
-            assert!(shown.decrypt_failed, "{id} must not display");
-
-            // …the archive does not, and above all does not abort.
-            let stored = store.get_row("notes", id).unwrap().unwrap();
-            let (archived, failed) = read::decrypt_note_text_for_archive(&stored, id, &vault);
-            assert!(!failed, "{id} must never fail the export");
-            assert!(archived.is_some(), "{id} must survive into the archive");
-        }
-    }
-    #[test]
     fn note_and_question_reads_both_require_enc_v2() {
         // Codex P1. `decrypt_note_text` (the notes gate) accepts enc:v1, plaintext and empty —
         // all three unbindable to a question id. enc:v1 is the sharp one: `decrypt_note` passes

@@ -9,25 +9,15 @@ use crate::CryptoError;
 const SENTINEL_V1: &str = "enc:v1:";
 const SENTINEL_V2: &str = "enc:v2:";
 
-/// Structural check for ANY sealed format, `enc:v1` or `enc:v2`.
-///
-/// **One legitimate caller: the snapshot export** ([`crate::sync::read::decrypt_note_text_for_archive`]).
-/// Do not reach for this on a display path. v1 carries no AAD, so [`decrypt_note`] opens a v1 payload
-/// under ANY id, and a read that renders the result cannot claim the content belongs to that row —
-/// the hole SUR-1070 closed. Use [`is_encrypted_v2`] anywhere the answer becomes visible text.
-pub fn is_encrypted(value: &str) -> bool {
-    value.starts_with(SENTINEL_V1) || value.starts_with(SENTINEL_V2)
-}
-
-/// Structural check for the AAD-bound format. `enc:v1` is deliberately NOT accepted: it carries no
-/// AAD, so [`decrypt_note`] opens a v1 payload under ANY id — the id argument is ignored entirely on
+/// Structural check for the AAD-bound format — the ONLY sentinel check in the crate, deliberately.
+/// `enc:v1` is not accepted: it carries no AAD, so [`decrypt_note`] opens a v1 payload under ANY id — the id argument is ignored entirely on
 /// that branch. Any caller asking "is this ciphertext bound to THIS row?" must gate on this.
 ///
-/// There is no longer a looser `is_encrypted` companion. It existed to mirror the PWA's
-/// `isEncrypted()` and accepted v1 and, by omission, made the permissive read gate easy to write —
-/// which is the hole SUR-1070 closed. A helper whose only remaining use was the wrong one is worse
-/// than no helper. Reintroduce a v1-aware check only with a caller that genuinely needs v1, and name
-/// it so the difference is unmissable.
+/// The looser `is_encrypted` companion is GONE. It mirrored the PWA's `isEncrypted()`, accepted v1,
+/// and by being the obvious thing to reach for it is what made the permissive read gate easy to
+/// write — the hole SUR-1070 closed. Both paths that briefly seemed to need it (the read gate, then
+/// the archive gate) turned out to need the strict check instead. Reintroduce a v1-aware helper only
+/// with a caller that genuinely needs v1, and name it so the difference is unmissable.
 pub fn is_encrypted_v2(value: &str) -> bool {
     value.starts_with(SENTINEL_V2)
 }
