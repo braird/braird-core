@@ -53,6 +53,8 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { maskedForSectionSplit } from './lib/changelog-structure.mjs';
+
 const DAY_MS = 86_400_000;
 
 /**
@@ -135,43 +137,29 @@ function requiredAssets(pins, version) {
  * The heading's date tail is kept, not discarded: it is the only thing that can date a section whose
  * release was never published, which is precisely the case signal (2) has to age.
  *
- * BOUNDARY, and it is the one `check-stale-release-markers.mjs` already argued out in this repo.
- * Fenced blocks are excluded, because a fenced example of a heading is something maintainers write
- * by accident. Indented code blocks, HTML comments and exotic Markdown are NOT, because resisting
- * those means reimplementing a CommonMark renderer inside a release script — the road that file
- * records as having no end (35 findings, each locally valid, the series divergent). The accepted
- * miss is pinned as a corpus row rather than left as folklore.
+ * Structure detection is SHARED with `check-stale-release-markers.mjs` (`lib/changelog-structure`)
+ * rather than reimplemented here. That is the whole boundary story, and it took three rounds of
+ * review to arrive at: this file grew its own fence rule, then a better one, then one that still
+ * mistook an info-string line for a closer — while a complete implementation, hardened by that
+ * script's own review series, sat one directory away. Two copies of a rule fail open, because the
+ * newer copy is always the one missing a case and the older one keeps passing its tests.
+ *
+ * Sharing also closed a miss this file had recorded as accepted: the shared classifier blanks HTML
+ * comments, so a commented-out example heading is no longer a boundary either.
  */
 export function parseChangelog(text) {
   // Blank fenced blocks before splitting. A fenced example of a `## [1.2.0]` heading inside
   // `[Unreleased]` would otherwise read as a real section boundary, filing everything after it —
   // including a genuine `### Security` — under an already-released version, leaving two signals
-  // green. Fence markers themselves are kept so the toggling stays legible.
-  // A fence closes only on the SAME character, at least as long as the one that opened it. A plain
-  // boolean let a ``` line inside a ~~~ block act as the close, so the block's contents were parsed
-  // as real and the true ~~~ re-opened the fence over the entry that followed — blanking a genuine
-  // `### Security`. CommonMark's rule, applied to the one part of it this parser depends on.
-  let fence = null; // { char, length }
-  const outsideFences = text
-    .split('\n')
-    .map((line) => {
-      const m = /^\s*(`{3,}|~{3,})/.exec(line);
-      if (m) {
-        const [char, length] = [m[1][0], m[1].length];
-        if (fence === null) {
-          fence = { char, length };
-          return line;
-        }
-        if (char === fence.char && length >= fence.length) {
-          fence = null;
-          return line;
-        }
-        return ''; // a foreign fence marker is just content inside the open block
-      }
-      return fence ? '' : line;
-    })
-    .join('\n');
-  const parts = outsideFences.split(/^## \[([^\]]+)\]([^\n]*)$/m);
+  // Structure comes from the SHARED masker, not from a fence rule written here. Three versions of
+  // that rule lived in this file — a boolean toggle, then a delimiter-aware one, then one that still
+  // took an info-string line as a closer — while a complete implementation sat in
+  // `check-stale-release-markers.mjs` the whole time.
+  //
+  // The split runs on the MASKED text, not the original. Deciding structure from a probe and then
+  // splitting the original is its own trap: the classifier correctly says "that commented-out
+  // heading is not a boundary" and the split treats it as one anyway.
+  const parts = maskedForSectionSplit(text).split(/^ {0,3}##\s+\[([^\]]+)\]([^\n]*)$/m);
   // parts[0] is the preamble; thereafter [version, headingTail, body, version, headingTail, ...].
   const sections = [];
   for (let i = 1; i < parts.length; i += 3) {
@@ -935,6 +923,19 @@ const CORPUS = [
     },
     detail: /in the FUTURE/,
   },
+  // ── a CLOSER carries nothing but whitespace (Codex P2, twelfth round) ──
+  {
+    name: 'an info-string line inside a fence is content, not the closing delimiter',
+    input: {
+      // ```rust is an OPENER shape. Treating it as a closer ended the block early, exposed the
+      // example heading, and let the real ``` re-open the fence over the Security entry.
+      changelog: '## [Unreleased]\n\n```\n```rust\n## [1.1.0] - 2025-12-01\n```\n\n### Security\n- a real fix\n',
+      published: new Map(),
+      unreleasedSecuritySince: '2026-01-01T00:00:00Z',
+      now: '2026-03-01T00:00:00Z',
+    },
+    expect: ['unreleased'],
+  },
   // ── a fence closes only on its OWN delimiter (Codex P2, eleventh round) ──
   {
     name: 'a backtick line inside a tilde fence does not close it and expose the example heading',
@@ -1059,15 +1060,10 @@ const CORPUS = [
     expect: ['unreleased'],
   },
   {
-    // ACCEPTED MISS, pinned so the boundary is executable rather than folklore — the convention
-    // `check-stale-release-markers.mjs` set for exactly this argument. An HTML-comment example still
-    // fools the split, and resisting it means a CommonMark renderer.
-    //
-    // The miss is narrower than it was, and not by design: the commented example duplicates a real
-    // heading, so the duplicate-section rule added for an unrelated finding reports it. The security
-    // entry is still misfiled — no `unreleased` finding — but the CHANGELOG no longer passes in
-    // silence. Recorded because a miss that shrank by accident will grow back the same way.
-    name: 'accepted miss: an HTML-comment example heading still fools the split',
+    // WAS an accepted miss, now closed — and by deletion rather than by effort. Adopting the shared
+    // structure masker brought HTML-comment blanking with it, because the older script had solved
+    // that too. The row is kept as a positive test: the boundary moved, so what pins it must move.
+    name: 'an HTML-comment example heading is not a section boundary either',
     input: {
       changelog:
         '## [Unreleased]\n\n<!--\n## [1.1.0] - 2025-12-01\n-->\n\n### Security\n- a real fix\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
@@ -1075,9 +1071,7 @@ const CORPUS = [
       unreleasedSecuritySince: '2026-01-01T00:00:00Z',
       now: '2026-03-01T00:00:00Z',
     },
-    // NOT `[]`: the duplicate-heading rule catches it sideways. What is still missing is the
-    // `unreleased` finding — the Security entry was filed under a released version.
-    expect: ['unpublished'],
+    expect: ['unreleased'],
   },
   // ── prerelease precedence (Codex P2 on PR #93) ──
   {

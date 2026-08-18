@@ -83,7 +83,11 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   reports unparseable and future dates alike, because the three sources (a CHANGELOG heading, a
   release's `published_at`, and a git committer timestamp) were each guarded separately and the
   third was missed twice. Fence tracking follows CommonMark's rule that a block closes only on
-  its own delimiter, so a backtick line inside a tilde block cannot expose an example heading.
+  its own delimiter, and the rules themselves are now SHARED with `check-stale-release-markers.mjs`
+  (`scripts/lib/changelog-structure.mjs`) rather than reimplemented — three progressively better
+  copies had grown in the new script while a complete implementation sat one directory away, and
+  two copies of one rule fail open because the newer is always the one missing a case. Adopting
+  it also closed a miss recorded as accepted: HTML-comment example headings are masked too.
   **The privileged and unprivileged halves are separate workflows**, and that split is a security
   boundary rather than tidiness. The staleness run reads a token for two private repositories from a
   public repo, so it is `schedule` + `workflow_dispatch` only and takes the token from an environment
