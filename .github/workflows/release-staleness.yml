@@ -15,6 +15,17 @@ name: Release staleness check
 # Daily, unlike the Monday drift checks. Its tightest deadline is 7 days, and a weekly cadence would
 # make that up to 14 in practice — a deadline the schedule cannot actually enforce is decoration.
 # Cost is one Node run plus two shallow clones.
+#
+# REQUIRES the `CONSUMER_PINS_READ_PAT` secret: a read-only PAT with `contents: read` on
+# braird/braird-android and braird/braird-ios, which are PRIVATE. Deliberately NOT `SURFC_READ_PAT`
+# — that one is scoped to braird/surfc, and widening it would extend an unrelated workflow's reach
+# to two more repositories to save creating one secret. Each cross-repo reader gets its own.
+#
+# braird-core is a PUBLIC repository, so holding a PAT for private repos here deserves a sentence.
+# Secrets are not exposed to workflows triggered from forks, and this workflow has no
+# `pull_request` trigger at all — chosen above for a different reason, but it also means no
+# fork-controlled run can ever reach this secret. Keep it that way: adding a `pull_request` trigger
+# here would change the security posture, not just the cadence.
 
 on:
   schedule:
@@ -49,9 +60,13 @@ jobs:
       # checker — "pin could not be read" — not as a green run that silently checked nothing.
       - name: Fetch the consumer pins
         env:
-          PAT: ${{ secrets.SURFC_READ_PAT }}
+          PAT: ${{ secrets.CONSUMER_PINS_READ_PAT }}
         run: |
           mkdir -p /tmp/consumers
+          if [ -z "$PAT" ]; then
+            echo "::error::CONSUMER_PINS_READ_PAT is not set — the consumer-pin signal cannot run."
+            echo "::error::Create a read-only PAT with contents:read on braird-android + braird-ios."
+          fi
           for repo in braird-android braird-ios; do
             git clone --depth 1 --quiet \
               "https://x-access-token:${PAT}@github.com/braird/${repo}.git" \

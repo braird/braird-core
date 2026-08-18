@@ -215,6 +215,13 @@ whether the stalled range contains a `### Security` section (7 days if it does, 
 It reports; it never opens a PR and never blocks a merge, because not having shipped something yet
 is not a reason to reject the next commit.
 
+The consumer-pin half reads `braird-core.lock` from braird-android and braird-ios, both private, so
+it needs a `CONSUMER_PINS_READ_PAT` secret — a read-only PAT with `contents: read` on those two
+repositories. Without it the check reports "pin could not be read" and fails, which is the intended
+behaviour: a reader that cannot see the consumers has not confirmed they are current. It is a
+separate secret from `SURFC_READ_PAT` on purpose — that one is scoped to surfc, and widening it
+would extend an unrelated workflow's reach to save creating one secret.
+
 ## Scope
 
 Android AAR + desktop jar (SUR-760), the iOS xcframework + Swift wrapper (SUR-745), and the
