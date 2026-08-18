@@ -206,6 +206,15 @@ async fn pull_table<S: PostgrestSink>(
             // alike), so a page of nothing-but-skips still makes forward progress. The server stamps
             // it NOT NULL (migration 0051); a missing value would leave the page non-advancing (see
             // the loop-exit guard below).
+            //
+            // THIS IS WHY A ROW CANNOT SIMPLY BE SKIPPED ON ARRIVAL (SUR-1070). Advancing here, before
+            // any merge decision, means a row this loop `continue`s past is never re-delivered — the
+            // device diverges permanently, silently, with no retry. Note the asymmetry: an ERROR
+            // return is different, because `?` exits before the `set_seq_cursor` below, so the cursor
+            // is not persisted and the row returns next pull — at the cost of failing that table on
+            // every pull, which `pull_then_flush` turns into a flush abort for EVERY table. Neither
+            // shape is a usable guard; validating pulled content needs a quarantine + retry rule. See
+            // the decision recorded on `Store::apply_row`.
             if let Some(seq) = obj.get("change_seq").and_then(Value::as_i64) {
                 page_max = page_max.max(seq);
             }

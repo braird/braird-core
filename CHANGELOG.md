@@ -6,6 +6,45 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Fixed
+- **A server-supplied note could tombstone a healthy one through the duplicate-collapse pass
+  (SUR-1070).** `reconcile_content_dupes` groups live notes by their STORED `content_tag` and never
+  decrypts, so it could not tell a tag the account key derived from one COPIED off another row —
+  and copying needs no HMAC key, only the ability to write the row. A planted row therefore joined a
+  real note's cluster, won the survivor sort trivially (it controls `tags`, `created_at` and `id`,
+  which ARE the ordering), and tombstoned the genuine note. The enc:v2 read gate could not help,
+  because this path never reads the text. A note now earns its place in a cluster by OPENING: its
+  `text` must be `enc:v2` **and** decrypt under that row's own id, and the tag it clusters on is
+  re-derived from that plaintext. The stored tag survives only as a prefilter deciding who is worth
+  decrypting. Two weaker gates were tried and rejected under review, and both are worth naming: a
+  sentinel check on `text` admits arbitrary bytes, because `enc:v2:` is a prefix and not a proof;
+  and a decrypt alone still admits a row that carries a GENUINE ciphertext while tampering with the
+  `content_tag` column only. Re-derivation is what closes the second one. Found by review while
+  documenting the posture below, which had claimed the read gate covered everything.
+  Side effect, deliberate: the pass now has the oracle's `decryptError` gate, so a corrupted note
+  can no longer be picked as survivor over a readable copy — an accepted residual risk since
+  SUR-835, now simply gone.
+
+### Changed
+- **Documented, not code: pulled rows are stored without content validation, and that is now an
+  accepted decision rather than an unexamined gap (SUR-1070).** `Store::apply_row` writes whatever it
+  is handed, so a pulled `text` can hold a value the account key never sealed. Three reasons this is
+  accepted. It discloses nothing — the server holds no key, so anything it supplies was never the
+  user's plaintext. It cannot be shown — since the preceding change, a read renders `text` only when
+  it is `enc:v2` and opens under that row's own id, so an unbound value reaches no screen, no search
+  index and no embedding queue. Columns consumed WITHOUT decryption sit outside that gate and are
+  guarded individually — `content_tag` was the one such case, fixed above. And **rejecting the row on
+  arrival would be worse than storing it, in both possible shapes**: a guard that SKIPS loses the row
+  for good (the watermark advances per row, before any merge decision), while a guard that ERRORS
+  keeps it (the `?` exits before `set_seq_cursor`) but fails that table on every pull, which
+  `pull_then_flush` turns into a flush abort for every table — one malformed row wedges the account's
+  entire sync. A real reject needs a quarantine and a retry rule, not a guard.
+  Recorded in three places on purpose: the README's security model (the posture), `apply_row`'s doc
+  (the choke point, where someone would notice the absence), and the watermark-advance comment in
+  `pull.rs` (the trap, where someone would reach for the fix). Both code comments now state what the
+  read gate does and does NOT buy, so the next person adding a consumer of a pulled column asks the
+  right question: does this read through the gate?
+
 ### Security
 - **A note read now requires `enc:v2`, so ciphertext that is not bound to its own row can no longer
   render as the user's text (SUR-1070).** `decrypt_note_text` accepted three things it should not

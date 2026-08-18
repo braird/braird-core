@@ -44,7 +44,10 @@
 //!    never propagated. Then dedup collapses live notes sharing a `content_tag` (the SUR-638
 //!    per-user HMAC content fingerprint) into one survivor, picked deterministically (most tags,
 //!    then earliest `created_at`, then lowest `id`) so two devices reconciling independently
-//!    converge on the SAME keeper. The losers' tags, image, `note_links` edges and
+//!    converge on the SAME keeper. The tag a note clusters on is RE-DERIVED from its own decrypted
+//!    plaintext, never the stored string (SUR-1070) — a stored tag can be copied off a genuine note
+//!    by anyone able to write the row, and trusting it let a server-supplied row win the survivor
+//!    sort and tombstone the real note. The losers' tags, image, `note_links` edges and
 //!    `collection_memberships` are merged onto the survivor and the losers soft-deleted — all
 //!    through the outbox (LWW-safe).
 //! 5. **`reconcile_note_signals`** (SUR-976; NO oracle counterpart — `note_signals` collection is
@@ -90,7 +93,7 @@ use serde_json::{json, Map, Value};
 use super::epoch_ms;
 use super::http::{CoverEgress, PostgrestSink};
 use super::outbox::resolve_book_id;
-use super::read::decrypt_note_text;
+use super::read::{decrypt_note_text, decrypt_v2_bound};
 use super::SyncEngine;
 use crate::store::Store;
 use crate::vault::Vault;
@@ -175,7 +178,7 @@ pub async fn reconcile<S: PostgrestSink + CoverEgress>(
     }
     // Best-effort, same posture as the dropped-tag pass: a content-dedup hiccup must never fail
     // the pull it follows — it simply retries next pull (the pass is idempotent).
-    let dupes_collapsed = reconcile_content_dupes(store).unwrap_or_else(|e| {
+    let dupes_collapsed = reconcile_content_dupes(store, vault).unwrap_or_else(|e| {
         eprintln!("reconcile: content-dedup pass failed (non-fatal, retries next pull): {e}");
         0
     });
@@ -529,7 +532,10 @@ fn preserved_custom_idea_id(user_id: &str, name: &str) -> String {
 /// `reconcileContentTags` (`surfc/src/db.js`). For every LIVE note with a null/empty `content_tag`
 /// but decryptable text, re-derive the tag (`Vault::content_tag` = the SUR-638 per-user HMAC over
 /// `normalize(plaintext)` + `book_id`) and persist it, so the [`reconcile_content_dupes`] pass that
-/// follows — which keys on the STORED tag and never decrypts — can cluster it. Without this, a note
+/// follows can cluster it. That pass authenticates by re-deriving the tag itself (SUR-1070), but it
+/// still PREFILTERS on the stored tag to avoid decrypting the whole corpus, so a tagless note is
+/// invisible to it until healed — which is why this pass still runs, and still runs first. Without
+/// this, a note
 /// whose tag was nulled by [`reconcile_stranded_notes`] (a rehome/detach makes the old tag stale,
 /// since `book_id` is HMAC input) stays tagless and un-clustered on native until its next user edit
 /// re-seals it; the PWA heals it at load, so this closes the parity gap.
@@ -641,36 +647,79 @@ fn reconcile_heal_content_tags(store: &Store, vault: &Vault) -> Result<usize, St
 /// The only case this is stricter than the oracle is a measure-zero exact tie (equal tag-count AND
 /// equal `created_at`); flagged for `sync-reviewer`.
 ///
-/// Dedup keys on the STORED `content_tag` alone — the core never decrypts note text here (a
-/// deliberate, safe divergence from the oracle's detect path, which reads text only to *recompute*
-/// a missing tag; the core leaves a tagless note untouched rather than recompute it).
+/// **Clustering keys on a RE-DERIVED tag, never on the stored one (SUR-1070).** A stored
+/// `content_tag` is an opaque string on a row the server can write, and putting a valid one there
+/// needs no key material at all — it can simply be COPIED off a genuine note. Trusting it let a
+/// server-supplied row join a real note's cluster, win the survivor sort (`tags`, `created_at` and
+/// `id` are the whole ordering, and all three are attacker-controlled) and tombstone the genuine
+/// note. A sentinel check on `text` does not fix that: `enc:v2:` is a prefix, not a proof.
 ///
-/// **Accepted residual risk (flagged for `sync-reviewer`):** because this runs pre-decrypt on
-/// stored rows, it has no equivalent to the oracle's `decryptError` gate (`reconcileContentTags`
-/// operates on already-decrypted notes and excludes decrypt-failures from clustering). A row only
-/// ever *has* a `content_tag` because it was encryptable at write time, so the only path to
-/// "tagged but currently undecryptable" is post-write corruption (bit-rot, a key-version bug). If
-/// such a corrupted note shares a `content_tag` with a healthy one, the two are BY DEFINITION the
-/// same content (the tag is `HMAC(normText, bookId)`), so collapsing them loses nothing — EXCEPT
-/// the narrow case where the corrupted note has more tags and is thus picked as survivor, keeping
-/// the unreadable copy over the readable one. This requires post-write corruption AND a surviving
-/// tag AND the corrupted row winning the survivor sort — accepted as sufficiently rare; the core
-/// can't cheaply detect decrypt-failure in the sync layer (no vault/keys here). Revisit if a
-/// decrypt-health signal ever reaches this layer (prefer a decryptable note as survivor).
-fn reconcile_content_dupes(store: &Store) -> Result<usize, String> {
+/// So a note earns its place in a cluster by OPENING: its `text` must be `enc:v2` and must decrypt
+/// under its OWN id (AAD = the note id), and the tag it then clusters on is
+/// `HMAC(normText, book_id)` re-derived from that plaintext. Only the account MK can produce a
+/// value that survives both steps, so a row the user's key never sealed can no longer reach the
+/// survivor sort — including the row that keeps a genuine ciphertext and tampers with the
+/// `content_tag` column alone, which a decrypt check on its own would have admitted.
+///
+/// The stored tag survives only as a **prefilter**: a note with no stored tag, or whose stored tag
+/// no other note shares, cannot be part of a collapse, so it is never decrypted. That keeps the
+/// cost proportional to the duplicate candidates rather than to the corpus, at the price of one
+/// pre-existing miss it does not introduce — two notes with identical content but different stored
+/// tags (the documented stale-tag-after-offline-book-merge edge, [`SyncEngine::enqueue_note`])
+/// never meet. They self-heal on the next plaintext-bearing edit, exactly as before.
+///
+/// Requiring a decrypt also RESOLVES the residual risk this pass used to accept: it now has the
+/// oracle's `decryptError` gate (`reconcileContentTags` excludes decrypt-failures from clustering),
+/// so a post-write-corrupted note can no longer be picked as survivor over a readable copy. An
+/// empty `text` is excluded too — [`decrypt_v2_bound`] is used deliberately in place of
+/// [`decrypt_note_text`], because the latter's empty-string concession is unauthenticated and would
+/// re-open the same door on `content_tag("", book_id)`.
+///
+/// This makes dedup the SECOND pass to hold keys, after the self-heal above. Same bounded crossing
+/// of the otherwise key-less sync layer (ADR 0003), same invariant: plaintext is transient, never
+/// persisted, and only the opaque HMAC is ever compared.
+fn reconcile_content_dupes(store: &Store, vault: &Vault) -> Result<usize, String> {
     let notes = store
         .list_live("notes", None, -1, 0)
         .map_err(|e| format!("list notes: {e}"))?;
 
-    // Group live notes by their stored content_tag. A note with no content_tag can't be
-    // fingerprint-matched without decrypting + re-deriving (out of scope) — skip it.
-    let mut by_tag: BTreeMap<String, Vec<Map<String, Value>>> = BTreeMap::new();
+    // PHASE 1 — prefilter on the STORED tag. This decides only who is worth DECRYPTING; it never
+    // decides who collapses. A note with no stored tag, or one whose stored tag no other note
+    // shares, cannot end up in a cluster, so it is skipped before any key is touched.
+    let mut candidates: BTreeMap<&str, Vec<&Map<String, Value>>> = BTreeMap::new();
     for row in &notes {
         match row.get("content_tag").and_then(Value::as_str) {
-            Some(tag) if !tag.is_empty() => {
-                by_tag.entry(tag.to_string()).or_default().push(row.clone())
-            }
+            Some(tag) if !tag.is_empty() => candidates.entry(tag).or_default().push(row),
             _ => {}
+        }
+    }
+
+    // PHASE 2 — authenticate, then group on the tag RE-DERIVED from the note's own plaintext
+    // (SUR-1070). A note that does not open under its own id contributes nothing: it is either
+    // server-supplied (never sealed by the account MK) or corrupt, and neither may steer a
+    // collapse. Re-deriving is what makes the tag unforgeable — a row that keeps a genuine
+    // ciphertext but tampers with the `content_tag` column derives its OWN tag here and falls out
+    // of the victim's cluster. Groups may merge across phase-1 buckets, which is correct: two notes
+    // that derive the same tag ARE the same content, whatever their stored tags claim.
+    let mut by_tag: BTreeMap<String, Vec<Map<String, Value>>> = BTreeMap::new();
+    for group in candidates.into_values() {
+        if group.len() < 2 {
+            continue;
+        }
+        for row in group {
+            let id = row.get("id").and_then(Value::as_str).unwrap_or_default();
+            let (text, _) = decrypt_v2_bound(row, id, vault);
+            let Some(plaintext) = text else {
+                continue; // unbound, unopenable, empty or absent — never fingerprinted
+            };
+            let book_id = row
+                .get("book_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            by_tag
+                .entry(vault.content_tag(plaintext, book_id))
+                .or_default()
+                .push(row.clone());
         }
     }
 
@@ -1591,6 +1640,105 @@ pub fn merge_content_duplicates(
 
 #[cfg(test)]
 mod tests {
+
+    /// SUR-1070. A note joins a fingerprint cluster only by OPENING — `text` must be `enc:v2` and
+    /// must decrypt under that row's own id, and the tag it clusters on is then re-derived from the
+    /// plaintext. Each row below shares the victim's STORED `content_tag`, so each one reaches the
+    /// clustering step, and each is shaped to win the survivor sort outright (`tags`, `created_at`
+    /// and `id` ARE the whole ordering). None may collapse the victim.
+    ///
+    /// The last two cases are the ones a weaker gate lets through, and they are why the gate is a
+    /// decrypt rather than a check on the stored fields:
+    ///   - `enc:v2:` is a PREFIX, not a proof — a sentinel test admits arbitrary bytes;
+    ///   - a row can carry a GENUINE ciphertext and tamper with the `content_tag` column alone, so
+    ///     "it decrypts" is not enough either. Only re-deriving the tag catches that one.
+    #[test]
+    fn only_a_note_that_opens_under_its_own_id_can_join_a_content_tag_cluster() {
+        // The victim: the user's real note. One tag, latest `created_at`, highest id — it loses
+        // every tiebreak, so any planted row that reaches the sort takes the survivor slot.
+        let vault = crate::Vault::generate();
+        let victim_tag = vault.content_tag("the real passage".into(), None);
+        let victim = json!({
+            "id": "z-victim",
+            "text": vault.encrypt_note(Some("z-victim".into()), "the real passage".into()),
+            "content_tag": victim_tag, "tags": ["idea"],
+            "created_at": 500, "updated_at": 500, "deleted": false
+        });
+
+        // The carrier for the tampered-tag case: sealed correctly under the PLANTED row's own id,
+        // so it opens. Only its content differs from the victim's, so only the RE-DERIVED tag can
+        // tell the two apart. Sealing it under any other id would make this a duplicate of the
+        // stolen-ciphertext case and prove nothing.
+        let opens_under_own_id =
+            vault.encrypt_note(Some("a-planted".into()), "a different passage".into());
+
+        for (case, text) in [
+            ("unsealed plaintext", "never sealed".to_string()),
+            (
+                "forged sentinel",
+                "enc:v2:AAAAAAAAAAAAAAAAAAAAAA==.QUJD".to_string(),
+            ),
+            ("empty text", String::new()),
+            // Bound to a DIFFERENT id, so the AAD refuses it here.
+            (
+                "stolen ciphertext",
+                vault.encrypt_note(Some("z-victim".into()), "the real passage".into()),
+            ),
+            // Opens perfectly — only the `content_tag` column was rewritten.
+            ("tampered tag only", opens_under_own_id.clone()),
+        ] {
+            let store = Store::open_in_memory().unwrap();
+            let planted = json!({
+                "id": "a-planted", "text": text,
+                "content_tag": victim_tag, "tags": ["idea", "extra", "more"],
+                "created_at": 1, "updated_at": 900, "deleted": false
+            });
+            store
+                .apply_row("notes", victim.as_object().unwrap())
+                .unwrap();
+            store
+                .apply_row("notes", planted.as_object().unwrap())
+                .unwrap();
+
+            let collapsed = reconcile_content_dupes(&store, &vault).unwrap();
+
+            assert_eq!(
+                collapsed, 0,
+                "{case}: a planted row must not drive a collapse"
+            );
+            assert_eq!(
+                store.get_row("notes", "z-victim").unwrap().unwrap()["deleted"],
+                json!(false),
+                "{case}: the user's real note must not be tombstoned by a planted fingerprint"
+            );
+        }
+    }
+
+    /// The other half of the gate: it must still collapse the duplicates it exists for. Without
+    /// this, deleting the whole pass would pass the test above.
+    #[test]
+    fn two_genuinely_identical_notes_still_collapse() {
+        let store = Store::open_in_memory().unwrap();
+        let vault = crate::Vault::generate();
+        let tag = vault.content_tag("the same passage".into(), None);
+        for (id, tags) in [("keep", &["a", "b"][..]), ("lose", &["a"][..])] {
+            let row = json!({
+                "id": id,
+                "text": vault.encrypt_note(Some(id.to_string()), "the same passage".into()),
+                "content_tag": tag, "tags": tags,
+                "created_at": 1, "updated_at": 1, "deleted": false
+            });
+            store.apply_row("notes", row.as_object().unwrap()).unwrap();
+        }
+
+        assert_eq!(reconcile_content_dupes(&store, &vault).unwrap(), 1);
+        assert_eq!(
+            store.get_row("notes", "lose").unwrap().unwrap()["deleted"],
+            json!(true),
+            "the duplicate with fewer tags is the loser"
+        );
+    }
+
     use super::*;
     use crate::sync::http::CoverSearchHit;
     use std::cell::RefCell;
@@ -2094,11 +2242,27 @@ mod tests {
 
     // ── reconcile_content_dupes (SUR-835) ────────────────────────────────────
 
-    /// A note carrying a `content_tag` (+ optional `image_path`) for the dedup tests.
-    fn cnote(id: &str, tag: &str, tags: &[&str], created_at: i64, image: Option<&str>) -> Value {
+    /// A note for the dedup tests: `body` is sealed as `enc:v2` under `id` and its `content_tag`
+    /// is derived from that same plaintext, so the row is genuinely the user's. Two notes sharing a
+    /// `body` share a fingerprint — which is what every caller means by passing the same string.
+    ///
+    /// Sealing for real is not ceremony: since SUR-1070 the dedup pass authenticates a note by
+    /// opening it, so a hand-written `"enc:v2:x"` is precisely the planted row the pass must refuse.
+    /// A helper that faked it could no longer exercise the collapse at all.
+    fn cnote(
+        vault: &Vault,
+        id: &str,
+        body: &str,
+        tags: &[&str],
+        created_at: i64,
+        image: Option<&str>,
+    ) -> Value {
         json!({
-            "id": id, "book_id": null, "text": "enc:v2:x", "tags": tags,
-            "content_tag": tag, "image_path": image,
+            "id": id, "book_id": null,
+            "text": vault.encrypt_note(Some(id.to_string()), body.to_string()),
+            "tags": tags,
+            "content_tag": vault.content_tag(body.to_string(), None),
+            "image_path": image,
             "created_at": created_at, "updated_at": created_at, "deleted": false
         })
     }
@@ -2125,11 +2289,16 @@ mod tests {
 
     #[test]
     fn collapses_a_pair_keeping_the_note_with_more_tags() {
+        let vault = Vault::generate();
         let store = Store::open_in_memory().unwrap();
-        put(&store, "notes", &cnote("n1", "T", &["a"], 1, None));
-        put(&store, "notes", &cnote("n2", "T", &["a", "b"], 2, None)); // more tags → survivor
+        put(&store, "notes", &cnote(&vault, "n1", "T", &["a"], 1, None));
+        put(
+            &store,
+            "notes",
+            &cnote(&vault, "n2", "T", &["a", "b"], 2, None),
+        ); // more tags → survivor
 
-        let collapsed = reconcile_content_dupes(&store).unwrap();
+        let collapsed = reconcile_content_dupes(&store, &vault).unwrap();
 
         assert_eq!(collapsed, 1);
         assert_eq!(live_ids(&store, "notes"), vec!["n2"]);
@@ -2138,39 +2307,50 @@ mod tests {
 
     #[test]
     fn tie_on_tag_count_breaks_to_earliest_created_at() {
+        let vault = Vault::generate();
         let store = Store::open_in_memory().unwrap();
-        put(&store, "notes", &cnote("late", "T", &["x"], 5, None));
-        put(&store, "notes", &cnote("early", "T", &["x"], 3, None)); // earliest → survivor
-        put(&store, "notes", &cnote("mid", "T", &["x"], 4, None));
+        put(
+            &store,
+            "notes",
+            &cnote(&vault, "late", "T", &["x"], 5, None),
+        );
+        put(
+            &store,
+            "notes",
+            &cnote(&vault, "early", "T", &["x"], 3, None),
+        ); // earliest → survivor
+        put(&store, "notes", &cnote(&vault, "mid", "T", &["x"], 4, None));
 
-        assert_eq!(reconcile_content_dupes(&store).unwrap(), 2);
+        assert_eq!(reconcile_content_dupes(&store, &vault).unwrap(), 2);
         assert_eq!(live_ids(&store, "notes"), vec!["early"]);
     }
 
     #[test]
     fn full_tie_breaks_to_lowest_id_for_cross_device_convergence() {
+        let vault = Vault::generate();
         let store = Store::open_in_memory().unwrap();
         // Same tag-count AND same created_at: only the id tiebreak decides — deterministically.
-        put(&store, "notes", &cnote("bbb", "T", &["x"], 5, None));
-        put(&store, "notes", &cnote("aaa", "T", &["x"], 5, None)); // lowest id → survivor
+        put(&store, "notes", &cnote(&vault, "bbb", "T", &["x"], 5, None));
+        put(&store, "notes", &cnote(&vault, "aaa", "T", &["x"], 5, None)); // lowest id → survivor
 
-        assert_eq!(reconcile_content_dupes(&store).unwrap(), 1);
+        assert_eq!(reconcile_content_dupes(&store, &vault).unwrap(), 1);
         assert_eq!(live_ids(&store, "notes"), vec!["aaa"]);
     }
 
     #[test]
     fn two_devices_in_different_insert_order_converge_on_the_same_survivor() {
+        let vault = Vault::generate();
         let mk = |order: [&str; 3]| {
             let store = Store::open_in_memory().unwrap();
             let rows = std::collections::HashMap::from([
-                ("p", cnote("p", "T", &["a", "b"], 2, None)),
-                ("q", cnote("q", "T", &["a"], 1, None)),
-                ("r", cnote("r", "T", &["a"], 3, None)),
+                ("p", cnote(&vault, "p", "T", &["a", "b"], 2, None)),
+                ("q", cnote(&vault, "q", "T", &["a"], 1, None)),
+                ("r", cnote(&vault, "r", "T", &["a"], 3, None)),
             ]);
             for id in order {
                 put(&store, "notes", &rows[id]);
             }
-            reconcile_content_dupes(&store).unwrap();
+            reconcile_content_dupes(&store, &vault).unwrap();
             live_ids(&store, "notes")
         };
         // "p" has the most tags → survivor, regardless of the order rows landed locally.
@@ -2180,11 +2360,20 @@ mod tests {
 
     #[test]
     fn survivor_gets_the_union_of_all_tags_order_preserved() {
+        let vault = Vault::generate();
         let store = Store::open_in_memory().unwrap();
-        put(&store, "notes", &cnote("n1", "T", &["a", "b"], 1, None)); // tie count, earliest → survivor
-        put(&store, "notes", &cnote("n2", "T", &["b", "c"], 2, None));
+        put(
+            &store,
+            "notes",
+            &cnote(&vault, "n1", "T", &["a", "b"], 1, None),
+        ); // tie count, earliest → survivor
+        put(
+            &store,
+            "notes",
+            &cnote(&vault, "n2", "T", &["b", "c"], 2, None),
+        );
 
-        reconcile_content_dupes(&store).unwrap();
+        reconcile_content_dupes(&store, &vault).unwrap();
 
         let tags = store.get_row("notes", "n1").unwrap().unwrap()["tags"].clone();
         assert_eq!(
@@ -2196,11 +2385,20 @@ mod tests {
 
     #[test]
     fn survivor_adopts_a_losers_image_only_when_it_has_none() {
+        let vault = Vault::generate();
         // Survivor lacks an image → adopts the loser's.
         let store = Store::open_in_memory().unwrap();
-        put(&store, "notes", &cnote("s", "T", &["a", "b"], 1, None));
-        put(&store, "notes", &cnote("l", "T", &["a"], 2, Some("img-l")));
-        reconcile_content_dupes(&store).unwrap();
+        put(
+            &store,
+            "notes",
+            &cnote(&vault, "s", "T", &["a", "b"], 1, None),
+        );
+        put(
+            &store,
+            "notes",
+            &cnote(&vault, "l", "T", &["a"], 2, Some("img-l")),
+        );
+        reconcile_content_dupes(&store, &vault).unwrap();
         assert_eq!(
             store.get_row("notes", "s").unwrap().unwrap()["image_path"],
             json!("img-l")
@@ -2211,10 +2409,14 @@ mod tests {
         put(
             &store,
             "notes",
-            &cnote("s", "T", &["a", "b"], 1, Some("img-s")),
+            &cnote(&vault, "s", "T", &["a", "b"], 1, Some("img-s")),
         );
-        put(&store, "notes", &cnote("l", "T", &["a"], 2, Some("img-l")));
-        reconcile_content_dupes(&store).unwrap();
+        put(
+            &store,
+            "notes",
+            &cnote(&vault, "l", "T", &["a"], 2, Some("img-l")),
+        );
+        reconcile_content_dupes(&store, &vault).unwrap();
         assert_eq!(
             store.get_row("notes", "s").unwrap().unwrap()["image_path"],
             json!("img-s")
@@ -2244,10 +2446,15 @@ mod tests {
 
     #[test]
     fn note_links_repoint_to_survivor_dropping_self_loops_and_duplicates() {
+        let vault = Vault::generate();
         let store = Store::open_in_memory().unwrap();
         // S survives, L is the loser (more tags on S). X is an unrelated note.
-        put(&store, "notes", &cnote("S", "T", &["a", "b"], 1, None));
-        put(&store, "notes", &cnote("L", "T", &["a"], 2, None));
+        put(
+            &store,
+            "notes",
+            &cnote(&vault, "S", "T", &["a", "b"], 1, None),
+        );
+        put(&store, "notes", &cnote(&vault, "L", "T", &["a"], 2, None));
         put(
             &store,
             "notes",
@@ -2259,7 +2466,7 @@ mod tests {
         put(&store, "note_links", &edge("e3", "X", "S", "dup")); // pre-existing
         put(&store, "note_links", &edge("e4", "X", "L", "dup")); // → dup of e3, dropped
 
-        reconcile_content_dupes(&store).unwrap();
+        reconcile_content_dupes(&store, &vault).unwrap();
 
         let e1 = store.get_row("note_links", "e1").unwrap().unwrap();
         assert_eq!(e1["from_note_id"], json!("X"));
@@ -2283,11 +2490,16 @@ mod tests {
 
     #[test]
     fn two_losers_sharing_a_duplicate_edge_collapse_to_one_deterministically() {
+        let vault = Vault::generate();
         let store = Store::open_in_memory().unwrap();
         // S survives (most tags); L1, L2 are both losers in the same content-tag cluster.
-        put(&store, "notes", &cnote("S", "T", &["a", "b", "c"], 1, None));
-        put(&store, "notes", &cnote("L1", "T", &["a"], 2, None));
-        put(&store, "notes", &cnote("L2", "T", &["a"], 3, None));
+        put(
+            &store,
+            "notes",
+            &cnote(&vault, "S", "T", &["a", "b", "c"], 1, None),
+        );
+        put(&store, "notes", &cnote(&vault, "L1", "T", &["a"], 2, None));
+        put(&store, "notes", &cnote(&vault, "L2", "T", &["a"], 3, None));
         put(
             &store,
             "notes",
@@ -2300,7 +2512,7 @@ mod tests {
         put(&store, "note_links", &edge("e2", "X", "L2", "ref"));
         put(&store, "note_links", &edge("e1", "X", "L1", "ref"));
 
-        reconcile_content_dupes(&store).unwrap();
+        reconcile_content_dupes(&store, &vault).unwrap();
 
         // Exactly one live X→S "ref" edge survives, and it's the lowest-id one (e1) — the SAME edge
         // the PWA (Dexie id-asc) keeps, so two devices converge instead of leaving a dup or a gap.
@@ -2314,6 +2526,7 @@ mod tests {
 
     #[test]
     fn repointed_and_tombstoned_edges_stage_the_full_not_null_shape() {
+        let vault = Vault::generate();
         // SUR-954: `repoint_note_links` must stage the server's NOT-NULL columns
         // (from/to/relation_type/created_at) on BOTH the repoint and the tombstone. `note_links`
         // has no sparse-PATCH flush fallback (`push.rs` patches `notes` only), so once an edge's
@@ -2321,8 +2534,12 @@ mod tests {
         // 23502s on every flush — wedging the outbox. Seeding via `apply_row` enqueues nothing, so
         // the merge payload IS alone here: the exact post-flush wire condition.
         let store = Store::open_in_memory().unwrap();
-        put(&store, "notes", &cnote("S", "T", &["a", "b"], 1, None));
-        put(&store, "notes", &cnote("L", "T", &["a"], 2, None));
+        put(
+            &store,
+            "notes",
+            &cnote(&vault, "S", "T", &["a", "b"], 1, None),
+        );
+        put(&store, "notes", &cnote(&vault, "L", "T", &["a"], 2, None));
         put(
             &store,
             "notes",
@@ -2332,7 +2549,7 @@ mod tests {
         put(&store, "note_links", &edge("e1", "X", "L", "ref")); // → repoint to X→S (live)
         put(&store, "note_links", &edge("e2", "L", "S", "ref")); // → self-loop S→S, tombstoned
 
-        reconcile_content_dupes(&store).unwrap();
+        reconcile_content_dupes(&store, &vault).unwrap();
 
         // Every staged edge — repoint AND tombstone — carries the full NOT-NULL shape.
         for id in ["e1", "e2"] {
@@ -2380,9 +2597,14 @@ mod tests {
 
     #[test]
     fn memberships_repoint_to_survivor_dedup_and_reactivate() {
+        let vault = Vault::generate();
         let store = Store::open_in_memory().unwrap();
-        put(&store, "notes", &cnote("S", "T", &["a", "b"], 1, None));
-        put(&store, "notes", &cnote("L", "T", &["a"], 2, None));
+        put(
+            &store,
+            "notes",
+            &cnote(&vault, "S", "T", &["a", "b"], 1, None),
+        );
+        put(&store, "notes", &cnote(&vault, "L", "T", &["a"], 2, None));
         // L in c1 (survivor absent → survivor row created, reactivating a tombstone w/ its createdAt).
         put(
             &store,
@@ -2406,7 +2628,7 @@ mod tests {
             &membership("c2:S", "S", "c2", false, 30),
         );
 
-        reconcile_content_dupes(&store).unwrap();
+        reconcile_content_dupes(&store, &vault).unwrap();
 
         assert!(
             is_deleted(&store, "collection_memberships", "c1:L"),
@@ -2445,13 +2667,18 @@ mod tests {
 
     #[test]
     fn a_second_pass_is_a_no_op() {
+        let vault = Vault::generate();
         let store = Store::open_in_memory().unwrap();
-        put(&store, "notes", &cnote("n1", "T", &["a"], 1, None));
-        put(&store, "notes", &cnote("n2", "T", &["a", "b"], 2, None));
+        put(&store, "notes", &cnote(&vault, "n1", "T", &["a"], 1, None));
+        put(
+            &store,
+            "notes",
+            &cnote(&vault, "n2", "T", &["a", "b"], 2, None),
+        );
 
-        assert_eq!(reconcile_content_dupes(&store).unwrap(), 1);
+        assert_eq!(reconcile_content_dupes(&store, &vault).unwrap(), 1);
         assert_eq!(
-            reconcile_content_dupes(&store).unwrap(),
+            reconcile_content_dupes(&store, &vault).unwrap(),
             0,
             "only the survivor is live with tag T — nothing left to collapse"
         );
@@ -2528,7 +2755,7 @@ mod tests {
         assert_eq!(reconcile_heal_content_tags(&store, &vault).unwrap(), 1);
         assert_eq!(stored_tag(&store, "dupe").as_deref(), Some(tag.as_str()));
         // Now dedup sees two notes sharing `tag` and collapses the duplicate into the survivor.
-        assert_eq!(reconcile_content_dupes(&store).unwrap(), 1);
+        assert_eq!(reconcile_content_dupes(&store, &vault).unwrap(), 1);
         assert_eq!(live_ids(&store, "notes"), vec!["keep"]);
         assert!(is_deleted(&store, "notes", "dupe"));
     }
@@ -2561,7 +2788,11 @@ mod tests {
         // keeps it off notes whose tag is already correct.
         let store = Store::open_in_memory().unwrap();
         let vault = Vault::generate();
-        put(&store, "notes", &cnote("n1", "PRESET", &["a"], 1, None));
+        // A literal tag on purpose: the assertion is that the heal pass does not RECOMPUTE it, so
+        // a derived one would prove nothing.
+        let mut row = tagless_note(&vault, "n1", None, "already tagged");
+        row["content_tag"] = json!("PRESET");
+        put(&store, "notes", &row);
 
         assert_eq!(reconcile_heal_content_tags(&store, &vault).unwrap(), 0);
         assert_eq!(stored_tag(&store, "n1").as_deref(), Some("PRESET"));
@@ -2640,7 +2871,7 @@ mod tests {
         assert_eq!(stored_tag(&store, "e1").as_deref(), Some(expected.as_str()));
         assert_eq!(stored_tag(&store, "e2").as_deref(), Some(expected.as_str()));
         // ...and dedup then collapses the pair (both empty → same tag), like the oracle clusters them.
-        assert_eq!(reconcile_content_dupes(&store).unwrap(), 1);
+        assert_eq!(reconcile_content_dupes(&store, &vault).unwrap(), 1);
     }
 
     /// The AC's byte-parity assertion: heal end-to-end reproduces the PWA's SUR-638 known-answer
@@ -3011,23 +3242,33 @@ mod tests {
 
     #[test]
     fn notes_without_a_content_tag_are_never_matched() {
+        let vault = Vault::generate();
         let store = Store::open_in_memory().unwrap();
         // Two notes, no content_tag at all — not fingerprint-matchable, must be left alone.
         put(&store, "notes", &note("n1", None, &[], 1));
         put(&store, "notes", &note("n2", None, &[], 2));
-        // And an empty-string tag is treated as absent.
-        put(&store, "notes", &cnote("n3", "", &[], 3, None));
-        put(&store, "notes", &cnote("n4", "", &[], 4, None));
+        // And an empty-string tag is treated as absent — built by hand, because `cnote` derives a
+        // real tag and a derived tag is never empty.
+        for id in ["n3", "n4"] {
+            let mut row = tagless_note(&vault, id, None, "same body, empty tag");
+            row["content_tag"] = json!("");
+            put(&store, "notes", &row);
+        }
 
-        assert_eq!(reconcile_content_dupes(&store).unwrap(), 0);
+        assert_eq!(reconcile_content_dupes(&store, &vault).unwrap(), 0);
         assert_eq!(live_ids(&store, "notes").len(), 4, "nothing collapsed");
     }
 
     #[test]
     fn a_singleton_content_tag_is_left_untouched() {
+        let vault = Vault::generate();
         let store = Store::open_in_memory().unwrap();
-        put(&store, "notes", &cnote("only", "T", &["a"], 1, None));
-        assert_eq!(reconcile_content_dupes(&store).unwrap(), 0);
+        put(
+            &store,
+            "notes",
+            &cnote(&vault, "only", "T", &["a"], 1, None),
+        );
+        assert_eq!(reconcile_content_dupes(&store, &vault).unwrap(), 0);
         assert_eq!(live_ids(&store, "notes"), vec!["only"]);
     }
 
@@ -4028,16 +4269,25 @@ mod tests {
 
     #[test]
     fn merge_loser_signals_retire_in_the_same_reconcile_cycle() {
+        let vault = Vault::generate();
         // Pins the pass-ordering decision: content-dedup tombstones the loser, then the
         // signals-retire pass running right after it catches the loser's row THIS cycle. The
         // loser's counters are discarded, not folded into the survivor (founder decision).
         let store = Store::open_in_memory().unwrap();
-        put(&store, "notes", &note_ct("keep", None, "TAG", &["a", "b"]));
-        put(&store, "notes", &note_ct("lose", None, "TAG", &["a"]));
+        put(
+            &store,
+            "notes",
+            &cnote(&vault, "keep", "TAG", &["a", "b"], 1, None),
+        );
+        put(
+            &store,
+            "notes",
+            &cnote(&vault, "lose", "TAG", &["a"], 1, None),
+        );
         put(&store, "note_signals", &signals("lose", false));
         let survivor_absent_before = store.get_row("note_signals", "keep").unwrap().is_none();
 
-        assert_eq!(reconcile_content_dupes(&store).unwrap(), 1);
+        assert_eq!(reconcile_content_dupes(&store, &vault).unwrap(), 1);
         assert!(is_deleted(&store, "notes", "lose"));
         assert_eq!(reconcile_note_signals(&store).unwrap(), 1);
 

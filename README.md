@@ -27,6 +27,20 @@ divergence. One audited Rust core, bound to each platform, removes that risk.
 - Pure-Rust [RustCrypto](https://github.com/RustCrypto) primitives (constant-time,
   WASM-portable) — `aes-gcm`, `hkdf`, `hmac`, `sha2`, `pbkdf2`. Backend rationale: see
   `docs/adr/0002-crypto-backend-rustcrypto.md`.
+- **Pulled rows are stored as the server returns them, and that is deliberate.** The store applies a
+  pulled row without inspecting its contents, so a `text` column can hold something the account key
+  never sealed. This is accepted rather than validated, for two reasons. It discloses nothing: the
+  server has no key, so anything it supplies was never the user's plaintext. And it cannot be
+  *shown*: a read renders `text` only when it is `enc:v2` and opens under that row's own id, so an
+  unbound value can never reach a screen, the search index or the embedding queue. Columns consumed
+  WITHOUT decryption are outside that gate's reach and are guarded individually — `content_tag` is
+  the one such case, and the duplicate-collapse pass now clusters on a tag it RE-DERIVES from each
+  note's own decrypted text rather than on the stored string. A sentinel check would not do: only a
+  decrypt under the row's own id proves the account key produced the value.
+  Rejecting a row on arrival would be worse than storing it either way: a skip loses the row for good
+  (the pull advances its cursor per row, before any merge decision), and an error wedges that table on
+  every subsequent pull, which aborts the flush for every table. A real reject needs a quarantine and
+  a retry rule, not a guard. Tracked as SUR-1070.
 
 ## What it implements
 

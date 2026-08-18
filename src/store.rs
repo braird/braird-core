@@ -897,6 +897,34 @@ impl Store {
     /// leaves at worst an orphan vector, which `sweep_orphan_embeddings` heals on the next embed
     /// pass. The branch is a table-name compare + one indexed DELETE, only on the tombstone path —
     /// nothing on the hot live-row path.
+    ///
+    /// **NO CONTENT VALIDATION, and that is a decision (SUR-1070, accepted 2026-08-18).** This
+    /// writes whatever the caller hands it, so a pulled `text` can hold a value the account key
+    /// never sealed — plaintext, `enc:v1`, anything. Do not "fix" that here:
+    ///
+    ///   - it discloses nothing. The server holds no key, so a value it supplies was never the
+    ///     user's plaintext; storing it exposes none of their data;
+    ///   - it cannot be shown. [`crate::sync::read`] renders `text` only when it is `enc:v2` AND
+    ///     opens under that row's own id, so an unbound value reaches no screen, no search index,
+    ///     no embedding queue and no content tag;
+    ///   - **both shapes of "reject" are worse than storing it, for DIFFERENT reasons.** A guard that
+    ///     SKIPS the row loses it: `pull_table` bumps its `change_seq` watermark for every processed
+    ///     row before any merge decision, so a skipped row is never re-delivered and the device
+    ///     diverges permanently and silently. A guard that ERRORS does not lose it — the `?` exits
+    ///     before `set_seq_cursor`, so the cursor is not persisted and the row returns next pull —
+    ///     but then that table fails on every pull, and `pull_then_flush` aborts the FLUSH for every
+    ///     table when any one fails. One malformed row, written by whoever can write rows, wedges
+    ///     the account's entire sync indefinitely. A real reject needs a quarantine and a retry
+    ///     rule, not a guard in this function.
+    ///
+    /// **What the read gate does and does not buy.** It stops an unbound value being SHOWN — no
+    /// screen, no search index, no embedding queue, no content-tag re-derivation. It does NOT make
+    /// every pulled column inert: a column consumed WITHOUT decryption is outside its reach, and
+    /// `content_tag` was exactly that until SUR-1070 made `reconcile_content_dupes` re-derive the
+    /// tag it clusters on from each note's own decrypted plaintext. Before adding a consumer of a
+    /// pulled column, ask whether it reads through the gate — and if it does not, note that a
+    /// SENTINEL check is not a substitute. `enc:v2:` is a prefix anyone can write; only a decrypt
+    /// under the row's own id proves the account key produced the value.
     pub fn apply_row(&self, table: &str, row: &Map<String, Value>) -> rusqlite::Result<()> {
         let schema = schema_or_err(table)?;
         let cols: Vec<&str> = schema.columns.iter().map(|(n, _)| *n).collect();
