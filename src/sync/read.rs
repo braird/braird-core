@@ -795,7 +795,18 @@ fn page_take(limit: i64) -> usize {
 ///
 /// An ABSENT `text` still yields `(None, false)` — a column making no claim differs from a column
 /// making an unverifiable one.
-fn decrypt_v2_bound(row: &Map<String, Value>, id: &str, vault: &Vault) -> (Option<String>, bool) {
+///
+/// `pub(super)` because two callers need the rule WITHOUT [`decrypt_note_text`]'s empty-string
+/// concession: [`decrypt_note_text`] itself, and the content-dedup pass
+/// ([`super::reconcile::reconcile_content_dupes`], SUR-1070), which authenticates a note before
+/// letting it join a fingerprint cluster. Dedup cannot take the concession — an empty `text` is
+/// unauthenticated, so accepting it would let a planted row cluster on
+/// `content_tag("", book_id)` and tombstone a genuine empty note.
+pub(super) fn decrypt_v2_bound(
+    row: &Map<String, Value>,
+    id: &str,
+    vault: &Vault,
+) -> (Option<String>, bool) {
     match string_field(row, "text") {
         None => (None, false),
         Some(t) if is_encrypted_v2(&t) => match vault.decrypt_note(Some(id.to_string()), t) {

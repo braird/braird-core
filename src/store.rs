@@ -920,8 +920,11 @@ impl Store {
     /// **What the read gate does and does not buy.** It stops an unbound value being SHOWN — no
     /// screen, no search index, no embedding queue, no content-tag re-derivation. It does NOT make
     /// every pulled column inert: a column consumed WITHOUT decryption is outside its reach, and
-    /// `content_tag` was exactly that until SUR-1070 gated `reconcile_content_dupes` on `enc:v2`
-    /// too. Before adding a consumer of a pulled column, ask whether it reads through the gate.
+    /// `content_tag` was exactly that until SUR-1070 made `reconcile_content_dupes` re-derive the
+    /// tag it clusters on from each note's own decrypted plaintext. Before adding a consumer of a
+    /// pulled column, ask whether it reads through the gate — and if it does not, note that a
+    /// SENTINEL check is not a substitute. `enc:v2:` is a prefix anyone can write; only a decrypt
+    /// under the row's own id proves the account key produced the value.
     pub fn apply_row(&self, table: &str, row: &Map<String, Value>) -> rusqlite::Result<()> {
         let schema = schema_or_err(table)?;
         let cols: Vec<&str> = schema.columns.iter().map(|(n, _)| *n).collect();

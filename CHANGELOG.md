@@ -13,9 +13,17 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   and copying needs no HMAC key, only the ability to write the row. A planted row therefore joined a
   real note's cluster, won the survivor sort trivially (it controls `tags`, `created_at` and `id`,
   which ARE the ordering), and tombstoned the genuine note. The enc:v2 read gate could not help,
-  because this path never reads the text — which is why the guard sits in the pass: a note whose
-  `text` is not `enc:v2` no longer joins a fingerprint cluster at all. Found by review while
+  because this path never reads the text. A note now earns its place in a cluster by OPENING: its
+  `text` must be `enc:v2` **and** decrypt under that row's own id, and the tag it clusters on is
+  re-derived from that plaintext. The stored tag survives only as a prefilter deciding who is worth
+  decrypting. Two weaker gates were tried and rejected under review, and both are worth naming: a
+  sentinel check on `text` admits arbitrary bytes, because `enc:v2:` is a prefix and not a proof;
+  and a decrypt alone still admits a row that carries a GENUINE ciphertext while tampering with the
+  `content_tag` column only. Re-derivation is what closes the second one. Found by review while
   documenting the posture below, which had claimed the read gate covered everything.
+  Side effect, deliberate: the pass now has the oracle's `decryptError` gate, so a corrupted note
+  can no longer be picked as survivor over a readable copy — an accepted residual risk since
+  SUR-835, now simply gone.
 
 ### Changed
 - **Documented, not code: pulled rows are stored without content validation, and that is now an

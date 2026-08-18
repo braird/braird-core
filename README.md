@@ -34,7 +34,9 @@ divergence. One audited Rust core, bound to each platform, removes that risk.
   *shown*: a read renders `text` only when it is `enc:v2` and opens under that row's own id, so an
   unbound value can never reach a screen, the search index or the embedding queue. Columns consumed
   WITHOUT decryption are outside that gate's reach and are guarded individually — `content_tag` is
-  the one such case, and the duplicate-collapse pass now ignores a note whose text is not `enc:v2`.
+  the one such case, and the duplicate-collapse pass now clusters on a tag it RE-DERIVES from each
+  note's own decrypted text rather than on the stored string. A sentinel check would not do: only a
+  decrypt under the row's own id proves the account key produced the value.
   Rejecting a row on arrival would be worse than storing it either way: a skip loses the row for good
   (the pull advances its cursor per row, before any merge decision), and an error wedges that table on
   every subsequent pull, which aborts the flush for every table. A real reject needs a quarantine and
