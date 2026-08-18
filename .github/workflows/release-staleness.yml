@@ -27,6 +27,12 @@ name: Release staleness check
 # fork-controlled run can ever reach this secret. Keep it that way: adding a `pull_request` trigger
 # here would change the security posture, not just the cadence.
 
+# CodeQL (actions/missing-workflow-permissions) on PR #93: pin the GITHUB_TOKEN down rather than
+# inheriting the repository default. `contents: read` is the whole requirement — the checkout, and
+# the `gh api .../releases` call below. This job never writes anything.
+permissions:
+  contents: read
+
 on:
   schedule:
     - cron: '0 9 * * *' # daily 09:00 UTC
@@ -55,6 +61,16 @@ jobs:
       - name: Self-check the rules before applying them
         run: node scripts/check-release-staleness.mjs --self-check
 
+      # A TAG IS NOT A RELEASE (Codex on PR #93). `release.yml` publishes create-only at the END of
+      # its job DAG, so a tag whose build failed leaves a tag with no release behind it. The checker
+      # judges every version against THIS list, never against `git tag`, so that state is reported
+      # instead of silently reading as shipped. One page of 100 is the ceiling and is ~6x the
+      # release history; paginate here if that ever stops being true.
+      - name: Fetch the published releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api "repos/${{ github.repository }}/releases?per_page=100" > /tmp/releases.json
+
       # Read-only, and the checker needs exactly one file from each. `|| true` is deliberate: a
       # clone that fails (revoked PAT, missing scope, outage) must surface as a FINDING from the
       # checker — "pin could not be read" — not as a green run that silently checked nothing.
@@ -74,4 +90,4 @@ jobs:
           done
 
       - name: Assert nothing finished is stuck
-        run: node scripts/check-release-staleness.mjs --consumers /tmp/consumers
+        run: node scripts/check-release-staleness.mjs --releases /tmp/releases.json --consumers /tmp/consumers

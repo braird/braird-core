@@ -3,39 +3,55 @@
 //
 // THE GAP THIS CLOSES. braird-core ships through two hops, and NOTHING watched either one. A fix
 // merges to `main` and sits in `[Unreleased]` until somebody remembers to cut a release; the release
-// is tagged and sits published until somebody remembers to bump `braird-core.lock` in the app repos.
+// is published and sits there until somebody remembers to bump `braird-core.lock` in the app repos.
 // Both hops are deliberate — no floating versions in a crypto core, and the pin PR is the
 // integration gate (docs/pinning.md) — but neither had a clock on it. SUR-1070's note-tombstoning
-// fix merged, and the only thing that surfaced "this is still not on a phone" was a human asking.
-// Every existing gate is a CORRECTNESS gate: it asks whether the tree is consistent, never whether
-// consistent work is stuck. `[Unreleased]` reads identically for a typo and for a security fix.
+// fix merged, was released, and the only thing that surfaced "this is still not on a phone" was a
+// human asking. Every existing gate is a CORRECTNESS gate: it asks whether the tree is consistent,
+// never whether consistent work is stuck. `[Unreleased]` reads identically for a typo and for a
+// security fix.
 //
-// TWO SIGNALS, because there are two ways to stall and neither implies the other:
-//   1. UNRELEASED — `[Unreleased]` carries a `### Security` section and no release has taken it.
-//   2. UNPINNED — a release exists that a consumer repo's pin still trails.
-// A fix that merges but is never released is invisible to (2): with no new tag, every consumer
-// agrees with the newest tag and looks current.
+// THREE SIGNALS, because there are three places work stops and none implies the others:
+//   1. UNRELEASED  — `[Unreleased]` carries `### Security` and no release has taken it.
+//   2. UNPUBLISHED — a CHANGELOG section names a version with no consumable GitHub Release.
+//   3. UNPINNED    — a published release a consumer's pin still trails.
+// A fix that merges but is never released is invisible to (3): with no new release, every consumer
+// agrees with the newest one and looks current. And (2) is not decoration — `release.yml` publishes
+// create-only at the END of the job DAG, so a tag whose build failed leaves a tag with no release
+// behind it. Without (2) that tag silently ends signal (1) (the entries left `[Unreleased]`) while
+// signal (3) starts telling consumers to pin something they cannot fetch.
+//
+// A TAG IS NOT A RELEASE, and this checker never treats one as the other. Every judgement here is
+// made against the published GitHub Releases passed in via `--releases`, never against `git tag`.
 //
 // SEVERITY DRIVES THE DEADLINE, and that is the whole reason this is usable. A gate that nags about
 // every unpinned patch is a gate people mute, and a muted gate is worse than none — the same
-// argument `check-stale-release-markers.mjs` makes for staying narrow. So an unpinned range
-// containing a `### Security` section is due in 7 days; anything else gets 30. A release nobody
-// urgently needs can wait for the next feature pin without anyone hearing about it.
+// argument `check-stale-release-markers.mjs` makes for staying narrow. A stalled range containing a
+// `### Security` section is due in 7 days; anything else gets 30.
 //
-// WHAT THIS DOES NOT DO. It does not judge whether a release SHOULD be cut, or open PRs, or block
-// a merge — it runs on a schedule, not in the merge path, because "you have not shipped this yet"
-// is never a reason to reject the next commit. It reports, loudly, on a clock.
+// THE DEADLINE RUNS FROM THE OLDEST STALLED RELEASE, NEVER THE NEWEST. Dating a consumer's lag from
+// the newest release would let an active repo suppress its own alarm forever: each new tag resets
+// the clock to zero while an old security release stays unpinned underneath. The age therefore comes
+// from the OLDEST unpinned release in the range — and, when the range contains security work, from
+// the oldest unpinned SECURITY release specifically, since that is the one whose deadline is short.
 //
-// Usage:  node scripts/check-release-staleness.mjs [--consumers <dir>] [--now <ISO>]
+// WHAT THIS DOES NOT DO. It does not judge whether a release SHOULD be cut, or open PRs, or block a
+// merge — it runs on a schedule, not in the merge path, because "you have not shipped this yet" is
+// never a reason to reject the next commit. It reports, loudly, on a clock.
+//
+// Usage:  node scripts/check-release-staleness.mjs --releases <file> [--consumers <dir>] [--now ISO]
 //         node scripts/check-release-staleness.mjs --self-check
 //
-// `--consumers <dir>` holds one shallow clone per consumer, named for the repo (e.g.
-// `<dir>/braird-android`). A consumer that is absent is REPORTED, never skipped: a clone that
-// failed must not read as "nothing to pin" (a fail-open gate is a decoration).
+// `--releases <file>` is the JSON body of `gh api repos/braird/braird-core/releases`. Required, not
+// optional: without it this cannot tell a published release from a bare tag, and guessing would
+// reintroduce exactly the failure mode signal (2) exists to catch.
+// `--consumers <dir>` holds one shallow clone per consumer, named for the repo. A consumer that is
+// absent is REPORTED, never skipped: a clone that failed must not read as "nothing to pin".
 
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const DAY_MS = 86_400_000;
 
@@ -49,20 +65,27 @@ const CONSUMERS = [
 ];
 
 // ── pure core ─────────────────────────────────────────────────────────────────
-// Everything below takes data and returns findings. The git and filesystem reads live at the edges,
-// which is what lets `--self-check` drive the real logic instead of a paraphrase of it.
+// Everything below takes data and returns findings. The git, filesystem and API reads live at the
+// edges, which is what lets `--self-check` drive the real logic instead of a paraphrase of it.
 
-/** Split a Keep a Changelog file into its `[Unreleased]` body and its released sections. */
+/**
+ * Split a Keep a Changelog file into its `[Unreleased]` body and its released sections.
+ *
+ * The heading's date tail is kept, not discarded: it is the only thing that can date a section whose
+ * release was never published, which is precisely the case signal (2) has to age.
+ */
 export function parseChangelog(text) {
-  const parts = text.split(/^## \[([^\]]+)\][^\n]*$/m);
-  // parts[0] is the preamble; thereafter [heading, body, heading, body, ...].
+  const parts = text.split(/^## \[([^\]]+)\]([^\n]*)$/m);
+  // parts[0] is the preamble; thereafter [version, headingTail, body, version, headingTail, ...].
   const sections = [];
-  for (let i = 1; i < parts.length; i += 2) {
-    sections.push({ version: parts[i], body: parts[i + 1] ?? '' });
+  for (let i = 1; i < parts.length; i += 3) {
+    const date = /-\s*(\d{4}-\d{2}-\d{2})/.exec(parts[i + 1] ?? '')?.[1] ?? null;
+    sections.push({ version: parts[i], date, body: parts[i + 2] ?? '' });
   }
-  const unreleased = sections.find((s) => s.version === 'Unreleased')?.body ?? '';
-  const released = sections.filter((s) => s.version !== 'Unreleased');
-  return { unreleased, released };
+  return {
+    unreleased: sections.find((s) => s.version === 'Unreleased')?.body ?? '',
+    released: sections.filter((s) => s.version !== 'Unreleased'),
+  };
 }
 
 /** Keep a Changelog puts security work under its own heading. That heading IS the severity signal. */
@@ -70,15 +93,41 @@ export function hasSecuritySection(body) {
   return /^### Security\s*$/m.test(body);
 }
 
-/** `v1.2.3` / `1.2.3` → [1,2,3]. Anything else → null, so a garbled pin is reported, not ranked. */
+/**
+ * `v1.2.3`, `1.2.3`, `v1.2.3-rc1`, `v1.2.3.4` → `{ core, pre }`; anything else → null, so a garbled
+ * pin is reported rather than silently ranked.
+ *
+ * The suffix is KEPT. `release.yml` accepts `^v\d+\.\d+\.\d+([.-][0-9A-Za-z.]+)?$` — prerelease tags
+ * are a supported shape — and a parser that dropped the suffix would rank `v1.2.3-rc1` equal to
+ * `v1.2.3`, so a consumer stuck on the release candidate would read as current forever.
+ */
 export function parseVersion(raw) {
-  const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(String(raw ?? '').trim());
-  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+  const m = /^v?(\d+)\.(\d+)\.(\d+)(?:[.-]([0-9A-Za-z.]+))?$/.exec(String(raw ?? '').trim());
+  return m ? { core: [Number(m[1]), Number(m[2]), Number(m[3])], pre: m[4] ?? null } : null;
+}
+
+/** Digit runs compare numerically, so `rc9` sorts before `rc10` rather than after it. */
+function compareNatural(a, b) {
+  const chunk = (s) => s.match(/\d+|\D+/g) ?? [];
+  const [x, y] = [chunk(a), chunk(b)];
+  for (let i = 0; i < Math.max(x.length, y.length); i += 1) {
+    const [p, q] = [x[i], y[i]];
+    if (p === undefined) return -1;
+    if (q === undefined) return 1;
+    const both = /^\d+$/.test(p) && /^\d+$/.test(q);
+    const cmp = both ? Number(p) - Number(q) : p < q ? -1 : p > q ? 1 : 0;
+    if (cmp !== 0) return cmp < 0 ? -1 : 1;
+  }
+  return 0;
 }
 
 export function compareVersions(a, b) {
-  for (let i = 0; i < 3; i += 1) if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
-  return 0;
+  for (let i = 0; i < 3; i += 1) if (a.core[i] !== b.core[i]) return a.core[i] < b.core[i] ? -1 : 1;
+  if (a.pre === b.pre) return 0;
+  // A finished release outranks any suffixed build of the same core version.
+  if (a.pre === null) return 1;
+  if (b.pre === null) return -1;
+  return compareNatural(a.pre, b.pre);
 }
 
 /** The released sections strictly newer than `pinned` — the range a consumer has not taken yet. */
@@ -95,85 +144,147 @@ function ageDays(now, since) {
   return Math.floor((Date.parse(now) - Date.parse(since)) / DAY_MS);
 }
 
+/** Oldest first, so "the one whose clock started earliest" is just `[0]`. */
+function oldestFirst(sections) {
+  return [...sections].sort((a, b) => compareVersions(parseVersion(a.version), parseVersion(b.version)));
+}
+
 /**
  * The whole decision, as one pure function.
  *
- * `unreleasedSecuritySince` is when `### Security` FIRST appeared under `[Unreleased]` — not when
- * the last release was cut. Those differ, and the difference matters: dating the finding from the
- * previous tag would accuse a fix merged this morning of being months late, which is exactly the
+ * `published` maps a version string to its release's `published_at`. A version absent from it has no
+ * consumable release, whatever `git tag` says.
+ *
+ * `unreleasedSecuritySince` is when `### Security` FIRST appeared under `[Unreleased]` — not when the
+ * last release was cut. Those differ, and the difference matters: dating the finding from the
+ * previous release would accuse a fix merged this morning of being months late, which is exactly the
  * kind of false alarm that gets a gate switched off.
  */
-export function evaluate({ changelog, latestTag, latestTagDate, unreleasedSecuritySince, consumers, now }) {
+export function evaluate({ changelog, published, unreleasedSecuritySince, consumers, now }) {
   const { unreleased, released } = parseChangelog(changelog);
   const findings = [];
+  const add = (signal, detail) => findings.push({ signal, detail });
 
+  // (1) UNRELEASED — security work that no release has taken.
   if (hasSecuritySection(unreleased)) {
-    const age = unreleasedSecuritySince === null ? null : ageDays(now, unreleasedSecuritySince);
-    if (age === null) {
-      findings.push({
-        signal: 'unreleased',
-        detail: 'CHANGELOG [Unreleased] has a ### Security section but its first commit could not be dated',
-      });
-    } else if (age > DEADLINE_DAYS.security) {
-      findings.push({
-        signal: 'unreleased',
-        detail:
-          `security work has sat in CHANGELOG [Unreleased] for ${age} days ` +
-          `(limit ${DEADLINE_DAYS.security}) — cut a release, or move the entry if it is not security work`,
-      });
+    if (unreleasedSecuritySince === null) {
+      add('unreleased', 'CHANGELOG [Unreleased] has a ### Security section but its first commit could not be dated');
+    } else {
+      const age = ageDays(now, unreleasedSecuritySince);
+      if (age > DEADLINE_DAYS.security) {
+        add(
+          'unreleased',
+          `security work has sat in CHANGELOG [Unreleased] for ${age} days (limit ` +
+            `${DEADLINE_DAYS.security}) — cut a release, or move the entry if it is not security work`,
+        );
+      }
     }
   }
 
+  // (2) UNPUBLISHED — the CHANGELOG claims a release consumers cannot fetch. `release.yml` publishes
+  // create-only at the end of its DAG, so a failed build leaves the tag with no release behind it.
+  // Aged from the section's own heading date: during a release PR the section legitimately exists
+  // before the tag is pushed, and a signal that fired there would fire on every release.
+  for (const s of oldestFirst(released)) {
+    if (published.has(s.version)) continue;
+    if (!s.date) {
+      add('unpublished', `CHANGELOG section [${s.version}] has no published release and no date to age it by`);
+      continue;
+    }
+    const limit = hasSecuritySection(s.body) ? DEADLINE_DAYS.security : DEADLINE_DAYS.routine;
+    const age = ageDays(now, `${s.date}T00:00:00Z`);
+    if (age > limit) {
+      add(
+        'unpublished',
+        `CHANGELOG section [${s.version}] (${s.date}, ${age} days old, limit ${limit}) has NO published ` +
+          `release${hasSecuritySection(s.body) ? ' and contains SECURITY work' : ''} — a tag whose ` +
+          'release build failed leaves exactly this state; re-run the release or cut a new version',
+      );
+    }
+  }
+
+  // (3) UNPINNED — a consumer trailing a published release.
   for (const { repo, pinnedTag, error } of consumers) {
     if (error) {
-      findings.push({ signal: 'unpinned', detail: `${repo}: pin could not be read (${error})` });
+      add('unpinned', `${repo}: pin could not be read (${error})`);
       continue;
     }
     const behind = releasesAfter(released, pinnedTag);
     if (behind === null) {
-      findings.push({ signal: 'unpinned', detail: `${repo}: unparseable pinned tag ${JSON.stringify(pinnedTag)}` });
+      add('unpinned', `${repo}: unparseable pinned tag ${JSON.stringify(pinnedTag)}`);
       continue;
     }
-    if (behind.length === 0) continue;
+    // Only a release a consumer could actually take counts against it.
+    const fetchable = oldestFirst(behind.filter((s) => published.has(s.version)));
+    if (fetchable.length === 0) continue;
 
-    const security = behind.some((s) => hasSecuritySection(s.body));
-    const limit = security ? DEADLINE_DAYS.security : DEADLINE_DAYS.routine;
-    const age = ageDays(now, latestTagDate);
+    // The clock starts at the OLDEST stalled release, never the newest — otherwise every new tag
+    // resets it to zero and an old security release underneath is suppressed indefinitely. When the
+    // range contains security work, the oldest SECURITY release is the one that sets the deadline.
+    const securities = fetchable.filter((s) => hasSecuritySection(s.body));
+    const clock = securities[0] ?? fetchable[0];
+    const limit = securities.length > 0 ? DEADLINE_DAYS.security : DEADLINE_DAYS.routine;
+    const age = ageDays(now, published.get(clock.version));
     if (age > limit) {
-      const versions = behind.map((s) => s.version).join(', ');
-      findings.push({
-        signal: 'unpinned',
-        detail:
-          `${repo} pins ${pinnedTag}, ${behind.length} release(s) behind ${latestTag} ` +
-          `(${versions})${security ? ' — the range contains SECURITY work' : ''}; ` +
-          `${latestTag} is ${age} days old (limit ${limit})`,
-      });
+      add(
+        'unpinned',
+        `${repo} pins ${pinnedTag}, ${fetchable.length} release(s) behind ` +
+          `(${fetchable.map((s) => s.version).join(', ')})${securities.length > 0 ? ' — the range contains SECURITY work' : ''}; ` +
+          `the oldest unpinned${securities.length > 0 ? ' security' : ''} release ${clock.version} ` +
+          `published ${age} days ago (limit ${limit})`,
+      );
     }
   }
   return findings;
 }
 
-// ── edges: git + filesystem ───────────────────────────────────────────────────
+// ── edges: git, filesystem, release list ──────────────────────────────────────
 
 const git = (...args) => execFileSync('git', args, { encoding: 'utf8' }).trim();
 
-function latestReleaseTag() {
-  const tags = git('tag', '--list', 'v*', '--sort=-v:refname').split('\n').filter(Boolean);
-  if (tags.length === 0) return null;
-  return { tag: tags[0], date: git('log', '-1', '--format=%cI', tags[0]) };
+/**
+ * version → `published_at`, for releases a consumer can actually fetch.
+ *
+ * A draft is not consumable, and neither is a release with no assets — `release.yml` attaches every
+ * artifact in the same create-only step, so an assetless release means that step did not finish.
+ */
+export function publishedReleases(json) {
+  const map = new Map();
+  for (const r of json) {
+    if (r.draft) continue;
+    if (!Array.isArray(r.assets) || r.assets.length === 0) continue;
+    const v = parseVersion(r.tag_name);
+    if (v) map.set(String(r.tag_name).replace(/^v/, ''), r.published_at);
+  }
+  return map;
+}
+
+/** The newest published release, by version precedence rather than by publish order. */
+function newestPublished(published) {
+  let best = null;
+  for (const version of published.keys()) {
+    const v = parseVersion(version);
+    if (v && (best === null || compareVersions(v, parseVersion(best)) > 0)) best = version;
+  }
+  return best;
 }
 
 /**
- * When `### Security` first showed up under `[Unreleased]` after the last release.
+ * When `### Security` first showed up under `[Unreleased]` after the newest published release.
  *
- * Walks the commits that touched CHANGELOG.md since the tag, oldest first, and stops at the first
- * one whose `[Unreleased]` already carried the heading. Bounded by the commits in one release
- * window, so it stays cheap. Returns null when nothing since the tag has it — which is also the
- * answer when the section arrived and then left again.
+ * Walks the commits that touched CHANGELOG.md since that release's tag, oldest first, and stops at
+ * the first whose `[Unreleased]` already carried the heading. Bounded by one release window, so it
+ * stays cheap. Returns null when nothing since then has it — also the answer when the section
+ * arrived and then left again.
  */
 function securityFirstSeenSince(tag) {
   const range = tag ? `${tag}..HEAD` : 'HEAD';
-  const shas = git('rev-list', '--reverse', range, '--', 'CHANGELOG.md').split('\n').filter(Boolean);
+  let shas;
+  try {
+    shas = git('rev-list', '--reverse', range, '--', 'CHANGELOG.md').split('\n').filter(Boolean);
+  } catch {
+    return null; // the tag is not present locally (shallow clone) — reported by the caller's grace
+  }
   for (const sha of shas) {
     let text;
     try {
@@ -199,90 +310,131 @@ function readConsumers(dir) {
 // The corpus is the specification. Each row states a situation and the finding signals it must
 // produce, so the boundary between "report" and "stay quiet" is executable rather than folklore.
 
-const SEC = '## [Unreleased]\n\n### Security\n- a fix\n\n## [1.2.0] - 2026-01-01\n\n### Security\n- shipped\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n';
-// A SHIPPED security release: the heading sits in the released section, not in `[Unreleased]`. This
-// is what the unpinned signal must react to, and keeping it separate from SEC is what stops the two
-// signals being tested as one.
-const SEC_RELEASED = '## [Unreleased]\n\n### Fixed\n- a typo\n\n## [1.2.0] - 2026-01-01\n\n### Security\n- shipped\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n';
-const QUIET = '## [Unreleased]\n\n### Fixed\n- a typo\n\n## [1.2.0] - 2026-01-01\n\n### Added\n- feature\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n';
+const CL = {
+  // `### Security` still sitting in [Unreleased].
+  unreleasedSecurity:
+    '## [Unreleased]\n\n### Security\n- a fix\n\n## [1.2.0] - 2026-01-01\n\n### Added\n- x\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
+  // A SHIPPED security release: the heading is in the released section, not in [Unreleased]. Keeping
+  // this separate is what stops signals (1) and (3) being tested as one.
+  shippedSecurity:
+    '## [Unreleased]\n\n### Fixed\n- a typo\n\n## [1.2.0] - 2026-01-01\n\n### Security\n- shipped\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
+  quiet:
+    '## [Unreleased]\n\n### Fixed\n- a typo\n\n## [1.2.0] - 2026-01-01\n\n### Added\n- feature\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
+  // The P1 shape: an old SECURITY release the consumer never took, with a routine release on top.
+  securityThenRoutine:
+    '## [Unreleased]\n\n### Fixed\n- x\n\n## [1.3.0] - 2026-05-01\n\n### Added\n- routine\n\n## [1.2.0] - 2026-01-20\n\n### Security\n- never pinned\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
+};
+
+const PUB = new Map([
+  ['1.1.0', '2025-12-01T00:00:00Z'],
+  ['1.2.0', '2026-01-01T00:00:00Z'],
+]);
+const PUB_P1 = new Map([
+  ['1.1.0', '2025-12-01T00:00:00Z'],
+  ['1.2.0', '2026-01-20T00:00:00Z'],
+  ['1.3.0', '2026-05-01T00:00:00Z'],
+]);
 
 const CORPUS = [
   {
     name: 'security sitting unreleased past the deadline is reported',
-    input: { changelog: SEC, unreleasedSecuritySince: '2026-02-01T00:00:00Z', now: '2026-02-20T00:00:00Z' },
+    input: { changelog: CL.unreleasedSecurity, unreleasedSecuritySince: '2026-02-01T00:00:00Z', now: '2026-02-20T00:00:00Z' },
     expect: ['unreleased'],
   },
   {
-    name: 'security merged inside the grace period is NOT reported — dated from the entry, not the tag',
-    input: { changelog: SEC, unreleasedSecuritySince: '2026-02-19T00:00:00Z', now: '2026-02-20T00:00:00Z' },
+    name: 'security merged inside the grace period is NOT reported — dated from the entry, not the release',
+    input: { changelog: CL.unreleasedSecurity, unreleasedSecuritySince: '2026-02-19T00:00:00Z', now: '2026-02-20T00:00:00Z' },
     expect: [],
   },
   {
     name: 'a non-security [Unreleased] is never a staleness finding, however old',
-    input: { changelog: QUIET, unreleasedSecuritySince: null, now: '2027-01-01T00:00:00Z' },
+    input: { changelog: CL.quiet, now: '2027-01-01T00:00:00Z' },
     expect: [],
   },
   {
     name: 'a consumer trailing a SECURITY release is reported after 7 days',
-    input: {
-      changelog: SEC_RELEASED,
-      unreleasedSecuritySince: null,
-      consumers: [{ repo: 'app', pinnedTag: 'v1.1.0' }],
-      latestTagDate: '2026-01-01T00:00:00Z',
-      now: '2026-01-15T00:00:00Z',
-    },
+    input: { changelog: CL.shippedSecurity, consumers: [{ repo: 'app', pinnedTag: 'v1.1.0' }], now: '2026-01-15T00:00:00Z' },
     expect: ['unpinned'],
   },
   {
-    name: 'a consumer trailing a ROUTINE release is quiet at 14 days and reported at 45',
-    input: {
-      changelog: QUIET,
-      unreleasedSecuritySince: null,
-      consumers: [{ repo: 'app', pinnedTag: 'v1.1.0' }],
-      latestTagDate: '2026-01-01T00:00:00Z',
-      now: '2026-01-15T00:00:00Z',
-    },
+    name: 'a consumer trailing a ROUTINE release is quiet at 14 days',
+    input: { changelog: CL.quiet, consumers: [{ repo: 'app', pinnedTag: 'v1.1.0' }], now: '2026-01-15T00:00:00Z' },
     expect: [],
   },
   {
     name: 'the same routine lag IS reported once it passes 30 days',
-    input: {
-      changelog: QUIET,
-      unreleasedSecuritySince: null,
-      consumers: [{ repo: 'app', pinnedTag: 'v1.1.0' }],
-      latestTagDate: '2026-01-01T00:00:00Z',
-      now: '2026-02-15T00:00:00Z',
-    },
+    input: { changelog: CL.quiet, consumers: [{ repo: 'app', pinnedTag: 'v1.1.0' }], now: '2026-02-15T00:00:00Z' },
     expect: ['unpinned'],
   },
   {
     name: 'a current consumer is quiet',
-    input: {
-      changelog: QUIET,
-      unreleasedSecuritySince: null,
-      consumers: [{ repo: 'app', pinnedTag: 'v1.2.0' }],
-      latestTagDate: '2026-01-01T00:00:00Z',
-      now: '2027-01-01T00:00:00Z',
-    },
+    input: { changelog: CL.quiet, consumers: [{ repo: 'app', pinnedTag: 'v1.2.0' }], now: '2027-01-01T00:00:00Z' },
     expect: [],
   },
   {
     name: 'an unreadable consumer pin FAILS rather than passing silently',
-    input: {
-      changelog: QUIET,
-      unreleasedSecuritySince: null,
-      consumers: [{ repo: 'app', error: 'clone missing' }],
-      now: '2026-01-15T00:00:00Z',
-    },
+    input: { changelog: CL.quiet, consumers: [{ repo: 'app', error: 'clone missing' }], now: '2026-01-15T00:00:00Z' },
     expect: ['unpinned'],
   },
   {
     name: 'a garbled pinned tag is reported, never ranked as current',
+    input: { changelog: CL.quiet, consumers: [{ repo: 'app', pinnedTag: 'latest' }], now: '2026-01-15T00:00:00Z' },
+    expect: ['unpinned'],
+  },
+  // ── the deadline runs from the OLDEST stalled release (Codex P1 on PR #93) ──
+  {
+    name: 'a NEW routine release does not reset the clock on an old unpinned SECURITY release',
     input: {
-      changelog: QUIET,
-      unreleasedSecuritySince: null,
-      consumers: [{ repo: 'app', pinnedTag: 'latest' }],
-      latestTagDate: '2026-01-01T00:00:00Z',
+      changelog: CL.securityThenRoutine,
+      published: PUB_P1,
+      consumers: [{ repo: 'app', pinnedTag: 'v1.1.0' }],
+      now: '2026-05-01T00:00:00Z', // 1.3.0 published TODAY; 1.2.0 security is 101 days old
+    },
+    expect: ['unpinned'],
+  },
+  {
+    name: 'and the finding names the oldest SECURITY release as the clock, not the newest release',
+    input: {
+      changelog: CL.securityThenRoutine,
+      published: PUB_P1,
+      consumers: [{ repo: 'app', pinnedTag: 'v1.1.0' }],
+      now: '2026-05-01T00:00:00Z',
+    },
+    detail: /oldest unpinned security release 1\.2\.0 published 101 days ago/,
+  },
+  // ── a tag is not a release (Codex P2 on PR #93) ──
+  {
+    name: 'a CHANGELOG section with no published release is reported once it ages past the limit',
+    input: { changelog: CL.quiet, published: new Map([['1.1.0', '2025-12-01T00:00:00Z']]), now: '2026-03-01T00:00:00Z' },
+    expect: ['unpublished'],
+  },
+  {
+    name: 'a section awaiting its tag during a release PR is NOT reported inside the grace period',
+    input: { changelog: CL.quiet, published: new Map([['1.1.0', '2025-12-01T00:00:00Z']]), now: '2026-01-10T00:00:00Z' },
+    expect: [],
+  },
+  {
+    name: 'an unpublished SECURITY section takes the SHORT deadline',
+    input: { changelog: CL.shippedSecurity, published: new Map([['1.1.0', '2025-12-01T00:00:00Z']]), now: '2026-01-15T00:00:00Z' },
+    expect: ['unpublished'],
+  },
+  {
+    name: 'a consumer is never told to pin a version that has no published release',
+    input: {
+      changelog: CL.quiet,
+      published: new Map([['1.1.0', '2025-12-01T00:00:00Z']]), // 1.2.0 tagged but never published
+      consumers: [{ repo: 'app', pinnedTag: 'v1.1.0' }],
+      now: '2026-01-15T00:00:00Z',
+    },
+    expect: [], // quiet on the pin; the unpublished signal owns this state (and is inside its grace)
+  },
+  // ── prerelease precedence (Codex P2 on PR #93) ──
+  {
+    name: 'a consumer stuck on a release candidate is NOT counted as current once the release ships',
+    input: {
+      changelog: '## [Unreleased]\n\n### Fixed\n- x\n\n## [1.2.0] - 2026-01-01\n\n### Security\n- shipped\n',
+      published: new Map([['1.2.0', '2026-01-01T00:00:00Z']]),
+      consumers: [{ repo: 'app', pinnedTag: 'v1.2.0-rc1' }],
       now: '2026-01-15T00:00:00Z',
     },
     expect: ['unpinned'],
@@ -291,18 +443,23 @@ const CORPUS = [
 
 function selfCheck() {
   let failed = 0;
-  for (const { name, input, expect } of CORPUS) {
-    const got = evaluate({
-      latestTag: 'v1.2.0',
-      latestTagDate: '2026-01-01T00:00:00Z',
+  for (const { name, input, expect, detail } of CORPUS) {
+    const findings = evaluate({
+      published: PUB,
+      unreleasedSecuritySince: null,
       consumers: [],
       ...input,
-    }).map((f) => f.signal);
-    const ok = got.length === expect.length && got.every((s, i) => s === expect[i]);
-    if (!ok) {
-      failed += 1;
-      console.error(`  FAIL ${name}\n       expected [${expect}] got [${got}]`);
+    });
+    let ok;
+    if (detail) {
+      ok = findings.some((f) => detail.test(f.detail));
+      if (!ok) console.error(`  FAIL ${name}\n       no finding matched ${detail}\n       got: ${findings.map((f) => f.detail).join(' | ') || '(none)'}`);
+    } else {
+      const got = findings.map((f) => f.signal);
+      ok = got.length === expect.length && got.every((s, i) => s === expect[i]);
+      if (!ok) console.error(`  FAIL ${name}\n       expected [${expect}] got [${got}]`);
     }
+    if (!ok) failed += 1;
   }
   if (failed > 0) {
     console.error(`check-release-staleness: self-check FAILED (${failed}/${CORPUS.length})`);
@@ -322,32 +479,47 @@ function main() {
     return i === -1 ? null : argv[i + 1];
   };
   const now = at('--now') ?? new Date().toISOString();
+  const releasesFile = at('--releases');
   const consumersDir = at('--consumers');
 
-  const latest = latestReleaseTag();
-  if (!latest) {
-    console.error('check-release-staleness: no v* tag found — nothing to measure against');
+  if (!releasesFile) {
+    console.error('check-release-staleness: --releases <file> is required (gh api repos/OWNER/REPO/releases).');
+    console.error('  Without it a bare tag is indistinguishable from a published release.');
     process.exit(2);
   }
 
+  let published;
+  try {
+    published = publishedReleases(JSON.parse(readFileSync(releasesFile, 'utf8')));
+  } catch (e) {
+    console.error(`check-release-staleness: could not read ${releasesFile}: ${e.message}`);
+    process.exit(2);
+  }
+  if (published.size === 0) {
+    console.error('check-release-staleness: no published release with assets found — refusing to guess.');
+    process.exit(2);
+  }
+
+  const newest = newestPublished(published);
   const findings = evaluate({
     changelog: readFileSync('CHANGELOG.md', 'utf8'),
-    latestTag: latest.tag,
-    latestTagDate: latest.date,
-    unreleasedSecuritySince: securityFirstSeenSince(latest.tag),
+    published,
+    unreleasedSecuritySince: securityFirstSeenSince(`v${newest}`),
     consumers: consumersDir ? readConsumers(consumersDir) : [],
     now,
   });
 
   if (findings.length === 0) {
-    console.log(`check-release-staleness: OK — nothing is stuck (latest ${latest.tag})`);
+    console.log(`check-release-staleness: OK — nothing is stuck (newest published v${newest})`);
     return;
   }
   console.error(`check-release-staleness: ${findings.length} finding(s)\n`);
   for (const f of findings) console.error(`  [${f.signal}] ${f.detail}`);
-  console.error('\nEach finding names work that is FINISHED but not on a device. Cut the release, or');
-  console.error('open the pin PR (docs/pinning.md). Neither hop is automatic, by design.');
+  console.error('\nEach finding names work that is FINISHED but not on a device. Cut the release, re-run');
+  console.error('a failed one, or open the pin PR (docs/pinning.md). No hop here is automatic, by design.');
   process.exit(1);
 }
 
-main();
+// Only run when invoked directly — the corpus and any future consumer import the pure functions,
+// and an import must not execute the checker as a side effect.
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) main();

@@ -210,8 +210,12 @@ Both steps are manual on purpose, and both are therefore places work can simply 
 this repo used to notice: `[Unreleased]` reads the same for a typo and for a security fix, and a
 published tag no consumer has pinned looks identical to one every consumer has taken.
 `.github/workflows/release-staleness.yml` runs daily and puts a clock on each hop — it reports when
-security work has sat unreleased, or when a consumer's pin trails a release, past a deadline set by
-whether the stalled range contains a `### Security` section (7 days if it does, 30 if it does not).
+security work has sat unreleased, when a CHANGELOG section names a version with no consumable
+release, or when a consumer's pin trails a published release, past a deadline set by whether the
+stalled range contains a `### Security` section (7 days if it does, 30 if it does not). It judges
+against published Releases rather than `git tag`, because a tag whose release build failed leaves a
+tag with no artifacts behind it, and the clock on a lagging pin starts at the OLDEST stalled release
+so a steady stream of new tags cannot suppress an old one.
 It reports; it never opens a PR and never blocks a merge, because not having shipped something yet
 is not a reason to reject the next commit.
 

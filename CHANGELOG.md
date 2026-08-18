@@ -14,10 +14,18 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   STUCK, and `[Unreleased]` reads identically for a typo and for a security fix. SUR-1070's
   note-tombstoning fix merged, then was released, and the only thing that surfaced "this is still not
   on a phone" was somebody asking.
-  `scripts/check-release-staleness.mjs` reports two signals, because there are two ways to stall and
-  neither implies the other: security work sitting in `[Unreleased]`, and a consumer pin trailing a
-  published release. A fix that merges but is never released is invisible to the second — with no new
-  tag, every consumer agrees with the newest one and looks current.
+  `scripts/check-release-staleness.mjs` reports three signals, because work stops in three places and
+  none implies the others: security work sitting in `[Unreleased]`, a CHANGELOG section naming a
+  version with no consumable release, and a consumer pin trailing a published release. A fix that
+  merges but is never released is invisible to the third — with no new release, every consumer agrees
+  with the newest one and looks current.
+  **A tag is never treated as a release.** `release.yml` publishes create-only at the end of its job
+  DAG, so a tag whose build failed leaves a tag with no release behind it; every judgement is made
+  against the published GitHub Releases, so that state is reported rather than silently ending the
+  first signal while the third starts telling consumers to pin something they cannot fetch.
+  **The deadline runs from the oldest stalled release, never the newest** — otherwise each new tag
+  resets the clock to zero and an old unpinned security release stays suppressed indefinitely, which
+  an actively released repo would do to itself forever.
   **Severity sets the deadline, and that is what makes it usable rather than noise:** a stalled range
   containing a `### Security` section is due in 7 days, anything else in 30, so a routine patch can
   wait for the next feature pin without anyone hearing about it. The unreleased signal is dated from
