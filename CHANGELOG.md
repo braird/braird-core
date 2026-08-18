@@ -6,6 +6,22 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Changed
+- **Documented, not code: pulled rows are stored without content validation, and that is now an
+  accepted decision rather than an unexamined gap (SUR-1070).** `Store::apply_row` writes whatever it
+  is handed, so a pulled `text` can hold a value the account key never sealed. Three reasons this is
+  accepted. It discloses nothing — the server holds no key, so anything it supplies was never the
+  user's plaintext. It cannot be shown — since the preceding change, a read renders `text` only when
+  it is `enc:v2` and opens under that row's own id, so an unbound value reaches no screen, no search
+  index, no embedding queue and no content tag. And **rejecting the row on arrival would be worse
+  than storing it**: `pull_table` advances its `change_seq` watermark for every processed row before
+  any merge decision, so a rejected row is never re-delivered and the device diverges permanently,
+  silently, with no retry — a real reject needs a quarantine and a retry rule, not a guard.
+  Recorded in three places on purpose: the README's security model (the posture), `apply_row`'s doc
+  (the choke point, where someone would notice the absence), and the watermark-advance comment in
+  `pull.rs` (the trap, where someone would reach for the fix). The decision's safety rests entirely
+  on the read gate, and both code comments say so — loosen that gate and these notes stop being true.
+
 ### Security
 - **A note read now requires `enc:v2`, so ciphertext that is not bound to its own row can no longer
   render as the user's text (SUR-1070).** `decrypt_note_text` accepted three things it should not

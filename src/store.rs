@@ -897,6 +897,24 @@ impl Store {
     /// leaves at worst an orphan vector, which `sweep_orphan_embeddings` heals on the next embed
     /// pass. The branch is a table-name compare + one indexed DELETE, only on the tombstone path —
     /// nothing on the hot live-row path.
+    ///
+    /// **NO CONTENT VALIDATION, and that is a decision (SUR-1070, accepted 2026-08-18).** This
+    /// writes whatever the caller hands it, so a pulled `text` can hold a value the account key
+    /// never sealed — plaintext, `enc:v1`, anything. Do not "fix" that here:
+    ///
+    ///   - it discloses nothing. The server holds no key, so a value it supplies was never the
+    ///     user's plaintext; storing it exposes none of their data;
+    ///   - it cannot be shown. [`crate::sync::read`] renders `text` only when it is `enc:v2` AND
+    ///     opens under that row's own id, so an unbound value reaches no screen, no search index,
+    ///     no embedding queue and no content tag;
+    ///   - **rejecting the row here would be worse than storing it.** `pull_table` advances its
+    ///     `change_seq` watermark for EVERY processed row, BEFORE any merge decision, so a rejected
+    ///     row is never re-delivered: the device diverges permanently, with no error and no retry.
+    ///     A real reject needs somewhere to put the row and a rule for retrying it — a quarantine
+    ///     table, not a guard in this function.
+    ///
+    /// The property that makes the whole thing safe lives in the READ gate, not here. If that gate
+    /// is ever loosened, this comment stops being true.
     pub fn apply_row(&self, table: &str, row: &Map<String, Value>) -> rusqlite::Result<()> {
         let schema = schema_or_err(table)?;
         let cols: Vec<&str> = schema.columns.iter().map(|(n, _)| *n).collect();

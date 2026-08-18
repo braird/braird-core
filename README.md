@@ -27,6 +27,16 @@ divergence. One audited Rust core, bound to each platform, removes that risk.
 - Pure-Rust [RustCrypto](https://github.com/RustCrypto) primitives (constant-time,
   WASM-portable) — `aes-gcm`, `hkdf`, `hmac`, `sha2`, `pbkdf2`. Backend rationale: see
   `docs/adr/0002-crypto-backend-rustcrypto.md`.
+- **Pulled rows are stored as the server returns them, and that is deliberate.** The store applies a
+  pulled row without inspecting its contents, so a `text` column can hold something the account key
+  never sealed. This is accepted rather than validated, for two reasons. It discloses nothing: the
+  server has no key, so anything it supplies was never the user's plaintext. And it cannot be
+  *shown*: a read renders `text` only when it is `enc:v2` and opens under that row's own id, so an
+  unbound value can never reach a screen, the search index, the embedding queue or a content tag.
+  Rejecting such a row on arrival would be worse than storing it — the pull advances its cursor per
+  row before any merge decision, so a rejected row is never re-delivered and the device diverges
+  permanently and silently. A real reject needs a quarantine and a retry rule, not a guard. Tracked
+  as SUR-1070.
 
 ## What it implements
 
