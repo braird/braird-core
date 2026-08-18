@@ -113,8 +113,12 @@ export function parseChangelog(text) {
     const date = /-\s*(\d{4}-\d{2}-\d{2})/.exec(parts[i + 1] ?? '')?.[1] ?? null;
     sections.push({ version: parts[i], date, body: parts[i + 2] ?? '' });
   }
+  const unreleasedSection = sections.find((s) => s.version === 'Unreleased');
   return {
-    unreleased: sections.find((s) => s.version === 'Unreleased')?.body ?? '',
+    unreleased: unreleasedSection?.body ?? '',
+    // Reported separately from its body: an ABSENT heading and an EMPTY one are the same string but
+    // not the same fact, and only one of them means the signal still works.
+    hasUnreleasedHeading: unreleasedSection !== undefined,
     released: sections.filter((s) => s.version !== 'Unreleased'),
   };
 }
@@ -232,9 +236,16 @@ function oldestFirst(sections) {
  * kind of false alarm that gets a gate switched off.
  */
 export function evaluate({ changelog, published, unreleasedSecuritySince, consumers, now }) {
-  const { unreleased, released } = parseChangelog(changelog);
+  const { unreleased, released, hasUnreleasedHeading } = parseChangelog(changelog);
   const findings = [];
   const add = (signal, detail) => findings.push({ signal, detail });
+
+  // Signal (1) reads one heading. If that heading is renamed or removed, the signal does not fail —
+  // it reads an empty string and reports nothing, forever. Self-audit after six review findings that
+  // all turned out to be silence rather than error.
+  if (!hasUnreleasedHeading) {
+    add('unreleased', 'CHANGELOG has no `## [Unreleased]` heading — the unreleased-security signal has nothing to read');
+  }
 
   // (1) UNRELEASED — security work that no release has taken.
   if (hasSecuritySection(unreleased)) {
@@ -355,6 +366,12 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
     const age = ageDays(now, published.get(clock.version).publishedAt);
     if (age === null) {
       add('unpinned', `${repo}: release ${clock.version} has an unparseable published_at`);
+      continue;
+    }
+    if (age < -1) {
+      // Same trap as a future CHANGELOG date, on the other date source: a negative age satisfies no
+      // deadline, so the lag would go unreported for as long as the timestamp is wrong.
+      add('unpinned', `${repo}: release ${clock.version} claims to be published ${-age} days in the FUTURE`);
       continue;
     }
     if (age >= limit) {
@@ -721,6 +738,22 @@ const CORPUS = [
     },
     expect: [],
   },
+  // ── self-audit: three more states this could have been silent in ──
+  {
+    name: 'a CHANGELOG with no [Unreleased] heading is reported, not read as "no security work"',
+    input: { changelog: '## [1.2.0] - 2026-01-01\n\n### Security\n- x\n', now: '2026-01-02T00:00:00Z' },
+    expect: ['unreleased'],
+  },
+  {
+    name: 'a release claiming a FUTURE published_at is reported, not given an endless grace period',
+    input: {
+      changelog: CL.shippedSecurity,
+      published: new Map([['1.1.0', rel('1.1.0', '2025-12-01T00:00:00Z')], ['1.2.0', rel('1.2.0', '2099-01-01T00:00:00Z')]]),
+      consumers: [{ ...APP, pinnedTag: 'v1.1.0' }],
+      now: '2026-01-15T00:00:00Z',
+    },
+    detail: /in the FUTURE/,
+  },
   // ── prerelease precedence (Codex P2 on PR #93) ──
   {
     name: 'a consumer stuck on a release candidate is NOT counted as current once the release ships',
@@ -807,6 +840,13 @@ function main() {
     console.error('  Without it a bare tag is indistinguishable from a published release.');
     process.exit(2);
   }
+  if (!consumersDir) {
+    // Required, not defaulted to "no consumers". Omitting it used to disable the pin signal entirely
+    // and still exit 0 — a green run that checked one third of what it claims to.
+    console.error('check-release-staleness: --consumers <dir> is required (one clone per consumer repo).');
+    console.error('  Omitting it would silently disable the consumer-pin signal and still report OK.');
+    process.exit(2);
+  }
 
   let published;
   try {
@@ -825,7 +865,7 @@ function main() {
     changelog: readFileSync('CHANGELOG.md', 'utf8'),
     published,
     unreleasedSecuritySince: securityFirstSeenSince(`v${newest}`),
-    consumers: consumersDir ? readConsumers(consumersDir) : [],
+    consumers: readConsumers(consumersDir),
     now,
   });
 

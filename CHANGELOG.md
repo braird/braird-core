@@ -55,6 +55,12 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   the failed-release alarm by seventy years, and postponement is indistinguishable from a grace
   period. One day of slack, since a maintainer east of UTC writing "today" is legitimately ahead
   of it.
+  **The recurring shape of every review finding on this checker was silence, not error** — six in
+  a row where the condition held and it reported nothing. So the remaining paths were audited
+  with that question rather than the usual one, which found three more: a CHANGELOG whose
+  `[Unreleased]` heading is renamed away (the signal reads an empty string and never fires), a
+  release whose `published_at` is in the future, and `--consumers` omitted, which disabled the
+  pin signal entirely while still exiting 0. All three are now findings or hard errors.
   **The privileged and unprivileged halves are separate workflows**, and that split is a security
   boundary rather than tidiness. The staleness run reads a token for two private repositories from a
   public repo, so it is `schedule` + `workflow_dispatch` only and takes the token from an environment
