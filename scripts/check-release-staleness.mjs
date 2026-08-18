@@ -248,6 +248,30 @@ function ageDays(now, since) {
   return Math.floor((a - b) / DAY_MS);
 }
 
+/**
+ * version → one section, with duplicate headings MERGED rather than overwritten.
+ *
+ * `release.yml` only checks that a matching heading exists, so a CHANGELOG can carry the same
+ * version twice. A plain `Map` keeps the last one, which downgrades severity whenever the security
+ * entry happens to be written first — silently swapping a 7-day deadline for a 30-day one. Bodies
+ * are concatenated so severity is the union: any `### Security` in any copy makes the whole version
+ * security work. The earliest date wins for the same reason — the conservative end of an ambiguity
+ * this function cannot resolve.
+ */
+export function sectionsByVersion(released) {
+  const byVersion = new Map();
+  for (const sec of released) {
+    const prior = byVersion.get(sec.version);
+    if (!prior) {
+      byVersion.set(sec.version, { ...sec });
+      continue;
+    }
+    prior.body += `\n${sec.body}`;
+    if (sec.date && (!prior.date || sec.date < prior.date)) prior.date = sec.date;
+  }
+  return byVersion;
+}
+
 /** Oldest first, so "the one whose clock started earliest" is just `[0]`. */
 function oldestFirst(sections) {
   return [...sections].sort((a, b) => compareVersions(parseVersion(a.version), parseVersion(b.version)));
@@ -333,10 +357,20 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
     }
   }
 
+  // A duplicated version heading is reported as well as merged. Merging keeps the deadline correct;
+  // saying so keeps the CHANGELOG honest, since the duplicate is a mistake either way.
+  const seen = new Set();
+  for (const sec of released) {
+    if (seen.has(sec.version)) {
+      add('unpublished', `CHANGELOG has more than one [${sec.version}] section — their severities are merged, but one of them is wrong`);
+    }
+    seen.add(sec.version);
+  }
+
   // A published release with no CHANGELOG section is reported in its own right. It is not itself a
   // staleness state, but it is the condition that used to HIDE one: the pin range was derived from
   // the CHANGELOG, so an undocumented release was invisible to it.
-  const documented = new Set(released.map((sec) => sec.version));
+  const documented = seen;
   for (const version of [...published.keys()].sort()) {
     if (!documented.has(version)) {
       add(
@@ -383,7 +417,7 @@ export function evaluate({ changelog, published, unreleasedSecuritySince, consum
       add('unpinned', `${repo}: unparseable pinned tag ${JSON.stringify(pinnedTag)}`);
       continue;
     }
-    const sectionFor = new Map(released.map((sec) => [sec.version, sec]));
+    const sectionFor = sectionsByVersion(released);
     const behind = [...published.keys()]
       .filter((version) => {
         const v = parseVersion(version);
@@ -814,6 +848,20 @@ const CORPUS = [
     },
     detail: /in the FUTURE/,
   },
+  // ── a duplicated heading must not downgrade severity (Codex P2, eighth round) ──
+  {
+    name: 'a version written twice takes the union of its severities, not the last one',
+    input: {
+      // Security first, routine second: a plain Map keeps the last and buys 23 extra days.
+      changelog:
+        '## [Unreleased]\n\n### Fixed\n- x\n\n## [1.2.0] - 2026-01-01\n\n### Security\n- the real one\n\n## [1.2.0] - 2026-01-01\n\n### Added\n- a duplicate heading\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
+      published: PUB,
+      consumers: [{ ...APP, pinnedTag: 'v1.1.0' }],
+      now: '2026-01-09T00:00:00Z', // 8 days: past 7, well inside 30
+    },
+    // The duplicate is reported, and the consumer is still held to the SHORT deadline.
+    expect: ['unpublished', 'unpinned'],
+  },
   // ── the CHANGELOG is not the register of what EXISTS (Codex P2, seventh round) ──
   {
     name: 'a published release with a missing heading still counts against a consumer',
@@ -852,7 +900,12 @@ const CORPUS = [
     // ACCEPTED MISS, pinned so the boundary is executable rather than folklore — the convention
     // `check-stale-release-markers.mjs` set for exactly this argument. An HTML-comment example still
     // fools the split, and resisting it means a CommonMark renderer.
-    name: 'accepted miss: an HTML-comment example heading is NOT excluded',
+    //
+    // The miss is narrower than it was, and not by design: the commented example duplicates a real
+    // heading, so the duplicate-section rule added for an unrelated finding reports it. The security
+    // entry is still misfiled — no `unreleased` finding — but the CHANGELOG no longer passes in
+    // silence. Recorded because a miss that shrank by accident will grow back the same way.
+    name: 'accepted miss: an HTML-comment example heading still fools the split',
     input: {
       changelog:
         '## [Unreleased]\n\n<!--\n## [1.1.0] - 2025-12-01\n-->\n\n### Security\n- a real fix\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
@@ -860,7 +913,9 @@ const CORPUS = [
       unreleasedSecuritySince: '2026-01-01T00:00:00Z',
       now: '2026-03-01T00:00:00Z',
     },
-    expect: [], // documented, not desired — see the boundary note on parseChangelog
+    // NOT `[]`: the duplicate-heading rule catches it sideways. What is still missing is the
+    // `unreleased` finding — the Security entry was filed under a released version.
+    expect: ['unpublished'],
   },
   // ── prerelease precedence (Codex P2 on PR #93) ──
   {
