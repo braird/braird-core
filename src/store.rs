@@ -881,6 +881,20 @@ impl Store {
         }
     }
 
+    /// Count rows INCLUDING tombstones — the counterpart to [`Store::count_live`], for the one
+    /// question a live count cannot answer: *did this ever exist?*
+    ///
+    /// Soft-deletes are how this store forgets, so every ordinary read filters them out. But a
+    /// tombstone is still evidence that the row was once written, and the prompt state machine
+    /// (SUR-1043) needs exactly that: it must not re-run onboarding for someone who answered a
+    /// question and later deleted it. Do NOT reach for this to build a user-facing list — a
+    /// tombstone is deleted, and only its past existence is a fact worth reading.
+    pub fn count_all(&self, table: &str) -> rusqlite::Result<i64> {
+        let schema = schema_or_err(table)?;
+        let sql = format!("SELECT count(*) FROM {}", schema.name);
+        self.conn.query_row(&sql, [], |row| row.get(0))
+    }
+
     /// Upsert a remote row into a synced table (the pull sink). The row is **projected onto the
     /// descriptor's known columns** — `user_id` (the one server-only column on the wire) and any
     /// future additive server column are dropped, and `Json` columns are stored as TEXT. A stray

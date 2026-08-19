@@ -37,6 +37,10 @@ use crate::embeddings::{
     self, EmbedSummary, Embedder, EmbedderError, RegisterEmbedderSummary, SemanticHit,
 };
 use crate::fusion::{self, RankedHit, RankedSearchPage, SemanticStatus};
+use crate::prompt::{
+    self, PromptEvent, PromptSettings, PromptState, PromptTone, PROMPT_ANSWERED_AT_KEY,
+    PROMPT_CADENCE_KEY, PROMPT_SKIPPED_AT_KEY, PROMPT_TONE_KEY,
+};
 use crate::search::{SearchDoc, SearchDocKind, SearchHit};
 use crate::store::{synced_table_names, StageExistingWriteError, Store};
 use crate::vault::Vault;
@@ -1416,7 +1420,21 @@ impl SyncEngine {
             deleted,
         } = draft;
 
-        let now = epoch_ms();
+        // MONOTONE OVER THE ROW IT PATCHES (SUR-1043), the [`SyncEngine::stage_signal_write`] rule
+        // (SUR-976). The server's `t01_lww_guard` SILENTLY cancels a strictly-older write while the
+        // flush clears the outbox as if it landed, so a device whose clock trails the stamp on a
+        // just-pulled question would reset its own check-in timer and no one else's — the rest of
+        // the fleet keeps prompting, and nothing is left to retry. Read and stage under ONE guard,
+        // so a concurrent pull cannot land a newer row between the two.
+        let store = lock!(self.store);
+        let now = epoch_ms().max(
+            store
+                .get_row("questions", &id)
+                .map_err(store_err)?
+                .and_then(|r| r.get("updated_at").and_then(Value::as_i64))
+                .unwrap_or(0)
+                .saturating_add(1),
+        );
         let mut row = Map::new();
         row.insert("id".into(), json!(id));
         insert_opt(&mut row, "status", status);
@@ -1434,7 +1452,28 @@ impl SyncEngine {
                 let ciphertext = self.vault.encrypt_note(Some(id.clone()), plaintext);
                 row.insert("text".into(), json!(ciphertext));
                 row.insert("created_at".into(), json!(created_at));
-                self.stage_write("questions", &id, row)
+                store
+                    .stage_local_write("questions", &id, row, now)
+                    .map_err(store_err)?;
+                // The marker write below takes the store lock itself, so this guard must go first.
+                drop(store);
+                // Authoring a question is what "onboarded" MEANS, so record it here rather than
+                // leaving SUR-1043 to infer it from rows that a delete or the pull path's
+                // tombstone-skip can take away (see `prompt::PROMPT_ANSWERED_AT_KEY`). Written
+                // once — a later question must not move the stamp, and re-staging an unchanged
+                // settings row would be pure outbox churn.
+                //
+                // Deliberately NOT in the question's transaction. A marker that failed to write
+                // leaves this device covered by the row-count fallback and re-records on the next
+                // question, whereas widening the seal path's transaction to carry a second table
+                // would put a settings failure in the way of the user's question reaching disk.
+                if read::user_setting(&lock!(self.store), PROMPT_ANSWERED_AT_KEY)
+                    .map_err(store_err)?
+                    .is_none()
+                {
+                    self.set_user_setting(PROMPT_ANSWERED_AT_KEY.into(), now.to_string())?;
+                }
+                Ok(())
             }
             None => {
                 // A metadata patch REQUIRES an existing live row, and the precondition is enforced
@@ -1445,7 +1484,7 @@ impl SyncEngine {
                 // legitimately empty one — while its sparse PATCH matches no server row and stays
                 // queued forever. Failing loudly costs one typed error the host already handles for
                 // notes; the alternative is a question the user never wrote.
-                lock!(self.store)
+                store
                     .stage_local_write_existing_live("questions", &id, row, Vec::new(), now)
                     .map_err(|e| match e {
                         crate::store::StageExistingWriteError::TargetMissing => {
@@ -1541,14 +1580,195 @@ impl SyncEngine {
     /// `prompt_tone`) always carry a value, and `deleted` already expresses removal — so the
     /// ambiguity is removed rather than defined. If a setting ever genuinely needs null-versus-absent,
     /// widen it then and write the `None` as an explicit JSON null, never as an omission.
+    /// MONOTONE OVER THE ROW IT REPLACES (SUR-1043), the [`SyncEngine::stage_signal_write`] rule
+    /// (SUR-976) applied to settings. The server's `t01_lww_guard` SILENTLY cancels a strictly-older
+    /// write — statement still 2xx, no `change_seq` bump — while the flush clears the outbox row as
+    /// if it landed. A setting written by a device whose clock trails the stamp on a just-pulled
+    /// row would therefore apply locally and reach no other device, with nothing left to retry it.
+    /// Migration 0050's §4.1 monotonicity assumption ("every edit stamps `Date.now()`") holds only
+    /// while no local clock lags a pulled stamp, which is exactly the case this restores.
+    ///
+    /// It matters most for `prompt_skipped_at`: a silently-cancelled skip leaves the OTHER devices
+    /// prompting, which is the multi-device promise this key exists to keep. Read and stage under
+    /// ONE guard, so a concurrent pull cannot land a newer row between the two and re-open the hole.
     pub fn set_user_setting(&self, key: String, value: String) -> Result<(), SyncError> {
-        let now = epoch_ms();
+        let store = lock!(self.store);
+        let stored_updated = store
+            .get_row("user_settings", &key)
+            .map_err(store_err)?
+            .and_then(|r| r.get("updated_at").and_then(Value::as_i64))
+            .unwrap_or(0);
+        let now = epoch_ms().max(stored_updated.saturating_add(1));
         let mut row = Map::new();
         row.insert("key".into(), json!(key));
         row.insert("value".into(), json!(value));
         row.insert("updated_at".into(), json!(now));
         row.insert("deleted".into(), json!(false));
-        self.stage_write("user_settings", &key, row)
+        store
+            .stage_local_write("user_settings", &key, row, now)
+            .map_err(store_err)
+    }
+
+    // ── the open-question prompt surface (SUR-1043, SUR-996 R2–R4) ───────────
+    // The typed façade over the two `user_settings` rows above, and the state machine that turns
+    // stored question metadata into the prompts a client renders or schedules. The rules live in
+    // `crate::prompt` as a pure function; these are the store-reading wrappers.
+
+    /// The prompt cadence + tone in force, defaulted and clamped (SUR-1043).
+    ///
+    /// Total, never failing on content: an unset key, a soft-deleted row, a cadence that does not
+    /// parse, and a tone a newer client invented all resolve to the defaults (168h /
+    /// Introspective) rather than an error. The clamp runs on READ as well as write, so a value
+    /// stored by an older build — or by a client that bypassed this façade — still lands inside
+    /// 72..=672 on the way out.
+    pub fn prompt_settings(&self) -> Result<PromptSettings, SyncError> {
+        let store = lock!(self.store);
+        Self::read_prompt_settings(&store).map_err(store_err)
+    }
+
+    /// Set the check-in cadence, clamped to 72..=672 hours (SUR-996 R4).
+    ///
+    /// ONE SETTING PER CALL, and that is the correctness boundary rather than a style choice.
+    /// Per-setting LWW is the whole reason `user_settings` is a KV table instead of a blob, and a
+    /// whole-object setter throws it away: a host that passes back a `PromptSettings` it read
+    /// before another device changed the tone would restage that stale tone with a FRESH
+    /// `updated_at` and win the merge with it. No amount of change-detection inside a whole-object
+    /// setter closes that — "the tone in this struct differs from the stored one" is exactly what a
+    /// deliberate tone change looks like too, so core cannot tell a stale cache from user intent.
+    /// Naming one setting per call removes the ambiguity instead of defining it, which is the
+    /// ruling this repo already made on [`SyncEngine::set_user_setting`]'s `Option` (SUR-1042): a
+    /// `set` API whose effect depends on state the caller cannot see is a trap.
+    ///
+    /// An unchanged value is not a write — no `updated_at` bump, no outbox churn, the
+    /// [`SyncEngine::stage_signal_write`] posture. Compared against the RAW stored string rather
+    /// than against [`SyncEngine::prompt_settings`], because that read substitutes defaults for
+    /// absent rows and "absent" must still write: otherwise a user who deliberately chose the
+    /// default cadence would never sync that choice, and a device holding a non-default value
+    /// would win the next merge by default.
+    pub fn set_prompt_cadence(&self, cadence_hours: u32) -> Result<(), SyncError> {
+        let cadence = prompt::clamp_cadence(cadence_hours).to_string();
+        let stored = {
+            let store = lock!(self.store);
+            read::user_setting(&store, PROMPT_CADENCE_KEY).map_err(store_err)?
+        };
+        if stored.as_deref() == Some(cadence.as_str()) {
+            return Ok(());
+        }
+        self.set_user_setting(PROMPT_CADENCE_KEY.into(), cadence)
+    }
+
+    /// Set the prompt tone (SUR-996 R4) — applies from the next prompt; a live question's text is
+    /// untouched. One setting per call, for the reason [`SyncEngine::set_prompt_cadence`] gives.
+    ///
+    /// Writing the tone deliberately overwrites a stored value this build does not recognise. That
+    /// is the one case where naming the setting is not enough on its own: [`prompt::parse_tone`]
+    /// folds an unknown tone to the Introspective fallback on read, so a host cannot see what it is
+    /// replacing. It is still the right behaviour — the user is choosing a tone on this device, and
+    /// an explicit choice must win over a value nothing here can render — but it means an older
+    /// client can flatten a newer client's tone, which is inherent to a forward-extensible
+    /// vocabulary with no server CHECK, not to this method.
+    pub fn set_prompt_tone(&self, tone: PromptTone) -> Result<(), SyncError> {
+        let value = prompt::tone_value(tone);
+        let stored = {
+            let store = lock!(self.store);
+            read::user_setting(&store, PROMPT_TONE_KEY).map_err(store_err)?
+        };
+        if stored.as_deref() == Some(value) {
+            return Ok(());
+        }
+        self.set_user_setting(PROMPT_TONE_KEY.into(), value.into())
+    }
+
+    /// The prompt(s) the client should act on now, sorted by `due_at` (SUR-1043).
+    ///
+    /// CONTRACT: cancel every pending prompt notification, then for each returned event render it
+    /// if `due_at <= now_ms` and schedule a local notification if `due_at > now_ms`. Re-run after
+    /// every answer, settings change, and sync pull that touched a question — that is what makes
+    /// answering on the phone silence the tablet (SUR-996 R5).
+    ///
+    /// Never empty, at most two (the opening 24h returns the initial prompt AND its nudge; see
+    /// [`prompt::next_events`] for the full rule table).
+    ///
+    /// Both timestamps are host-supplied. `now_ms` follows the read-surface convention
+    /// ([`SyncEngine::question_notes`]) — core reads no clock, so the result is a pure function of
+    /// its inputs and testable at any point on the timeline. `account_created_at_ms` has no choice
+    /// about it: core holds no account-creation stamp anywhere, because `user_profiles` is
+    /// server-authoritative and stays outside the client sync surface. Both platforms read it from
+    /// the same GoTrue user object.
+    pub fn next_prompt_events(
+        &self,
+        now_ms: i64,
+        account_created_at_ms: i64,
+    ) -> Result<Vec<PromptEvent>, SyncError> {
+        // Heal a legacy account before reading it: question history written by a core that predates
+        // the marker proves onboarding on THIS device, but the proof is local — the row it rests on
+        // can be deleted, and the pull path then hands the next device nothing (it discards a
+        // tombstone for a row it never had). Recording the marker now turns a device-local fact into
+        // an account-wide one, while the history that evidences it still exists. Fires at most once
+        // per account: after this the marker is present and the branch is dead.
+        let legacy_history = {
+            let store = lock!(self.store);
+            read::user_setting(&store, PROMPT_ANSWERED_AT_KEY)
+                .map_err(store_err)?
+                .is_none()
+                && store.count_all("questions").map_err(store_err)? > 0
+        };
+        if legacy_history {
+            self.set_user_setting(PROMPT_ANSWERED_AT_KEY.into(), now_ms.to_string())?;
+        }
+
+        let store = lock!(self.store);
+        let settings = Self::read_prompt_settings(&store).map_err(store_err)?;
+        let state = PromptState {
+            account_created_at_ms,
+            questions: read::question_metas(&store).map_err(store_err)?,
+            has_ever_answered: read::user_setting(&store, PROMPT_ANSWERED_AT_KEY)
+                .map_err(store_err)?
+                .is_some(),
+            prompt_skipped_at_ms: read::user_setting(&store, PROMPT_SKIPPED_AT_KEY)
+                .map_err(store_err)?
+                .and_then(|v| v.parse().ok()),
+        };
+        Ok(prompt::next_events(&state, &settings, now_ms))
+    }
+
+    /// Record that the user dismissed a prompt without answering it (SUR-996 R2).
+    ///
+    /// Hosts MUST call this when the sheet is dismissed unanswered, not only when Skip is tapped:
+    /// the one-cadence quiet period is anchored on this timestamp, and an initial prompt with no
+    /// recorded skip deliberately stays due forever (founder, 2026-08-19) so a user who never saw
+    /// the sheet keeps being offered it.
+    ///
+    /// `now_ms` is host-supplied because it is a semantic timestamp — the moment of the
+    /// interaction — not the row's `updated_at` bookkeeping stamp, which `set_user_setting` still
+    /// sets from the internal clock.
+    pub fn skip_prompt(&self, now_ms: i64) -> Result<(), SyncError> {
+        self.set_user_setting(PROMPT_SKIPPED_AT_KEY.into(), now_ms.to_string())
+    }
+
+    /// Record a skipped check-in (SUR-996 R3) — the timer resets, nothing else changes.
+    ///
+    /// A metadata-only patch of `checkin_at` alone: `plaintext: None` makes no Vault call and
+    /// [`insert_opt`] omits every other `None`, so the ciphertext, the status, and the previous
+    /// `checkin_response` all survive byte-for-byte. Skipping is never punished and never visibly
+    /// counted, so nothing records that this WAS a skip — "still open" and "skip" reset the timer
+    /// identically, and the stored vocabulary was deliberately not extended to tell them apart
+    /// (founder, 2026-08-19).
+    ///
+    /// Inherits [`SyncError::PatchTargetMissing`] for an id that has no live row, from the same
+    /// precondition [`SyncEngine::enqueue_question`] enforces.
+    pub fn skip_checkin(&self, question_id: String, now_ms: i64) -> Result<(), SyncError> {
+        self.enqueue_question(QuestionUpsert {
+            id: question_id,
+            plaintext: None,
+            status: None,
+            tone: None,
+            resolved_at: None,
+            checkin_at: Some(now_ms),
+            checkin_response: None,
+            created_at: 0,
+            deleted: false,
+        })
     }
 
     /// Enqueue a note-signals upsert (SUR-726) — per-note behavioural counters, keyed by `note_id`
@@ -2015,6 +2235,22 @@ impl SyncEngine {
 }
 
 impl SyncEngine {
+    /// Assemble [`PromptSettings`] from an ALREADY-HELD store guard (SUR-1043) — the shared body of
+    /// [`SyncEngine::prompt_settings`] and [`SyncEngine::next_prompt_events`]. Taking the guard
+    /// rather than re-locking keeps the settings and the question rows behind ONE acquisition, so a
+    /// concurrent settings write cannot land between them and produce a `due_at` computed from a
+    /// cadence that was never in force.
+    fn read_prompt_settings(store: &Store) -> rusqlite::Result<PromptSettings> {
+        let cadence = read::user_setting(store, PROMPT_CADENCE_KEY)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(prompt::CADENCE_DEFAULT_HOURS);
+        let tone = read::user_setting(store, PROMPT_TONE_KEY)?;
+        Ok(PromptSettings {
+            cadence_hours: prompt::clamp_cadence(cadence),
+            tone: prompt::parse_tone(tone.as_deref()),
+        })
+    }
+
     /// Read-merge-stage a `note_signals` row (SUR-966; extracted verbatim from SUR-956's inline
     /// margins block so `replace_handwritten_annotations` and `record_note_signal` share ONE
     /// read-merge-stage — the FFI has no signals read-back, so this math cannot live host-side
@@ -3117,6 +3353,7 @@ pub(crate) fn epoch_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prompt::{PromptEventKind, PromptTone};
     use serde_json::Value;
 
     #[test]
@@ -4701,6 +4938,761 @@ mod tests {
             queued.get("id").is_none(),
             "user_settings has no id column — an invented one would break the composite upsert"
         );
+    }
+
+    // ── the prompt surface (SUR-1043) ────────────────────────────────────────
+
+    #[test]
+    fn prompt_settings_default_when_nothing_is_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+
+        let settings = engine.prompt_settings().unwrap();
+        assert_eq!(settings.cadence_hours, prompt::CADENCE_DEFAULT_HOURS);
+        assert_eq!(settings.tone, PromptTone::Introspective);
+    }
+
+    #[test]
+    fn prompt_settings_round_trip_through_the_two_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        engine.set_prompt_cadence(336).unwrap();
+        engine.set_prompt_tone(PromptTone::Productive).unwrap();
+
+        let settings = engine.prompt_settings().unwrap();
+        assert_eq!(settings.cadence_hours, 336);
+        assert_eq!(settings.tone, PromptTone::Productive);
+
+        // Two rows, not one blob — per-setting LWW is the reason this table exists.
+        let store = Store::open(db_path).unwrap();
+        assert_eq!(
+            store
+                .get_row("user_settings", PROMPT_CADENCE_KEY)
+                .unwrap()
+                .unwrap()["value"]
+                .as_str(),
+            Some("336")
+        );
+        assert_eq!(
+            store
+                .get_row("user_settings", PROMPT_TONE_KEY)
+                .unwrap()
+                .unwrap()["value"]
+                .as_str(),
+            Some("productive")
+        );
+    }
+
+    #[test]
+    fn changing_one_setting_does_not_restage_the_other() {
+        // The stomp this guards: a host that saved a cadence change must not carry a tone back with
+        // it and win LWW against a newer tone from another device.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.set_prompt_cadence(168).unwrap();
+        engine.set_prompt_tone(PromptTone::Introspective).unwrap();
+        // Stamp the tone row with a sentinel `updated_at` no clock would produce, so the assertion
+        // cannot pass by two writes landing in the same millisecond.
+        let store = Store::open(db_path).unwrap();
+        let mut tone_row = store
+            .get_row("user_settings", PROMPT_TONE_KEY)
+            .unwrap()
+            .unwrap();
+        tone_row.insert("updated_at".into(), json!(42));
+        store.apply_row("user_settings", &tone_row).unwrap();
+
+        // Only the cadence moves.
+        engine.set_prompt_cadence(336).unwrap();
+
+        let tone_after = Store::open(db_path)
+            .unwrap()
+            .get_row("user_settings", PROMPT_TONE_KEY)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            tone_after["updated_at"],
+            json!(42),
+            "an unchanged tone must not be restaged — a fresh updated_at would win LWW against a \
+             newer tone from another device"
+        );
+        assert_eq!(engine.prompt_settings().unwrap().cadence_hours, 336);
+    }
+
+    #[test]
+    fn a_cadence_change_cannot_reach_the_tone_row_at_all() {
+        // The stale-cache stomp, structurally: a host that read the settings, then PULLED another
+        // device's newer tone, then saved a cadence change. A whole-object setter could not tell
+        // that stale tone from a deliberate change back, so the API does not offer it one — there
+        // is no argument here that could carry a tone.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.set_prompt_tone(PromptTone::Introspective).unwrap();
+
+        // The other device's newer tone arrives.
+        let store = Store::open(db_path).unwrap();
+        let mut pulled = store
+            .get_row("user_settings", PROMPT_TONE_KEY)
+            .unwrap()
+            .unwrap();
+        pulled.insert("value".into(), json!("productive"));
+        pulled.insert("updated_at".into(), json!(42));
+        store.apply_row("user_settings", &pulled).unwrap();
+
+        engine.set_prompt_cadence(336).unwrap();
+
+        let settings = engine.prompt_settings().unwrap();
+        assert_eq!(settings.cadence_hours, 336);
+        assert_eq!(
+            settings.tone,
+            PromptTone::Productive,
+            "saving a cadence must not be able to resurrect this device's older tone"
+        );
+        assert_eq!(
+            Store::open(db_path)
+                .unwrap()
+                .get_row("user_settings", PROMPT_TONE_KEY)
+                .unwrap()
+                .unwrap()["updated_at"],
+            json!(42),
+            "the pulled tone row must not be restaged at all"
+        );
+    }
+
+    #[test]
+    fn writing_an_identical_setting_stages_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.set_prompt_cadence(336).unwrap();
+        engine.set_prompt_tone(PromptTone::Productive).unwrap();
+        let queued = Store::open(db_path).unwrap().outbox_items().unwrap().len();
+
+        engine.set_prompt_cadence(336).unwrap();
+        engine.set_prompt_tone(PromptTone::Productive).unwrap();
+
+        assert_eq!(
+            Store::open(db_path).unwrap().outbox_items().unwrap().len(),
+            queued,
+            "an unchanged value is not a write"
+        );
+    }
+
+    #[test]
+    fn choosing_the_default_values_still_syncs_them() {
+        // Compared against the RAW stored string, not against the defaulted read: "absent" and
+        // "happens to equal the default" are different, and only the former may skip the write.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        engine
+            .set_prompt_cadence(prompt::CADENCE_DEFAULT_HOURS)
+            .unwrap();
+        engine.set_prompt_tone(PromptTone::Introspective).unwrap();
+
+        let store = Store::open(db_path).unwrap();
+        assert!(
+            store
+                .get_row("user_settings", PROMPT_CADENCE_KEY)
+                .unwrap()
+                .is_some(),
+            "a deliberate choice of the default value must still reach the other devices"
+        );
+        assert!(store
+            .get_row("user_settings", PROMPT_TONE_KEY)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn a_check_in_names_the_question_it_is_about() {
+        // The client must not have to re-derive "which question" — that re-implements the pick and
+        // is exactly the drift this state machine removes.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+        let draft = |id: &str, created_at: i64, status: &str| QuestionUpsert {
+            id: id.into(),
+            plaintext: Some("q".into()),
+            status: Some(status.into()),
+            tone: None,
+            resolved_at: None,
+            checkin_at: None,
+            checkin_response: None,
+            created_at,
+            deleted: false,
+        };
+        engine
+            .enqueue_question(draft("old", 1_000, "active"))
+            .unwrap();
+        engine
+            .enqueue_question(draft("newer", 2_000, "active"))
+            .unwrap();
+
+        let events = engine.next_prompt_events(2_001, 500).unwrap();
+
+        assert_eq!(events[0].kind, PromptEventKind::CheckIn);
+        assert_eq!(
+            events[0].question_id.as_deref(),
+            Some("newer"),
+            "the event must name the SAME question the machine picked"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_cadence_is_clamped_on_the_way_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        engine.set_prompt_cadence(9_999).unwrap();
+
+        // Clamped before it is STORED, so a device that never runs this build still reads a legal
+        // value out of the synced row.
+        assert_eq!(
+            Store::open(db_path)
+                .unwrap()
+                .get_row("user_settings", PROMPT_CADENCE_KEY)
+                .unwrap()
+                .unwrap()["value"]
+                .as_str(),
+            Some("672")
+        );
+        assert_eq!(
+            engine.prompt_settings().unwrap().cadence_hours,
+            prompt::CADENCE_MAX_HOURS
+        );
+    }
+
+    #[test]
+    fn unreadable_stored_settings_fall_back_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+
+        // Written past the façade, the way an older build or a newer client could.
+        engine
+            .set_user_setting(PROMPT_CADENCE_KEY.into(), "abc".into())
+            .unwrap();
+        engine
+            .set_user_setting(PROMPT_TONE_KEY.into(), "zen".into())
+            .unwrap();
+
+        let settings = engine.prompt_settings().unwrap();
+        assert_eq!(settings.cadence_hours, prompt::CADENCE_DEFAULT_HOURS);
+        assert_eq!(settings.tone, PromptTone::Introspective);
+    }
+
+    #[test]
+    fn an_unclamped_stored_cadence_is_clamped_on_the_way_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+
+        engine
+            .set_user_setting(PROMPT_CADENCE_KEY.into(), "1".into())
+            .unwrap();
+
+        assert_eq!(
+            engine.prompt_settings().unwrap().cadence_hours,
+            prompt::CADENCE_MIN_HOURS
+        );
+    }
+
+    #[test]
+    fn skip_checkin_moves_only_the_timer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        engine
+            .enqueue_question(QuestionUpsert {
+                id: "q1".into(),
+                plaintext: Some("what am I optimising for?".into()),
+                status: Some("active".into()),
+                tone: Some("productive".into()),
+                resolved_at: None,
+                checkin_at: None,
+                checkin_response: Some("active".into()),
+                created_at: 10,
+                deleted: false,
+            })
+            .unwrap();
+        let before = Store::open(db_path)
+            .unwrap()
+            .get_row("questions", "q1")
+            .unwrap()
+            .unwrap();
+
+        engine.skip_checkin("q1".into(), 5_000).unwrap();
+
+        let after = Store::open(db_path)
+            .unwrap()
+            .get_row("questions", "q1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after["checkin_at"], json!(5_000));
+        // The ciphertext, the birth stamp, the status and the PREVIOUS response all survive: a
+        // skip is a timer reset, not an answer.
+        assert_eq!(after["text"], before["text"]);
+        assert_eq!(after["created_at"], before["created_at"]);
+        assert_eq!(after["status"].as_str(), Some("active"));
+        assert_eq!(after["checkin_response"].as_str(), Some("active"));
+        assert_eq!(
+            engine
+                .get_question("q1".into())
+                .unwrap()
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("what am I optimising for?"),
+            "the question still decrypts after a skip"
+        );
+    }
+
+    #[test]
+    fn skip_checkin_refuses_a_question_that_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+
+        assert!(matches!(
+            engine.skip_checkin("ghost".into(), 1_000),
+            Err(SyncError::PatchTargetMissing)
+        ));
+    }
+
+    #[test]
+    fn the_prompt_timeline_walks_from_a_fresh_account_to_a_re_offer() {
+        // The whole loop over a real store, one host clock reading at a time.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+        let created = 1_000_000_i64;
+        let hour = 60 * 60 * 1000_i64;
+        let cadence = prompt::CADENCE_DEFAULT_HOURS as i64 * hour;
+        let events = |now: i64| engine.next_prompt_events(now, created).unwrap();
+
+        // 1. Fresh account: the prompt is due and the nudge is already scheduled.
+        let opening = events(created + 60_000);
+        assert_eq!(
+            opening.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            vec![PromptEventKind::Initial, PromptEventKind::Nudge]
+        );
+        assert_eq!(opening[1].due_at, created + prompt::NUDGE_DELAY_MS);
+
+        // 2. Skipped: the prompt goes quiet for one full cadence, and the skip cancels the nudge —
+        //    a user who declined is not pinged 24h later (founder, 2026-08-19).
+        engine.skip_prompt(created + 120_000).unwrap();
+        let skipped = events(created + 130_000);
+        assert_eq!(
+            skipped.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            vec![PromptEventKind::Initial]
+        );
+        assert_eq!(skipped[0].due_at, created + 120_000 + cadence);
+
+        // 3. Answered: the loop switches to check-ins, one cadence from birth.
+        let answered_at = created + 5 * hour;
+        engine
+            .enqueue_question(QuestionUpsert {
+                id: "q1".into(),
+                plaintext: Some("what am I sitting with?".into()),
+                status: Some("active".into()),
+                tone: Some("introspective".into()),
+                resolved_at: None,
+                checkin_at: None,
+                checkin_response: None,
+                created_at: answered_at,
+                deleted: false,
+            })
+            .unwrap();
+        let live = events(answered_at + 1);
+        assert_eq!(
+            live.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            vec![PromptEventKind::CheckIn]
+        );
+        assert_eq!(live[0].due_at, answered_at + cadence);
+
+        // 4. Skipped check-in: the timer resets, nothing is punished.
+        let skipped_checkin_at = answered_at + cadence + hour;
+        engine
+            .skip_checkin("q1".into(), skipped_checkin_at)
+            .unwrap();
+        assert_eq!(
+            events(skipped_checkin_at + 1)[0].due_at,
+            skipped_checkin_at + cadence
+        );
+
+        // 5. Resolved, new question declined: back to an initial prompt, one cadence out, and the
+        //    nudge never returns.
+        let resolved_at = skipped_checkin_at + cadence;
+        engine
+            .enqueue_question(QuestionUpsert {
+                id: "q1".into(),
+                plaintext: None,
+                status: Some("resolved".into()),
+                tone: None,
+                resolved_at: Some(resolved_at),
+                checkin_at: Some(resolved_at),
+                checkin_response: Some("resolved".into()),
+                created_at: 0,
+                deleted: false,
+            })
+            .unwrap();
+        let after_resolve = events(resolved_at + 1);
+        assert_eq!(
+            after_resolve.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            vec![PromptEventKind::Initial]
+        );
+        assert_eq!(after_resolve[0].due_at, resolved_at + cadence);
+    }
+
+    #[test]
+    fn a_settings_change_reschedules_the_pending_check_in() {
+        // SUR-996 R4: a cadence change on one device moves the next prompt everywhere. Core's half
+        // is that the SAME state yields a new `due_at` — the clients re-run this after a pull.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+        engine
+            .enqueue_question(QuestionUpsert {
+                id: "q1".into(),
+                plaintext: Some("q".into()),
+                status: Some("active".into()),
+                tone: None,
+                resolved_at: None,
+                checkin_at: None,
+                checkin_response: None,
+                created_at: 500_000,
+                deleted: false,
+            })
+            .unwrap();
+
+        let before = engine.next_prompt_events(500_001, 1_000).unwrap()[0].due_at;
+        engine
+            .set_prompt_cadence(prompt::CADENCE_MIN_HOURS)
+            .unwrap();
+        engine.set_prompt_tone(PromptTone::Productive).unwrap();
+        let after = engine.next_prompt_events(500_001, 1_000).unwrap();
+
+        assert!(after[0].due_at < before);
+        assert_eq!(after[0].tone, PromptTone::Productive);
+    }
+
+    #[test]
+    fn a_deleted_question_still_spends_the_onboarding_nudge() {
+        // End-to-end, because the bug lives in the gap between the store and the machine: every
+        // ordinary read filters tombstones, so after a delete the live rows are indistinguishable
+        // from a fresh account — and the nudge would fire again at +24h for someone who has already
+        // answered one.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+        let created = 1_000_000_i64;
+        let draft = |deleted: bool| QuestionUpsert {
+            id: "q1".into(),
+            plaintext: Some("what am I sitting with?".into()),
+            status: Some("active".into()),
+            tone: None,
+            resolved_at: None,
+            checkin_at: None,
+            checkin_response: None,
+            created_at: created + 1_000,
+            deleted,
+        };
+
+        engine.enqueue_question(draft(false)).unwrap();
+        engine.enqueue_question(draft(true)).unwrap();
+
+        // The live surface is empty again...
+        assert!(engine.list_questions(50, 0).unwrap().is_empty());
+
+        // ...but onboarding still happened, so only the prompt returns — never the nudge.
+        let events = engine
+            .next_prompt_events(created + 60_000, created)
+            .unwrap();
+        assert_eq!(
+            events.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            vec![PromptEventKind::Initial]
+        );
+    }
+
+    #[test]
+    fn onboarding_survives_a_device_that_never_saw_the_question() {
+        // The hole a tombstone-inclusive count cannot close: `pull_table` DISCARDS a tombstone for
+        // a row it never had, so a second device installed inside the opening 24h finds no question
+        // rows at all — live or dead — and would re-run onboarding. The synced marker is what
+        // actually crosses.
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.sqlite");
+        let engine = engine_at(first.to_str().unwrap());
+        let created = 1_000_000_i64;
+        engine
+            .enqueue_question(QuestionUpsert {
+                id: "q1".into(),
+                plaintext: Some("what am I sitting with?".into()),
+                status: Some("active".into()),
+                tone: None,
+                resolved_at: None,
+                checkin_at: None,
+                checkin_response: None,
+                created_at: created + 1_000,
+                deleted: false,
+            })
+            .unwrap();
+        let marker = Store::open(first.to_str().unwrap())
+            .unwrap()
+            .get_row("user_settings", PROMPT_ANSWERED_AT_KEY)
+            .unwrap()
+            .expect("authoring a question records the onboarding marker");
+
+        // A fresh device: it pulls the settings row, but the question's tombstone never arrives.
+        let second = dir.path().join("second.sqlite");
+        let fresh = engine_at(second.to_str().unwrap());
+        Store::open(second.to_str().unwrap())
+            .unwrap()
+            .apply_row("user_settings", &marker)
+            .unwrap();
+
+        assert!(fresh.list_questions(50, 0).unwrap().is_empty());
+        assert_eq!(
+            fresh
+                .next_prompt_events(created + 60_000, created)
+                .unwrap()
+                .iter()
+                .map(|e| e.kind)
+                .collect::<Vec<_>>(),
+            vec![PromptEventKind::Initial],
+            "a device with no question rows at all must still see onboarding as done"
+        );
+    }
+
+    #[test]
+    fn legacy_question_history_backfills_the_marker_before_it_can_vanish() {
+        // A question authored by a core that predates the marker proves onboarding only LOCALLY:
+        // delete it and the next device gets nothing, because the pull path discards a tombstone
+        // for a row it never had. Reading the state heals the account while the evidence exists.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        // A question in the store with NO marker — the pre-SUR-1043 shape.
+        let store = Store::open(db_path).unwrap();
+        let mut legacy = Map::new();
+        legacy.insert("id".into(), json!("legacy"));
+        legacy.insert("text".into(), json!("enc:v2:whatever"));
+        legacy.insert("status".into(), json!("resolved"));
+        legacy.insert("created_at".into(), json!(1_000));
+        legacy.insert("updated_at".into(), json!(2_000));
+        legacy.insert("deleted".into(), json!(false));
+        store.apply_row("questions", &legacy).unwrap();
+        assert!(read::user_setting(&store, PROMPT_ANSWERED_AT_KEY)
+            .unwrap()
+            .is_none());
+        drop(store);
+
+        engine.next_prompt_events(3_000, 1_000).unwrap();
+
+        assert!(
+            Store::open(db_path)
+                .unwrap()
+                .get_row("user_settings", PROMPT_ANSWERED_AT_KEY)
+                .unwrap()
+                .is_some(),
+            "legacy history must be recorded as a marker, not left as a local-only inference"
+        );
+    }
+
+    #[test]
+    fn a_check_in_patch_outruns_a_pulled_question_from_a_faster_clock() {
+        // Same silent-cancel as the settings path: a skip stamped older than the pulled row is
+        // dropped by t01_lww_guard while the flush clears the outbox, so the timer resets on this
+        // device and the rest of the fleet keeps prompting.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_question(QuestionUpsert {
+                id: "q1".into(),
+                plaintext: Some("q".into()),
+                status: Some("active".into()),
+                tone: None,
+                resolved_at: None,
+                checkin_at: None,
+                checkin_response: None,
+                created_at: 1_000,
+                deleted: false,
+            })
+            .unwrap();
+
+        // The same question, pulled back from a device whose clock is years ahead.
+        let far_future = epoch_ms() + 5 * 365 * 24 * 60 * 60 * 1000;
+        let store = Store::open(db_path).unwrap();
+        let mut pulled = store.get_row("questions", "q1").unwrap().unwrap();
+        pulled.insert("updated_at".into(), json!(far_future));
+        store.apply_row("questions", &pulled).unwrap();
+        drop(store);
+
+        engine.skip_checkin("q1".into(), 9_000).unwrap();
+
+        let after = Store::open(db_path)
+            .unwrap()
+            .get_row("questions", "q1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after["checkin_at"], json!(9_000));
+        assert!(
+            after["updated_at"].as_i64().unwrap() > far_future,
+            "a check-in patch must outrank the row it patches, or the server cancels it in silence"
+        );
+    }
+
+    #[test]
+    fn the_onboarding_marker_is_written_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        let draft = |id: &str| QuestionUpsert {
+            id: id.into(),
+            plaintext: Some("q".into()),
+            status: Some("active".into()),
+            tone: None,
+            resolved_at: None,
+            checkin_at: None,
+            checkin_response: None,
+            created_at: 500_000,
+            deleted: false,
+        };
+
+        engine.enqueue_question(draft("q1")).unwrap();
+        let first = Store::open(db_path)
+            .unwrap()
+            .get_row("user_settings", PROMPT_ANSWERED_AT_KEY)
+            .unwrap()
+            .unwrap();
+        engine.enqueue_question(draft("q2")).unwrap();
+
+        assert_eq!(
+            Store::open(db_path)
+                .unwrap()
+                .get_row("user_settings", PROMPT_ANSWERED_AT_KEY)
+                .unwrap()
+                .unwrap()["value"],
+            first["value"],
+            "a later question must not move the stamp — it marks the FIRST"
+        );
+    }
+
+    #[test]
+    fn a_settings_write_outruns_a_pulled_row_from_a_faster_clock() {
+        // The server's t01_lww_guard silently cancels a strictly-older write while the flush clears
+        // the outbox, so a skip recorded on a lagging device would apply locally and reach nobody —
+        // with nothing left to retry it. The stamp is clamped past whatever it replaces.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.skip_prompt(1_000).unwrap();
+
+        // A skip pulled from a device whose clock is years ahead.
+        let far_future = epoch_ms() + 5 * 365 * 24 * 60 * 60 * 1000;
+        let store = Store::open(db_path).unwrap();
+        let mut pulled = store
+            .get_row("user_settings", PROMPT_SKIPPED_AT_KEY)
+            .unwrap()
+            .unwrap();
+        pulled.insert("updated_at".into(), json!(far_future));
+        store.apply_row("user_settings", &pulled).unwrap();
+
+        engine.skip_prompt(2_000).unwrap();
+
+        let after = Store::open(db_path)
+            .unwrap()
+            .get_row("user_settings", PROMPT_SKIPPED_AT_KEY)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after["value"].as_str(), Some("2000"));
+        assert!(
+            after["updated_at"].as_i64().unwrap() > far_future,
+            "a local write must outrank the row it replaces, or the server cancels it in silence"
+        );
+    }
+
+    #[test]
+    fn a_question_that_cannot_be_decrypted_still_schedules() {
+        // The machine reads metadata only, so a foreign-AAD or corrupt row keeps its check-in
+        // instead of silently dropping out of the loop.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_question(QuestionUpsert {
+                id: "q1".into(),
+                plaintext: Some("q".into()),
+                status: Some("active".into()),
+                tone: None,
+                resolved_at: None,
+                checkin_at: None,
+                checkin_response: None,
+                created_at: 500_000,
+                deleted: false,
+            })
+            .unwrap();
+
+        // A different engine means a different Vault, so the stored ciphertext will not open.
+        let other = engine_at(db_path);
+        assert!(
+            other
+                .get_question("q1".into())
+                .unwrap()
+                .unwrap()
+                .decrypt_failed
+        );
+        assert_eq!(
+            other.next_prompt_events(500_001, 1_000).unwrap()[0].kind,
+            PromptEventKind::CheckIn
+        );
+    }
+
+    #[test]
+    fn a_deleted_setting_row_reads_as_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.set_prompt_cadence(336).unwrap();
+        engine.set_prompt_tone(PromptTone::Productive).unwrap();
+
+        // Soft-delete the row the way a pulled tombstone would.
+        let store = Store::open(db_path).unwrap();
+        let mut row = store
+            .get_row("user_settings", PROMPT_TONE_KEY)
+            .unwrap()
+            .unwrap();
+        row.insert("deleted".into(), json!(true));
+        store.apply_row("user_settings", &row).unwrap();
+
+        assert_eq!(
+            engine.prompt_settings().unwrap().tone,
+            PromptTone::Introspective
+        );
+        assert_eq!(engine.prompt_settings().unwrap().cadence_hours, 336);
     }
 
     #[test]

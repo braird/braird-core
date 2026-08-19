@@ -6,6 +6,108 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **The open-question prompt state machine + typed `PromptSettings` (SUR-1043, SUR-996 R2–R4).**
+  Core now owns the prompt timing rules, so iOS and Android cannot drift on them: clients render
+  the sheet for a past-due event and schedule a local notification for a future one, and that is
+  their whole share of the logic. Six exports — `prompt_settings`, `set_prompt_cadence`,
+  `set_prompt_tone`, `next_prompt_events`, `skip_prompt`, `skip_checkin` — over two new records
+  (`PromptSettings`, `PromptEvent`) and two new enums (`PromptTone`, `PromptEventKind`). All
+  additive; a host on an older pin keeps working until it takes the new one.
+  `set_user_setting` (SUR-1042) shipped untyped and named this ticket as the owner of the key
+  constants and the 72..=672 clamp; those now exist, along with the READ leg the KV table never
+  had — `user_settings` could be written and never read back. That read stays crate-internal, so
+  reading a setting goes through the typed façade. Note what this does NOT buy: `set_user_setting`
+  remains exported, so a host can still write `prompt_cadence` directly and store a value outside
+  72..=672. The clamp therefore runs on READ as well as write, which is what actually guarantees a
+  legal cadence — from an older build, a newer client, or a host that bypassed the façade.
+  `next_prompt_events` returns a sorted list (never empty, at most two) rather than a single event,
+  because the opening 24 hours have two pending at once: the initial prompt is due immediately AND
+  its one nudge must already be scheduled for +24h. The user that nudge exists for is precisely the
+  one who never reopens the app, so there is no later call in which to learn about it; the
+  alternative was clients hardcoding the +24h themselves, which is the drift the ticket prevents.
+  Both timestamps are host-supplied. `now_ms` follows the read-surface convention (`question_notes`)
+  so the result stays a pure function of its inputs. `account_created_at_ms` has no choice about it:
+  core holds no account-creation stamp anywhere, because `user_profiles` is server-authoritative and
+  stays outside the client sync surface.
+  Four rules the code cannot derive, decided by the founder 2026-08-19: an initial prompt that was
+  never answered AND never skipped stays due indefinitely (the one-cadence quiet period anchors on a
+  recorded skip, so hosts must call `skip_prompt` when the sheet is dismissed unanswered, not only
+  when Skip is tapped); the tone defaults to Introspective when unset or unrecognised; a skipped
+  check-in writes `checkin_at` alone and is deliberately indistinguishable from "still open" in
+  stored data (both reset the timer identically, so no `checkin_response` value was added for it);
+  and `checkin_at` means WHEN the last check-in was actioned, never when the next is due — core
+  derives due-time, which is what stops a client writing its own idea of the cadence into a synced
+  row, at the cost of a cadence change applying retroactively.
+  The machine reads question METADATA only, never the text, so no Vault call is on this path and a
+  question that fails to decrypt still schedules its check-in.
+  New synced key `prompt_skipped_at`, stored rather than kept device-local so per-row LWW makes the
+  newest skip win — a skip on the phone silences the same prompt on the tablet.
+  Settings are written ONE AT A TIME — `set_prompt_cadence` and `set_prompt_tone`, never a
+  whole-object setter — and that is the correctness boundary, not a style choice. Per-setting LWW is
+  the whole reason `user_settings` is a KV table rather than a blob, and a setter taking both values
+  throws it away: a host that passes back settings it read before another device changed the tone
+  restages that stale tone with a fresh `updated_at` and wins the merge with it. Change-detection
+  inside such a setter does not close the hole either, because "the tone in this struct differs from
+  the stored one" is exactly what a deliberate tone change looks like — core cannot tell a stale
+  cache from user intent. Naming one setting per call removes the ambiguity instead of defining it,
+  which is the ruling this repo already made on `set_user_setting`'s `Option` (SUR-1042).
+  An unchanged value is still not a write (no `updated_at` bump, no outbox churn), compared against
+  the STORED string rather than the defaulted read — "absent" and "happens to equal the default" are
+  different, and only the former may skip the write, or a user who deliberately chose the defaults
+  would never sync that choice.
+  The nudge is spent by a RECORDED onboarding marker (`prompt_answered_at`, written the first time
+  a question is authored), not by inferring it from the rows in hand. Three review rounds went into
+  this one boolean and each fix was a better inference from data that was never meant to answer the
+  question: the live rows, which a soft-delete empties; then a tombstone-inclusive count, which the
+  pull path defeats because it discards a tombstone for a row the device never had, so a second
+  device inside the opening 24 hours saw a pristine account and re-ran onboarding. A settings row IS
+  meant to answer it, and it is live-forever, so no tombstone rule can drop it. `Store::count_all`
+  stays as a fallback for a question authored by a core that predates the marker.
+  The same monotonic clamp applies to `enqueue_question`, so a check-in skip or any other metadata
+  patch outranks the row it patches — otherwise the timer reset landed on one device while the rest
+  of the fleet kept prompting. Two call sites now carry this rule and `stage_signal_write` was the
+  first; whether it belongs in `stage_local_write` for every table is a repo-wide question raised on
+  the PR rather than answered here.
+  The onboarding marker is backfilled from legacy question history the first time the state is read,
+  so an account whose only question predates the marker is healed while that history still exists —
+  a local-only inference dies with the row it rests on.
+  `set_user_setting` now stamps `updated_at` monotonically over the row it replaces — the SUR-976
+  rule applied to settings. The server's `t01_lww_guard` silently cancels a strictly-older write
+  (statement still 2xx, no `change_seq` bump) while the flush clears the outbox as if it landed, so
+  a setting written by a device whose clock trails a just-pulled stamp applied locally and reached
+  no other device, with nothing left to retry it. It matters most for `prompt_skipped_at`: a
+  silently-cancelled skip leaves the other devices prompting, which is the multi-device promise the
+  key exists to keep. Migration 0050's §4.1 monotonicity assumption ("every edit stamps
+  `Date.now()`") holds only while no local clock lags a pulled stamp; this restores it.
+  Every interaction anchor is bounded to `[birth, now]` — no earlier than the thing it acts on was
+  born, and never in the future. The upper bound is what the monotonic write clamp above makes
+  necessary: `updated_at` is a bookkeeping stamp deliberately pushed past a pulled row's, so a
+  dismissal that never set `resolved_at` inherits it, and an unbounded anchor postpones the next
+  prompt by the remote clock's skew — months of silence from one wrong clock. The same bound covers
+  a `checkin_at` or a synced `prompt_skipped_at` written by a device running fast.
+  A future stamp falls back to the BIRTH, not to `now`, and the difference is the whole subtlety:
+  hosts re-run the machine after every pull, answer and settings change, so clamping to `now` would
+  re-clamp on each call and push the prompt out another cadence every time — permanently one cadence
+  away, never arriving. The birth is fixed, so unchanged state gives an unchanged answer however
+  often it is asked, and the failure direction is showing the prompt rather than hiding it.
+  Both question-derived anchors are clamped to the question's own `created_at`, matching the window
+  clamp `question_notes` already applies. A device whose clock runs behind can stamp a `checkin_at`
+  or `resolved_at` earlier than a `created_at` written by another device, and the raw stamp would
+  shorten the next interval by the skew — past one cadence of it, the check-in would fall due
+  immediately and the sheet would reappear the moment the user answered one. The account-level skip
+  stamp is deliberately not clamped: it has no birth stamp to clamp against, and a skew-early skip
+  only makes the initial prompt due sooner, which is where it sits with no skip recorded at all.
+  A recorded skip cancels the nudge as well as earning the quiet period (founder, 2026-08-19). R2
+  covers the skipper and the leaver in one sentence, but they have not done the same thing: the
+  nudge exists so a user who wandered off mid-onboarding does not lose the moment, while a skip is
+  an answer. Nudging 24h after an explicit dismissal contradicts the same rule's promise that the
+  next prompt waits a full cadence, and "always skippable, never nagged" is an explicit non-goal of
+  the feature.
+  A `CheckIn` event carries the id of the question it is about. The machine already decides which
+  question wins when several are briefly active (a supersede, or a sync window); a client
+  re-deriving that pick would be the cross-platform drift this ticket removes.
+
 ### Fixed
 - **The release-staleness checker could not read its own CHANGELOG (SUR-1070 follow-up).** An
   unterminated `<!--` marker masked every line after it to end of file, and the likeliest source

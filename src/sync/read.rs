@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Map, Value};
 
 use crate::note_encryption::is_encrypted_v2;
+use crate::prompt::QuestionMeta;
 use crate::search::{SearchDoc, SearchDocKind};
 use crate::store::Store;
 use crate::vault::Vault;
@@ -719,6 +720,47 @@ fn question_record(row: &Map<String, Value>, vault: &Vault) -> QuestionRecord {
         id,
     }
 }
+
+/// One synced setting's value, or `None` when the row is absent or soft-deleted (SUR-1043).
+///
+/// The read half of the `user_settings` KV — SUR-1042 shipped [`SyncEngine::set_user_setting`] with
+/// no way to read it back, because nothing typed owned the vocabulary yet. Kept untyped and crate
+/// -internal: the FFI surface exposes [`crate::prompt::PromptSettings`], not raw keys, so a host
+/// cannot typo a key or write an unclamped cadence past the façade.
+///
+/// [`SyncEngine::set_user_setting`]: crate::sync::SyncEngine::set_user_setting
+pub fn user_setting(store: &Store, key: &str) -> rusqlite::Result<Option<String>> {
+    match store.get_row("user_settings", key)? {
+        Some(row) if !is_deleted(&row) => Ok(string_field(&row, "value")),
+        _ => Ok(None),
+    }
+}
+
+/// Every live question as prompt-state metadata (SUR-1043) — status and timestamps only.
+///
+/// No vault and no `text` column: the state machine schedules from metadata alone, so a question
+/// that fails to decrypt still gets its check-in, and no plaintext is produced for a caller that
+/// would only discard it.
+pub fn question_metas(store: &Store) -> rusqlite::Result<Vec<QuestionMeta>> {
+    Ok(store
+        .list_live("questions", None, QUESTION_META_SCAN_LIMIT, 0)?
+        .iter()
+        .map(|row| QuestionMeta {
+            id: string_field(row, "id").unwrap_or_default(),
+            status: string_field(row, "status"),
+            created_at: int_field(row, "created_at"),
+            updated_at: int_field(row, "updated_at"),
+            resolved_at: opt_int_field(row, "resolved_at"),
+            checkin_at: opt_int_field(row, "checkin_at"),
+        })
+        .collect())
+}
+
+/// v1 has ONE live question at a time and archives the rest, so the log grows by roughly one row
+/// per cadence period — a decade of weekly questions is ~520 rows. ponytail: a bounded scan of
+/// three plaintext columns; narrow it to the newest N by `created_at` only if a log ever gets big
+/// enough to measure.
+const QUESTION_META_SCAN_LIMIT: i64 = 5_000;
 
 fn custom_idea_record(row: &Map<String, Value>) -> CustomIdeaRecord {
     CustomIdeaRecord {

@@ -28,6 +28,9 @@ import uniffi.braird_core.ImportCounts
 import uniffi.braird_core.ImportSummary
 import uniffi.braird_core.NoteSignalKind
 import uniffi.braird_core.NoteUpsert
+import uniffi.braird_core.PromptEventKind
+import uniffi.braird_core.PromptSettings
+import uniffi.braird_core.PromptTone
 import uniffi.braird_core.QuestionNoteOverride
 import uniffi.braird_core.QuestionUpsert
 import uniffi.braird_core.SearchDocKind
@@ -1072,6 +1075,67 @@ class RoundTripTest {
 
         // The first synced setting, keyed by name (no id column).
         engine.setUserSetting("prompt_cadence", "168")
+    }
+
+    /** The SUR-1043 prompt surface over the ABI — two fieldless enums and two records carrying
+     * them by value, which is the marshalling shape (jna#1259) Rust-side tests never exercise.
+     * Also pins the two claims a client depends on and cannot verify itself: the cadence clamp is
+     * enforced in CORE, not by the picker, and the opening phase returns BOTH the initial prompt
+     * and its nudge in one call. */
+    @Test
+    fun promptSurfaceOverFfi() {
+        val db = File.createTempFile("braird-p", ".sqlite").apply { deleteOnExit() }
+        val engine = SyncEngine.open(db.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
+        val created = 1_000_000L
+        val hourMs = 3_600_000L
+
+        // Nothing stored yet: the defaults cross intact.
+        assertEquals(PromptSettings(168u, PromptTone.INTROSPECTIVE), engine.promptSettings())
+
+        // An out-of-range cadence is clamped by core, not by the client's picker. One setting per
+        // call, so saving a cadence has no argument that could carry a stale tone back.
+        engine.setPromptCadence(10u)
+        engine.setPromptTone(PromptTone.PRODUCTIVE)
+        val clamped = engine.promptSettings()
+        assertEquals(72u, clamped.cadenceHours)
+        assertEquals(PromptTone.PRODUCTIVE, clamped.tone)
+
+        // A fresh account: the prompt is due now AND the nudge is already scheduled for +24h.
+        val opening = engine.nextPromptEvents(created + 60_000L, created)
+        assertEquals(listOf(PromptEventKind.INITIAL, PromptEventKind.NUDGE), opening.map { it.kind })
+        assertEquals(created, opening[0].dueAt)
+        assertEquals(created + 24 * hourMs, opening[1].dueAt)
+        assertEquals(PromptTone.PRODUCTIVE, opening[0].tone)
+
+        // Answered: the loop switches to a check-in one cadence from the question's birth.
+        engine.enqueueQuestion(
+            QuestionUpsert(
+                id = "q1", plaintext = "what am I sitting with?", status = "active",
+                tone = "productive", resolvedAt = null, checkinAt = null, checkinResponse = null,
+                createdAt = created, deleted = false,
+            )
+        )
+        val live = engine.nextPromptEvents(created + 60_000L, created)
+        assertEquals(listOf(PromptEventKind.CHECK_IN), live.map { it.kind })
+        assertEquals(created + 72 * hourMs, live[0].dueAt)
+        // The event names its question, so the client never re-derives the pick.
+        assertEquals("q1", live[0].questionId)
+        assertEquals(null, opening[0].questionId, "an initial prompt has no question yet")
+
+        // Skipping the check-in resets the timer and leaves the sealed text alone.
+        val skippedAt = created + 80 * hourMs
+        engine.skipCheckin("q1", skippedAt)
+        assertEquals(skippedAt + 72 * hourMs, engine.nextPromptEvents(skippedAt + 1, created)[0].dueAt)
+        assertEquals("what am I sitting with?", engine.getQuestion("q1")!!.text)
+
+        // A recorded skip earns the quiet period on a fresh account, and cancels the nudge with it:
+        // a user who declined is not pinged 24h later.
+        val other = File.createTempFile("braird-p2", ".sqlite").apply { deleteOnExit() }
+        val fresh = SyncEngine.open(other.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
+        fresh.skipPrompt(created + 5_000L)
+        val quiet = fresh.nextPromptEvents(created + 6_000L, created)
+        assertEquals(listOf(PromptEventKind.INITIAL), quiet.map { it.kind })
+        assertEquals(created + 5_000L + 168 * hourMs, quiet[0].dueAt)
     }
 
     /** A stale/invalid handle used to throw InternalException BEFORE the shim's guard,
