@@ -49,7 +49,11 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   adjacency rule covers subsection headings (blank-above only, since the house style puts the
   first bullet directly under the heading), so an exposed quoted `### Security` cannot raise a
   false 7-day alarm; and a duplicated section heading is refused at write time rather than
-  merged into a daily finding after the fact. One blank line was inserted before a `### Fixed`
+  merged into a daily finding after the fact. A live heading between raw comment-marker pairs is
+  refused outright — comments, unlike code spans, can contain blank lines, so the adjacency rules
+  cannot reach an exposed comment interior, and the region rule deliberately does not model WHY
+  the markers were mishandled (the reported bypass was backslash-escaped backticks shielding a
+  real opener; the next one would be something else). One blank line was inserted before a `### Fixed`
   in the 0.13.1 section — whitespace-only, no entry text changed — where a formatting slip in
   shipped history was the sole exception to the rule across 47 subsection headings.
 

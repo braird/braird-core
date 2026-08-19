@@ -234,6 +234,36 @@ export function validateChangelog(text) {
       );
     }
   });
+  // A live heading between a raw comment-opener and a raw closer is ambiguous NO MATTER WHAT the
+  // classifier decided about those markers. Comments — unlike code spans — can contain blank lines,
+  // so the adjacency rules above cannot reach an exposed comment interior; and deciding whether a
+  // marker is "really" syntax (escapes, entities, ...) is the divergent CommonMark series this
+  // design exists to end. Escaped backticks shielding a real opener was the reported bypass; this
+  // rule does not care why the markers were mishandled, only that a heading sits between them.
+  // Marker pairing follows the lookahead rule: an opener with no closer anywhere is prose.
+  {
+    let searchFrom = 0;
+    for (;;) {
+      const open = text.indexOf('<!--', searchFrom);
+      if (open === -1) break;
+      const close = text.indexOf('-->', open + 4);
+      if (close === -1) break;
+      const openLine = text.slice(0, open).split('\n').length - 1;
+      const closeLine = text.slice(0, close).split('\n').length - 1;
+      structure.forEach((st, i) => {
+        if (i <= openLine || i > closeLine) return;
+        const headingLike = st.heading !== null || (!st.insideFence && /^ {0,3}###[ \t]/.test(st.masked));
+        if (headingLike) {
+          violations.push(
+            `line ${i + 1} parses as a heading but sits between comment markers (lines ` +
+              `${openLine + 1}..${closeLine + 1}) — ambiguous; split the quoted markers (write ` +
+              "'<!' + '--') or keep them on one line",
+          );
+        }
+      });
+      searchFrom = close + 3;
+    }
+  }
   for (const { line, text: t } of maskedHeadingShapedLines(text)) {
     violations.push(
       `line ${line} is heading-shaped but sits inside a fence or comment (${JSON.stringify(t)}) — ` +
@@ -1393,6 +1423,17 @@ const VALIDATION_CORPUS = [
       '## [Unreleased]\n\n### Fixed\n- x\n\n## [1.2.0] - 2026-01-01\n\n### Added\n- an example follows\n\n' +
       '## [0.9.0] - 2020-01-01\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- y\n',
     expect: /not in decreasing order/,
+  },
+  {
+    name: 'headings between raw comment markers are loud, whatever shielded the opener',
+    // Reported bypass: backslash-escaped backticks pair as a phantom code span, shield the real
+    // opener, and the comment interior — which CAN contain blank lines, unlike a span — is exposed
+    // with every heading blank-surrounded and validly ordered. The region rule does not model
+    // escapes; it refuses ANY live heading between raw marker pairs.
+    changelog:
+      '## [Unreleased]\n\n### Fixed\n- writes \\`<!--\\` literally\n\n## [0.14.1] - 2026-07-30\n\n' +
+      '### Security\n- phantom\n\n-->\n\n## [0.14.0] - 2026-07-29\n\n### Added\n- x\n',
+    expect: /sits between comment markers/,
   },
   {
     name: 'an exposed quoted ### Security touching its quote text is loud — no false 7-day alarm',
