@@ -50,6 +50,13 @@ pub mod embeddings;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fusion;
 
+// The open-question prompt state machine + typed settings (SUR-1043, SUR-996 R2–R4). Pure logic
+// with no store or clock of its own, but gated off wasm32 like `sync`, its only consumer: the PWA
+// never gets this feature (native-first, SUR-996 non-goals), so its DTOs have no business on the
+// wasm binding surface.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod prompt;
+
 pub use vault::Vault;
 
 uniffi::setup_scaffolding!();

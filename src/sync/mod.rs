@@ -37,6 +37,10 @@ use crate::embeddings::{
     self, EmbedSummary, Embedder, EmbedderError, RegisterEmbedderSummary, SemanticHit,
 };
 use crate::fusion::{self, RankedHit, RankedSearchPage, SemanticStatus};
+use crate::prompt::{
+    self, PromptEvent, PromptSettings, PromptState, PROMPT_CADENCE_KEY, PROMPT_SKIPPED_AT_KEY,
+    PROMPT_TONE_KEY,
+};
 use crate::search::{SearchDoc, SearchDocKind, SearchHit};
 use crate::store::{synced_table_names, StageExistingWriteError, Store};
 use crate::vault::Vault;
@@ -1551,6 +1555,114 @@ impl SyncEngine {
         self.stage_write("user_settings", &key, row)
     }
 
+    // ── the open-question prompt surface (SUR-1043, SUR-996 R2–R4) ───────────
+    // The typed façade over the two `user_settings` rows above, and the state machine that turns
+    // stored question metadata into the prompts a client renders or schedules. The rules live in
+    // `crate::prompt` as a pure function; these are the store-reading wrappers.
+
+    /// The prompt cadence + tone in force, defaulted and clamped (SUR-1043).
+    ///
+    /// Total, never failing on content: an unset key, a soft-deleted row, a cadence that does not
+    /// parse, and a tone a newer client invented all resolve to the defaults (168h /
+    /// Introspective) rather than an error. The clamp runs on READ as well as write, so a value
+    /// stored by an older build — or by a client that bypassed this façade — still lands inside
+    /// 72..=672 on the way out.
+    pub fn prompt_settings(&self) -> Result<PromptSettings, SyncError> {
+        let store = lock!(self.store);
+        Self::read_prompt_settings(&store).map_err(store_err)
+    }
+
+    /// Write both prompt settings, clamping the cadence first (SUR-996 R4).
+    ///
+    /// TWO ROWS, ONE CALL, and deliberately not one blob: per-setting LWW is the whole reason
+    /// `user_settings` is a KV table, so a device changing the cadence must not stomp another
+    /// device's tone. Routed through [`SyncEngine::set_user_setting`] rather than staging directly
+    /// — one write path per table, so the outbox semantics cannot drift between them.
+    ///
+    /// Not transactional across the two rows: a failure between them leaves the first applied.
+    /// ponytail: acceptable because each row is independently meaningful and the next successful
+    /// call converges both; a settings write that needed atomicity would need a different table.
+    pub fn set_prompt_settings(&self, settings: PromptSettings) -> Result<(), SyncError> {
+        let cadence = prompt::clamp_cadence(settings.cadence_hours);
+        self.set_user_setting(PROMPT_CADENCE_KEY.into(), cadence.to_string())?;
+        self.set_user_setting(
+            PROMPT_TONE_KEY.into(),
+            prompt::tone_value(settings.tone).into(),
+        )
+    }
+
+    /// The prompt(s) the client should act on now, sorted by `due_at` (SUR-1043).
+    ///
+    /// CONTRACT: cancel every pending prompt notification, then for each returned event render it
+    /// if `due_at <= now_ms` and schedule a local notification if `due_at > now_ms`. Re-run after
+    /// every answer, settings change, and sync pull that touched a question — that is what makes
+    /// answering on the phone silence the tablet (SUR-996 R5).
+    ///
+    /// Never empty, at most two (the opening 24h returns the initial prompt AND its nudge; see
+    /// [`prompt::next_events`] for the full rule table).
+    ///
+    /// Both timestamps are host-supplied. `now_ms` follows the read-surface convention
+    /// ([`SyncEngine::question_notes`]) — core reads no clock, so the result is a pure function of
+    /// its inputs and testable at any point on the timeline. `account_created_at_ms` has no choice
+    /// about it: core holds no account-creation stamp anywhere, because `user_profiles` is
+    /// server-authoritative and stays outside the client sync surface. Both platforms read it from
+    /// the same GoTrue user object.
+    pub fn next_prompt_events(
+        &self,
+        now_ms: i64,
+        account_created_at_ms: i64,
+    ) -> Result<Vec<PromptEvent>, SyncError> {
+        let store = lock!(self.store);
+        let settings = Self::read_prompt_settings(&store).map_err(store_err)?;
+        let state = PromptState {
+            account_created_at_ms,
+            questions: read::question_metas(&store).map_err(store_err)?,
+            prompt_skipped_at_ms: read::user_setting(&store, PROMPT_SKIPPED_AT_KEY)
+                .map_err(store_err)?
+                .and_then(|v| v.parse().ok()),
+        };
+        Ok(prompt::next_events(&state, &settings, now_ms))
+    }
+
+    /// Record that the user dismissed a prompt without answering it (SUR-996 R2).
+    ///
+    /// Hosts MUST call this when the sheet is dismissed unanswered, not only when Skip is tapped:
+    /// the one-cadence quiet period is anchored on this timestamp, and an initial prompt with no
+    /// recorded skip deliberately stays due forever (founder, 2026-08-19) so a user who never saw
+    /// the sheet keeps being offered it.
+    ///
+    /// `now_ms` is host-supplied because it is a semantic timestamp — the moment of the
+    /// interaction — not the row's `updated_at` bookkeeping stamp, which `set_user_setting` still
+    /// sets from the internal clock.
+    pub fn skip_prompt(&self, now_ms: i64) -> Result<(), SyncError> {
+        self.set_user_setting(PROMPT_SKIPPED_AT_KEY.into(), now_ms.to_string())
+    }
+
+    /// Record a skipped check-in (SUR-996 R3) — the timer resets, nothing else changes.
+    ///
+    /// A metadata-only patch of `checkin_at` alone: `plaintext: None` makes no Vault call and
+    /// [`insert_opt`] omits every other `None`, so the ciphertext, the status, and the previous
+    /// `checkin_response` all survive byte-for-byte. Skipping is never punished and never visibly
+    /// counted, so nothing records that this WAS a skip — "still open" and "skip" reset the timer
+    /// identically, and the stored vocabulary was deliberately not extended to tell them apart
+    /// (founder, 2026-08-19).
+    ///
+    /// Inherits [`SyncError::PatchTargetMissing`] for an id that has no live row, from the same
+    /// precondition [`SyncEngine::enqueue_question`] enforces.
+    pub fn skip_checkin(&self, question_id: String, now_ms: i64) -> Result<(), SyncError> {
+        self.enqueue_question(QuestionUpsert {
+            id: question_id,
+            plaintext: None,
+            status: None,
+            tone: None,
+            resolved_at: None,
+            checkin_at: Some(now_ms),
+            checkin_response: None,
+            created_at: 0,
+            deleted: false,
+        })
+    }
+
     /// Enqueue a note-signals upsert (SUR-726) — per-note behavioural counters, keyed by `note_id`
     /// (there is NO separate `id` column; the payload carries `note_id` only, matching
     /// `upsertNoteSignals`). Whole-row LWW; concurrent increments are lossy but self-heal (SUR-737,
@@ -2015,6 +2127,22 @@ impl SyncEngine {
 }
 
 impl SyncEngine {
+    /// Assemble [`PromptSettings`] from an ALREADY-HELD store guard (SUR-1043) — the shared body of
+    /// [`SyncEngine::prompt_settings`] and [`SyncEngine::next_prompt_events`]. Taking the guard
+    /// rather than re-locking keeps the settings and the question rows behind ONE acquisition, so a
+    /// concurrent settings write cannot land between them and produce a `due_at` computed from a
+    /// cadence that was never in force.
+    fn read_prompt_settings(store: &Store) -> rusqlite::Result<PromptSettings> {
+        let cadence = read::user_setting(store, PROMPT_CADENCE_KEY)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(prompt::CADENCE_DEFAULT_HOURS);
+        let tone = read::user_setting(store, PROMPT_TONE_KEY)?;
+        Ok(PromptSettings {
+            cadence_hours: prompt::clamp_cadence(cadence),
+            tone: prompt::parse_tone(tone.as_deref()),
+        })
+    }
+
     /// Read-merge-stage a `note_signals` row (SUR-966; extracted verbatim from SUR-956's inline
     /// margins block so `replace_handwritten_annotations` and `record_note_signal` share ONE
     /// read-merge-stage — the FFI has no signals read-back, so this math cannot live host-side
@@ -3117,6 +3245,7 @@ pub(crate) fn epoch_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prompt::{PromptEventKind, PromptTone};
     use serde_json::Value;
 
     #[test]
@@ -4701,6 +4830,371 @@ mod tests {
             queued.get("id").is_none(),
             "user_settings has no id column — an invented one would break the composite upsert"
         );
+    }
+
+    // ── the prompt surface (SUR-1043) ────────────────────────────────────────
+
+    #[test]
+    fn prompt_settings_default_when_nothing_is_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+
+        let settings = engine.prompt_settings().unwrap();
+        assert_eq!(settings.cadence_hours, prompt::CADENCE_DEFAULT_HOURS);
+        assert_eq!(settings.tone, PromptTone::Introspective);
+    }
+
+    #[test]
+    fn prompt_settings_round_trip_through_the_two_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        engine
+            .set_prompt_settings(PromptSettings {
+                cadence_hours: 336,
+                tone: PromptTone::Productive,
+            })
+            .unwrap();
+
+        let settings = engine.prompt_settings().unwrap();
+        assert_eq!(settings.cadence_hours, 336);
+        assert_eq!(settings.tone, PromptTone::Productive);
+
+        // Two rows, not one blob — per-setting LWW is the reason this table exists.
+        let store = Store::open(db_path).unwrap();
+        assert_eq!(
+            store
+                .get_row("user_settings", PROMPT_CADENCE_KEY)
+                .unwrap()
+                .unwrap()["value"]
+                .as_str(),
+            Some("336")
+        );
+        assert_eq!(
+            store
+                .get_row("user_settings", PROMPT_TONE_KEY)
+                .unwrap()
+                .unwrap()["value"]
+                .as_str(),
+            Some("productive")
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_cadence_is_clamped_on_the_way_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        engine
+            .set_prompt_settings(PromptSettings {
+                cadence_hours: 9_999,
+                tone: PromptTone::Introspective,
+            })
+            .unwrap();
+
+        // Clamped before it is STORED, so a device that never runs this build still reads a legal
+        // value out of the synced row.
+        assert_eq!(
+            Store::open(db_path)
+                .unwrap()
+                .get_row("user_settings", PROMPT_CADENCE_KEY)
+                .unwrap()
+                .unwrap()["value"]
+                .as_str(),
+            Some("672")
+        );
+        assert_eq!(
+            engine.prompt_settings().unwrap().cadence_hours,
+            prompt::CADENCE_MAX_HOURS
+        );
+    }
+
+    #[test]
+    fn unreadable_stored_settings_fall_back_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+
+        // Written past the façade, the way an older build or a newer client could.
+        engine
+            .set_user_setting(PROMPT_CADENCE_KEY.into(), "abc".into())
+            .unwrap();
+        engine
+            .set_user_setting(PROMPT_TONE_KEY.into(), "zen".into())
+            .unwrap();
+
+        let settings = engine.prompt_settings().unwrap();
+        assert_eq!(settings.cadence_hours, prompt::CADENCE_DEFAULT_HOURS);
+        assert_eq!(settings.tone, PromptTone::Introspective);
+    }
+
+    #[test]
+    fn an_unclamped_stored_cadence_is_clamped_on_the_way_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+
+        engine
+            .set_user_setting(PROMPT_CADENCE_KEY.into(), "1".into())
+            .unwrap();
+
+        assert_eq!(
+            engine.prompt_settings().unwrap().cadence_hours,
+            prompt::CADENCE_MIN_HOURS
+        );
+    }
+
+    #[test]
+    fn skip_checkin_moves_only_the_timer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        engine
+            .enqueue_question(QuestionUpsert {
+                id: "q1".into(),
+                plaintext: Some("what am I optimising for?".into()),
+                status: Some("active".into()),
+                tone: Some("productive".into()),
+                resolved_at: None,
+                checkin_at: None,
+                checkin_response: Some("active".into()),
+                created_at: 10,
+                deleted: false,
+            })
+            .unwrap();
+        let before = Store::open(db_path)
+            .unwrap()
+            .get_row("questions", "q1")
+            .unwrap()
+            .unwrap();
+
+        engine.skip_checkin("q1".into(), 5_000).unwrap();
+
+        let after = Store::open(db_path)
+            .unwrap()
+            .get_row("questions", "q1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after["checkin_at"], json!(5_000));
+        // The ciphertext, the birth stamp, the status and the PREVIOUS response all survive: a
+        // skip is a timer reset, not an answer.
+        assert_eq!(after["text"], before["text"]);
+        assert_eq!(after["created_at"], before["created_at"]);
+        assert_eq!(after["status"].as_str(), Some("active"));
+        assert_eq!(after["checkin_response"].as_str(), Some("active"));
+        assert_eq!(
+            engine
+                .get_question("q1".into())
+                .unwrap()
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("what am I optimising for?"),
+            "the question still decrypts after a skip"
+        );
+    }
+
+    #[test]
+    fn skip_checkin_refuses_a_question_that_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+
+        assert!(matches!(
+            engine.skip_checkin("ghost".into(), 1_000),
+            Err(SyncError::PatchTargetMissing)
+        ));
+    }
+
+    #[test]
+    fn the_prompt_timeline_walks_from_a_fresh_account_to_a_re_offer() {
+        // The whole loop over a real store, one host clock reading at a time.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+        let created = 1_000_000_i64;
+        let hour = 60 * 60 * 1000_i64;
+        let cadence = prompt::CADENCE_DEFAULT_HOURS as i64 * hour;
+        let events = |now: i64| engine.next_prompt_events(now, created).unwrap();
+
+        // 1. Fresh account: the prompt is due and the nudge is already scheduled.
+        let opening = events(created + 60_000);
+        assert_eq!(
+            opening.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            vec![PromptEventKind::Initial, PromptEventKind::Nudge]
+        );
+        assert_eq!(opening[1].due_at, created + prompt::NUDGE_DELAY_MS);
+
+        // 2. Skipped: the prompt goes quiet for one cadence, the nudge still stands.
+        engine.skip_prompt(created + 120_000).unwrap();
+        let skipped = events(created + 130_000);
+        assert_eq!(
+            skipped.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            vec![PromptEventKind::Nudge, PromptEventKind::Initial]
+        );
+        assert_eq!(skipped[1].due_at, created + 120_000 + cadence);
+
+        // 3. Answered: the loop switches to check-ins, one cadence from birth.
+        let answered_at = created + 5 * hour;
+        engine
+            .enqueue_question(QuestionUpsert {
+                id: "q1".into(),
+                plaintext: Some("what am I sitting with?".into()),
+                status: Some("active".into()),
+                tone: Some("introspective".into()),
+                resolved_at: None,
+                checkin_at: None,
+                checkin_response: None,
+                created_at: answered_at,
+                deleted: false,
+            })
+            .unwrap();
+        let live = events(answered_at + 1);
+        assert_eq!(
+            live.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            vec![PromptEventKind::CheckIn]
+        );
+        assert_eq!(live[0].due_at, answered_at + cadence);
+
+        // 4. Skipped check-in: the timer resets, nothing is punished.
+        let skipped_checkin_at = answered_at + cadence + hour;
+        engine
+            .skip_checkin("q1".into(), skipped_checkin_at)
+            .unwrap();
+        assert_eq!(
+            events(skipped_checkin_at + 1)[0].due_at,
+            skipped_checkin_at + cadence
+        );
+
+        // 5. Resolved, new question declined: back to an initial prompt, one cadence out, and the
+        //    nudge never returns.
+        let resolved_at = skipped_checkin_at + cadence;
+        engine
+            .enqueue_question(QuestionUpsert {
+                id: "q1".into(),
+                plaintext: None,
+                status: Some("resolved".into()),
+                tone: None,
+                resolved_at: Some(resolved_at),
+                checkin_at: Some(resolved_at),
+                checkin_response: Some("resolved".into()),
+                created_at: 0,
+                deleted: false,
+            })
+            .unwrap();
+        let after_resolve = events(resolved_at + 1);
+        assert_eq!(
+            after_resolve.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            vec![PromptEventKind::Initial]
+        );
+        assert_eq!(after_resolve[0].due_at, resolved_at + cadence);
+    }
+
+    #[test]
+    fn a_settings_change_reschedules_the_pending_check_in() {
+        // SUR-996 R4: a cadence change on one device moves the next prompt everywhere. Core's half
+        // is that the SAME state yields a new `due_at` — the clients re-run this after a pull.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+        engine
+            .enqueue_question(QuestionUpsert {
+                id: "q1".into(),
+                plaintext: Some("q".into()),
+                status: Some("active".into()),
+                tone: None,
+                resolved_at: None,
+                checkin_at: None,
+                checkin_response: None,
+                created_at: 500_000,
+                deleted: false,
+            })
+            .unwrap();
+
+        let before = engine.next_prompt_events(500_001, 1_000).unwrap()[0].due_at;
+        engine
+            .set_prompt_settings(PromptSettings {
+                cadence_hours: prompt::CADENCE_MIN_HOURS,
+                tone: PromptTone::Productive,
+            })
+            .unwrap();
+        let after = engine.next_prompt_events(500_001, 1_000).unwrap();
+
+        assert!(after[0].due_at < before);
+        assert_eq!(after[0].tone, PromptTone::Productive);
+    }
+
+    #[test]
+    fn a_question_that_cannot_be_decrypted_still_schedules() {
+        // The machine reads metadata only, so a foreign-AAD or corrupt row keeps its check-in
+        // instead of silently dropping out of the loop.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_question(QuestionUpsert {
+                id: "q1".into(),
+                plaintext: Some("q".into()),
+                status: Some("active".into()),
+                tone: None,
+                resolved_at: None,
+                checkin_at: None,
+                checkin_response: None,
+                created_at: 500_000,
+                deleted: false,
+            })
+            .unwrap();
+
+        // A different engine means a different Vault, so the stored ciphertext will not open.
+        let other = engine_at(db_path);
+        assert!(
+            other
+                .get_question("q1".into())
+                .unwrap()
+                .unwrap()
+                .decrypt_failed
+        );
+        assert_eq!(
+            other.next_prompt_events(500_001, 1_000).unwrap()[0].kind,
+            PromptEventKind::CheckIn
+        );
+    }
+
+    #[test]
+    fn a_deleted_setting_row_reads_as_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .set_prompt_settings(PromptSettings {
+                cadence_hours: 336,
+                tone: PromptTone::Productive,
+            })
+            .unwrap();
+
+        // Soft-delete the row the way a pulled tombstone would.
+        let store = Store::open(db_path).unwrap();
+        let mut row = store
+            .get_row("user_settings", PROMPT_TONE_KEY)
+            .unwrap()
+            .unwrap();
+        row.insert("deleted".into(), json!(true));
+        store.apply_row("user_settings", &row).unwrap();
+
+        assert_eq!(
+            engine.prompt_settings().unwrap().tone,
+            PromptTone::Introspective
+        );
+        assert_eq!(engine.prompt_settings().unwrap().cadence_hours, 336);
     }
 
     #[test]

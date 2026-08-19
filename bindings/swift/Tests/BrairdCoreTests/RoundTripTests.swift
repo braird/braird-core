@@ -1013,4 +1013,71 @@ final class RoundTripTests: XCTestCase {
         // The first synced setting, keyed by name (no id column).
         try engine.setUserSetting(key: "prompt_cadence", value: "168")
     }
+
+    /// SUR-1043: the prompt surface over the FFI — the Swift half of `promptSurfaceOverFfi`. Two
+    /// fieldless enums and two records carrying them by value, which is the marshalling shape the
+    /// Rust tests never cross. Also pins the two claims a client depends on and cannot check for
+    /// itself: the cadence clamp lives in CORE, not in the picker, and the opening phase hands back
+    /// BOTH the initial prompt and its nudge in one call.
+    func testPromptSurfaceOverFfi() throws {
+        let db = FileManager.default.temporaryDirectory
+            .appendingPathComponent("braird-p-\(UUID().uuidString).sqlite")
+        let engine = try SyncEngine.open(
+            dbPath: db.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
+            vault: Vault.generate())
+        let created: Int64 = 1_000_000
+        let hourMs: Int64 = 3_600_000
+
+        // Nothing stored yet: the defaults cross intact.
+        let defaults = try engine.promptSettings()
+        XCTAssertEqual(defaults.cadenceHours, 168)
+        XCTAssertEqual(defaults.tone, .introspective)
+
+        // An out-of-range cadence is clamped by core, not by the client's picker.
+        try engine.setPromptSettings(
+            settings: PromptSettings(cadenceHours: 10, tone: .productive))
+        let clamped = try engine.promptSettings()
+        XCTAssertEqual(clamped.cadenceHours, 72)
+        XCTAssertEqual(clamped.tone, .productive)
+
+        // A fresh account: the prompt is due now AND the nudge is already scheduled for +24h.
+        let opening = try engine.nextPromptEvents(
+            nowMs: created + 60_000, accountCreatedAtMs: created)
+        XCTAssertEqual(opening.map { $0.kind }, [.initial, .nudge])
+        XCTAssertEqual(opening[0].dueAt, created)
+        XCTAssertEqual(opening[1].dueAt, created + 24 * hourMs)
+        XCTAssertEqual(opening[0].tone, .productive)
+
+        // Answered: the loop switches to a check-in one cadence from the question's birth.
+        try engine.enqueueQuestion(
+            draft: QuestionUpsert(
+                id: "q1", plaintext: "what am I sitting with?", status: "active",
+                tone: "productive", resolvedAt: nil, checkinAt: nil, checkinResponse: nil,
+                createdAt: created, deleted: false))
+        let live = try engine.nextPromptEvents(
+            nowMs: created + 60_000, accountCreatedAtMs: created)
+        XCTAssertEqual(live.map { $0.kind }, [.checkIn])
+        XCTAssertEqual(live[0].dueAt, created + 72 * hourMs)
+
+        // Skipping the check-in resets the timer and leaves the sealed text alone.
+        let skippedAt = created + 80 * hourMs
+        try engine.skipCheckin(questionId: "q1", nowMs: skippedAt)
+        XCTAssertEqual(
+            try engine.nextPromptEvents(nowMs: skippedAt + 1, accountCreatedAtMs: created)[0].dueAt,
+            skippedAt + 72 * hourMs)
+        XCTAssertEqual(try engine.getQuestion(id: "q1")?.text, "what am I sitting with?")
+
+        // A recorded skip is what earns the quiet period on a fresh account.
+        let other = FileManager.default.temporaryDirectory
+            .appendingPathComponent("braird-p2-\(UUID().uuidString).sqlite")
+        let fresh = try SyncEngine.open(
+            dbPath: other.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
+            vault: Vault.generate())
+        try fresh.skipPrompt(nowMs: created + 5_000)
+        let quiet = try fresh.nextPromptEvents(
+            nowMs: created + 6_000, accountCreatedAtMs: created
+        ).filter { $0.kind == .initial }
+        XCTAssertEqual(quiet.count, 1)
+        XCTAssertEqual(quiet[0].dueAt, created + 5_000 + 168 * hourMs)
+    }
 }

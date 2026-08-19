@@ -900,6 +900,16 @@ internal open class UniffiVTableCallbackInterfaceEmbedder(
 
 
 
+
+
+
+
+
+
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -996,6 +1006,8 @@ internal interface UniffiLib : Library {
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_merge_content_duplicates(`ptr`: Pointer,`survivorId`: RustBuffer.ByValue,`loserIds`: RustBuffer.ByValue,`allowCrossCluster`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Int
+    fun uniffi_braird_core_fn_method_syncengine_next_prompt_events(`ptr`: Pointer,`nowMs`: Long,`accountCreatedAtMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_note_ids_for_collection(`ptr`: Pointer,`collectionId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_note_links_for_note(`ptr`: Pointer,`noteId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1006,6 +1018,8 @@ internal interface UniffiLib : Library {
     ): Int
     fun uniffi_braird_core_fn_method_syncengine_pending_embed_count(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Int
+    fun uniffi_braird_core_fn_method_syncengine_prompt_settings(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_pull(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_question_notes(`ptr`: Pointer,`questionId`: RustBuffer.ByValue,`nowMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -1026,10 +1040,16 @@ internal interface UniffiLib : Library {
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_set_access_token(`ptr`: Pointer,`jwt`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    fun uniffi_braird_core_fn_method_syncengine_set_prompt_settings(`ptr`: Pointer,`settings`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_braird_core_fn_method_syncengine_set_user_setting(`ptr`: Pointer,`key`: RustBuffer.ByValue,`value`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_similar_notes(`ptr`: Pointer,`noteId`: RustBuffer.ByValue,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_skip_checkin(`ptr`: Pointer,`questionId`: RustBuffer.ByValue,`nowMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_braird_core_fn_method_syncengine_skip_prompt(`ptr`: Pointer,`nowMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_braird_core_fn_method_syncengine_soft_delete_signals_for_note(`ptr`: Pointer,`noteId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_sync(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
@@ -1248,6 +1268,8 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_merge_content_duplicates(
     ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_next_prompt_events(
+    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_note_ids_for_collection(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_note_links_for_note(
@@ -1257,6 +1279,8 @@ internal interface UniffiLib : Library {
     fun uniffi_braird_core_checksum_method_syncengine_notes_this_week(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_pending_embed_count(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_prompt_settings(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_pull(
     ): Short
@@ -1278,9 +1302,15 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_set_access_token(
     ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_set_prompt_settings(
+    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_set_user_setting(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_similar_notes(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_skip_checkin(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_skip_prompt(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_soft_delete_signals_for_note(
     ): Short
@@ -1434,6 +1464,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_merge_content_duplicates() != 26022.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_next_prompt_events() != 21888.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_braird_core_checksum_method_syncengine_note_ids_for_collection() != 25011.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1447,6 +1480,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_pending_embed_count() != 26076.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_prompt_settings() != 18424.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_pull() != 8960.toShort()) {
@@ -1479,10 +1515,19 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_set_access_token() != 47386.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_set_prompt_settings() != 58431.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_braird_core_checksum_method_syncengine_set_user_setting() != 2882.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_similar_notes() != 52094.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_skip_checkin() != 64973.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_skip_prompt() != 15062.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_soft_delete_signals_for_note() != 38804.toShort()) {
@@ -2715,6 +2760,26 @@ public interface SyncEngineInterface {
     fun `mergeContentDuplicates`(`survivorId`: kotlin.String, `loserIds`: List<kotlin.String>, `allowCrossCluster`: kotlin.Boolean): kotlin.UInt
     
     /**
+     * The prompt(s) the client should act on now, sorted by `due_at` (SUR-1043).
+     *
+     * CONTRACT: cancel every pending prompt notification, then for each returned event render it
+     * if `due_at <= now_ms` and schedule a local notification if `due_at > now_ms`. Re-run after
+     * every answer, settings change, and sync pull that touched a question — that is what makes
+     * answering on the phone silence the tablet (SUR-996 R5).
+     *
+     * Never empty, at most two (the opening 24h returns the initial prompt AND its nudge; see
+     * [`prompt::next_events`] for the full rule table).
+     *
+     * Both timestamps are host-supplied. `now_ms` follows the read-surface convention
+     * ([`SyncEngine::question_notes`]) — core reads no clock, so the result is a pure function of
+     * its inputs and testable at any point on the timeline. `account_created_at_ms` has no choice
+     * about it: core holds no account-creation stamp anywhere, because `user_profiles` is
+     * server-authoritative and stays outside the client sync surface. Both platforms read it from
+     * the same GoTrue user object.
+     */
+    fun `nextPromptEvents`(`nowMs`: kotlin.Long, `accountCreatedAtMs`: kotlin.Long): List<PromptEvent>
+    
+    /**
      * Live member note ids of a collection (SUR-923) — feeds the host-side collection-delete
      * cascade (which must see memberships of already-deleted notes, so: deliberately no notes
      * join) and the collection-scoped note list (which re-checks note liveness host-side, as
@@ -2749,6 +2814,17 @@ public interface SyncEngineInterface {
      * any persistent "search index is rebuilding" UI off this). Zero = corpus current.
      */
     fun `pendingEmbedCount`(): kotlin.UInt
+    
+    /**
+     * The prompt cadence + tone in force, defaulted and clamped (SUR-1043).
+     *
+     * Total, never failing on content: an unset key, a soft-deleted row, a cadence that does not
+     * parse, and a tone a newer client invented all resolve to the defaults (168h /
+     * Introspective) rather than an error. The clamp runs on READ as well as write, so a value
+     * stored by an older build — or by a client that bypassed this façade — still lands inside
+     * 72..=672 on the way out.
+     */
+    fun `promptSettings`(): PromptSettings
     
     /**
      * Pull incrementally from Supabase for **all eight synced tables** (SUR-726 —
@@ -2957,6 +3033,20 @@ public interface SyncEngineInterface {
     fun `setAccessToken`(`jwt`: kotlin.String)
     
     /**
+     * Write both prompt settings, clamping the cadence first (SUR-996 R4).
+     *
+     * TWO ROWS, ONE CALL, and deliberately not one blob: per-setting LWW is the whole reason
+     * `user_settings` is a KV table, so a device changing the cadence must not stomp another
+     * device's tone. Routed through [`SyncEngine::set_user_setting`] rather than staging directly
+     * — one write path per table, so the outbox semantics cannot drift between them.
+     *
+     * Not transactional across the two rows: a failure between them leaves the first applied.
+     * ponytail: acceptable because each row is independently meaningful and the next successful
+     * call converges both; a settings write that needed atomicity would need a different table.
+     */
+    fun `setPromptSettings`(`settings`: PromptSettings)
+    
+    /**
      * Write one synced user setting (SUR-1042) — braird's first synced settings, a per-user KV
      * whose local pk is `key` (there is no `id` column).
      *
@@ -2989,6 +3079,35 @@ public interface SyncEngineInterface {
      * [`SyncEngine::pending_embed_count`], not this.
      */
     fun `similarNotes`(`noteId`: kotlin.String, `limit`: kotlin.UInt): List<SemanticHit>
+    
+    /**
+     * Record a skipped check-in (SUR-996 R3) — the timer resets, nothing else changes.
+     *
+     * A metadata-only patch of `checkin_at` alone: `plaintext: None` makes no Vault call and
+     * [`insert_opt`] omits every other `None`, so the ciphertext, the status, and the previous
+     * `checkin_response` all survive byte-for-byte. Skipping is never punished and never visibly
+     * counted, so nothing records that this WAS a skip — "still open" and "skip" reset the timer
+     * identically, and the stored vocabulary was deliberately not extended to tell them apart
+     * (founder, 2026-08-19).
+     *
+     * Inherits [`SyncError::PatchTargetMissing`] for an id that has no live row, from the same
+     * precondition [`SyncEngine::enqueue_question`] enforces.
+     */
+    fun `skipCheckin`(`questionId`: kotlin.String, `nowMs`: kotlin.Long)
+    
+    /**
+     * Record that the user dismissed a prompt without answering it (SUR-996 R2).
+     *
+     * Hosts MUST call this when the sheet is dismissed unanswered, not only when Skip is tapped:
+     * the one-cadence quiet period is anchored on this timestamp, and an initial prompt with no
+     * recorded skip deliberately stays due forever (founder, 2026-08-19) so a user who never saw
+     * the sheet keeps being offered it.
+     *
+     * `now_ms` is host-supplied because it is a semantic timestamp — the moment of the
+     * interaction — not the row's `updated_at` bookkeeping stamp, which `set_user_setting` still
+     * sets from the internal clock.
+     */
+    fun `skipPrompt`(`nowMs`: kotlin.Long)
     
     /**
      * Tombstone a note's `note_signals` row on note delete (SUR-966), mirroring the surfc oracle.
@@ -3776,6 +3895,37 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
 
     
     /**
+     * The prompt(s) the client should act on now, sorted by `due_at` (SUR-1043).
+     *
+     * CONTRACT: cancel every pending prompt notification, then for each returned event render it
+     * if `due_at <= now_ms` and schedule a local notification if `due_at > now_ms`. Re-run after
+     * every answer, settings change, and sync pull that touched a question — that is what makes
+     * answering on the phone silence the tablet (SUR-996 R5).
+     *
+     * Never empty, at most two (the opening 24h returns the initial prompt AND its nudge; see
+     * [`prompt::next_events`] for the full rule table).
+     *
+     * Both timestamps are host-supplied. `now_ms` follows the read-surface convention
+     * ([`SyncEngine::question_notes`]) — core reads no clock, so the result is a pure function of
+     * its inputs and testable at any point on the timeline. `account_created_at_ms` has no choice
+     * about it: core holds no account-creation stamp anywhere, because `user_profiles` is
+     * server-authoritative and stays outside the client sync surface. Both platforms read it from
+     * the same GoTrue user object.
+     */
+    @Throws(SyncException::class)override fun `nextPromptEvents`(`nowMs`: kotlin.Long, `accountCreatedAtMs`: kotlin.Long): List<PromptEvent> {
+            return FfiConverterSequenceTypePromptEvent.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_next_prompt_events(
+        it, FfiConverterLong.lower(`nowMs`),FfiConverterLong.lower(`accountCreatedAtMs`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * Live member note ids of a collection (SUR-923) — feeds the host-side collection-delete
      * cascade (which must see memberships of already-deleted notes, so: deliberately no notes
      * join) and the collection-scoped note list (which re-checks note liveness host-side, as
@@ -3858,6 +4008,28 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     callWithPointer {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_pending_embed_count(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * The prompt cadence + tone in force, defaulted and clamped (SUR-1043).
+     *
+     * Total, never failing on content: an unset key, a soft-deleted row, a cadence that does not
+     * parse, and a tone a newer client invented all resolve to the defaults (168h /
+     * Introspective) rather than an error. The clamp runs on READ as well as write, so a value
+     * stored by an older build — or by a client that bypassed this façade — still lands inside
+     * 72..=672 on the way out.
+     */
+    @Throws(SyncException::class)override fun `promptSettings`(): PromptSettings {
+            return FfiConverterTypePromptSettings.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_prompt_settings(
         it, _status)
 }
     }
@@ -4181,6 +4353,30 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
 
     
     /**
+     * Write both prompt settings, clamping the cadence first (SUR-996 R4).
+     *
+     * TWO ROWS, ONE CALL, and deliberately not one blob: per-setting LWW is the whole reason
+     * `user_settings` is a KV table, so a device changing the cadence must not stomp another
+     * device's tone. Routed through [`SyncEngine::set_user_setting`] rather than staging directly
+     * — one write path per table, so the outbox semantics cannot drift between them.
+     *
+     * Not transactional across the two rows: a failure between them leaves the first applied.
+     * ponytail: acceptable because each row is independently meaningful and the next successful
+     * call converges both; a settings write that needed atomicity would need a different table.
+     */
+    @Throws(SyncException::class)override fun `setPromptSettings`(`settings`: PromptSettings)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_set_prompt_settings(
+        it, FfiConverterTypePromptSettings.lower(`settings`),_status)
+}
+    }
+    
+    
+
+    
+    /**
      * Write one synced user setting (SUR-1042) — braird's first synced settings, a per-user KV
      * whose local pk is `key` (there is no `id` column).
      *
@@ -4232,6 +4428,55 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     }
     )
     }
+    
+
+    
+    /**
+     * Record a skipped check-in (SUR-996 R3) — the timer resets, nothing else changes.
+     *
+     * A metadata-only patch of `checkin_at` alone: `plaintext: None` makes no Vault call and
+     * [`insert_opt`] omits every other `None`, so the ciphertext, the status, and the previous
+     * `checkin_response` all survive byte-for-byte. Skipping is never punished and never visibly
+     * counted, so nothing records that this WAS a skip — "still open" and "skip" reset the timer
+     * identically, and the stored vocabulary was deliberately not extended to tell them apart
+     * (founder, 2026-08-19).
+     *
+     * Inherits [`SyncError::PatchTargetMissing`] for an id that has no live row, from the same
+     * precondition [`SyncEngine::enqueue_question`] enforces.
+     */
+    @Throws(SyncException::class)override fun `skipCheckin`(`questionId`: kotlin.String, `nowMs`: kotlin.Long)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_skip_checkin(
+        it, FfiConverterString.lower(`questionId`),FfiConverterLong.lower(`nowMs`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Record that the user dismissed a prompt without answering it (SUR-996 R2).
+     *
+     * Hosts MUST call this when the sheet is dismissed unanswered, not only when Skip is tapped:
+     * the one-cadence quiet period is anchored on this timestamp, and an initial prompt with no
+     * recorded skip deliberately stays due forever (founder, 2026-08-19) so a user who never saw
+     * the sheet keeps being offered it.
+     *
+     * `now_ms` is host-supplied because it is a semantic timestamp — the moment of the
+     * interaction — not the row's `updated_at` bookkeeping stamp, which `set_user_setting` still
+     * sets from the internal clock.
+     */
+    @Throws(SyncException::class)override fun `skipPrompt`(`nowMs`: kotlin.Long)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_skip_prompt(
+        it, FfiConverterLong.lower(`nowMs`),_status)
+}
+    }
+    
     
 
     
@@ -5879,6 +6124,87 @@ public object FfiConverterTypeNoteUpsert: FfiConverterRustBuffer<NoteUpsert> {
 
 
 /**
+ * One prompt the client should act on. `due_at <= now` → render the sheet; `due_at > now` →
+ * schedule a local notification for that moment.
+ *
+ * `tone` is the tone in force now, and is meaningful for `CheckIn` only: `Initial` shows both
+ * phrasings as the picker, and the nudge copy is deliberately generic (no question text ever
+ * reaches a lock screen — SUR-996 R5). It rides on every event anyway because a non-optional
+ * field is simpler across three binding languages than an `Option` two of three kinds ignore.
+ */
+data class PromptEvent (
+    var `kind`: PromptEventKind, 
+    var `dueAt`: kotlin.Long, 
+    var `tone`: PromptTone
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypePromptEvent: FfiConverterRustBuffer<PromptEvent> {
+    override fun read(buf: ByteBuffer): PromptEvent {
+        return PromptEvent(
+            FfiConverterTypePromptEventKind.read(buf),
+            FfiConverterLong.read(buf),
+            FfiConverterTypePromptTone.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: PromptEvent) = (
+            FfiConverterTypePromptEventKind.allocationSize(value.`kind`) +
+            FfiConverterLong.allocationSize(value.`dueAt`) +
+            FfiConverterTypePromptTone.allocationSize(value.`tone`)
+    )
+
+    override fun write(value: PromptEvent, buf: ByteBuffer) {
+            FfiConverterTypePromptEventKind.write(value.`kind`, buf)
+            FfiConverterLong.write(value.`dueAt`, buf)
+            FfiConverterTypePromptTone.write(value.`tone`, buf)
+    }
+}
+
+
+
+/**
+ * The typed façade over the two settings rows. `cadence_hours` is ALWAYS clamped — a value read
+ * out of this struct has already passed [`clamp_cadence`], so hosts never see a raw stored number.
+ */
+data class PromptSettings (
+    var `cadenceHours`: kotlin.UInt, 
+    var `tone`: PromptTone
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypePromptSettings: FfiConverterRustBuffer<PromptSettings> {
+    override fun read(buf: ByteBuffer): PromptSettings {
+        return PromptSettings(
+            FfiConverterUInt.read(buf),
+            FfiConverterTypePromptTone.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: PromptSettings) = (
+            FfiConverterUInt.allocationSize(value.`cadenceHours`) +
+            FfiConverterTypePromptTone.allocationSize(value.`tone`)
+    )
+
+    override fun write(value: PromptSettings, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`cadenceHours`, buf)
+            FfiConverterTypePromptTone.write(value.`tone`, buf)
+    }
+}
+
+
+
+/**
  * The result of a pull across the FFI: rows seen, rows merged (last-write-wins winners +
  * applied tombstones), incoming deletes skipped as "don't-resurrect" (a delete for a row this
  * device never had), and the local edits dropped as stale by the outbox rebase (SUR-736/738 —
@@ -6864,6 +7190,77 @@ public object FfiConverterTypeNoteSignalKind: FfiConverterRustBuffer<NoteSignalK
 
 
 /**
+ * What a due prompt is. `Initial` asks for a question (and doubles as the tone picker on first
+ * use), `Nudge` is the one-and-only reminder for an unanswered initial prompt, `CheckIn` revisits
+ * the live question at cadence.
+ */
+
+enum class PromptEventKind {
+    
+    INITIAL,
+    NUDGE,
+    CHECK_IN;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypePromptEventKind: FfiConverterRustBuffer<PromptEventKind> {
+    override fun read(buf: ByteBuffer) = try {
+        PromptEventKind.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: PromptEventKind) = 4UL
+
+    override fun write(value: PromptEventKind, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * Which phrasing a prompt uses (SUR-996). The strings themselves stay client-side (SUR-996 Q1 —
+ * localization lives with the clients); core owns only the choice, so both platforms cannot
+ * disagree about which tone is in force.
+ */
+
+enum class PromptTone {
+    
+    INTROSPECTIVE,
+    PRODUCTIVE;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypePromptTone: FfiConverterRustBuffer<PromptTone> {
+    override fun read(buf: ByteBuffer) = try {
+        PromptTone.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: PromptTone) = 4UL
+
+    override fun write(value: PromptTone, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
  * Which entity a [`SearchHit`] points at. Mirrors the PWA's `type` field (`'note'`/`'idea'`),
  * but a closed enum gives Swift/Kotlin an exhaustive switch instead of a stringly-typed field.
  * Scope is notes + custom-ideas only (SUR-744 decision 1); books aren't indexed by the PWA and
@@ -7617,6 +8014,34 @@ public object FfiConverterSequenceTypeNoteRecord: FfiConverterRustBuffer<List<No
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeNoteRecord.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypePromptEvent: FfiConverterRustBuffer<List<PromptEvent>> {
+    override fun read(buf: ByteBuffer): List<PromptEvent> {
+        val len = buf.getInt()
+        return List<PromptEvent>(len) {
+            FfiConverterTypePromptEvent.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<PromptEvent>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypePromptEvent.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<PromptEvent>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypePromptEvent.write(it, buf)
         }
     }
 }

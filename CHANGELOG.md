@@ -6,6 +6,42 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **The open-question prompt state machine + typed `PromptSettings` (SUR-1043, SUR-996 R2–R4).**
+  Core now owns the prompt timing rules, so iOS and Android cannot drift on them: clients render
+  the sheet for a past-due event and schedule a local notification for a future one, and that is
+  their whole share of the logic. Five exports — `prompt_settings`, `set_prompt_settings`,
+  `next_prompt_events`, `skip_prompt`, `skip_checkin` — over two new records (`PromptSettings`,
+  `PromptEvent`) and two new enums (`PromptTone`, `PromptEventKind`). All additive; a host on an
+  older pin keeps working until it takes the new one.
+  `set_user_setting` (SUR-1042) shipped untyped and named this ticket as the owner of the key
+  constants and the 72..=672 clamp; those now exist, along with the READ leg the KV table never
+  had — `user_settings` could be written and never read back. Kept crate-internal on purpose: the
+  FFI exposes the typed façade, so no host can typo a key or store an unclamped cadence past it.
+  The clamp runs on read as well as write, so a value stored by an older build still arrives legal.
+  `next_prompt_events` returns a sorted list (never empty, at most two) rather than a single event,
+  because the opening 24 hours have two pending at once: the initial prompt is due immediately AND
+  its one nudge must already be scheduled for +24h. The user that nudge exists for is precisely the
+  one who never reopens the app, so there is no later call in which to learn about it; the
+  alternative was clients hardcoding the +24h themselves, which is the drift the ticket prevents.
+  Both timestamps are host-supplied. `now_ms` follows the read-surface convention (`question_notes`)
+  so the result stays a pure function of its inputs. `account_created_at_ms` has no choice about it:
+  core holds no account-creation stamp anywhere, because `user_profiles` is server-authoritative and
+  stays outside the client sync surface.
+  Four rules the code cannot derive, decided by the founder 2026-08-19: an initial prompt that was
+  never answered AND never skipped stays due indefinitely (the one-cadence quiet period anchors on a
+  recorded skip, so hosts must call `skip_prompt` when the sheet is dismissed unanswered, not only
+  when Skip is tapped); the tone defaults to Introspective when unset or unrecognised; a skipped
+  check-in writes `checkin_at` alone and is deliberately indistinguishable from "still open" in
+  stored data (both reset the timer identically, so no `checkin_response` value was added for it);
+  and `checkin_at` means WHEN the last check-in was actioned, never when the next is due — core
+  derives due-time, which is what stops a client writing its own idea of the cadence into a synced
+  row, at the cost of a cadence change applying retroactively.
+  The machine reads question METADATA only, never the text, so no Vault call is on this path and a
+  question that fails to decrypt still schedules its check-in.
+  New synced key `prompt_skipped_at`, stored rather than kept device-local so per-row LWW makes the
+  newest skip win — a skip on the phone silences the same prompt on the tablet.
+
 ### Fixed
 - **The release-staleness checker could not read its own CHANGELOG (SUR-1070 follow-up).** An
   unterminated `<!--` marker masked every line after it to end of file, and the likeliest source

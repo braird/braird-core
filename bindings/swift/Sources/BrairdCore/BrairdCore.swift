@@ -1192,6 +1192,26 @@ public protocol SyncEngineProtocol : AnyObject {
     func mergeContentDuplicates(survivorId: String, loserIds: [String], allowCrossCluster: Bool) throws  -> UInt32
     
     /**
+     * The prompt(s) the client should act on now, sorted by `due_at` (SUR-1043).
+     *
+     * CONTRACT: cancel every pending prompt notification, then for each returned event render it
+     * if `due_at <= now_ms` and schedule a local notification if `due_at > now_ms`. Re-run after
+     * every answer, settings change, and sync pull that touched a question — that is what makes
+     * answering on the phone silence the tablet (SUR-996 R5).
+     *
+     * Never empty, at most two (the opening 24h returns the initial prompt AND its nudge; see
+     * [`prompt::next_events`] for the full rule table).
+     *
+     * Both timestamps are host-supplied. `now_ms` follows the read-surface convention
+     * ([`SyncEngine::question_notes`]) — core reads no clock, so the result is a pure function of
+     * its inputs and testable at any point on the timeline. `account_created_at_ms` has no choice
+     * about it: core holds no account-creation stamp anywhere, because `user_profiles` is
+     * server-authoritative and stays outside the client sync surface. Both platforms read it from
+     * the same GoTrue user object.
+     */
+    func nextPromptEvents(nowMs: Int64, accountCreatedAtMs: Int64) throws  -> [PromptEvent]
+    
+    /**
      * Live member note ids of a collection (SUR-923) — feeds the host-side collection-delete
      * cascade (which must see memberships of already-deleted notes, so: deliberately no notes
      * join) and the collection-scoped note list (which re-checks note liveness host-side, as
@@ -1226,6 +1246,17 @@ public protocol SyncEngineProtocol : AnyObject {
      * any persistent "search index is rebuilding" UI off this). Zero = corpus current.
      */
     func pendingEmbedCount() throws  -> UInt32
+    
+    /**
+     * The prompt cadence + tone in force, defaulted and clamped (SUR-1043).
+     *
+     * Total, never failing on content: an unset key, a soft-deleted row, a cadence that does not
+     * parse, and a tone a newer client invented all resolve to the defaults (168h /
+     * Introspective) rather than an error. The clamp runs on READ as well as write, so a value
+     * stored by an older build — or by a client that bypassed this façade — still lands inside
+     * 72..=672 on the way out.
+     */
+    func promptSettings() throws  -> PromptSettings
     
     /**
      * Pull incrementally from Supabase for **all eight synced tables** (SUR-726 —
@@ -1434,6 +1465,20 @@ public protocol SyncEngineProtocol : AnyObject {
     func setAccessToken(jwt: String) 
     
     /**
+     * Write both prompt settings, clamping the cadence first (SUR-996 R4).
+     *
+     * TWO ROWS, ONE CALL, and deliberately not one blob: per-setting LWW is the whole reason
+     * `user_settings` is a KV table, so a device changing the cadence must not stomp another
+     * device's tone. Routed through [`SyncEngine::set_user_setting`] rather than staging directly
+     * — one write path per table, so the outbox semantics cannot drift between them.
+     *
+     * Not transactional across the two rows: a failure between them leaves the first applied.
+     * ponytail: acceptable because each row is independently meaningful and the next successful
+     * call converges both; a settings write that needed atomicity would need a different table.
+     */
+    func setPromptSettings(settings: PromptSettings) throws 
+    
+    /**
      * Write one synced user setting (SUR-1042) — braird's first synced settings, a per-user KV
      * whose local pk is `key` (there is no `id` column).
      *
@@ -1466,6 +1511,35 @@ public protocol SyncEngineProtocol : AnyObject {
      * [`SyncEngine::pending_embed_count`], not this.
      */
     func similarNotes(noteId: String, limit: UInt32) throws  -> [SemanticHit]
+    
+    /**
+     * Record a skipped check-in (SUR-996 R3) — the timer resets, nothing else changes.
+     *
+     * A metadata-only patch of `checkin_at` alone: `plaintext: None` makes no Vault call and
+     * [`insert_opt`] omits every other `None`, so the ciphertext, the status, and the previous
+     * `checkin_response` all survive byte-for-byte. Skipping is never punished and never visibly
+     * counted, so nothing records that this WAS a skip — "still open" and "skip" reset the timer
+     * identically, and the stored vocabulary was deliberately not extended to tell them apart
+     * (founder, 2026-08-19).
+     *
+     * Inherits [`SyncError::PatchTargetMissing`] for an id that has no live row, from the same
+     * precondition [`SyncEngine::enqueue_question`] enforces.
+     */
+    func skipCheckin(questionId: String, nowMs: Int64) throws 
+    
+    /**
+     * Record that the user dismissed a prompt without answering it (SUR-996 R2).
+     *
+     * Hosts MUST call this when the sheet is dismissed unanswered, not only when Skip is tapped:
+     * the one-cadence quiet period is anchored on this timestamp, and an initial prompt with no
+     * recorded skip deliberately stays due forever (founder, 2026-08-19) so a user who never saw
+     * the sheet keeps being offered it.
+     *
+     * `now_ms` is host-supplied because it is a semantic timestamp — the moment of the
+     * interaction — not the row's `updated_at` bookkeeping stamp, which `set_user_setting` still
+     * sets from the internal clock.
+     */
+    func skipPrompt(nowMs: Int64) throws 
     
     /**
      * Tombstone a note's `note_signals` row on note delete (SUR-966), mirroring the surfc oracle.
@@ -2127,6 +2201,33 @@ open func mergeContentDuplicates(survivorId: String, loserIds: [String], allowCr
 }
     
     /**
+     * The prompt(s) the client should act on now, sorted by `due_at` (SUR-1043).
+     *
+     * CONTRACT: cancel every pending prompt notification, then for each returned event render it
+     * if `due_at <= now_ms` and schedule a local notification if `due_at > now_ms`. Re-run after
+     * every answer, settings change, and sync pull that touched a question — that is what makes
+     * answering on the phone silence the tablet (SUR-996 R5).
+     *
+     * Never empty, at most two (the opening 24h returns the initial prompt AND its nudge; see
+     * [`prompt::next_events`] for the full rule table).
+     *
+     * Both timestamps are host-supplied. `now_ms` follows the read-surface convention
+     * ([`SyncEngine::question_notes`]) — core reads no clock, so the result is a pure function of
+     * its inputs and testable at any point on the timeline. `account_created_at_ms` has no choice
+     * about it: core holds no account-creation stamp anywhere, because `user_profiles` is
+     * server-authoritative and stays outside the client sync surface. Both platforms read it from
+     * the same GoTrue user object.
+     */
+open func nextPromptEvents(nowMs: Int64, accountCreatedAtMs: Int64)throws  -> [PromptEvent] {
+    return try  FfiConverterSequenceTypePromptEvent.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_next_prompt_events(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),
+        FfiConverterInt64.lower(accountCreatedAtMs),$0
+    )
+})
+}
+    
+    /**
      * Live member note ids of a collection (SUR-923) — feeds the host-side collection-delete
      * cascade (which must see memberships of already-deleted notes, so: deliberately no notes
      * join) and the collection-scoped note list (which re-checks note liveness host-side, as
@@ -2189,6 +2290,22 @@ open func notesThisWeek(nowMs: Int64)throws  -> UInt32 {
 open func pendingEmbedCount()throws  -> UInt32 {
     return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_pending_embed_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * The prompt cadence + tone in force, defaulted and clamped (SUR-1043).
+     *
+     * Total, never failing on content: an unset key, a soft-deleted row, a cadence that does not
+     * parse, and a tone a newer client invented all resolve to the defaults (168h /
+     * Introspective) rather than an error. The clamp runs on READ as well as write, so a value
+     * stored by an older build — or by a client that bypassed this façade — still lands inside
+     * 72..=672 on the way out.
+     */
+open func promptSettings()throws  -> PromptSettings {
+    return try  FfiConverterTypePromptSettings.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_prompt_settings(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -2465,6 +2582,25 @@ open func setAccessToken(jwt: String) {try! rustCall() {
 }
     
     /**
+     * Write both prompt settings, clamping the cadence first (SUR-996 R4).
+     *
+     * TWO ROWS, ONE CALL, and deliberately not one blob: per-setting LWW is the whole reason
+     * `user_settings` is a KV table, so a device changing the cadence must not stomp another
+     * device's tone. Routed through [`SyncEngine::set_user_setting`] rather than staging directly
+     * — one write path per table, so the outbox semantics cannot drift between them.
+     *
+     * Not transactional across the two rows: a failure between them leaves the first applied.
+     * ponytail: acceptable because each row is independently meaningful and the next successful
+     * call converges both; a settings write that needed atomicity would need a different table.
+     */
+open func setPromptSettings(settings: PromptSettings)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_set_prompt_settings(self.uniffiClonePointer(),
+        FfiConverterTypePromptSettings.lower(settings),$0
+    )
+}
+}
+    
+    /**
      * Write one synced user setting (SUR-1042) — braird's first synced settings, a per-user KV
      * whose local pk is `key` (there is no `id` column).
      *
@@ -2509,6 +2645,46 @@ open func similarNotes(noteId: String, limit: UInt32)throws  -> [SemanticHit] {
         FfiConverterUInt32.lower(limit),$0
     )
 })
+}
+    
+    /**
+     * Record a skipped check-in (SUR-996 R3) — the timer resets, nothing else changes.
+     *
+     * A metadata-only patch of `checkin_at` alone: `plaintext: None` makes no Vault call and
+     * [`insert_opt`] omits every other `None`, so the ciphertext, the status, and the previous
+     * `checkin_response` all survive byte-for-byte. Skipping is never punished and never visibly
+     * counted, so nothing records that this WAS a skip — "still open" and "skip" reset the timer
+     * identically, and the stored vocabulary was deliberately not extended to tell them apart
+     * (founder, 2026-08-19).
+     *
+     * Inherits [`SyncError::PatchTargetMissing`] for an id that has no live row, from the same
+     * precondition [`SyncEngine::enqueue_question`] enforces.
+     */
+open func skipCheckin(questionId: String, nowMs: Int64)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_skip_checkin(self.uniffiClonePointer(),
+        FfiConverterString.lower(questionId),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+}
+}
+    
+    /**
+     * Record that the user dismissed a prompt without answering it (SUR-996 R2).
+     *
+     * Hosts MUST call this when the sheet is dismissed unanswered, not only when Skip is tapped:
+     * the one-cadence quiet period is anchored on this timestamp, and an initial prompt with no
+     * recorded skip deliberately stays due forever (founder, 2026-08-19) so a user who never saw
+     * the sheet keeps being offered it.
+     *
+     * `now_ms` is host-supplied because it is a semantic timestamp — the moment of the
+     * interaction — not the row's `updated_at` bookkeeping stamp, which `set_user_setting` still
+     * sets from the internal clock.
+     */
+open func skipPrompt(nowMs: Int64)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_skip_prompt(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+}
 }
     
     /**
@@ -4900,6 +5076,159 @@ public func FfiConverterTypeNoteUpsert_lower(_ value: NoteUpsert) -> RustBuffer 
 
 
 /**
+ * One prompt the client should act on. `due_at <= now` → render the sheet; `due_at > now` →
+ * schedule a local notification for that moment.
+ *
+ * `tone` is the tone in force now, and is meaningful for `CheckIn` only: `Initial` shows both
+ * phrasings as the picker, and the nudge copy is deliberately generic (no question text ever
+ * reaches a lock screen — SUR-996 R5). It rides on every event anyway because a non-optional
+ * field is simpler across three binding languages than an `Option` two of three kinds ignore.
+ */
+public struct PromptEvent {
+    public var kind: PromptEventKind
+    public var dueAt: Int64
+    public var tone: PromptTone
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(kind: PromptEventKind, dueAt: Int64, tone: PromptTone) {
+        self.kind = kind
+        self.dueAt = dueAt
+        self.tone = tone
+    }
+}
+
+
+
+extension PromptEvent: Equatable, Hashable {
+    public static func ==(lhs: PromptEvent, rhs: PromptEvent) -> Bool {
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.dueAt != rhs.dueAt {
+            return false
+        }
+        if lhs.tone != rhs.tone {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(kind)
+        hasher.combine(dueAt)
+        hasher.combine(tone)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePromptEvent: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PromptEvent {
+        return
+            try PromptEvent(
+                kind: FfiConverterTypePromptEventKind.read(from: &buf), 
+                dueAt: FfiConverterInt64.read(from: &buf), 
+                tone: FfiConverterTypePromptTone.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PromptEvent, into buf: inout [UInt8]) {
+        FfiConverterTypePromptEventKind.write(value.kind, into: &buf)
+        FfiConverterInt64.write(value.dueAt, into: &buf)
+        FfiConverterTypePromptTone.write(value.tone, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePromptEvent_lift(_ buf: RustBuffer) throws -> PromptEvent {
+    return try FfiConverterTypePromptEvent.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePromptEvent_lower(_ value: PromptEvent) -> RustBuffer {
+    return FfiConverterTypePromptEvent.lower(value)
+}
+
+
+/**
+ * The typed façade over the two settings rows. `cadence_hours` is ALWAYS clamped — a value read
+ * out of this struct has already passed [`clamp_cadence`], so hosts never see a raw stored number.
+ */
+public struct PromptSettings {
+    public var cadenceHours: UInt32
+    public var tone: PromptTone
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(cadenceHours: UInt32, tone: PromptTone) {
+        self.cadenceHours = cadenceHours
+        self.tone = tone
+    }
+}
+
+
+
+extension PromptSettings: Equatable, Hashable {
+    public static func ==(lhs: PromptSettings, rhs: PromptSettings) -> Bool {
+        if lhs.cadenceHours != rhs.cadenceHours {
+            return false
+        }
+        if lhs.tone != rhs.tone {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(cadenceHours)
+        hasher.combine(tone)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePromptSettings: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PromptSettings {
+        return
+            try PromptSettings(
+                cadenceHours: FfiConverterUInt32.read(from: &buf), 
+                tone: FfiConverterTypePromptTone.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PromptSettings, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.cadenceHours, into: &buf)
+        FfiConverterTypePromptTone.write(value.tone, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePromptSettings_lift(_ buf: RustBuffer) throws -> PromptSettings {
+    return try FfiConverterTypePromptSettings.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePromptSettings_lower(_ value: PromptSettings) -> RustBuffer {
+    return FfiConverterTypePromptSettings.lower(value)
+}
+
+
+/**
  * The result of a pull across the FFI: rows seen, rows merged (last-write-wins winners +
  * applied tombstones), incoming deletes skipped as "don't-resurrect" (a delete for a row this
  * device never had), and the local edits dropped as stale by the outbox rebase (SUR-736/738 —
@@ -6566,6 +6895,151 @@ extension NoteSignalKind: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * What a due prompt is. `Initial` asks for a question (and doubles as the tone picker on first
+ * use), `Nudge` is the one-and-only reminder for an unanswered initial prompt, `CheckIn` revisits
+ * the live question at cadence.
+ */
+
+public enum PromptEventKind {
+    
+    case initial
+    case nudge
+    case checkIn
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePromptEventKind: FfiConverterRustBuffer {
+    typealias SwiftType = PromptEventKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PromptEventKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .initial
+        
+        case 2: return .nudge
+        
+        case 3: return .checkIn
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PromptEventKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .initial:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .nudge:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .checkIn:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePromptEventKind_lift(_ buf: RustBuffer) throws -> PromptEventKind {
+    return try FfiConverterTypePromptEventKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePromptEventKind_lower(_ value: PromptEventKind) -> RustBuffer {
+    return FfiConverterTypePromptEventKind.lower(value)
+}
+
+
+
+extension PromptEventKind: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Which phrasing a prompt uses (SUR-996). The strings themselves stay client-side (SUR-996 Q1 —
+ * localization lives with the clients); core owns only the choice, so both platforms cannot
+ * disagree about which tone is in force.
+ */
+
+public enum PromptTone {
+    
+    case introspective
+    case productive
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePromptTone: FfiConverterRustBuffer {
+    typealias SwiftType = PromptTone
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PromptTone {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .introspective
+        
+        case 2: return .productive
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PromptTone, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .introspective:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .productive:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePromptTone_lift(_ buf: RustBuffer) throws -> PromptTone {
+    return try FfiConverterTypePromptTone.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePromptTone_lower(_ value: PromptTone) -> RustBuffer {
+    return FfiConverterTypePromptTone.lower(value)
+}
+
+
+
+extension PromptTone: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Which entity a [`SearchHit`] points at. Mirrors the PWA's `type` field (`'note'`/`'idea'`),
  * but a closed enum gives Swift/Kotlin an exhaustive switch instead of a stringly-typed field.
  * Scope is notes + custom-ideas only (SUR-744 decision 1); books aren't indexed by the PWA and
@@ -7275,6 +7749,31 @@ fileprivate struct FfiConverterSequenceTypeNoteRecord: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypePromptEvent: FfiConverterRustBuffer {
+    typealias SwiftType = [PromptEvent]
+
+    public static func write(_ value: [PromptEvent], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePromptEvent.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PromptEvent] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PromptEvent]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePromptEvent.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeQuestionRecord: FfiConverterRustBuffer {
     typealias SwiftType = [QuestionRecord]
 
@@ -7550,6 +8049,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_merge_content_duplicates() != 26022) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_braird_core_checksum_method_syncengine_next_prompt_events() != 21888) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_braird_core_checksum_method_syncengine_note_ids_for_collection() != 25011) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7563,6 +8065,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_pending_embed_count() != 26076) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_prompt_settings() != 18424) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_pull() != 8960) {
@@ -7595,10 +8100,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_set_access_token() != 47386) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_braird_core_checksum_method_syncengine_set_prompt_settings() != 58431) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_braird_core_checksum_method_syncengine_set_user_setting() != 2882) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_similar_notes() != 52094) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_skip_checkin() != 64973) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_skip_prompt() != 15062) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_soft_delete_signals_for_note() != 38804) {
