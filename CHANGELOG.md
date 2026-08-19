@@ -61,7 +61,10 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   writes. Heading-shaped text indented one to three spaces is refused too — CommonMark still
   renders it as a heading (including nested in a list item), while this format's structure sits at
   column 0, exactly as `release.yml`'s own heading check requires — and a deleted or renamed
-  `CHANGELOG.md` now fails the self-check instead of leaving it green with nothing to validate. One blank line was inserted before a `### Fixed`
+  `CHANGELOG.md` now fails the self-check instead of leaving it green with nothing to validate. The
+  document-level section split uses the same line-bounded whitespace as every per-line grammar — its
+  `\s+` matched a newline, so a bare `##` line joined the next line into a phantom section the
+  classifier never saw and the validator never audited. One blank line was inserted before a `### Fixed`
   in the 0.13.1 section — whitespace-only, no entry text changed — where a formatting slip in
   shipped history was the sole exception to the rule across 47 subsection headings.
 

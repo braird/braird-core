@@ -43,7 +43,10 @@
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 
 const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
-const VERSION_HEADING = /^ {0,3}##\s+\[([^\]]+)\]/;
+// `[ \t]` rather than `\s`: these run per line so `\s` cannot cross a newline HERE, but the section
+// split in the staleness checker runs on the whole document and was caught doing exactly that. One
+// alphabet everywhere, so the grammars cannot disagree about what a heading is.
+const VERSION_HEADING = /^ {0,3}##[ \t]+\[([^\]]+)\]/;
 
 /**
  * The `[start, end)` ranges of inline code spans on one line, by CommonMark's rule that a span is
@@ -173,7 +176,7 @@ export function classifyChangelogLines(text) {
 }
 
 /** A line that would read as structure if it were live: a section heading or a subsection heading. */
-const HEADING_SHAPED = /^ {0,3}(## \[|###\s)/;
+const HEADING_SHAPED = /^ {0,3}(## \[|###[ \t])/;
 
 /**
  * Every line the classifier HID whose raw text is heading-shaped — the ambiguity detector that lets

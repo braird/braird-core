@@ -159,7 +159,12 @@ export function parseChangelog(text) {
   // The split runs on the MASKED text, not the original. Deciding structure from a probe and then
   // splitting the original is its own trap: the classifier correctly says "that commented-out
   // heading is not a boundary" and the split treats it as one anyway.
-  const parts = maskedForSectionSplit(text).split(/^ {0,3}##\s+\[([^\]]+)\]([^\n]*)$/m);
+  // `[ \t]+`, never `\s+`: the split runs on the WHOLE document, so `\s+` matches a newline and a
+  // bare `##` line followed by `[x.y.z] - date` on the next line parsed as a heading — one the
+  // line-bounded classifier never saw, so the validator audited nothing and the phantom section
+  // silently adopted the Security work below it. Every heading grammar here is line-bounded; the
+  // split must use the same alphabet.
+  const parts = maskedForSectionSplit(text).split(/^ {0,3}##[ \t]+\[([^\]]+)\]([^\n]*)$/m);
   // parts[0] is the preamble; thereafter [version, headingTail, body, version, headingTail, ...].
   const sections = [];
   for (let i = 1; i < parts.length; i += 3) {
@@ -1143,6 +1148,23 @@ const CORPUS = [
       now: '2026-03-01T00:00:00Z',
     },
     expect: [], // 9.9.9 is commented out, so it is not an undocumented release
+  },
+  // ── the split is line-bounded like every other heading grammar (Codex, this PR) ──
+  {
+    name: 'a bare ## line does not join the next line into a phantom section across the newline',
+    input: {
+      // `\s+` in the document-level split matched the newline; the classifier never saw a heading
+      // on either line, so the validator audited nothing and 0.14.1 adopted the Security work.
+      changelog:
+        '## [Unreleased]\n\n### Fixed\n- x\n\n##\n[0.14.1] - 2026-07-30\n\n### Security\n- the real fix\n\n' +
+        '## [0.14.0] - 2026-07-29\n\n### Added\n- x\n',
+      published: new Map([['0.14.0', rel('0.14.0', '2026-07-29T00:00:00Z')], ['0.14.1', rel('0.14.1', '2026-07-30T00:00:00Z')]]),
+      unreleasedSecuritySince: '2026-01-01T00:00:00Z',
+      now: '2026-03-01T00:00:00Z',
+    },
+    // The Security work stays in [Unreleased] and fires; and published 0.14.1, no longer supplied a
+    // phantom section by the crossing split, is correctly reported undocumented.
+    expect: ['unreleased', 'unpublished'],
   },
   // ── an UNTERMINATED comment marker is prose, not a comment that eats the file ──
   // This one shipped and broke the real CHANGELOG: the entry describing the comment handling
