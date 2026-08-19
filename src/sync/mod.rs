@@ -38,8 +38,8 @@ use crate::embeddings::{
 };
 use crate::fusion::{self, RankedHit, RankedSearchPage, SemanticStatus};
 use crate::prompt::{
-    self, PromptEvent, PromptSettings, PromptState, PROMPT_CADENCE_KEY, PROMPT_SKIPPED_AT_KEY,
-    PROMPT_TONE_KEY,
+    self, PromptEvent, PromptSettings, PromptState, PromptTone, PROMPT_CADENCE_KEY,
+    PROMPT_SKIPPED_AT_KEY, PROMPT_TONE_KEY,
 };
 use crate::search::{SearchDoc, SearchDocKind, SearchHit};
 use crate::store::{synced_table_names, StageExistingWriteError, Store};
@@ -1572,50 +1572,57 @@ impl SyncEngine {
         Self::read_prompt_settings(&store).map_err(store_err)
     }
 
-    /// Write the prompt settings that actually changed, clamping the cadence first (SUR-996 R4).
+    /// Set the check-in cadence, clamped to 72..=672 hours (SUR-996 R4).
     ///
-    /// ONLY THE ROWS THAT MOVED, and that is load-bearing rather than an optimisation. Per-setting
-    /// LWW is the whole reason `user_settings` is a KV table instead of a blob, but writing both
-    /// rows on every call would throw that away: a host holding a `PromptSettings` it read before
-    /// another device changed the tone would carry the stale tone back with a FRESH `updated_at`,
-    /// and LWW would hand the stale value the win. Comparing each key against its STORED string
-    /// first means a call that changes only the cadence touches only the cadence row, so the other
-    /// device's tone survives the merge. Same change-detection posture as
-    /// [`SyncEngine::stage_signal_write`] — an unchanged value is not a write, so there is no
-    /// `updated_at` bump and no outbox churn either.
+    /// ONE SETTING PER CALL, and that is the correctness boundary rather than a style choice.
+    /// Per-setting LWW is the whole reason `user_settings` is a KV table instead of a blob, and a
+    /// whole-object setter throws it away: a host that passes back a `PromptSettings` it read
+    /// before another device changed the tone would restage that stale tone with a FRESH
+    /// `updated_at` and win the merge with it. No amount of change-detection inside a whole-object
+    /// setter closes that — "the tone in this struct differs from the stored one" is exactly what a
+    /// deliberate tone change looks like too, so core cannot tell a stale cache from user intent.
+    /// Naming one setting per call removes the ambiguity instead of defining it, which is the
+    /// ruling this repo already made on [`SyncEngine::set_user_setting`]'s `Option` (SUR-1042): a
+    /// `set` API whose effect depends on state the caller cannot see is a trap.
     ///
-    /// Compared against the RAW stored string, not against [`SyncEngine::prompt_settings`], because
-    /// that read substitutes defaults for absent rows — and "absent" must still write. Otherwise a
-    /// user who deliberately chose the default values would never sync that choice, and a device
-    /// holding a non-default value would win the next merge by default.
-    ///
-    /// The residual case core cannot fix: a host that passes a genuinely stale tone AFTER pulling
-    /// the newer one is indistinguishable from a user deliberately changing it back. Hosts should
-    /// re-read settings before writing them.
-    ///
-    /// Routed through [`SyncEngine::set_user_setting`] rather than staging directly — one write
-    /// path per table, so the outbox semantics cannot drift between them. Not transactional across
-    /// the two rows: a failure between them leaves the first applied. ponytail: acceptable because
-    /// each row is independently meaningful and the next successful call converges both.
-    pub fn set_prompt_settings(&self, settings: PromptSettings) -> Result<(), SyncError> {
-        let cadence = prompt::clamp_cadence(settings.cadence_hours).to_string();
-        let tone = prompt::tone_value(settings.tone);
-
-        let (stored_cadence, stored_tone) = {
+    /// An unchanged value is not a write — no `updated_at` bump, no outbox churn, the
+    /// [`SyncEngine::stage_signal_write`] posture. Compared against the RAW stored string rather
+    /// than against [`SyncEngine::prompt_settings`], because that read substitutes defaults for
+    /// absent rows and "absent" must still write: otherwise a user who deliberately chose the
+    /// default cadence would never sync that choice, and a device holding a non-default value
+    /// would win the next merge by default.
+    pub fn set_prompt_cadence(&self, cadence_hours: u32) -> Result<(), SyncError> {
+        let cadence = prompt::clamp_cadence(cadence_hours).to_string();
+        let stored = {
             let store = lock!(self.store);
-            (
-                read::user_setting(&store, PROMPT_CADENCE_KEY).map_err(store_err)?,
-                read::user_setting(&store, PROMPT_TONE_KEY).map_err(store_err)?,
-            )
+            read::user_setting(&store, PROMPT_CADENCE_KEY).map_err(store_err)?
         };
+        if stored.as_deref() == Some(cadence.as_str()) {
+            return Ok(());
+        }
+        self.set_user_setting(PROMPT_CADENCE_KEY.into(), cadence)
+    }
 
-        if stored_cadence.as_deref() != Some(cadence.as_str()) {
-            self.set_user_setting(PROMPT_CADENCE_KEY.into(), cadence)?;
+    /// Set the prompt tone (SUR-996 R4) — applies from the next prompt; a live question's text is
+    /// untouched. One setting per call, for the reason [`SyncEngine::set_prompt_cadence`] gives.
+    ///
+    /// Writing the tone deliberately overwrites a stored value this build does not recognise. That
+    /// is the one case where naming the setting is not enough on its own: [`prompt::parse_tone`]
+    /// folds an unknown tone to the Introspective fallback on read, so a host cannot see what it is
+    /// replacing. It is still the right behaviour — the user is choosing a tone on this device, and
+    /// an explicit choice must win over a value nothing here can render — but it means an older
+    /// client can flatten a newer client's tone, which is inherent to a forward-extensible
+    /// vocabulary with no server CHECK, not to this method.
+    pub fn set_prompt_tone(&self, tone: PromptTone) -> Result<(), SyncError> {
+        let value = prompt::tone_value(tone);
+        let stored = {
+            let store = lock!(self.store);
+            read::user_setting(&store, PROMPT_TONE_KEY).map_err(store_err)?
+        };
+        if stored.as_deref() == Some(value) {
+            return Ok(());
         }
-        if stored_tone.as_deref() != Some(tone) {
-            self.set_user_setting(PROMPT_TONE_KEY.into(), tone.into())?;
-        }
-        Ok(())
+        self.set_user_setting(PROMPT_TONE_KEY.into(), value.into())
     }
 
     /// The prompt(s) the client should act on now, sorted by `due_at` (SUR-1043).
@@ -4879,12 +4886,8 @@ mod tests {
         let db_path = db.to_str().unwrap();
         let engine = engine_at(db_path);
 
-        engine
-            .set_prompt_settings(PromptSettings {
-                cadence_hours: 336,
-                tone: PromptTone::Productive,
-            })
-            .unwrap();
+        engine.set_prompt_cadence(336).unwrap();
+        engine.set_prompt_tone(PromptTone::Productive).unwrap();
 
         let settings = engine.prompt_settings().unwrap();
         assert_eq!(settings.cadence_hours, 336);
@@ -4912,18 +4915,14 @@ mod tests {
 
     #[test]
     fn changing_one_setting_does_not_restage_the_other() {
-        // The stomp this guards: a host holding settings it read BEFORE another device changed the
-        // tone would otherwise carry the stale tone back with a fresh `updated_at` and win LWW.
+        // The stomp this guards: a host that saved a cadence change must not carry a tone back with
+        // it and win LWW against a newer tone from another device.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
         let engine = engine_at(db_path);
-        engine
-            .set_prompt_settings(PromptSettings {
-                cadence_hours: 168,
-                tone: PromptTone::Introspective,
-            })
-            .unwrap();
+        engine.set_prompt_cadence(168).unwrap();
+        engine.set_prompt_tone(PromptTone::Introspective).unwrap();
         // Stamp the tone row with a sentinel `updated_at` no clock would produce, so the assertion
         // cannot pass by two writes landing in the same millisecond.
         let store = Store::open(db_path).unwrap();
@@ -4935,12 +4934,7 @@ mod tests {
         store.apply_row("user_settings", &tone_row).unwrap();
 
         // Only the cadence moves.
-        engine
-            .set_prompt_settings(PromptSettings {
-                cadence_hours: 336,
-                tone: PromptTone::Introspective,
-            })
-            .unwrap();
+        engine.set_prompt_cadence(336).unwrap();
 
         let tone_after = Store::open(db_path)
             .unwrap()
@@ -4957,19 +4951,59 @@ mod tests {
     }
 
     #[test]
-    fn writing_identical_settings_stages_nothing() {
+    fn a_cadence_change_cannot_reach_the_tone_row_at_all() {
+        // The stale-cache stomp, structurally: a host that read the settings, then PULLED another
+        // device's newer tone, then saved a cadence change. A whole-object setter could not tell
+        // that stale tone from a deliberate change back, so the API does not offer it one — there
+        // is no argument here that could carry a tone.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
         let engine = engine_at(db_path);
-        let settings = PromptSettings {
-            cadence_hours: 336,
-            tone: PromptTone::Productive,
-        };
-        engine.set_prompt_settings(settings).unwrap();
+        engine.set_prompt_tone(PromptTone::Introspective).unwrap();
+
+        // The other device's newer tone arrives.
+        let store = Store::open(db_path).unwrap();
+        let mut pulled = store
+            .get_row("user_settings", PROMPT_TONE_KEY)
+            .unwrap()
+            .unwrap();
+        pulled.insert("value".into(), json!("productive"));
+        pulled.insert("updated_at".into(), json!(42));
+        store.apply_row("user_settings", &pulled).unwrap();
+
+        engine.set_prompt_cadence(336).unwrap();
+
+        let settings = engine.prompt_settings().unwrap();
+        assert_eq!(settings.cadence_hours, 336);
+        assert_eq!(
+            settings.tone,
+            PromptTone::Productive,
+            "saving a cadence must not be able to resurrect this device's older tone"
+        );
+        assert_eq!(
+            Store::open(db_path)
+                .unwrap()
+                .get_row("user_settings", PROMPT_TONE_KEY)
+                .unwrap()
+                .unwrap()["updated_at"],
+            json!(42),
+            "the pulled tone row must not be restaged at all"
+        );
+    }
+
+    #[test]
+    fn writing_an_identical_setting_stages_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.set_prompt_cadence(336).unwrap();
+        engine.set_prompt_tone(PromptTone::Productive).unwrap();
         let queued = Store::open(db_path).unwrap().outbox_items().unwrap().len();
 
-        engine.set_prompt_settings(settings).unwrap();
+        engine.set_prompt_cadence(336).unwrap();
+        engine.set_prompt_tone(PromptTone::Productive).unwrap();
 
         assert_eq!(
             Store::open(db_path).unwrap().outbox_items().unwrap().len(),
@@ -4988,11 +5022,9 @@ mod tests {
         let engine = engine_at(db_path);
 
         engine
-            .set_prompt_settings(PromptSettings {
-                cadence_hours: prompt::CADENCE_DEFAULT_HOURS,
-                tone: PromptTone::Introspective,
-            })
+            .set_prompt_cadence(prompt::CADENCE_DEFAULT_HOURS)
             .unwrap();
+        engine.set_prompt_tone(PromptTone::Introspective).unwrap();
 
         let store = Store::open(db_path).unwrap();
         assert!(
@@ -5050,12 +5082,7 @@ mod tests {
         let db_path = db.to_str().unwrap();
         let engine = engine_at(db_path);
 
-        engine
-            .set_prompt_settings(PromptSettings {
-                cadence_hours: 9_999,
-                tone: PromptTone::Introspective,
-            })
-            .unwrap();
+        engine.set_prompt_cadence(9_999).unwrap();
 
         // Clamped before it is STORED, so a device that never runs this build still reads a legal
         // value out of the synced row.
@@ -5192,14 +5219,15 @@ mod tests {
         );
         assert_eq!(opening[1].due_at, created + prompt::NUDGE_DELAY_MS);
 
-        // 2. Skipped: the prompt goes quiet for one cadence, the nudge still stands.
+        // 2. Skipped: the prompt goes quiet for one full cadence, and the skip cancels the nudge —
+        //    a user who declined is not pinged 24h later (founder, 2026-08-19).
         engine.skip_prompt(created + 120_000).unwrap();
         let skipped = events(created + 130_000);
         assert_eq!(
             skipped.iter().map(|e| e.kind).collect::<Vec<_>>(),
-            vec![PromptEventKind::Nudge, PromptEventKind::Initial]
+            vec![PromptEventKind::Initial]
         );
-        assert_eq!(skipped[1].due_at, created + 120_000 + cadence);
+        assert_eq!(skipped[0].due_at, created + 120_000 + cadence);
 
         // 3. Answered: the loop switches to check-ins, one cadence from birth.
         let answered_at = created + 5 * hour;
@@ -5280,11 +5308,9 @@ mod tests {
 
         let before = engine.next_prompt_events(500_001, 1_000).unwrap()[0].due_at;
         engine
-            .set_prompt_settings(PromptSettings {
-                cadence_hours: prompt::CADENCE_MIN_HOURS,
-                tone: PromptTone::Productive,
-            })
+            .set_prompt_cadence(prompt::CADENCE_MIN_HOURS)
             .unwrap();
+        engine.set_prompt_tone(PromptTone::Productive).unwrap();
         let after = engine.next_prompt_events(500_001, 1_000).unwrap();
 
         assert!(after[0].due_at < before);
@@ -5334,12 +5360,8 @@ mod tests {
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
         let engine = engine_at(db_path);
-        engine
-            .set_prompt_settings(PromptSettings {
-                cadence_hours: 336,
-                tone: PromptTone::Productive,
-            })
-            .unwrap();
+        engine.set_prompt_cadence(336).unwrap();
+        engine.set_prompt_tone(PromptTone::Productive).unwrap();
 
         // Soft-delete the row the way a pulled tombstone would.
         let store = Store::open(db_path).unwrap();

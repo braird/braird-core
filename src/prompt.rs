@@ -161,7 +161,7 @@ fn is_active(q: &QuestionMeta) -> bool {
 /// |---|---|
 /// | a live question exists | `CheckIn` at `(checkin_at ?? created_at) + cadence` |
 /// | nothing ever answered, no skip | `Initial` at account creation, `+ Nudge` while `now < +24h` |
-/// | nothing ever answered, skipped at `t` | `Initial` at `t + cadence`, `+ Nudge` while `now < +24h` |
+/// | nothing ever answered, skipped at `t` | `Initial` at `t + cadence` — the skip cancels the nudge |
 /// | only archived questions | `Initial` at `max(last close, skip) + cadence` — never a `Nudge` again |
 ///
 /// "Resolved → offer a new question" is not here: that dialog happens in the resolve flow, at the
@@ -232,8 +232,16 @@ pub fn next_events(
     // question row at all — live or archived — means the user has answered once and is past the
     // phase the nudge serves. The client schedules a one-shot notification for `due_at`; the OS
     // does not repeat it.
+    //
+    // A RECORDED SKIP CANCELS IT (founder, 2026-08-19). R2's sentence covers the skipper and the
+    // leaver in one breath, but the two have not done the same thing: the nudge exists so a user
+    // who wandered off mid-onboarding does not lose the moment, while a skip is an answer — the
+    // user was asked and declined. Nudging them 24h later contradicts the same paragraph's promise
+    // that the next prompt waits a full cadence (≥72h), and "always skippable, never nagged" is an
+    // explicit non-goal of the feature. So the quiet period a skip earns is quiet, not quieter-
+    // except-once.
     let nudge_at = state.account_created_at_ms.saturating_add(NUDGE_DELAY_MS);
-    if state.questions.is_empty() && now_ms < nudge_at {
+    if state.questions.is_empty() && state.prompt_skipped_at_ms.is_none() && now_ms < nudge_at {
         events.push(event(PromptEventKind::Nudge, nudge_at));
     }
 
@@ -320,20 +328,17 @@ mod tests {
     }
 
     #[test]
-    fn a_skip_inside_the_nudge_window_still_gets_its_nudge() {
+    fn a_skip_inside_the_nudge_window_cancels_the_nudge() {
+        // Founder, 2026-08-19: a skip is an answer, so the quiet period it earns is quiet. Nudging
+        // 24h after an explicit dismissal would contradict the same rule's ≥72h promise.
         let skipped = CREATED + 60_000;
         let events = next_events(
             &state(vec![], Some(skipped)),
             &settings(PromptTone::Introspective),
             skipped + 1,
         );
-        // Sorted: cadence (≥72h) always outruns the 24h nudge, so the nudge lands first.
-        assert_eq!(
-            kinds(&events),
-            vec![PromptEventKind::Nudge, PromptEventKind::Initial]
-        );
-        assert_eq!(events[0].due_at, CREATED + NUDGE_DELAY_MS);
-        assert_eq!(events[1].due_at, skipped + CADENCE_MS);
+        assert_eq!(kinds(&events), vec![PromptEventKind::Initial]);
+        assert_eq!(events[0].due_at, skipped + CADENCE_MS);
     }
 
     #[test]

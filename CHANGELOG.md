@@ -41,13 +41,25 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   question that fails to decrypt still schedules its check-in.
   New synced key `prompt_skipped_at`, stored rather than kept device-local so per-row LWW makes the
   newest skip win — a skip on the phone silences the same prompt on the tablet.
-  `set_prompt_settings` writes only the rows whose value actually changed, which is load-bearing
-  rather than an optimisation: writing both on every call would have thrown away the per-setting
-  isolation the KV table exists for. A host holding settings it read before another device changed
-  the tone would have carried the stale tone back with a fresh `updated_at`, and LWW would have
-  handed the stale value the win. Each key is compared against its STORED string, not against the
-  defaulted read — "absent" and "happens to equal the default" are different, and only the former
-  may skip the write, or a user who deliberately chose the defaults would never sync that choice.
+  Settings are written ONE AT A TIME — `set_prompt_cadence` and `set_prompt_tone`, never a
+  whole-object setter — and that is the correctness boundary, not a style choice. Per-setting LWW is
+  the whole reason `user_settings` is a KV table rather than a blob, and a setter taking both values
+  throws it away: a host that passes back settings it read before another device changed the tone
+  restages that stale tone with a fresh `updated_at` and wins the merge with it. Change-detection
+  inside such a setter does not close the hole either, because "the tone in this struct differs from
+  the stored one" is exactly what a deliberate tone change looks like — core cannot tell a stale
+  cache from user intent. Naming one setting per call removes the ambiguity instead of defining it,
+  which is the ruling this repo already made on `set_user_setting`'s `Option` (SUR-1042).
+  An unchanged value is still not a write (no `updated_at` bump, no outbox churn), compared against
+  the STORED string rather than the defaulted read — "absent" and "happens to equal the default" are
+  different, and only the former may skip the write, or a user who deliberately chose the defaults
+  would never sync that choice.
+  A recorded skip cancels the nudge as well as earning the quiet period (founder, 2026-08-19). R2
+  covers the skipper and the leaver in one sentence, but they have not done the same thing: the
+  nudge exists so a user who wandered off mid-onboarding does not lose the moment, while a skip is
+  an answer. Nudging 24h after an explicit dismissal contradicts the same rule's promise that the
+  next prompt waits a full cadence, and "always skippable, never nagged" is an explicit non-goal of
+  the feature.
   A `CheckIn` event carries the id of the question it is about. The machine already decides which
   question wins when several are briefly active (a supersede, or a sync window); a client
   re-deriving that pick would be the cross-platform drift this ticket removes.

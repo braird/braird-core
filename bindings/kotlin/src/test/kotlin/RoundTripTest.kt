@@ -1092,8 +1092,10 @@ class RoundTripTest {
         // Nothing stored yet: the defaults cross intact.
         assertEquals(PromptSettings(168u, PromptTone.INTROSPECTIVE), engine.promptSettings())
 
-        // An out-of-range cadence is clamped by core, not by the client's picker.
-        engine.setPromptSettings(PromptSettings(cadenceHours = 10u, tone = PromptTone.PRODUCTIVE))
+        // An out-of-range cadence is clamped by core, not by the client's picker. One setting per
+        // call, so saving a cadence has no argument that could carry a stale tone back.
+        engine.setPromptCadence(10u)
+        engine.setPromptTone(PromptTone.PRODUCTIVE)
         val clamped = engine.promptSettings()
         assertEquals(72u, clamped.cadenceHours)
         assertEquals(PromptTone.PRODUCTIVE, clamped.tone)
@@ -1126,12 +1128,14 @@ class RoundTripTest {
         assertEquals(skippedAt + 72 * hourMs, engine.nextPromptEvents(skippedAt + 1, created)[0].dueAt)
         assertEquals("what am I sitting with?", engine.getQuestion("q1")!!.text)
 
-        // A recorded skip is what earns the quiet period on a fresh account.
+        // A recorded skip earns the quiet period on a fresh account, and cancels the nudge with it:
+        // a user who declined is not pinged 24h later.
         val other = File.createTempFile("braird-p2", ".sqlite").apply { deleteOnExit() }
         val fresh = SyncEngine.open(other.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
         fresh.skipPrompt(created + 5_000L)
-        val quiet = fresh.nextPromptEvents(created + 6_000L, created).single { it.kind == PromptEventKind.INITIAL }
-        assertEquals(created + 5_000L + 168 * hourMs, quiet.dueAt)
+        val quiet = fresh.nextPromptEvents(created + 6_000L, created)
+        assertEquals(listOf(PromptEventKind.INITIAL), quiet.map { it.kind })
+        assertEquals(created + 5_000L + 168 * hourMs, quiet[0].dueAt)
     }
 
     /** A stale/invalid handle used to throw InternalException BEFORE the shim's guard,

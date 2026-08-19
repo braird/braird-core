@@ -1033,9 +1033,10 @@ final class RoundTripTests: XCTestCase {
         XCTAssertEqual(defaults.cadenceHours, 168)
         XCTAssertEqual(defaults.tone, .introspective)
 
-        // An out-of-range cadence is clamped by core, not by the client's picker.
-        try engine.setPromptSettings(
-            settings: PromptSettings(cadenceHours: 10, tone: .productive))
+        // An out-of-range cadence is clamped by core, not by the client's picker. One setting per
+        // call, so saving a cadence has no argument that could carry a stale tone back.
+        try engine.setPromptCadence(cadenceHours: 10)
+        try engine.setPromptTone(tone: .productive)
         let clamped = try engine.promptSettings()
         XCTAssertEqual(clamped.cadenceHours, 72)
         XCTAssertEqual(clamped.tone, .productive)
@@ -1070,7 +1071,8 @@ final class RoundTripTests: XCTestCase {
             skippedAt + 72 * hourMs)
         XCTAssertEqual(try engine.getQuestion(id: "q1")?.text, "what am I sitting with?")
 
-        // A recorded skip is what earns the quiet period on a fresh account.
+        // A recorded skip earns the quiet period on a fresh account, and cancels the nudge with it:
+        // a user who declined is not pinged 24h later.
         let other = FileManager.default.temporaryDirectory
             .appendingPathComponent("braird-p2-\(UUID().uuidString).sqlite")
         let fresh = try SyncEngine.open(
@@ -1078,9 +1080,8 @@ final class RoundTripTests: XCTestCase {
             vault: Vault.generate())
         try fresh.skipPrompt(nowMs: created + 5_000)
         let quiet = try fresh.nextPromptEvents(
-            nowMs: created + 6_000, accountCreatedAtMs: created
-        ).filter { $0.kind == .initial }
-        XCTAssertEqual(quiet.count, 1)
+            nowMs: created + 6_000, accountCreatedAtMs: created)
+        XCTAssertEqual(quiet.map { $0.kind }, [.initial])
         XCTAssertEqual(quiet[0].dueAt, created + 5_000 + 168 * hourMs)
     }
 }

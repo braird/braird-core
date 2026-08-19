@@ -1465,33 +1465,41 @@ public protocol SyncEngineProtocol : AnyObject {
     func setAccessToken(jwt: String) 
     
     /**
-     * Write the prompt settings that actually changed, clamping the cadence first (SUR-996 R4).
+     * Set the check-in cadence, clamped to 72..=672 hours (SUR-996 R4).
      *
-     * ONLY THE ROWS THAT MOVED, and that is load-bearing rather than an optimisation. Per-setting
-     * LWW is the whole reason `user_settings` is a KV table instead of a blob, but writing both
-     * rows on every call would throw that away: a host holding a `PromptSettings` it read before
-     * another device changed the tone would carry the stale tone back with a FRESH `updated_at`,
-     * and LWW would hand the stale value the win. Comparing each key against its STORED string
-     * first means a call that changes only the cadence touches only the cadence row, so the other
-     * device's tone survives the merge. Same change-detection posture as
-     * [`SyncEngine::stage_signal_write`] — an unchanged value is not a write, so there is no
-     * `updated_at` bump and no outbox churn either.
+     * ONE SETTING PER CALL, and that is the correctness boundary rather than a style choice.
+     * Per-setting LWW is the whole reason `user_settings` is a KV table instead of a blob, and a
+     * whole-object setter throws it away: a host that passes back a `PromptSettings` it read
+     * before another device changed the tone would restage that stale tone with a FRESH
+     * `updated_at` and win the merge with it. No amount of change-detection inside a whole-object
+     * setter closes that — "the tone in this struct differs from the stored one" is exactly what a
+     * deliberate tone change looks like too, so core cannot tell a stale cache from user intent.
+     * Naming one setting per call removes the ambiguity instead of defining it, which is the
+     * ruling this repo already made on [`SyncEngine::set_user_setting`]'s `Option` (SUR-1042): a
+     * `set` API whose effect depends on state the caller cannot see is a trap.
      *
-     * Compared against the RAW stored string, not against [`SyncEngine::prompt_settings`], because
-     * that read substitutes defaults for absent rows — and "absent" must still write. Otherwise a
-     * user who deliberately chose the default values would never sync that choice, and a device
-     * holding a non-default value would win the next merge by default.
-     *
-     * The residual case core cannot fix: a host that passes a genuinely stale tone AFTER pulling
-     * the newer one is indistinguishable from a user deliberately changing it back. Hosts should
-     * re-read settings before writing them.
-     *
-     * Routed through [`SyncEngine::set_user_setting`] rather than staging directly — one write
-     * path per table, so the outbox semantics cannot drift between them. Not transactional across
-     * the two rows: a failure between them leaves the first applied. ponytail: acceptable because
-     * each row is independently meaningful and the next successful call converges both.
+     * An unchanged value is not a write — no `updated_at` bump, no outbox churn, the
+     * [`SyncEngine::stage_signal_write`] posture. Compared against the RAW stored string rather
+     * than against [`SyncEngine::prompt_settings`], because that read substitutes defaults for
+     * absent rows and "absent" must still write: otherwise a user who deliberately chose the
+     * default cadence would never sync that choice, and a device holding a non-default value
+     * would win the next merge by default.
      */
-    func setPromptSettings(settings: PromptSettings) throws 
+    func setPromptCadence(cadenceHours: UInt32) throws 
+    
+    /**
+     * Set the prompt tone (SUR-996 R4) — applies from the next prompt; a live question's text is
+     * untouched. One setting per call, for the reason [`SyncEngine::set_prompt_cadence`] gives.
+     *
+     * Writing the tone deliberately overwrites a stored value this build does not recognise. That
+     * is the one case where naming the setting is not enough on its own: [`prompt::parse_tone`]
+     * folds an unknown tone to the Introspective fallback on read, so a host cannot see what it is
+     * replacing. It is still the right behaviour — the user is choosing a tone on this device, and
+     * an explicit choice must win over a value nothing here can render — but it means an older
+     * client can flatten a newer client's tone, which is inherent to a forward-extensible
+     * vocabulary with no server CHECK, not to this method.
+     */
+    func setPromptTone(tone: PromptTone) throws 
     
     /**
      * Write one synced user setting (SUR-1042) — braird's first synced settings, a per-user KV
@@ -2597,35 +2605,48 @@ open func setAccessToken(jwt: String) {try! rustCall() {
 }
     
     /**
-     * Write the prompt settings that actually changed, clamping the cadence first (SUR-996 R4).
+     * Set the check-in cadence, clamped to 72..=672 hours (SUR-996 R4).
      *
-     * ONLY THE ROWS THAT MOVED, and that is load-bearing rather than an optimisation. Per-setting
-     * LWW is the whole reason `user_settings` is a KV table instead of a blob, but writing both
-     * rows on every call would throw that away: a host holding a `PromptSettings` it read before
-     * another device changed the tone would carry the stale tone back with a FRESH `updated_at`,
-     * and LWW would hand the stale value the win. Comparing each key against its STORED string
-     * first means a call that changes only the cadence touches only the cadence row, so the other
-     * device's tone survives the merge. Same change-detection posture as
-     * [`SyncEngine::stage_signal_write`] — an unchanged value is not a write, so there is no
-     * `updated_at` bump and no outbox churn either.
+     * ONE SETTING PER CALL, and that is the correctness boundary rather than a style choice.
+     * Per-setting LWW is the whole reason `user_settings` is a KV table instead of a blob, and a
+     * whole-object setter throws it away: a host that passes back a `PromptSettings` it read
+     * before another device changed the tone would restage that stale tone with a FRESH
+     * `updated_at` and win the merge with it. No amount of change-detection inside a whole-object
+     * setter closes that — "the tone in this struct differs from the stored one" is exactly what a
+     * deliberate tone change looks like too, so core cannot tell a stale cache from user intent.
+     * Naming one setting per call removes the ambiguity instead of defining it, which is the
+     * ruling this repo already made on [`SyncEngine::set_user_setting`]'s `Option` (SUR-1042): a
+     * `set` API whose effect depends on state the caller cannot see is a trap.
      *
-     * Compared against the RAW stored string, not against [`SyncEngine::prompt_settings`], because
-     * that read substitutes defaults for absent rows — and "absent" must still write. Otherwise a
-     * user who deliberately chose the default values would never sync that choice, and a device
-     * holding a non-default value would win the next merge by default.
-     *
-     * The residual case core cannot fix: a host that passes a genuinely stale tone AFTER pulling
-     * the newer one is indistinguishable from a user deliberately changing it back. Hosts should
-     * re-read settings before writing them.
-     *
-     * Routed through [`SyncEngine::set_user_setting`] rather than staging directly — one write
-     * path per table, so the outbox semantics cannot drift between them. Not transactional across
-     * the two rows: a failure between them leaves the first applied. ponytail: acceptable because
-     * each row is independently meaningful and the next successful call converges both.
+     * An unchanged value is not a write — no `updated_at` bump, no outbox churn, the
+     * [`SyncEngine::stage_signal_write`] posture. Compared against the RAW stored string rather
+     * than against [`SyncEngine::prompt_settings`], because that read substitutes defaults for
+     * absent rows and "absent" must still write: otherwise a user who deliberately chose the
+     * default cadence would never sync that choice, and a device holding a non-default value
+     * would win the next merge by default.
      */
-open func setPromptSettings(settings: PromptSettings)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
-    uniffi_braird_core_fn_method_syncengine_set_prompt_settings(self.uniffiClonePointer(),
-        FfiConverterTypePromptSettings.lower(settings),$0
+open func setPromptCadence(cadenceHours: UInt32)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_set_prompt_cadence(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(cadenceHours),$0
+    )
+}
+}
+    
+    /**
+     * Set the prompt tone (SUR-996 R4) — applies from the next prompt; a live question's text is
+     * untouched. One setting per call, for the reason [`SyncEngine::set_prompt_cadence`] gives.
+     *
+     * Writing the tone deliberately overwrites a stored value this build does not recognise. That
+     * is the one case where naming the setting is not enough on its own: [`prompt::parse_tone`]
+     * folds an unknown tone to the Introspective fallback on read, so a host cannot see what it is
+     * replacing. It is still the right behaviour — the user is choosing a tone on this device, and
+     * an explicit choice must win over a value nothing here can render — but it means an older
+     * client can flatten a newer client's tone, which is inherent to a forward-extensible
+     * vocabulary with no server CHECK, not to this method.
+     */
+open func setPromptTone(tone: PromptTone)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_set_prompt_tone(self.uniffiClonePointer(),
+        FfiConverterTypePromptTone.lower(tone),$0
     )
 }
 }
@@ -8144,7 +8165,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_set_access_token() != 47386) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_set_prompt_settings() != 56368) {
+    if (uniffi_braird_core_checksum_method_syncengine_set_prompt_cadence() != 59597) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_set_prompt_tone() != 45506) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_set_user_setting() != 2882) {
