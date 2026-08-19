@@ -41,6 +41,16 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   question that fails to decrypt still schedules its check-in.
   New synced key `prompt_skipped_at`, stored rather than kept device-local so per-row LWW makes the
   newest skip win — a skip on the phone silences the same prompt on the tablet.
+  `set_prompt_settings` writes only the rows whose value actually changed, which is load-bearing
+  rather than an optimisation: writing both on every call would have thrown away the per-setting
+  isolation the KV table exists for. A host holding settings it read before another device changed
+  the tone would have carried the stale tone back with a fresh `updated_at`, and LWW would have
+  handed the stale value the win. Each key is compared against its STORED string, not against the
+  defaulted read — "absent" and "happens to equal the default" are different, and only the former
+  may skip the write, or a user who deliberately chose the defaults would never sync that choice.
+  A `CheckIn` event carries the id of the question it is about. The machine already decides which
+  question wins when several are briefly active (a supersede, or a sync window); a client
+  re-deriving that pick would be the cross-platform drift this ticket removes.
 
 ### Fixed
 - **The release-staleness checker could not read its own CHANGELOG (SUR-1070 follow-up).** An

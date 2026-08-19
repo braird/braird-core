@@ -1572,23 +1572,50 @@ impl SyncEngine {
         Self::read_prompt_settings(&store).map_err(store_err)
     }
 
-    /// Write both prompt settings, clamping the cadence first (SUR-996 R4).
+    /// Write the prompt settings that actually changed, clamping the cadence first (SUR-996 R4).
     ///
-    /// TWO ROWS, ONE CALL, and deliberately not one blob: per-setting LWW is the whole reason
-    /// `user_settings` is a KV table, so a device changing the cadence must not stomp another
-    /// device's tone. Routed through [`SyncEngine::set_user_setting`] rather than staging directly
-    /// — one write path per table, so the outbox semantics cannot drift between them.
+    /// ONLY THE ROWS THAT MOVED, and that is load-bearing rather than an optimisation. Per-setting
+    /// LWW is the whole reason `user_settings` is a KV table instead of a blob, but writing both
+    /// rows on every call would throw that away: a host holding a `PromptSettings` it read before
+    /// another device changed the tone would carry the stale tone back with a FRESH `updated_at`,
+    /// and LWW would hand the stale value the win. Comparing each key against its STORED string
+    /// first means a call that changes only the cadence touches only the cadence row, so the other
+    /// device's tone survives the merge. Same change-detection posture as
+    /// [`SyncEngine::stage_signal_write`] — an unchanged value is not a write, so there is no
+    /// `updated_at` bump and no outbox churn either.
     ///
-    /// Not transactional across the two rows: a failure between them leaves the first applied.
-    /// ponytail: acceptable because each row is independently meaningful and the next successful
-    /// call converges both; a settings write that needed atomicity would need a different table.
+    /// Compared against the RAW stored string, not against [`SyncEngine::prompt_settings`], because
+    /// that read substitutes defaults for absent rows — and "absent" must still write. Otherwise a
+    /// user who deliberately chose the default values would never sync that choice, and a device
+    /// holding a non-default value would win the next merge by default.
+    ///
+    /// The residual case core cannot fix: a host that passes a genuinely stale tone AFTER pulling
+    /// the newer one is indistinguishable from a user deliberately changing it back. Hosts should
+    /// re-read settings before writing them.
+    ///
+    /// Routed through [`SyncEngine::set_user_setting`] rather than staging directly — one write
+    /// path per table, so the outbox semantics cannot drift between them. Not transactional across
+    /// the two rows: a failure between them leaves the first applied. ponytail: acceptable because
+    /// each row is independently meaningful and the next successful call converges both.
     pub fn set_prompt_settings(&self, settings: PromptSettings) -> Result<(), SyncError> {
-        let cadence = prompt::clamp_cadence(settings.cadence_hours);
-        self.set_user_setting(PROMPT_CADENCE_KEY.into(), cadence.to_string())?;
-        self.set_user_setting(
-            PROMPT_TONE_KEY.into(),
-            prompt::tone_value(settings.tone).into(),
-        )
+        let cadence = prompt::clamp_cadence(settings.cadence_hours).to_string();
+        let tone = prompt::tone_value(settings.tone);
+
+        let (stored_cadence, stored_tone) = {
+            let store = lock!(self.store);
+            (
+                read::user_setting(&store, PROMPT_CADENCE_KEY).map_err(store_err)?,
+                read::user_setting(&store, PROMPT_TONE_KEY).map_err(store_err)?,
+            )
+        };
+
+        if stored_cadence.as_deref() != Some(cadence.as_str()) {
+            self.set_user_setting(PROMPT_CADENCE_KEY.into(), cadence)?;
+        }
+        if stored_tone.as_deref() != Some(tone) {
+            self.set_user_setting(PROMPT_TONE_KEY.into(), tone.into())?;
+        }
+        Ok(())
     }
 
     /// The prompt(s) the client should act on now, sorted by `due_at` (SUR-1043).
@@ -4880,6 +4907,139 @@ mod tests {
                 .unwrap()["value"]
                 .as_str(),
             Some("productive")
+        );
+    }
+
+    #[test]
+    fn changing_one_setting_does_not_restage_the_other() {
+        // The stomp this guards: a host holding settings it read BEFORE another device changed the
+        // tone would otherwise carry the stale tone back with a fresh `updated_at` and win LWW.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .set_prompt_settings(PromptSettings {
+                cadence_hours: 168,
+                tone: PromptTone::Introspective,
+            })
+            .unwrap();
+        // Stamp the tone row with a sentinel `updated_at` no clock would produce, so the assertion
+        // cannot pass by two writes landing in the same millisecond.
+        let store = Store::open(db_path).unwrap();
+        let mut tone_row = store
+            .get_row("user_settings", PROMPT_TONE_KEY)
+            .unwrap()
+            .unwrap();
+        tone_row.insert("updated_at".into(), json!(42));
+        store.apply_row("user_settings", &tone_row).unwrap();
+
+        // Only the cadence moves.
+        engine
+            .set_prompt_settings(PromptSettings {
+                cadence_hours: 336,
+                tone: PromptTone::Introspective,
+            })
+            .unwrap();
+
+        let tone_after = Store::open(db_path)
+            .unwrap()
+            .get_row("user_settings", PROMPT_TONE_KEY)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            tone_after["updated_at"],
+            json!(42),
+            "an unchanged tone must not be restaged — a fresh updated_at would win LWW against a \
+             newer tone from another device"
+        );
+        assert_eq!(engine.prompt_settings().unwrap().cadence_hours, 336);
+    }
+
+    #[test]
+    fn writing_identical_settings_stages_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        let settings = PromptSettings {
+            cadence_hours: 336,
+            tone: PromptTone::Productive,
+        };
+        engine.set_prompt_settings(settings).unwrap();
+        let queued = Store::open(db_path).unwrap().outbox_items().unwrap().len();
+
+        engine.set_prompt_settings(settings).unwrap();
+
+        assert_eq!(
+            Store::open(db_path).unwrap().outbox_items().unwrap().len(),
+            queued,
+            "an unchanged value is not a write"
+        );
+    }
+
+    #[test]
+    fn choosing_the_default_values_still_syncs_them() {
+        // Compared against the RAW stored string, not against the defaulted read: "absent" and
+        // "happens to equal the default" are different, and only the former may skip the write.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        engine
+            .set_prompt_settings(PromptSettings {
+                cadence_hours: prompt::CADENCE_DEFAULT_HOURS,
+                tone: PromptTone::Introspective,
+            })
+            .unwrap();
+
+        let store = Store::open(db_path).unwrap();
+        assert!(
+            store
+                .get_row("user_settings", PROMPT_CADENCE_KEY)
+                .unwrap()
+                .is_some(),
+            "a deliberate choice of the default value must still reach the other devices"
+        );
+        assert!(store
+            .get_row("user_settings", PROMPT_TONE_KEY)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn a_check_in_names_the_question_it_is_about() {
+        // The client must not have to re-derive "which question" — that re-implements the pick and
+        // is exactly the drift this state machine removes.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+        let draft = |id: &str, created_at: i64, status: &str| QuestionUpsert {
+            id: id.into(),
+            plaintext: Some("q".into()),
+            status: Some(status.into()),
+            tone: None,
+            resolved_at: None,
+            checkin_at: None,
+            checkin_response: None,
+            created_at,
+            deleted: false,
+        };
+        engine
+            .enqueue_question(draft("old", 1_000, "active"))
+            .unwrap();
+        engine
+            .enqueue_question(draft("newer", 2_000, "active"))
+            .unwrap();
+
+        let events = engine.next_prompt_events(2_001, 500).unwrap();
+
+        assert_eq!(events[0].kind, PromptEventKind::CheckIn);
+        assert_eq!(
+            events[0].question_id.as_deref(),
+            Some("newer"),
+            "the event must name the SAME question the machine picked"
         );
     }
 

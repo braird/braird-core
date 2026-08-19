@@ -1116,6 +1116,9 @@ class RoundTripTest {
         val live = engine.nextPromptEvents(created + 60_000L, created)
         assertEquals(listOf(PromptEventKind.CHECK_IN), live.map { it.kind })
         assertEquals(created + 72 * hourMs, live[0].dueAt)
+        // The event names its question, so the client never re-derives the pick.
+        assertEquals("q1", live[0].questionId)
+        assertEquals(null, opening[0].questionId, "an initial prompt has no question yet")
 
         // Skipping the check-in resets the timer and leaves the sealed text alone.
         val skippedAt = created + 80 * hourMs

@@ -1465,16 +1465,31 @@ public protocol SyncEngineProtocol : AnyObject {
     func setAccessToken(jwt: String) 
     
     /**
-     * Write both prompt settings, clamping the cadence first (SUR-996 R4).
+     * Write the prompt settings that actually changed, clamping the cadence first (SUR-996 R4).
      *
-     * TWO ROWS, ONE CALL, and deliberately not one blob: per-setting LWW is the whole reason
-     * `user_settings` is a KV table, so a device changing the cadence must not stomp another
-     * device's tone. Routed through [`SyncEngine::set_user_setting`] rather than staging directly
-     * — one write path per table, so the outbox semantics cannot drift between them.
+     * ONLY THE ROWS THAT MOVED, and that is load-bearing rather than an optimisation. Per-setting
+     * LWW is the whole reason `user_settings` is a KV table instead of a blob, but writing both
+     * rows on every call would throw that away: a host holding a `PromptSettings` it read before
+     * another device changed the tone would carry the stale tone back with a FRESH `updated_at`,
+     * and LWW would hand the stale value the win. Comparing each key against its STORED string
+     * first means a call that changes only the cadence touches only the cadence row, so the other
+     * device's tone survives the merge. Same change-detection posture as
+     * [`SyncEngine::stage_signal_write`] — an unchanged value is not a write, so there is no
+     * `updated_at` bump and no outbox churn either.
      *
-     * Not transactional across the two rows: a failure between them leaves the first applied.
-     * ponytail: acceptable because each row is independently meaningful and the next successful
-     * call converges both; a settings write that needed atomicity would need a different table.
+     * Compared against the RAW stored string, not against [`SyncEngine::prompt_settings`], because
+     * that read substitutes defaults for absent rows — and "absent" must still write. Otherwise a
+     * user who deliberately chose the default values would never sync that choice, and a device
+     * holding a non-default value would win the next merge by default.
+     *
+     * The residual case core cannot fix: a host that passes a genuinely stale tone AFTER pulling
+     * the newer one is indistinguishable from a user deliberately changing it back. Hosts should
+     * re-read settings before writing them.
+     *
+     * Routed through [`SyncEngine::set_user_setting`] rather than staging directly — one write
+     * path per table, so the outbox semantics cannot drift between them. Not transactional across
+     * the two rows: a failure between them leaves the first applied. ponytail: acceptable because
+     * each row is independently meaningful and the next successful call converges both.
      */
     func setPromptSettings(settings: PromptSettings) throws 
     
@@ -2582,16 +2597,31 @@ open func setAccessToken(jwt: String) {try! rustCall() {
 }
     
     /**
-     * Write both prompt settings, clamping the cadence first (SUR-996 R4).
+     * Write the prompt settings that actually changed, clamping the cadence first (SUR-996 R4).
      *
-     * TWO ROWS, ONE CALL, and deliberately not one blob: per-setting LWW is the whole reason
-     * `user_settings` is a KV table, so a device changing the cadence must not stomp another
-     * device's tone. Routed through [`SyncEngine::set_user_setting`] rather than staging directly
-     * — one write path per table, so the outbox semantics cannot drift between them.
+     * ONLY THE ROWS THAT MOVED, and that is load-bearing rather than an optimisation. Per-setting
+     * LWW is the whole reason `user_settings` is a KV table instead of a blob, but writing both
+     * rows on every call would throw that away: a host holding a `PromptSettings` it read before
+     * another device changed the tone would carry the stale tone back with a FRESH `updated_at`,
+     * and LWW would hand the stale value the win. Comparing each key against its STORED string
+     * first means a call that changes only the cadence touches only the cadence row, so the other
+     * device's tone survives the merge. Same change-detection posture as
+     * [`SyncEngine::stage_signal_write`] — an unchanged value is not a write, so there is no
+     * `updated_at` bump and no outbox churn either.
      *
-     * Not transactional across the two rows: a failure between them leaves the first applied.
-     * ponytail: acceptable because each row is independently meaningful and the next successful
-     * call converges both; a settings write that needed atomicity would need a different table.
+     * Compared against the RAW stored string, not against [`SyncEngine::prompt_settings`], because
+     * that read substitutes defaults for absent rows — and "absent" must still write. Otherwise a
+     * user who deliberately chose the default values would never sync that choice, and a device
+     * holding a non-default value would win the next merge by default.
+     *
+     * The residual case core cannot fix: a host that passes a genuinely stale tone AFTER pulling
+     * the newer one is indistinguishable from a user deliberately changing it back. Hosts should
+     * re-read settings before writing them.
+     *
+     * Routed through [`SyncEngine::set_user_setting`] rather than staging directly — one write
+     * path per table, so the outbox semantics cannot drift between them. Not transactional across
+     * the two rows: a failure between them leaves the first applied. ponytail: acceptable because
+     * each row is independently meaningful and the next successful call converges both.
      */
 open func setPromptSettings(settings: PromptSettings)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_set_prompt_settings(self.uniffiClonePointer(),
@@ -5083,18 +5113,26 @@ public func FfiConverterTypeNoteUpsert_lower(_ value: NoteUpsert) -> RustBuffer 
  * phrasings as the picker, and the nudge copy is deliberately generic (no question text ever
  * reaches a lock screen — SUR-996 R5). It rides on every event anyway because a non-optional
  * field is simpler across three binding languages than an `Option` two of three kinds ignore.
+ *
+ * `question_id` names the question a `CheckIn` is ABOUT, and is `None` for the other two kinds
+ * (neither has a question yet). Carried rather than left for the client to work out: the machine
+ * already picked which question wins when several are momentarily active, and a client re-deriving
+ * that pick is exactly the cross-platform drift this module exists to prevent. It is the id the
+ * host passes back to [`crate::sync::SyncEngine::skip_checkin`] or `enqueue_question`.
  */
 public struct PromptEvent {
     public var kind: PromptEventKind
     public var dueAt: Int64
     public var tone: PromptTone
+    public var questionId: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(kind: PromptEventKind, dueAt: Int64, tone: PromptTone) {
+    public init(kind: PromptEventKind, dueAt: Int64, tone: PromptTone, questionId: String?) {
         self.kind = kind
         self.dueAt = dueAt
         self.tone = tone
+        self.questionId = questionId
     }
 }
 
@@ -5111,6 +5149,9 @@ extension PromptEvent: Equatable, Hashable {
         if lhs.tone != rhs.tone {
             return false
         }
+        if lhs.questionId != rhs.questionId {
+            return false
+        }
         return true
     }
 
@@ -5118,6 +5159,7 @@ extension PromptEvent: Equatable, Hashable {
         hasher.combine(kind)
         hasher.combine(dueAt)
         hasher.combine(tone)
+        hasher.combine(questionId)
     }
 }
 
@@ -5131,7 +5173,8 @@ public struct FfiConverterTypePromptEvent: FfiConverterRustBuffer {
             try PromptEvent(
                 kind: FfiConverterTypePromptEventKind.read(from: &buf), 
                 dueAt: FfiConverterInt64.read(from: &buf), 
-                tone: FfiConverterTypePromptTone.read(from: &buf)
+                tone: FfiConverterTypePromptTone.read(from: &buf), 
+                questionId: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -5139,6 +5182,7 @@ public struct FfiConverterTypePromptEvent: FfiConverterRustBuffer {
         FfiConverterTypePromptEventKind.write(value.kind, into: &buf)
         FfiConverterInt64.write(value.dueAt, into: &buf)
         FfiConverterTypePromptTone.write(value.tone, into: &buf)
+        FfiConverterOptionString.write(value.questionId, into: &buf)
     }
 }
 
@@ -8100,7 +8144,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_set_access_token() != 47386) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_set_prompt_settings() != 58431) {
+    if (uniffi_braird_core_checksum_method_syncengine_set_prompt_settings() != 56368) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_set_user_setting() != 2882) {

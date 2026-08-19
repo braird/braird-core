@@ -76,11 +76,18 @@ pub struct PromptSettings {
 /// phrasings as the picker, and the nudge copy is deliberately generic (no question text ever
 /// reaches a lock screen — SUR-996 R5). It rides on every event anyway because a non-optional
 /// field is simpler across three binding languages than an `Option` two of three kinds ignore.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+///
+/// `question_id` names the question a `CheckIn` is ABOUT, and is `None` for the other two kinds
+/// (neither has a question yet). Carried rather than left for the client to work out: the machine
+/// already picked which question wins when several are momentarily active, and a client re-deriving
+/// that pick is exactly the cross-platform drift this module exists to prevent. It is the id the
+/// host passes back to [`crate::sync::SyncEngine::skip_checkin`] or `enqueue_question`.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct PromptEvent {
     pub kind: PromptEventKind,
     pub due_at: i64,
     pub tone: PromptTone,
+    pub question_id: Option<String>,
 }
 
 /// The metadata of one stored question, as the machine needs it. Internal — not a UniFFI type:
@@ -88,6 +95,7 @@ pub struct PromptEvent {
 /// asymmetry IS the anti-drift property; a client-assembled state would put the assembly rules
 /// back into two codebases.
 pub struct QuestionMeta {
+    pub id: String,
     /// `active | resolved | dismissed`, or anything a newer client wrote. Absent or unrecognised
     /// counts as ACTIVE (see [`is_active`]).
     pub status: Option<String>,
@@ -165,7 +173,13 @@ pub fn next_events(
 ) -> Vec<PromptEvent> {
     let cadence_ms = clamp_cadence(settings.cadence_hours) as i64 * HOUR_MS;
     let tone = settings.tone;
-    let event = |kind, due_at| PromptEvent { kind, due_at, tone };
+    // Initial and Nudge name no question — neither exists yet when they fire.
+    let event = |kind, due_at| PromptEvent {
+        kind,
+        due_at,
+        tone,
+        question_id: None,
+    };
 
     // The NEWEST live question wins. A "New question" supersede archives the old row and creates a
     // new one, and both are live rows until the tombstone flushes; picking the newest keeps the
@@ -179,10 +193,12 @@ pub fn next_events(
     if let Some(q) = active {
         // No `checkin_at` yet = just answered, so the first check-in is one cadence from birth.
         let anchor = q.checkin_at.unwrap_or(q.created_at);
-        return vec![event(
-            PromptEventKind::CheckIn,
-            anchor.saturating_add(cadence_ms),
-        )];
+        return vec![PromptEvent {
+            kind: PromptEventKind::CheckIn,
+            due_at: anchor.saturating_add(cadence_ms),
+            tone,
+            question_id: Some(q.id.clone()),
+        }];
     }
 
     // A question that was answered and then closed anchors the next initial-style prompt on its
@@ -242,6 +258,7 @@ mod tests {
 
     fn question(status: &str, created_at: i64) -> QuestionMeta {
         QuestionMeta {
+            id: format!("q-{created_at}"),
             status: Some(status.into()),
             created_at,
             updated_at: created_at,
@@ -469,6 +486,29 @@ mod tests {
             resolved + 1,
         );
         assert_eq!(events[0].due_at, resolved + CADENCE_MS);
+    }
+
+    #[test]
+    fn only_a_check_in_names_a_question() {
+        let live = next_events(
+            &state(vec![question("active", CREATED)], None),
+            &settings(PromptTone::Introspective),
+            CREATED + 1,
+        );
+        assert_eq!(live[0].question_id.as_deref(), Some("q-1000000"));
+
+        // Initial and Nudge fire when there is no question to name.
+        for event in next_events(
+            &state(vec![], None),
+            &settings(PromptTone::Introspective),
+            CREATED,
+        ) {
+            assert_eq!(
+                event.question_id, None,
+                "{:?} must name no question",
+                event.kind
+            );
+        }
     }
 
     #[test]

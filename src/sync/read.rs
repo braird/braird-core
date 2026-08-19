@@ -746,6 +746,7 @@ pub fn question_metas(store: &Store) -> rusqlite::Result<Vec<QuestionMeta>> {
         .list_live("questions", None, QUESTION_META_SCAN_LIMIT, 0)?
         .iter()
         .map(|row| QuestionMeta {
+            id: string_field(row, "id").unwrap_or_default(),
             status: string_field(row, "status"),
             created_at: int_field(row, "created_at"),
             updated_at: int_field(row, "updated_at"),

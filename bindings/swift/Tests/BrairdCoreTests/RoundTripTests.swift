@@ -1058,6 +1058,9 @@ final class RoundTripTests: XCTestCase {
             nowMs: created + 60_000, accountCreatedAtMs: created)
         XCTAssertEqual(live.map { $0.kind }, [.checkIn])
         XCTAssertEqual(live[0].dueAt, created + 72 * hourMs)
+        // The event names its question, so the client never re-derives the pick.
+        XCTAssertEqual(live[0].questionId, "q1")
+        XCTAssertNil(opening[0].questionId, "an initial prompt has no question yet")
 
         // Skipping the check-in resets the timer and leaves the sealed text alone.
         let skippedAt = created + 80 * hourMs
