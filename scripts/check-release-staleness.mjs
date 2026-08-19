@@ -211,13 +211,26 @@ export function validateChangelog(text) {
   const rawLines = text.split('\n');
   const structure = classifyChangelogLines(text);
   structure.forEach((st, i) => {
-    if (st.heading === null) return;
     const aboveBlank = i === 0 || rawLines[i - 1].trim() === '';
-    const belowBlank = i === rawLines.length - 1 || rawLines[i + 1].trim() === '';
-    if (!aboveBlank || !belowBlank) {
+    if (st.heading !== null) {
+      const belowBlank = i === rawLines.length - 1 || rawLines[i + 1].trim() === '';
+      if (!aboveBlank || !belowBlank) {
+        violations.push(
+          `line ${i + 1} parses as section heading [${st.heading}] but touches adjacent text — a real ` +
+            'heading stands alone between blank lines; an exposed quotation does not',
+        );
+      }
+      return;
+    }
+    // Subsection headings carry the SEVERITY, so an exposed quoted `### Security` is a false 7-day
+    // alarm rather than a false section — same exposure, same rule, one asymmetry: the house style
+    // puts the first bullet directly under the heading, so only blank-ABOVE is required. That still
+    // closes the quote case, because a code span cannot contain a blank line — the span's opening
+    // text is always the line directly above the quoted heading.
+    if (!st.insideFence && /^ {0,3}###[ 	]/.test(st.masked) && !aboveBlank) {
       violations.push(
-        `line ${i + 1} parses as section heading [${st.heading}] but touches adjacent text — a real ` +
-          'heading stands alone between blank lines; an exposed quotation does not',
+        `line ${i + 1} parses as a subsection heading but touches the text above it — a real ` +
+          'subsection heading follows a blank line; an exposed quotation does not',
       );
     }
   });
@@ -227,7 +240,13 @@ export function validateChangelog(text) {
         'ambiguous; indent the example four spaces or quote it inline instead',
     );
   }
-  const { released, unreleased, hasUnreleasedHeading } = parseChangelog(text);
+  const { released, unreleased, hasUnreleasedHeading, duplicates } = parseChangelog(text);
+  // The daily run MERGES duplicate sections defensively (severities union) because it must read
+  // whatever main contains — but the write-time gate must REFUSE them, or the merge-conflict shape
+  // this defends against sails through the PR and is only ever a daily finding after the fact.
+  for (const version of duplicates) {
+    violations.push(`the CHANGELOG has more than one [${version}] section — a merge conflict resolved badly`);
+  }
   for (let i = 1; i < released.length; i += 1) {
     const [a, b] = [parseVersion(released[i - 1].version), parseVersion(released[i].version)];
     if (!a || !b) {
@@ -1374,6 +1393,20 @@ const VALIDATION_CORPUS = [
       '## [Unreleased]\n\n### Fixed\n- x\n\n## [1.2.0] - 2026-01-01\n\n### Added\n- an example follows\n\n' +
       '## [0.9.0] - 2020-01-01\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- y\n',
     expect: /not in decreasing order/,
+  },
+  {
+    name: 'an exposed quoted ### Security touching its quote text is loud — no false 7-day alarm',
+    changelog:
+      '## [Unreleased]\n\n### Fixed\n- routine work, quoting `a span\n### Security\nspan text` here\n\n' +
+      '## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
+    expect: /subsection heading but touches the text above/,
+  },
+  {
+    name: 'a duplicated section heading is refused at write time, not merged into a daily finding',
+    changelog:
+      '## [Unreleased]\n\n### Fixed\n- x\n\n## [Unreleased]\n\n### Security\n- hidden by the duplicate\n\n' +
+      '## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
+    expect: /more than one \[Unreleased\] section/,
   },
   {
     name: 'an unknown subsection heading is loud — a typo cannot silently change a deadline',

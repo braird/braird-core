@@ -45,7 +45,13 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   the claim that an exposed quotation must break one of those invariants — a plausible version
   slots into the order — so the exposed direction got its own unconditional rule: a real heading
   stands alone between blank lines (all 28 in this file do), and a heading quoted inside a code
-  span necessarily touches its quoting text, because a span cannot contain a blank line.
+  span necessarily touches its quoting text, because a span cannot contain a blank line. The same
+  adjacency rule covers subsection headings (blank-above only, since the house style puts the
+  first bullet directly under the heading), so an exposed quoted `### Security` cannot raise a
+  false 7-day alarm; and a duplicated section heading is refused at write time rather than
+  merged into a daily finding after the fact. One blank line was inserted before a `### Fixed`
+  in the 0.13.1 section — whitespace-only, no entry text changed — where a formatting slip in
+  shipped history was the sole exception to the rule across 47 subsection headings.
 
 ### Added
 - **A daily check that fails when finished work has stopped moving toward a device (SUR-1070
@@ -740,6 +746,7 @@ no host code changes required.
   non-`handwritten_annotation` edge are the broader note-delete edge cascade (SUR-84 parity), tracked
   separately. `refresh-annotation-signal` in the native-parity manifest flips from waived to core.
   Spine (sync); sync-reviewer + crypto-reviewer. No FFI change → no bindings regen.
+
 ### Fixed
 - **`reconcile.rs` `repoint_note_links` now stages the full NOT-NULL shape (SUR-954).** A
   content-dedupe merge (`reconcile_content_dupes` → `merge_into_survivor` → `repoint_note_links`)
