@@ -932,6 +932,34 @@ const CORPUS = [
     },
     detail: /in the FUTURE/,
   },
+  // ── a marker inside `backticks` is a quotation, whatever appears later in the file ──
+  // The lookahead alone was not enough: quoted syntax became a real opener the moment any later
+  // entry added an ordinary comment. Measured on the real CHANGELOG, one such comment cost two
+  // sections and the unreleased-security signal.
+  {
+    name: 'a quoted comment marker stays literal even when a real comment appears later',
+    input: {
+      changelog:
+        '## [Unreleased]\n\n### Security\n- an entry documenting the `<!--` marker\n\n' +
+        '## [1.2.0] - 2026-01-01\n\n<!-- an ordinary editor note -->\n\n### Added\n- x\n\n' +
+        '## [1.1.0] - 2025-12-01\n\n### Added\n- y\n',
+      published: PUB,
+      unreleasedSecuritySince: '2026-01-01T00:00:00Z',
+      now: '2026-03-01T00:00:00Z',
+    },
+    expect: ['unreleased'], // both sections still parse; no phantom "undocumented release" findings
+  },
+  {
+    name: 'but an UNQUOTED comment still hides the heading inside it',
+    input: {
+      changelog:
+        '## [Unreleased]\n\n### Fixed\n- x\n\n<!--\n## [9.9.9] - 2026-01-01\n-->\n\n' +
+        '## [1.1.0] - 2025-12-01\n\n### Added\n- y\n',
+      published: new Map([['1.1.0', rel('1.1.0', '2025-12-01T00:00:00Z')]]),
+      now: '2026-03-01T00:00:00Z',
+    },
+    expect: [], // 9.9.9 is commented out, so it is not an undocumented release
+  },
   // ── an UNTERMINATED comment marker is prose, not a comment that eats the file ──
   // This one shipped and broke the real CHANGELOG: the entry describing the comment handling
   // contained a literal marker, which opened a comment that never closed and masked every heading

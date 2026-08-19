@@ -25,6 +25,10 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   the genuine article, which is a gap no amount of further fixtures would have closed.
   This entry deliberately contains the literal marker rather than escaping it, so the CHANGELOG is
   its own regression fixture: revert the fix and the self-check's real-file smoke fails here.
+  A marker inside `backticks` is also treated as a quotation rather than syntax, which the
+  unterminated-marker rule alone did not cover: quoted syntax became a real opener the moment any
+  later entry added an ordinary closed comment. Measured on this file, one such comment cost two
+  sections and the unreleased-security signal.
 
 ### Added
 - **A daily check that fails when finished work has stopped moving toward a device (SUR-1070

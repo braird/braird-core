@@ -27,6 +27,36 @@ const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 const VERSION_HEADING = /^ {0,3}##\s+\[([^\]]+)\]/;
 
 /**
+ * The `[start, end)` ranges of inline code spans on one line, by CommonMark's rule that a span is
+ * delimited by backtick runs of EQUAL length.
+ *
+ * Needed because a comment marker written inside backticks is a quotation, not syntax — and a
+ * CHANGELOG documenting a parser quotes syntax constantly. Without this, `` `<!--` `` in prose opens
+ * a real comment the moment any later entry contains an ordinary closed one, masking everything
+ * between them. Measured on this repository's own file: one added comment took it from 27 sections
+ * to 25 and silenced the unreleased-security signal.
+ */
+function codeSpanRanges(line) {
+  const runs = [];
+  for (const m of line.matchAll(/`+/g)) runs.push({ at: m.index, len: m[0].length });
+  const ranges = [];
+  const used = new Array(runs.length).fill(false);
+  for (let i = 0; i < runs.length; i += 1) {
+    if (used[i]) continue;
+    for (let j = i + 1; j < runs.length; j += 1) {
+      if (used[j] || runs[j].len !== runs[i].len) continue;
+      ranges.push([runs[i].at, runs[j].at + runs[j].len]);
+      used[i] = true;
+      used[j] = true;
+      break;
+    }
+  }
+  return ranges;
+}
+
+const inAnyRange = (ranges, at) => ranges.some(([from, to]) => at >= from && at < to);
+
+/**
  * Blank any HTML-comment span on one line, carrying the open/closed state across lines.
  *
  * `hasCloserAfter(offset)` decides whether a `<!--` is a real comment opener or just prose. Without
@@ -38,11 +68,19 @@ const VERSION_HEADING = /^ {0,3}##\s+\[([^\]]+)\]/;
  * An unterminated marker is therefore treated as literal text. That direction is deliberate: masking
  * fails toward SILENCE, which is the failure mode this whole checker exists to avoid, while treating
  * it as prose fails toward noise. A genuinely forgotten `-->` shows up as findings, not as quiet.
+ *
+ * The lookahead alone was not enough, and the gap is instructive: it only protects a marker with NO
+ * closer anywhere, so quoted syntax became a real opener as soon as any later entry added an
+ * ordinary comment. Both rules are needed — code spans decide whether a marker is syntax at all, the
+ * lookahead decides what to do with one that is.
  */
 function maskComments(line, openAtStart, lineOffset, hasCloserAfter) {
   let open = openAtStart;
   let out = '';
   let i = 0;
+  // Only OPENERS are shielded by code spans. Inside an actual comment, backticks are ordinary
+  // characters, so the search for a closer must not skip them.
+  const spans = codeSpanRanges(line);
   while (i < line.length) {
     if (open) {
       const end = line.indexOf('-->', i);
@@ -59,8 +97,13 @@ function maskComments(line, openAtStart, lineOffset, hasCloserAfter) {
       if (start === -1) {
         out += line.slice(i);
         i = line.length;
+      } else if (inAnyRange(spans, start)) {
+        // Quoted syntax inside `backticks`, not a comment. Copy through and keep scanning after it,
+        // so a genuine comment later on the same line is still found.
+        out += line.slice(i, start + 4);
+        i = start + 4;
       } else if (!hasCloserAfter(lineOffset + start)) {
-        out += line.slice(i); // prose mentioning the marker, not a comment
+        out += line.slice(i); // an unterminated marker is prose, not a comment that eats the file
         i = line.length;
       } else {
         out += line.slice(i, start);
