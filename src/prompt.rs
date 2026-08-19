@@ -30,6 +30,17 @@ pub const PROMPT_TONE_KEY: &str = "prompt_tone";
 /// on the phone silences the same prompt on the tablet. The local `meta` KV would have been
 /// cheaper and would have double-prompted every multi-device user.
 pub const PROMPT_SKIPPED_AT_KEY: &str = "prompt_skipped_at";
+/// When this account first authored a question (epoch ms, decimal string) — the onboarding-done
+/// marker, written once and never cleared.
+///
+/// An explicitly RECORDED fact, after three review rounds proved it cannot be inferred. "Has this
+/// user onboarded?" was read first from the live question rows, which a soft-delete empties; then
+/// from a tombstone-inclusive count, which `pull_table` defeats because it discards a tombstone for
+/// a row the device never had (`pull.rs`, mirroring the JS `if (n.deleted && !local) continue`). A
+/// second device installed inside the opening 24 hours therefore saw a pristine account and re-ran
+/// onboarding. Each fix was a better inference from data that was never meant to answer the
+/// question; a settings row is meant to, and it is live-forever, so no tombstone rule can drop it.
+pub const PROMPT_ANSWERED_AT_KEY: &str = "prompt_answered_at";
 
 /// Cadence bounds (SUR-996 R4): 72 hours to 4 weeks, defaulting to one week. Clamped in core on
 /// BOTH read and write, so an out-of-range value from any client — or one already stored by an
@@ -113,12 +124,12 @@ pub struct PromptState {
     pub account_created_at_ms: i64,
     /// Every live question row, any status.
     pub questions: Vec<QuestionMeta>,
-    /// Whether a question has EVER existed on this account, tombstones included.
+    /// Whether this account has EVER authored a question — the onboarding-done fact.
     ///
-    /// Distinct from `!questions.is_empty()` on purpose: a soft-deleted question disappears from
-    /// every ordinary read, and reading "no questions" as "never answered" would restart onboarding
-    /// for someone who has been through it. Deletion is the only thing that separates the two, and
-    /// a tombstone is still proof the user answered once.
+    /// Read from the synced [`PROMPT_ANSWERED_AT_KEY`] marker, not inferred from the rows in hand.
+    /// Neither the live questions nor a tombstone-inclusive count of them can answer this on a
+    /// device that was not present for the writing: a delete empties the first, and the pull path
+    /// discards a tombstone for a row it never had, so the second reads zero on a fresh install.
     pub has_ever_answered: bool,
     pub prompt_skipped_at_ms: Option<i64>,
 }

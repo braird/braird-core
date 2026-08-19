@@ -38,8 +38,8 @@ use crate::embeddings::{
 };
 use crate::fusion::{self, RankedHit, RankedSearchPage, SemanticStatus};
 use crate::prompt::{
-    self, PromptEvent, PromptSettings, PromptState, PromptTone, PROMPT_CADENCE_KEY,
-    PROMPT_SKIPPED_AT_KEY, PROMPT_TONE_KEY,
+    self, PromptEvent, PromptSettings, PromptState, PromptTone, PROMPT_ANSWERED_AT_KEY,
+    PROMPT_CADENCE_KEY, PROMPT_SKIPPED_AT_KEY, PROMPT_TONE_KEY,
 };
 use crate::search::{SearchDoc, SearchDocKind, SearchHit};
 use crate::store::{synced_table_names, StageExistingWriteError, Store};
@@ -1438,7 +1438,24 @@ impl SyncEngine {
                 let ciphertext = self.vault.encrypt_note(Some(id.clone()), plaintext);
                 row.insert("text".into(), json!(ciphertext));
                 row.insert("created_at".into(), json!(created_at));
-                self.stage_write("questions", &id, row)
+                self.stage_write("questions", &id, row)?;
+                // Authoring a question is what "onboarded" MEANS, so record it here rather than
+                // leaving SUR-1043 to infer it from rows that a delete or the pull path's
+                // tombstone-skip can take away (see `prompt::PROMPT_ANSWERED_AT_KEY`). Written
+                // once — a later question must not move the stamp, and re-staging an unchanged
+                // settings row would be pure outbox churn.
+                //
+                // Deliberately NOT in the question's transaction. A marker that failed to write
+                // leaves this device covered by the row-count fallback and re-records on the next
+                // question, whereas widening the seal path's transaction to carry a second table
+                // would put a settings failure in the way of the user's question reaching disk.
+                if read::user_setting(&lock!(self.store), PROMPT_ANSWERED_AT_KEY)
+                    .map_err(store_err)?
+                    .is_none()
+                {
+                    self.set_user_setting(PROMPT_ANSWERED_AT_KEY.into(), now.to_string())?;
+                }
+                Ok(())
             }
             None => {
                 // A metadata patch REQUIRES an existing live row, and the precondition is enforced
@@ -1545,14 +1562,33 @@ impl SyncEngine {
     /// `prompt_tone`) always carry a value, and `deleted` already expresses removal — so the
     /// ambiguity is removed rather than defined. If a setting ever genuinely needs null-versus-absent,
     /// widen it then and write the `None` as an explicit JSON null, never as an omission.
+    /// MONOTONE OVER THE ROW IT REPLACES (SUR-1043), the [`SyncEngine::stage_signal_write`] rule
+    /// (SUR-976) applied to settings. The server's `t01_lww_guard` SILENTLY cancels a strictly-older
+    /// write — statement still 2xx, no `change_seq` bump — while the flush clears the outbox row as
+    /// if it landed. A setting written by a device whose clock trails the stamp on a just-pulled
+    /// row would therefore apply locally and reach no other device, with nothing left to retry it.
+    /// Migration 0050's §4.1 monotonicity assumption ("every edit stamps `Date.now()`") holds only
+    /// while no local clock lags a pulled stamp, which is exactly the case this restores.
+    ///
+    /// It matters most for `prompt_skipped_at`: a silently-cancelled skip leaves the OTHER devices
+    /// prompting, which is the multi-device promise this key exists to keep. Read and stage under
+    /// ONE guard, so a concurrent pull cannot land a newer row between the two and re-open the hole.
     pub fn set_user_setting(&self, key: String, value: String) -> Result<(), SyncError> {
-        let now = epoch_ms();
+        let store = lock!(self.store);
+        let stored_updated = store
+            .get_row("user_settings", &key)
+            .map_err(store_err)?
+            .and_then(|r| r.get("updated_at").and_then(Value::as_i64))
+            .unwrap_or(0);
+        let now = epoch_ms().max(stored_updated.saturating_add(1));
         let mut row = Map::new();
         row.insert("key".into(), json!(key));
         row.insert("value".into(), json!(value));
         row.insert("updated_at".into(), json!(now));
         row.insert("deleted".into(), json!(false));
-        self.stage_write("user_settings", &key, row)
+        store
+            .stage_local_write("user_settings", &key, row, now)
+            .map_err(store_err)
     }
 
     // ── the open-question prompt surface (SUR-1043, SUR-996 R2–R4) ───────────
@@ -1651,9 +1687,13 @@ impl SyncEngine {
         let state = PromptState {
             account_created_at_ms,
             questions: read::question_metas(&store).map_err(store_err)?,
-            // Counted with tombstones, unlike every other read here: a deleted question still
-            // proves onboarding happened (see [`PromptState::has_ever_answered`]).
-            has_ever_answered: store.count_all("questions").map_err(store_err)? > 0,
+            // The recorded marker first; the local row count only as a fallback for a question
+            // authored by a core that predates it. See [`PromptState::has_ever_answered`] for why
+            // the count alone cannot answer this on a device that missed the writing.
+            has_ever_answered: read::user_setting(&store, PROMPT_ANSWERED_AT_KEY)
+                .map_err(store_err)?
+                .is_some()
+                || store.count_all("questions").map_err(store_err)? > 0,
             prompt_skipped_at_ms: read::user_setting(&store, PROMPT_SKIPPED_AT_KEY)
                 .map_err(store_err)?
                 .and_then(|v| v.parse().ok()),
@@ -5355,6 +5395,128 @@ mod tests {
         assert_eq!(
             events.iter().map(|e| e.kind).collect::<Vec<_>>(),
             vec![PromptEventKind::Initial]
+        );
+    }
+
+    #[test]
+    fn onboarding_survives_a_device_that_never_saw_the_question() {
+        // The hole a tombstone-inclusive count cannot close: `pull_table` DISCARDS a tombstone for
+        // a row it never had, so a second device installed inside the opening 24h finds no question
+        // rows at all — live or dead — and would re-run onboarding. The synced marker is what
+        // actually crosses.
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.sqlite");
+        let engine = engine_at(first.to_str().unwrap());
+        let created = 1_000_000_i64;
+        engine
+            .enqueue_question(QuestionUpsert {
+                id: "q1".into(),
+                plaintext: Some("what am I sitting with?".into()),
+                status: Some("active".into()),
+                tone: None,
+                resolved_at: None,
+                checkin_at: None,
+                checkin_response: None,
+                created_at: created + 1_000,
+                deleted: false,
+            })
+            .unwrap();
+        let marker = Store::open(first.to_str().unwrap())
+            .unwrap()
+            .get_row("user_settings", PROMPT_ANSWERED_AT_KEY)
+            .unwrap()
+            .expect("authoring a question records the onboarding marker");
+
+        // A fresh device: it pulls the settings row, but the question's tombstone never arrives.
+        let second = dir.path().join("second.sqlite");
+        let fresh = engine_at(second.to_str().unwrap());
+        Store::open(second.to_str().unwrap())
+            .unwrap()
+            .apply_row("user_settings", &marker)
+            .unwrap();
+
+        assert!(fresh.list_questions(50, 0).unwrap().is_empty());
+        assert_eq!(
+            fresh
+                .next_prompt_events(created + 60_000, created)
+                .unwrap()
+                .iter()
+                .map(|e| e.kind)
+                .collect::<Vec<_>>(),
+            vec![PromptEventKind::Initial],
+            "a device with no question rows at all must still see onboarding as done"
+        );
+    }
+
+    #[test]
+    fn the_onboarding_marker_is_written_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        let draft = |id: &str| QuestionUpsert {
+            id: id.into(),
+            plaintext: Some("q".into()),
+            status: Some("active".into()),
+            tone: None,
+            resolved_at: None,
+            checkin_at: None,
+            checkin_response: None,
+            created_at: 500_000,
+            deleted: false,
+        };
+
+        engine.enqueue_question(draft("q1")).unwrap();
+        let first = Store::open(db_path)
+            .unwrap()
+            .get_row("user_settings", PROMPT_ANSWERED_AT_KEY)
+            .unwrap()
+            .unwrap();
+        engine.enqueue_question(draft("q2")).unwrap();
+
+        assert_eq!(
+            Store::open(db_path)
+                .unwrap()
+                .get_row("user_settings", PROMPT_ANSWERED_AT_KEY)
+                .unwrap()
+                .unwrap()["value"],
+            first["value"],
+            "a later question must not move the stamp — it marks the FIRST"
+        );
+    }
+
+    #[test]
+    fn a_settings_write_outruns_a_pulled_row_from_a_faster_clock() {
+        // The server's t01_lww_guard silently cancels a strictly-older write while the flush clears
+        // the outbox, so a skip recorded on a lagging device would apply locally and reach nobody —
+        // with nothing left to retry it. The stamp is clamped past whatever it replaces.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.skip_prompt(1_000).unwrap();
+
+        // A skip pulled from a device whose clock is years ahead.
+        let far_future = epoch_ms() + 5 * 365 * 24 * 60 * 60 * 1000;
+        let store = Store::open(db_path).unwrap();
+        let mut pulled = store
+            .get_row("user_settings", PROMPT_SKIPPED_AT_KEY)
+            .unwrap()
+            .unwrap();
+        pulled.insert("updated_at".into(), json!(far_future));
+        store.apply_row("user_settings", &pulled).unwrap();
+
+        engine.skip_prompt(2_000).unwrap();
+
+        let after = Store::open(db_path)
+            .unwrap()
+            .get_row("user_settings", PROMPT_SKIPPED_AT_KEY)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after["value"].as_str(), Some("2000"));
+        assert!(
+            after["updated_at"].as_i64().unwrap() > far_future,
+            "a local write must outrank the row it replaces, or the server cancels it in silence"
         );
     }
 

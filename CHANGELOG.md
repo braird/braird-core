@@ -54,11 +54,22 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   the STORED string rather than the defaulted read — "absent" and "happens to equal the default" are
   different, and only the former may skip the write, or a user who deliberately chose the defaults
   would never sync that choice.
-  The nudge is spent by having ever answered, tombstones included, not by the live rows in hand. A
-  soft-deleted question disappears from every ordinary read, so after a delete the live surface is
-  indistinguishable from a brand-new account — and the onboarding nudge would have fired again at
-  +24h for someone who had already answered one. New `Store::count_all` answers the one question a
-  live count cannot: did this ever exist.
+  The nudge is spent by a RECORDED onboarding marker (`prompt_answered_at`, written the first time
+  a question is authored), not by inferring it from the rows in hand. Three review rounds went into
+  this one boolean and each fix was a better inference from data that was never meant to answer the
+  question: the live rows, which a soft-delete empties; then a tombstone-inclusive count, which the
+  pull path defeats because it discards a tombstone for a row the device never had, so a second
+  device inside the opening 24 hours saw a pristine account and re-ran onboarding. A settings row IS
+  meant to answer it, and it is live-forever, so no tombstone rule can drop it. `Store::count_all`
+  stays as a fallback for a question authored by a core that predates the marker.
+  `set_user_setting` now stamps `updated_at` monotonically over the row it replaces — the SUR-976
+  rule applied to settings. The server's `t01_lww_guard` silently cancels a strictly-older write
+  (statement still 2xx, no `change_seq` bump) while the flush clears the outbox as if it landed, so
+  a setting written by a device whose clock trails a just-pulled stamp applied locally and reached
+  no other device, with nothing left to retry it. It matters most for `prompt_skipped_at`: a
+  silently-cancelled skip leaves the other devices prompting, which is the multi-device promise the
+  key exists to keep. Migration 0050's §4.1 monotonicity assumption ("every edit stamps
+  `Date.now()`") holds only while no local clock lags a pulled stamp; this restores it.
   Both question-derived anchors are clamped to the question's own `created_at`, matching the window
   clamp `question_notes` already applies. A device whose clock runs behind can stamp a `checkin_at`
   or `resolved_at` earlier than a `created_at` written by another device, and the raw stamp would
