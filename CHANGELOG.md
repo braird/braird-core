@@ -6,6 +6,74 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Fixed
+- **The release-staleness checker could not read its own CHANGELOG (SUR-1070 follow-up).** An
+  unterminated `<!--` marker masked every line after it to end of file, and the likeliest source
+  of one is an entry DESCRIBING comment handling — which is exactly what happened: the entry
+  documenting this parser contained a literal marker, so the parser found zero sections in the file
+  it had just been merged into. It did not fail as an error, either. It reported all 27 published
+  releases as "published but has no CHANGELOG section", which reads like 27 real findings.
+  A marker with no closer anywhere in the document is now treated as prose. That direction is
+  deliberate: masking fails toward SILENCE, which is the failure mode this checker exists to avoid,
+  while treating it as text fails toward noise — a genuinely forgotten closer surfaces as findings
+  rather than as quiet.
+  Two guards were added with it, because the bug was cheap and the diagnosis was not. Parsing zero
+  released sections from a CHANGELOG while published releases exist is now a hard error rather than
+  a pile of findings — it is a parser failure, and saying so costs one line instead of an
+  investigation. And the self-check now parses the repository's REAL CHANGELOG, not only its
+  synthetic fixtures: 48 hand-written cases were green while the parser could not read 1,954 lines of
+  the genuine article, which is a gap no amount of further fixtures would have closed.
+  This entry deliberately contains the literal marker rather than escaping it, so the CHANGELOG is
+  its own regression fixture: revert the fix and the self-check's real-file smoke fails here.
+  A marker inside `backticks` is also treated as a quotation rather than syntax, which the
+  unterminated-marker rule alone did not cover: quoted syntax became a real opener the moment any
+  later entry added an ordinary closed comment. Measured on this file, one such comment cost two
+  sections and the unreleased-security signal.
+  **The Markdown-exactness series ends here by design, not by another rule (SUR-1070 follow-up).**
+  Four consecutive review findings were the same finding — a CommonMark subtlety the hand-rolled
+  classifier did not model — and the series does not converge; `check-stale-release-markers.mjs`
+  ran it once already and froze a boundary instead. The classifier is now frozen the same way, and
+  what replaces further exactness is a guarantee that a misparse in EITHER direction is loud: a
+  document validator makes any heading-shaped line hidden inside a fence or comment a hard error
+  naming the line, and an exposed quoted example breaks version monotonicity or the subsection
+  vocabulary, which are hard errors too. Violations mean the DOCUMENT is ambiguous — the fix
+  belongs in the entry, by its author, at the PR that writes it, which is when the self-check now
+  runs (it triggers on `CHANGELOG.md`, and every PR must touch it). The `### Security` check also
+  stopped being a bespoke regex: subsection headings are extracted once, ATX decorations
+  normalized, and anything outside the Keep a Changelog vocabulary is an error — so a typo like
+  `### Securty` is refused rather than silently taking the 30-day deadline. Review then disproved
+  the claim that an exposed quotation must break one of those invariants — a plausible version
+  slots into the order — so the exposed direction got its own unconditional rule: a real heading
+  stands alone between blank lines (all 28 in this file do), and a heading quoted inside a code
+  span necessarily touches its quoting text, because a span cannot contain a blank line. The same
+  adjacency rule covers subsection headings (blank-above only, since the house style puts the
+  first bullet directly under the heading), so an exposed quoted `### Security` cannot raise a
+  false 7-day alarm; and a duplicated section heading is refused at write time rather than
+  merged into a daily finding after the fact. A live heading between raw comment-marker pairs is
+  refused outright — comments, unlike code spans, can contain blank lines, so the adjacency rules
+  cannot reach an exposed comment interior, and the region rule deliberately does not model WHY
+  the markers were mishandled (the reported bypass was backslash-escaped backticks shielding a
+  real opener; the next one would be something else). Line-initial raw HTML is refused outright:
+  every CommonMark HTML block type begins with `<` at line start, blocks can contain blank lines,
+  and their interiors do not render as Markdown — one line-shape ban retires the whole carrier
+  family (`<pre>` was the reported instance) instead of chasing it one tag at a time. The real
+  file has zero line-initial `<` across two thousand lines, so the ban costs nothing anyone
+  writes. Heading-shaped text indented one to three spaces is refused too — CommonMark still
+  renders it as a heading (including nested in a list item), while this format's structure sits at
+  column 0, exactly as `release.yml`'s own heading check requires — and a deleted or renamed
+  `CHANGELOG.md` now fails the self-check instead of leaving it green with nothing to validate. The
+  document-level section split uses the same line-bounded whitespace as every per-line grammar — its
+  `\s+` matched a newline, so a bare `##` line joined the next line into a phantom section the
+  classifier never saw and the validator never audited. The ambiguity detector now shares the
+  parser's own regex objects instead of transcribing them — the transcription required exactly one
+  space after `##` where the parser accepts any run, so a two-space heading was real to one
+  grammar and invisible to the other. The indent guard was a third transcription with the same
+  drift; every heading-shape decision in the validator now calls the shared testers
+  (`isHeadingShaped`, `isSubsectionShaped`), and no copied heading grammar remains outside the
+  shared module. One blank line was inserted before a `### Fixed`
+  in the 0.13.1 section — whitespace-only, no entry text changed — where a formatting slip in
+  shipped history was the sole exception to the rule across 47 subsection headings.
+
 ### Added
 - **A daily check that fails when finished work has stopped moving toward a device (SUR-1070
   follow-up).** braird-core reaches a phone through two deliberately manual hops — merge to a
@@ -699,6 +767,7 @@ no host code changes required.
   non-`handwritten_annotation` edge are the broader note-delete edge cascade (SUR-84 parity), tracked
   separately. `refresh-annotation-signal` in the native-parity manifest flips from waived to core.
   Spine (sync); sync-reviewer + crypto-reviewer. No FFI change → no bindings regen.
+
 ### Fixed
 - **`reconcile.rs` `repoint_note_links` now stages the full NOT-NULL shape (SUR-954).** A
   content-dedupe merge (`reconcile_content_dupes` → `merge_into_survivor` → `repoint_note_links`)

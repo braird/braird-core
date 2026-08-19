@@ -22,15 +22,92 @@
 // swallow that fence's closing delimiter; the fence then never closes and every following line,
 // including a real `### Security`, is masked to EOF. Precedence has to be decided per line, in
 // order, because each state can hide the other's syntax.
+//
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// THE BOUNDARY IS FROZEN HERE, and the reasoning deserves its length because four consecutive
+// review findings were the same finding: "your hand-rolled parsing missed a CommonMark rule" —
+// fence closers, then info strings, then code-span resolution order, then code spans crossing line
+// breaks. Each was locally valid. The series does not converge; `check-stale-release-markers.mjs`
+// already ran it once ("35 findings, each locally valid, the series divergent") and settled on a
+// boundary instead. This module now does the same, with one improvement the sibling could not have:
+//
+// THE CLASSIFIER NO LONGER NEEDS TO BE RIGHT — IT NEEDS TO NEVER BE SILENTLY WRONG. A misparse has
+// two directions. EXPOSING a quoted example (a phantom heading) breaks the document invariants the
+// staleness checker validates — version order, uniqueness, the subsection vocabulary — and fails
+// loudly there. HIDING a real line is caught by `maskedHeadingShapedLines` below: any masked line
+// whose RAW text is heading-shaped makes the document AMBIGUOUS, which is a hard validation error
+// at the PR that introduces it, not a silent daily miss. Both directions land on noise. Further
+// CommonMark exactness (multi-line code spans, link titles, setext headings, ...) therefore buys
+// nothing the validator does not already guarantee, and findings about it should be answered with
+// this paragraph and a pinned corpus row rather than another rule.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
 
 const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
-const VERSION_HEADING = /^ {0,3}##\s+\[([^\]]+)\]/;
+// `[ \t]` rather than `\s`: these run per line so `\s` cannot cross a newline HERE, but the section
+// split in the staleness checker runs on the whole document and was caught doing exactly that. One
+// alphabet everywhere, so the grammars cannot disagree about what a heading is.
+const VERSION_HEADING = /^ {0,3}##[ \t]+\[([^\]]+)\]/;
 
-/** Blank any HTML-comment span on one line, carrying the open/closed state across lines. */
-function maskComments(line, openAtStart) {
+/**
+ * The `[start, end)` ranges of inline code spans on one line, by CommonMark's rule that a span is
+ * delimited by backtick runs of EQUAL length.
+ *
+ * Needed because a comment marker written inside backticks is a quotation, not syntax — and a
+ * CHANGELOG documenting a parser quotes syntax constantly. Without this, `` `<!--` `` in prose opens
+ * a real comment the moment any later entry contains an ordinary closed one, masking everything
+ * between them. Measured on this repository's own file: one added comment took it from 27 sections
+ * to 25 and silenced the unreleased-security signal.
+ */
+function codeSpanRanges(line) {
+  const runs = [];
+  for (const m of line.matchAll(/`+/g)) runs.push({ at: m.index, len: m[0].length });
+  const ranges = [];
+  // Runs are consumed IN DOCUMENT ORDER: an opener pairs with the next equal-length run, and every
+  // run between the two is spent inside that span — it can never open or close anything else. The
+  // previous version paired leftovers independently, so run lengths 1,2,1,2 produced OVERLAPPING
+  // spans and the second one shielded a real `<`+`!--` sitting after the first span's closer.
+  // CommonMark resolves spans left-to-right; so must we.
+  let i = 0;
+  while (i < runs.length) {
+    let j = i + 1;
+    while (j < runs.length && runs[j].len !== runs[i].len) j += 1;
+    if (j < runs.length) {
+      ranges.push([runs[i].at, runs[j].at + runs[j].len]);
+      i = j + 1; // everything through the closer is consumed
+    } else {
+      i += 1; // an unmatched run is literal text; later runs may still pair among themselves
+    }
+  }
+  return ranges;
+}
+
+const inAnyRange = (ranges, at) => ranges.some(([from, to]) => at >= from && at < to);
+
+/**
+ * Blank any HTML-comment span on one line, carrying the open/closed state across lines.
+ *
+ * `hasCloserAfter(offset)` decides whether a `<!--` is a real comment opener or just prose. Without
+ * that lookahead an UNTERMINATED marker masks everything to end of file, and the likeliest source of
+ * one is a CHANGELOG entry *describing* comment syntax — which is exactly how this shipped broken:
+ * the entry documenting the comment handling contained a literal `<!--`, and the parser reading that
+ * entry then found zero sections in its own file.
+ *
+ * An unterminated marker is therefore treated as literal text. That direction is deliberate: masking
+ * fails toward SILENCE, which is the failure mode this whole checker exists to avoid, while treating
+ * it as prose fails toward noise. A genuinely forgotten `-->` shows up as findings, not as quiet.
+ *
+ * The lookahead alone was not enough, and the gap is instructive: it only protects a marker with NO
+ * closer anywhere, so quoted syntax became a real opener as soon as any later entry added an
+ * ordinary comment. Both rules are needed — code spans decide whether a marker is syntax at all, the
+ * lookahead decides what to do with one that is.
+ */
+function maskComments(line, openAtStart, lineOffset, hasCloserAfter) {
   let open = openAtStart;
   let out = '';
   let i = 0;
+  // Only OPENERS are shielded by code spans. Inside an actual comment, backticks are ordinary
+  // characters, so the search for a closer must not skip them.
+  const spans = codeSpanRanges(line);
   while (i < line.length) {
     if (open) {
       const end = line.indexOf('-->', i);
@@ -46,6 +123,14 @@ function maskComments(line, openAtStart) {
       const start = line.indexOf('<!--', i);
       if (start === -1) {
         out += line.slice(i);
+        i = line.length;
+      } else if (inAnyRange(spans, start)) {
+        // Quoted syntax inside `backticks`, not a comment. Copy through and keep scanning after it,
+        // so a genuine comment later on the same line is still found.
+        out += line.slice(i, start + 4);
+        i = start + 4;
+      } else if (!hasCloserAfter(lineOffset + start)) {
+        out += line.slice(i); // an unterminated marker is prose, not a comment that eats the file
         i = line.length;
       } else {
         out += line.slice(i, start);
@@ -68,13 +153,17 @@ function maskComments(line, openAtStart) {
 export function classifyChangelogLines(text) {
   let fence = null; // the opening delimiter run we are inside, if any
   let inComment = false;
+  let offset = 0;
+  const hasCloserAfter = (at) => text.indexOf('-->', at) !== -1;
   return text.split('\n').map((raw) => {
+    const lineOffset = offset;
+    offset += raw.length + 1; // + the newline the split consumed
     if (fence) {
       const f = FENCE.exec(raw);
       if (f && f[1][0] === fence[0] && f[1].length >= fence.length && f[2].trim() === '') fence = null;
       return { insideFence: true, heading: null, masked: '' };
     }
-    const { masked, open } = maskComments(raw, inComment);
+    const { masked, open } = maskComments(raw, inComment, lineOffset, hasCloserAfter);
     inComment = open;
     const f = FENCE.exec(masked);
     if (f) {
@@ -84,6 +173,44 @@ export function classifyChangelogLines(text) {
     const h = VERSION_HEADING.exec(masked);
     return { insideFence: false, heading: h ? h[1].trim() : null, masked };
   });
+}
+
+/** A line that would read as structure if it were live: a section heading or a subsection heading. */
+const SUBSECTION_HEADING = /^ {0,3}###[ \t]/;
+
+/**
+ * Heading-shaped = matches THE PARSER'S OWN grammars, not a parallel literal. The previous version
+ * was a second copy that required exactly one space after `##` while `VERSION_HEADING` accepts any
+ * `[ \t]+` run — so `##  [0.16.0]` was a real heading to the parser and invisible to the ambiguity
+ * detector, exactly one commit after "one alphabet everywhere" was written down. A shared regex
+ * object cannot drift; a transcription of one can and did.
+ */
+/** The subsection half alone, for rules that treat section and subsection headings differently. */
+export function isSubsectionShaped(line) {
+  return SUBSECTION_HEADING.test(line);
+}
+
+export function isHeadingShaped(line) {
+  return VERSION_HEADING.test(line) || SUBSECTION_HEADING.test(line);
+}
+
+/**
+ * Every line the classifier HID whose raw text is heading-shaped — the ambiguity detector that lets
+ * the boundary above stay frozen.
+ *
+ * If any CommonMark subtlety this module does not model causes a real heading to be masked, the
+ * damage is no longer a silently missing section or a silently demoted severity: the line shows up
+ * here, and the staleness checker turns it into a hard validation error naming the line. The fix is
+ * then made in the DOCUMENT (indent the example four spaces, or quote it inline) by the author who
+ * wrote it, at the PR that introduces it — not in this parser, months later, after a quiet miss.
+ */
+export function maskedHeadingShapedLines(text) {
+  const structure = classifyChangelogLines(text);
+  return text
+    .split('\n')
+    .map((raw, i) => ({ raw, i, s: structure[i] }))
+    .filter(({ raw, s }) => isHeadingShaped(raw) && (s.insideFence || !isHeadingShaped(s.masked)))
+    .map(({ raw, i }) => ({ line: i + 1, text: raw.trim() }));
 }
 
 /**

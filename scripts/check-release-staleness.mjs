@@ -53,7 +53,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { maskedForSectionSplit } from './lib/changelog-structure.mjs';
+import { classifyChangelogLines, isHeadingShaped, isSubsectionShaped, maskedForSectionSplit, maskedHeadingShapedLines } from './lib/changelog-structure.mjs';
 
 const DAY_MS = 86_400_000;
 
@@ -159,7 +159,12 @@ export function parseChangelog(text) {
   // The split runs on the MASKED text, not the original. Deciding structure from a probe and then
   // splitting the original is its own trap: the classifier correctly says "that commented-out
   // heading is not a boundary" and the split treats it as one anyway.
-  const parts = maskedForSectionSplit(text).split(/^ {0,3}##\s+\[([^\]]+)\]([^\n]*)$/m);
+  // `[ \t]+`, never `\s+`: the split runs on the WHOLE document, so `\s+` matches a newline and a
+  // bare `##` line followed by `[x.y.z] - date` on the next line parsed as a heading — one the
+  // line-bounded classifier never saw, so the validator audited nothing and the phantom section
+  // silently adopted the Security work below it. Every heading grammar here is line-bounded; the
+  // split must use the same alphabet.
+  const parts = maskedForSectionSplit(text).split(/^ {0,3}##[ \t]+\[([^\]]+)\]([^\n]*)$/m);
   // parts[0] is the preamble; thereafter [version, headingTail, body, version, headingTail, ...].
   const sections = [];
   for (let i = 1; i < parts.length; i += 3) {
@@ -184,13 +189,183 @@ export function parseChangelog(text) {
   };
 }
 
+/**
+ * Document-discipline violations: the states in which this CHANGELOG cannot be trusted to mean what
+ * it appears to mean. THIS IS THE CLASS FIX for the divergent Markdown-parsing finding series.
+ *
+ * The parser (lib/changelog-structure) is frozen at a boundary; what replaces further exactness is
+ * the guarantee that a misparse in EITHER direction is loud:
+ *   - a quoted example EXPOSED as a real heading breaks version monotonicity, uniqueness, or the
+ *     subsection vocabulary — violations below;
+ *   - a real line HIDDEN by masking is heading-shaped raw text inside a fence/comment — the
+ *     ambiguity violation below, naming the exact line.
+ * Violations are hard errors (exit 2), not findings: they mean the document is ambiguous, and the
+ * fix belongs in the document, by its author, at the PR that introduces it. The self-check runs
+ * this against the repository's real CHANGELOG, and the selfcheck workflow triggers on CHANGELOG.md
+ * — every PR must add an entry (CI-enforced), so an ambiguous entry is refused at write time.
+ */
+export function validateChangelog(text) {
+  const violations = [];
+  // A real heading stands alone between blank lines — every Keep a Changelog heading does, and all
+  // 28 in this repository do. A heading TOUCHING text is a quotation the parser exposed: review
+  // disproved the assumption that an exposed quote must break version order (a plausible version
+  // slots right in), but a CommonMark code span cannot contain a blank line, so whatever quoting
+  // construct carried the heading, its delimiter text is adjacent. This closes the exposed
+  // direction UNCONDITIONALLY, the way maskedHeadingShapedLines closes the hidden one: neither
+  // rule needs to know WHICH Markdown subtlety was mismodelled.
+  const rawLines = text.split('\n');
+  const structure = classifyChangelogLines(text);
+  structure.forEach((st, i) => {
+    const aboveBlank = i === 0 || rawLines[i - 1].trim() === '';
+    if (st.heading !== null) {
+      const belowBlank = i === rawLines.length - 1 || rawLines[i + 1].trim() === '';
+      if (!aboveBlank || !belowBlank) {
+        violations.push(
+          `line ${i + 1} parses as section heading [${st.heading}] but touches adjacent text — a real ` +
+            'heading stands alone between blank lines; an exposed quotation does not',
+        );
+      }
+      return;
+    }
+    // Subsection headings carry the SEVERITY, so an exposed quoted `### Security` is a false 7-day
+    // alarm rather than a false section — same exposure, same rule, one asymmetry: the house style
+    // puts the first bullet directly under the heading, so only blank-ABOVE is required. That still
+    // closes the quote case, because a code span cannot contain a blank line — the span's opening
+    // text is always the line directly above the quoted heading.
+    if (!st.insideFence && isSubsectionShaped(st.masked) && !aboveBlank) {
+      violations.push(
+        `line ${i + 1} parses as a subsection heading but touches the text above it — a real ` +
+          'subsection heading follows a blank line; an exposed quotation does not',
+      );
+    }
+  });
+  // Raw HTML at line start is refused outright, which retires the whole carrier family instead of
+  // chasing it one tag at a time. Every CommonMark HTML block (types 1–7: <pre>, <script>, <div>,
+  // <details>, <!DOCTYPE, <?…, <![CDATA[ …) begins with `<` at the start of a line, blocks can
+  // contain blank lines, and their interiors do not render as Markdown — so a quoted heading inside
+  // one is exposed by this parser while every adjacency and ordering invariant holds. <pre> was the
+  // reported instance; banning the line shape closes the other six types unseen. Inline HTML
+  // mid-line cannot span a blank line, so it cannot carry a blank-surrounded heading, and `<!--`
+  // is exempt because the comment machinery and the region rule below govern it. The real
+  // CHANGELOG has zero line-initial `<` across 2,000 lines — this bans nothing anyone writes.
+  // Structure in THIS document lives at column 0 — all 28 section headings and 47 subsection
+  // headings do, and release.yml's own heading check is an exact column-0 match. CommonMark still
+  // renders a 1-3-space-indented heading AS a heading (including nested inside a list item, the
+  // reported case), so heading-shaped text at that indent is two things at once: a heading to the
+  // renderer, a stray line to this format. The daily run stays permissive (an indented
+  // `### Security` still counts, erring toward firing); the write-time gate refuses the shape.
+  // `isHeadingShaped` + a leading-space test, never a third transcription of the grammar — the
+  // first two transcriptions each drifted from `[ \t]+` and each drift was a review finding.
+  structure.forEach((st, i) => {
+    if (st.insideFence) return;
+    if (/^ {1,3}/.test(st.masked) && isHeadingShaped(st.masked)) {
+      violations.push(
+        `line ${i + 1} is a heading indented ${st.masked.match(/^ +/)[0].length} space(s) — structural ` +
+          'headings sit at column 0 in this format; indent an example four spaces or quote it inline',
+      );
+    }
+  });
+  structure.forEach((st, i) => {
+    if (st.insideFence) return;
+    if (/^ {0,3}(<[A-Za-z]|<\/|<\?|<!(?!--))/.test(st.masked)) {
+      violations.push(
+        `line ${i + 1} starts with raw HTML (${JSON.stringify(rawLines[i].trim().slice(0, 40))}) — ` +
+          'HTML blocks can hide or expose heading-shaped text; indent the example four spaces or quote it inline',
+      );
+    }
+  });
+
+  // A live heading between a raw comment-opener and a raw closer is ambiguous NO MATTER WHAT the
+  // classifier decided about those markers. Comments — unlike code spans — can contain blank lines,
+  // so the adjacency rules above cannot reach an exposed comment interior; and deciding whether a
+  // marker is "really" syntax (escapes, entities, ...) is the divergent CommonMark series this
+  // design exists to end. Escaped backticks shielding a real opener was the reported bypass; this
+  // rule does not care why the markers were mishandled, only that a heading sits between them.
+  // Marker pairing follows the lookahead rule: an opener with no closer anywhere is prose.
+  {
+    let searchFrom = 0;
+    for (;;) {
+      const open = text.indexOf('<!--', searchFrom);
+      if (open === -1) break;
+      const close = text.indexOf('-->', open + 4);
+      if (close === -1) break;
+      const openLine = text.slice(0, open).split('\n').length - 1;
+      const closeLine = text.slice(0, close).split('\n').length - 1;
+      structure.forEach((st, i) => {
+        if (i <= openLine || i > closeLine) return;
+        const headingLike = st.heading !== null || (!st.insideFence && isHeadingShaped(st.masked));
+        if (headingLike) {
+          violations.push(
+            `line ${i + 1} parses as a heading but sits between comment markers (lines ` +
+              `${openLine + 1}..${closeLine + 1}) — ambiguous; split the quoted markers (write ` +
+              "'<!' + '--') or keep them on one line",
+          );
+        }
+      });
+      searchFrom = close + 3;
+    }
+  }
+  for (const { line, text: t } of maskedHeadingShapedLines(text)) {
+    violations.push(
+      `line ${line} is heading-shaped but sits inside a fence or comment (${JSON.stringify(t)}) — ` +
+        'ambiguous; indent the example four spaces or quote it inline instead',
+    );
+  }
+  const { released, unreleased, hasUnreleasedHeading, duplicates } = parseChangelog(text);
+  // The daily run MERGES duplicate sections defensively (severities union) because it must read
+  // whatever main contains — but the write-time gate must REFUSE them, or the merge-conflict shape
+  // this defends against sails through the PR and is only ever a daily finding after the fact.
+  for (const version of duplicates) {
+    violations.push(`the CHANGELOG has more than one [${version}] section — a merge conflict resolved badly`);
+  }
+  for (let i = 1; i < released.length; i += 1) {
+    const [a, b] = [parseVersion(released[i - 1].version), parseVersion(released[i].version)];
+    if (!a || !b) {
+      if (!b) violations.push(`section [${released[i].version}] does not parse as a version`);
+      continue;
+    }
+    if (compareVersions(a, b) <= 0) {
+      violations.push(
+        `sections [${released[i - 1].version}] then [${released[i].version}] are not in decreasing ` +
+          'order — a quoted example heading parsed as real, or the sections are misordered',
+      );
+    }
+  }
+  if (released.length > 0 && !parseVersion(released[0].version)) {
+    violations.push(`section [${released[0].version}] does not parse as a version`);
+  }
+  const bodies = hasUnreleasedHeading ? [['Unreleased', unreleased]] : [];
+  for (const sec of released) bodies.push([sec.version, sec.body]);
+  for (const [name, body] of bodies) {
+    for (const h of subsectionHeadings(body)) {
+      if (!KAC_TYPES.has(h)) {
+        violations.push(
+          `section [${name}] has a subsection heading "### ${h}" outside the Keep a Changelog ` +
+            'vocabulary (Added, Changed, Deprecated, Removed, Fixed, Security) — a typo here can ' +
+            'silently change a deadline',
+        );
+      }
+    }
+  }
+  return violations;
+}
+
+/** The six subsection types Keep a Changelog defines. Anything else in a `###` slot is a mistake. */
+const KAC_TYPES = new Set(['Added', 'Changed', 'Deprecated', 'Removed', 'Fixed', 'Security']);
+
+/**
+ * The `###` subsection headings in one section body, normalized per ATX rules — up to three leading
+ * spaces, an optional closing hash run. Both decorations were separate review findings when the
+ * Security check was a bespoke regex; extracting ONCE means a decorated heading is either
+ * normalized here or reported as unknown by [`validateChangelog`], never silently invisible.
+ */
+export function subsectionHeadings(body) {
+  return [...body.matchAll(/^ {0,3}###[ 	]+(.+?)[ 	]*(?:#+[ 	]*)?$/gm)].map((m) => m[1].trim());
+}
+
 /** Keep a Changelog puts security work under its own heading. That heading IS the severity signal. */
 export function hasSecuritySection(body) {
-  // ATX heading rules, and each clause is a finding this has already had: up to three leading
-  // spaces, and an optional closing hash run (`### Security ###`). Both make a real heading
-  // invisible, which silences the unreleased signal outright and quietly demotes a release from the
-  // 7-day deadline to the 30-day one.
-  return /^ {0,3}###\s+Security\s*(?:#+[ 	]*)?$/m.test(body);
+  return subsectionHeadings(body).includes('Security');
 }
 
 /**
@@ -932,6 +1107,82 @@ const CORPUS = [
     },
     detail: /in the FUTURE/,
   },
+  // ── code spans resolve in DOCUMENT ORDER, never as overlapping leftover pairs ──
+  // Run lengths 1,2,1,2 with a real comment opener between the 3rd and 4th runs: CommonMark pairs
+  // the two length-1 runs (consuming the length-2 run between them) and leaves the trailing run as
+  // literal text, so the marker IS a comment. Independent pairing built a second, overlapping span
+  // that shielded it, and the heading inside the comment surfaced as a phantom release.
+  {
+    name: 'leftover backtick runs do not form an overlapping span that shields a real comment',
+    input: {
+      changelog:
+        '## [Unreleased]\n\n### Fixed\n- `a ``b` <!-- ``\n## [9.9.9] - 2026-01-01\n-->\n\n' +
+        '## [1.1.0] - 2025-12-01\n\n### Added\n- y\n',
+      published: new Map([['1.1.0', rel('1.1.0', '2025-12-01T00:00:00Z')]]),
+      now: '2026-03-01T00:00:00Z',
+    },
+    expect: [], // 9.9.9 stays inside the comment; no phantom "undocumented release"
+  },
+  // ── a marker inside `backticks` is a quotation, whatever appears later in the file ──
+  // The lookahead alone was not enough: quoted syntax became a real opener the moment any later
+  // entry added an ordinary comment. Measured on the real CHANGELOG, one such comment cost two
+  // sections and the unreleased-security signal.
+  {
+    name: 'a quoted comment marker stays literal even when a real comment appears later',
+    input: {
+      changelog:
+        '## [Unreleased]\n\n### Security\n- an entry documenting the `<!--` marker\n\n' +
+        '## [1.2.0] - 2026-01-01\n\n<!-- an ordinary editor note -->\n\n### Added\n- x\n\n' +
+        '## [1.1.0] - 2025-12-01\n\n### Added\n- y\n',
+      published: PUB,
+      unreleasedSecuritySince: '2026-01-01T00:00:00Z',
+      now: '2026-03-01T00:00:00Z',
+    },
+    expect: ['unreleased'], // both sections still parse; no phantom "undocumented release" findings
+  },
+  {
+    name: 'but an UNQUOTED comment still hides the heading inside it',
+    input: {
+      changelog:
+        '## [Unreleased]\n\n### Fixed\n- x\n\n<!--\n## [9.9.9] - 2026-01-01\n-->\n\n' +
+        '## [1.1.0] - 2025-12-01\n\n### Added\n- y\n',
+      published: new Map([['1.1.0', rel('1.1.0', '2025-12-01T00:00:00Z')]]),
+      now: '2026-03-01T00:00:00Z',
+    },
+    expect: [], // 9.9.9 is commented out, so it is not an undocumented release
+  },
+  // ── the split is line-bounded like every other heading grammar (Codex, this PR) ──
+  {
+    name: 'a bare ## line does not join the next line into a phantom section across the newline',
+    input: {
+      // `\s+` in the document-level split matched the newline; the classifier never saw a heading
+      // on either line, so the validator audited nothing and 0.14.1 adopted the Security work.
+      changelog:
+        '## [Unreleased]\n\n### Fixed\n- x\n\n##\n[0.14.1] - 2026-07-30\n\n### Security\n- the real fix\n\n' +
+        '## [0.14.0] - 2026-07-29\n\n### Added\n- x\n',
+      published: new Map([['0.14.0', rel('0.14.0', '2026-07-29T00:00:00Z')], ['0.14.1', rel('0.14.1', '2026-07-30T00:00:00Z')]]),
+      unreleasedSecuritySince: '2026-01-01T00:00:00Z',
+      now: '2026-03-01T00:00:00Z',
+    },
+    // The Security work stays in [Unreleased] and fires; and published 0.14.1, no longer supplied a
+    // phantom section by the crossing split, is correctly reported undocumented.
+    expect: ['unreleased', 'unpublished'],
+  },
+  // ── an UNTERMINATED comment marker is prose, not a comment that eats the file ──
+  // This one shipped and broke the real CHANGELOG: the entry describing the comment handling
+  // contained a literal marker, which opened a comment that never closed and masked every heading
+  // after it. The checker could not read its own file.
+  {
+    name: 'a changelog mentioning a comment marker in prose still parses its sections',
+    input: {
+      changelog:
+        '## [Unreleased]\n\n### Security\n- a fix that mentions <!-- in prose and never closes it\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
+      published: new Map([['1.1.0', rel('1.1.0', '2025-12-01T00:00:00Z')]]),
+      unreleasedSecuritySince: '2026-01-01T00:00:00Z',
+      now: '2026-03-01T00:00:00Z',
+    },
+    expect: ['unreleased'], // and crucially NOT 27 "undocumented release" findings
+  },
   // ── comment syntax is literal INSIDE a fence (Codex P2, fifteenth round) ──
   {
     name: 'a comment marker inside a fenced example does not swallow the fence closer',
@@ -1178,8 +1429,158 @@ function checkConsumerPlumbing() {
   return problems;
 }
 
+/**
+ * The corpus is entirely synthetic, and that is a gap it cannot see past: every fixture is a handful
+ * of lines written to exercise one rule. The parser shipped unable to read this repository's ACTUAL
+ * CHANGELOG — 1,954 lines, zero sections found — with all 47 cases green.
+ *
+ * So when a real CHANGELOG is at hand, parse it too. Not for its content, just for the one property
+ * no fixture can assert: that the parser still works on the genuine article.
+ */
+function checkRealChangelog() {
+  // Missing is FAILURE, not skip. Review demonstrated a PR deleting CHANGELOG.md sails through:
+  // the changelog gate only checks whether the file appears in the diff (a deletion does), and an
+  // early return here made the self-check green with nothing to validate. Every context this runs
+  // in checks out the repository, so absence only ever means deleted or renamed.
+  if (!existsSync('CHANGELOG.md')) return ['CHANGELOG.md does not exist — deleted or renamed?'];
+  const text = readFileSync('CHANGELOG.md', 'utf8');
+  const { released, hasUnreleasedHeading } = parseChangelog(text);
+  const problems = [];
+  if (!hasUnreleasedHeading) problems.push('the real CHANGELOG.md has no [Unreleased] heading');
+  if (released.length === 0) problems.push('the real CHANGELOG.md parsed to ZERO released sections');
+  // The discipline gate: an ambiguous entry is refused at the PR that writes it (the selfcheck
+  // workflow triggers on CHANGELOG.md, and every PR must touch it), never discovered by a daily run.
+  for (const v of validateChangelog(text)) problems.push(`the real CHANGELOG.md is ambiguous: ${v}`);
+  return problems;
+}
+
+/**
+ * The validator's own corpus: each row is a document sin and the guarantee that it is LOUD. These
+ * are the states the frozen parser is allowed to get wrong, because the validator catches both
+ * directions — which is the whole argument for freezing it.
+ */
+const VALIDATION_CORPUS = [
+  {
+    name: 'a real Security heading swallowed by a comment span is an ambiguity error, not a silent miss',
+    // The multi-line code-span shape from review: a quoted opener whose closer sits lines away.
+    // Whatever the parser decides about the span, the masked heading-shaped line is flagged.
+    changelog:
+      '## [Unreleased]\n\n### Fixed\n- quoting <!-- an opener\n\n### Security\n- the real fix\n' +
+      '- and `-->` quoted later\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
+    expect: /heading-shaped but sits inside a fence or comment/,
+  },
+  {
+    name: 'an exposed quote that keeps versions ORDERED is still loud — headings stand alone',
+    // Review disproved "every exposed quote breaks an invariant" with a plausible version that
+    // slots into the order. The blank-line rule is unconditional: a code span cannot contain a
+    // blank line, so the quoted heading necessarily touches its quoting text.
+    changelog:
+      '## [Unreleased]\n\n### Fixed\n- quoting `a span\n## [0.14.1] - 2026-07-30\nspan text` here\n\n' +
+      '### Security\n- the real fix\n\n## [0.14.0] - 2026-07-29\n\n### Added\n- x\n',
+    expect: /touches adjacent text/,
+  },
+  {
+    name: 'a quoted example heading EXPOSED as real breaks monotonicity and is loud',
+    changelog:
+      '## [Unreleased]\n\n### Fixed\n- x\n\n## [1.2.0] - 2026-01-01\n\n### Added\n- an example follows\n\n' +
+      '## [0.9.0] - 2020-01-01\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- y\n',
+    expect: /not in decreasing order/,
+  },
+  {
+    name: 'a nested heading with TWO spaces after ## is still caught by the indent rule',
+    // Third transcription drift: the indent guard hand-copied `## [` with one space while the
+    // parser accepts any [ \t]+ run, so `  ##  [0.14.1]` parsed as a real section and the guard
+    // missed it. The guard now consults the shared grammar; this row pins the two-space form.
+    changelog:
+      '## [Unreleased]\n\n### Fixed\n- a nested example:\n\n  ##  [0.14.1] - 2026-07-30\n\n' +
+      '### Security\n- the real fix\n\n## [0.14.0] - 2026-07-29\n\n### Added\n- x\n',
+    expect: /is a heading indented 2 space/,
+  },
+  {
+    name: 'a heading nested in a list by 2-space indent is loud — structure sits at column 0',
+    // CommonMark renders it as a heading inside the list item; this format does not recognize it.
+    // Plausibly ordered and published, so no other invariant fires — the indent rule must.
+    changelog:
+      '## [Unreleased]\n\n### Fixed\n- a nested example:\n\n  ## [0.14.1] - 2026-07-30\n\n' +
+      '### Security\n- the real fix\n\n## [0.14.0] - 2026-07-29\n\n### Added\n- x\n',
+    expect: /indented .*structural headings sit at column 0/,
+  },
+  {
+    name: 'a heading quoted inside a <pre> block is loud — line-initial raw HTML is refused',
+    changelog:
+      '## [Unreleased]\n\n### Fixed\n- x\n\n<pre>\n\n## [0.14.1] - 2026-07-30\n\n### Security\n- phantom\n\n</pre>\n\n' +
+      '## [0.14.0] - 2026-07-29\n\n### Added\n- x\n',
+    expect: /starts with raw HTML/,
+  },
+  {
+    name: 'a two-space `##  [v]` heading hidden under a mask is still heading-shaped',
+    // The ambiguity detector was a TRANSCRIPTION of the heading grammar requiring exactly one
+    // space, while the parser accepts any [ \t]+ run — so this heading was real to one and
+    // invisible to the other. The detector now shares the parser's regex objects.
+    changelog:
+      '## [Unreleased]\n\n### Fixed\n- quoting `a span <!--\n##  [0.16.0] - 2026-08-01\n\n' +
+      '### Security\n- hidden\n\nspan` with --> closer\n\n## [0.14.0] - 2026-07-29\n\n### Added\n- x\n',
+    // Pinned to the TWO-SPACE line specifically: the masked `### Security` fires too, and an
+    // expectation satisfied by it would let a one-space transcription of the grammar survive.
+    expect: /heading-shaped but sits inside a fence or comment \("##  \[0\.16\.0\]/,
+  },
+  {
+    name: 'headings between raw comment markers are loud, whatever shielded the opener',
+    // Reported bypass: backslash-escaped backticks pair as a phantom code span, shield the real
+    // opener, and the comment interior — which CAN contain blank lines, unlike a span — is exposed
+    // with every heading blank-surrounded and validly ordered. The region rule does not model
+    // escapes; it refuses ANY live heading between raw marker pairs.
+    changelog:
+      '## [Unreleased]\n\n### Fixed\n- writes \\`<!--\\` literally\n\n## [0.14.1] - 2026-07-30\n\n' +
+      '### Security\n- phantom\n\n-->\n\n## [0.14.0] - 2026-07-29\n\n### Added\n- x\n',
+    expect: /sits between comment markers/,
+  },
+  {
+    name: 'an exposed quoted ### Security touching its quote text is loud — no false 7-day alarm',
+    changelog:
+      '## [Unreleased]\n\n### Fixed\n- routine work, quoting `a span\n### Security\nspan text` here\n\n' +
+      '## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
+    expect: /subsection heading but touches the text above/,
+  },
+  {
+    name: 'a duplicated section heading is refused at write time, not merged into a daily finding',
+    changelog:
+      '## [Unreleased]\n\n### Fixed\n- x\n\n## [Unreleased]\n\n### Security\n- hidden by the duplicate\n\n' +
+      '## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
+    expect: /more than one \[Unreleased\] section/,
+  },
+  {
+    name: 'an unknown subsection heading is loud — a typo cannot silently change a deadline',
+    changelog: '## [Unreleased]\n\n### Securty\n- oops\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
+    expect: /outside the Keep a Changelog vocabulary/,
+  },
+  {
+    name: 'a clean document has no violations',
+    changelog: '## [Unreleased]\n\n### Security\n- a fix\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
+    expect: null,
+  },
+];
+
+function checkValidator() {
+  const problems = [];
+  for (const { name, changelog, expect } of VALIDATION_CORPUS) {
+    const got = validateChangelog(changelog);
+    const ok = expect === null ? got.length === 0 : got.some((v) => expect.test(v));
+    if (!ok) problems.push(`${name} — got: ${got.join(' | ') || '(none)'}`);
+  }
+  return problems;
+}
+
 function selfCheck() {
   let failed = 0;
+  for (const problem of checkRealChangelog()) {
+    failed += 1;
+    console.error(`  FAIL real-file smoke — ${problem}`);
+  }
+  for (const problem of checkValidator()) {
+    failed += 1;
+    console.error(`  FAIL validator — ${problem}`);
+  }
   for (const problem of checkConsumerPlumbing()) {
     failed += 1;
     console.error(`  FAIL consumer plumbing — ${problem}`);
@@ -1245,6 +1646,28 @@ function main() {
   }
   if (published.size === 0) {
     console.error('check-release-staleness: no published release with assets found — refusing to guess.');
+    process.exit(2);
+  }
+
+  // An AMBIGUOUS document is a hard error before it is anything else. Every violation here means
+  // some line cannot be trusted to mean what it appears to mean, and staleness findings computed
+  // from it would be noise wearing the uniform of signal.
+  const changelogText = readFileSync('CHANGELOG.md', 'utf8');
+  const violations = validateChangelog(changelogText);
+  if (violations.length > 0) {
+    console.error('check-release-staleness: the CHANGELOG is ambiguous — refusing to compute staleness from it.');
+    for (const v of violations) console.error(`  ${v}`);
+    process.exit(2);
+  }
+
+  // A CHANGELOG that parses to ZERO released sections is a parser failure, not a repository with no
+  // releases — and it does not present as an error. It presents as every published release being
+  // reported "undocumented", which reads like 27 real findings. Fail loudly instead: the one time
+  // this happened, the misleading findings cost more than the bug.
+  const parsed = parseChangelog(changelogText);
+  if (parsed.released.length === 0 && published.size > 0) {
+    console.error('check-release-staleness: parsed 0 released sections from a CHANGELOG that should have many.');
+    console.error('  That is a PARSER failure, not a finding. Refusing to report staleness from it.');
     process.exit(2);
   }
 
