@@ -53,7 +53,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { maskedForSectionSplit } from './lib/changelog-structure.mjs';
+import { maskedForSectionSplit, maskedHeadingShapedLines } from './lib/changelog-structure.mjs';
 
 const DAY_MS = 86_400_000;
 
@@ -184,13 +184,78 @@ export function parseChangelog(text) {
   };
 }
 
+/**
+ * Document-discipline violations: the states in which this CHANGELOG cannot be trusted to mean what
+ * it appears to mean. THIS IS THE CLASS FIX for the divergent Markdown-parsing finding series.
+ *
+ * The parser (lib/changelog-structure) is frozen at a boundary; what replaces further exactness is
+ * the guarantee that a misparse in EITHER direction is loud:
+ *   - a quoted example EXPOSED as a real heading breaks version monotonicity, uniqueness, or the
+ *     subsection vocabulary — violations below;
+ *   - a real line HIDDEN by masking is heading-shaped raw text inside a fence/comment — the
+ *     ambiguity violation below, naming the exact line.
+ * Violations are hard errors (exit 2), not findings: they mean the document is ambiguous, and the
+ * fix belongs in the document, by its author, at the PR that introduces it. The self-check runs
+ * this against the repository's real CHANGELOG, and the selfcheck workflow triggers on CHANGELOG.md
+ * — every PR must add an entry (CI-enforced), so an ambiguous entry is refused at write time.
+ */
+export function validateChangelog(text) {
+  const violations = [];
+  for (const { line, text: t } of maskedHeadingShapedLines(text)) {
+    violations.push(
+      `line ${line} is heading-shaped but sits inside a fence or comment (${JSON.stringify(t)}) — ` +
+        'ambiguous; indent the example four spaces or quote it inline instead',
+    );
+  }
+  const { released, unreleased, hasUnreleasedHeading } = parseChangelog(text);
+  for (let i = 1; i < released.length; i += 1) {
+    const [a, b] = [parseVersion(released[i - 1].version), parseVersion(released[i].version)];
+    if (!a || !b) {
+      if (!b) violations.push(`section [${released[i].version}] does not parse as a version`);
+      continue;
+    }
+    if (compareVersions(a, b) <= 0) {
+      violations.push(
+        `sections [${released[i - 1].version}] then [${released[i].version}] are not in decreasing ` +
+          'order — a quoted example heading parsed as real, or the sections are misordered',
+      );
+    }
+  }
+  if (released.length > 0 && !parseVersion(released[0].version)) {
+    violations.push(`section [${released[0].version}] does not parse as a version`);
+  }
+  const bodies = hasUnreleasedHeading ? [['Unreleased', unreleased]] : [];
+  for (const sec of released) bodies.push([sec.version, sec.body]);
+  for (const [name, body] of bodies) {
+    for (const h of subsectionHeadings(body)) {
+      if (!KAC_TYPES.has(h)) {
+        violations.push(
+          `section [${name}] has a subsection heading "### ${h}" outside the Keep a Changelog ` +
+            'vocabulary (Added, Changed, Deprecated, Removed, Fixed, Security) — a typo here can ' +
+            'silently change a deadline',
+        );
+      }
+    }
+  }
+  return violations;
+}
+
+/** The six subsection types Keep a Changelog defines. Anything else in a `###` slot is a mistake. */
+const KAC_TYPES = new Set(['Added', 'Changed', 'Deprecated', 'Removed', 'Fixed', 'Security']);
+
+/**
+ * The `###` subsection headings in one section body, normalized per ATX rules — up to three leading
+ * spaces, an optional closing hash run. Both decorations were separate review findings when the
+ * Security check was a bespoke regex; extracting ONCE means a decorated heading is either
+ * normalized here or reported as unknown by [`validateChangelog`], never silently invisible.
+ */
+export function subsectionHeadings(body) {
+  return [...body.matchAll(/^ {0,3}###[ 	]+(.+?)[ 	]*(?:#+[ 	]*)?$/gm)].map((m) => m[1].trim());
+}
+
 /** Keep a Changelog puts security work under its own heading. That heading IS the severity signal. */
 export function hasSecuritySection(body) {
-  // ATX heading rules, and each clause is a finding this has already had: up to three leading
-  // spaces, and an optional closing hash run (`### Security ###`). Both make a real heading
-  // invisible, which silences the unreleased signal outright and quietly demotes a release from the
-  // 7-day deadline to the 30-day one.
-  return /^ {0,3}###\s+Security\s*(?:#+[ 	]*)?$/m.test(body);
+  return subsectionHeadings(body).includes('Security');
 }
 
 /**
@@ -1247,10 +1312,58 @@ function checkConsumerPlumbing() {
  */
 function checkRealChangelog() {
   if (!existsSync('CHANGELOG.md')) return [];
-  const { released, hasUnreleasedHeading } = parseChangelog(readFileSync('CHANGELOG.md', 'utf8'));
+  const text = readFileSync('CHANGELOG.md', 'utf8');
+  const { released, hasUnreleasedHeading } = parseChangelog(text);
   const problems = [];
   if (!hasUnreleasedHeading) problems.push('the real CHANGELOG.md has no [Unreleased] heading');
   if (released.length === 0) problems.push('the real CHANGELOG.md parsed to ZERO released sections');
+  // The discipline gate: an ambiguous entry is refused at the PR that writes it (the selfcheck
+  // workflow triggers on CHANGELOG.md, and every PR must touch it), never discovered by a daily run.
+  for (const v of validateChangelog(text)) problems.push(`the real CHANGELOG.md is ambiguous: ${v}`);
+  return problems;
+}
+
+/**
+ * The validator's own corpus: each row is a document sin and the guarantee that it is LOUD. These
+ * are the states the frozen parser is allowed to get wrong, because the validator catches both
+ * directions — which is the whole argument for freezing it.
+ */
+const VALIDATION_CORPUS = [
+  {
+    name: 'a real Security heading swallowed by a comment span is an ambiguity error, not a silent miss',
+    // The multi-line code-span shape from review: a quoted opener whose closer sits lines away.
+    // Whatever the parser decides about the span, the masked heading-shaped line is flagged.
+    changelog:
+      '## [Unreleased]\n\n### Fixed\n- quoting <!-- an opener\n\n### Security\n- the real fix\n' +
+      '- and `-->` quoted later\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
+    expect: /heading-shaped but sits inside a fence or comment/,
+  },
+  {
+    name: 'a quoted example heading EXPOSED as real breaks monotonicity and is loud',
+    changelog:
+      '## [Unreleased]\n\n### Fixed\n- x\n\n## [1.2.0] - 2026-01-01\n\n### Added\n- an example follows\n\n' +
+      '## [0.9.0] - 2020-01-01\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- y\n',
+    expect: /not in decreasing order/,
+  },
+  {
+    name: 'an unknown subsection heading is loud — a typo cannot silently change a deadline',
+    changelog: '## [Unreleased]\n\n### Securty\n- oops\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
+    expect: /outside the Keep a Changelog vocabulary/,
+  },
+  {
+    name: 'a clean document has no violations',
+    changelog: '## [Unreleased]\n\n### Security\n- a fix\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
+    expect: null,
+  },
+];
+
+function checkValidator() {
+  const problems = [];
+  for (const { name, changelog, expect } of VALIDATION_CORPUS) {
+    const got = validateChangelog(changelog);
+    const ok = expect === null ? got.length === 0 : got.some((v) => expect.test(v));
+    if (!ok) problems.push(`${name} — got: ${got.join(' | ') || '(none)'}`);
+  }
   return problems;
 }
 
@@ -1259,6 +1372,10 @@ function selfCheck() {
   for (const problem of checkRealChangelog()) {
     failed += 1;
     console.error(`  FAIL real-file smoke — ${problem}`);
+  }
+  for (const problem of checkValidator()) {
+    failed += 1;
+    console.error(`  FAIL validator — ${problem}`);
   }
   for (const problem of checkConsumerPlumbing()) {
     failed += 1;
@@ -1328,11 +1445,22 @@ function main() {
     process.exit(2);
   }
 
+  // An AMBIGUOUS document is a hard error before it is anything else. Every violation here means
+  // some line cannot be trusted to mean what it appears to mean, and staleness findings computed
+  // from it would be noise wearing the uniform of signal.
+  const changelogText = readFileSync('CHANGELOG.md', 'utf8');
+  const violations = validateChangelog(changelogText);
+  if (violations.length > 0) {
+    console.error('check-release-staleness: the CHANGELOG is ambiguous — refusing to compute staleness from it.');
+    for (const v of violations) console.error(`  ${v}`);
+    process.exit(2);
+  }
+
   // A CHANGELOG that parses to ZERO released sections is a parser failure, not a repository with no
   // releases — and it does not present as an error. It presents as every published release being
   // reported "undocumented", which reads like 27 real findings. Fail loudly instead: the one time
   // this happened, the misleading findings cost more than the bug.
-  const parsed = parseChangelog(readFileSync('CHANGELOG.md', 'utf8'));
+  const parsed = parseChangelog(changelogText);
   if (parsed.released.length === 0 && published.size > 0) {
     console.error('check-release-staleness: parsed 0 released sections from a CHANGELOG that should have many.');
     console.error('  That is a PARSER failure, not a finding. Refusing to report staleness from it.');

@@ -29,6 +29,19 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   unterminated-marker rule alone did not cover: quoted syntax became a real opener the moment any
   later entry added an ordinary closed comment. Measured on this file, one such comment cost two
   sections and the unreleased-security signal.
+  **The Markdown-exactness series ends here by design, not by another rule (SUR-1070 follow-up).**
+  Four consecutive review findings were the same finding — a CommonMark subtlety the hand-rolled
+  classifier did not model — and the series does not converge; `check-stale-release-markers.mjs`
+  ran it once already and froze a boundary instead. The classifier is now frozen the same way, and
+  what replaces further exactness is a guarantee that a misparse in EITHER direction is loud: a
+  document validator makes any heading-shaped line hidden inside a fence or comment a hard error
+  naming the line, and an exposed quoted example breaks version monotonicity or the subsection
+  vocabulary, which are hard errors too. Violations mean the DOCUMENT is ambiguous — the fix
+  belongs in the entry, by its author, at the PR that writes it, which is when the self-check now
+  runs (it triggers on `CHANGELOG.md`, and every PR must touch it). The `### Security` check also
+  stopped being a bespoke regex: subsection headings are extracted once, ATX decorations
+  normalized, and anything outside the Keep a Changelog vocabulary is an error — so a typo like
+  `### Securty` is refused rather than silently taking the 30-day deadline.
 
 ### Added
 - **A daily check that fails when finished work has stopped moving toward a device (SUR-1070

@@ -22,6 +22,25 @@
 // swallow that fence's closing delimiter; the fence then never closes and every following line,
 // including a real `### Security`, is masked to EOF. Precedence has to be decided per line, in
 // order, because each state can hide the other's syntax.
+//
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// THE BOUNDARY IS FROZEN HERE, and the reasoning deserves its length because four consecutive
+// review findings were the same finding: "your hand-rolled parsing missed a CommonMark rule" —
+// fence closers, then info strings, then code-span resolution order, then code spans crossing line
+// breaks. Each was locally valid. The series does not converge; `check-stale-release-markers.mjs`
+// already ran it once ("35 findings, each locally valid, the series divergent") and settled on a
+// boundary instead. This module now does the same, with one improvement the sibling could not have:
+//
+// THE CLASSIFIER NO LONGER NEEDS TO BE RIGHT — IT NEEDS TO NEVER BE SILENTLY WRONG. A misparse has
+// two directions. EXPOSING a quoted example (a phantom heading) breaks the document invariants the
+// staleness checker validates — version order, uniqueness, the subsection vocabulary — and fails
+// loudly there. HIDING a real line is caught by `maskedHeadingShapedLines` below: any masked line
+// whose RAW text is heading-shaped makes the document AMBIGUOUS, which is a hard validation error
+// at the PR that introduces it, not a silent daily miss. Both directions land on noise. Further
+// CommonMark exactness (multi-line code spans, link titles, setext headings, ...) therefore buys
+// nothing the validator does not already guarantee, and findings about it should be answered with
+// this paragraph and a pinned corpus row rather than another rule.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
 
 const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 const VERSION_HEADING = /^ {0,3}##\s+\[([^\]]+)\]/;
@@ -151,6 +170,28 @@ export function classifyChangelogLines(text) {
     const h = VERSION_HEADING.exec(masked);
     return { insideFence: false, heading: h ? h[1].trim() : null, masked };
   });
+}
+
+/** A line that would read as structure if it were live: a section heading or a subsection heading. */
+const HEADING_SHAPED = /^ {0,3}(## \[|###\s)/;
+
+/**
+ * Every line the classifier HID whose raw text is heading-shaped — the ambiguity detector that lets
+ * the boundary above stay frozen.
+ *
+ * If any CommonMark subtlety this module does not model causes a real heading to be masked, the
+ * damage is no longer a silently missing section or a silently demoted severity: the line shows up
+ * here, and the staleness checker turns it into a hard validation error naming the line. The fix is
+ * then made in the DOCUMENT (indent the example four spaces, or quote it inline) by the author who
+ * wrote it, at the PR that introduces it — not in this parser, months later, after a quiet miss.
+ */
+export function maskedHeadingShapedLines(text) {
+  const structure = classifyChangelogLines(text);
+  return text
+    .split('\n')
+    .map((raw, i) => ({ raw, i, s: structure[i] }))
+    .filter(({ raw, s }) => HEADING_SHAPED.test(raw) && (s.insideFence || !HEADING_SHAPED.test(s.masked)))
+    .map(({ raw, i }) => ({ line: i + 1, text: raw.trim() }));
 }
 
 /**

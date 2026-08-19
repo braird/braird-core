@@ -20,6 +20,11 @@ on:
   pull_request:
     paths:
       - 'scripts/check-release-staleness.mjs'
+      # Every PR must add a CHANGELOG entry (CI-enforced), and the self-check now VALIDATES the real
+      # CHANGELOG — heading-shaped lines hidden in fences/comments, version order, the subsection
+      # vocabulary. Triggering here means an ambiguous entry is refused at the PR that writes it,
+      # with the author looking at it, instead of confusing a daily run weeks later.
+      - 'CHANGELOG.md'
       # The shared parser decides which lines are sections and which are prose, so a change here can
       # break every signal without touching the checker itself. Omitting it meant a parser-only PR
       # merged without the corpus ever running.
@@ -31,6 +36,7 @@ on:
     paths:
       - 'scripts/check-release-staleness.mjs'
       - 'scripts/lib/changelog-structure.mjs'
+      - 'CHANGELOG.md'
 
 jobs:
   self-check:
