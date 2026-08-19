@@ -26,8 +26,20 @@
 const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 const VERSION_HEADING = /^ {0,3}##\s+\[([^\]]+)\]/;
 
-/** Blank any HTML-comment span on one line, carrying the open/closed state across lines. */
-function maskComments(line, openAtStart) {
+/**
+ * Blank any HTML-comment span on one line, carrying the open/closed state across lines.
+ *
+ * `hasCloserAfter(offset)` decides whether a `<!--` is a real comment opener or just prose. Without
+ * that lookahead an UNTERMINATED marker masks everything to end of file, and the likeliest source of
+ * one is a CHANGELOG entry *describing* comment syntax — which is exactly how this shipped broken:
+ * the entry documenting the comment handling contained a literal `<!--`, and the parser reading that
+ * entry then found zero sections in its own file.
+ *
+ * An unterminated marker is therefore treated as literal text. That direction is deliberate: masking
+ * fails toward SILENCE, which is the failure mode this whole checker exists to avoid, while treating
+ * it as prose fails toward noise. A genuinely forgotten `-->` shows up as findings, not as quiet.
+ */
+function maskComments(line, openAtStart, lineOffset, hasCloserAfter) {
   let open = openAtStart;
   let out = '';
   let i = 0;
@@ -46,6 +58,9 @@ function maskComments(line, openAtStart) {
       const start = line.indexOf('<!--', i);
       if (start === -1) {
         out += line.slice(i);
+        i = line.length;
+      } else if (!hasCloserAfter(lineOffset + start)) {
+        out += line.slice(i); // prose mentioning the marker, not a comment
         i = line.length;
       } else {
         out += line.slice(i, start);
@@ -68,13 +83,17 @@ function maskComments(line, openAtStart) {
 export function classifyChangelogLines(text) {
   let fence = null; // the opening delimiter run we are inside, if any
   let inComment = false;
+  let offset = 0;
+  const hasCloserAfter = (at) => text.indexOf('-->', at) !== -1;
   return text.split('\n').map((raw) => {
+    const lineOffset = offset;
+    offset += raw.length + 1; // + the newline the split consumed
     if (fence) {
       const f = FENCE.exec(raw);
       if (f && f[1][0] === fence[0] && f[1].length >= fence.length && f[2].trim() === '') fence = null;
       return { insideFence: true, heading: null, masked: '' };
     }
-    const { masked, open } = maskComments(raw, inComment);
+    const { masked, open } = maskComments(raw, inComment, lineOffset, hasCloserAfter);
     inComment = open;
     const f = FENCE.exec(masked);
     if (f) {

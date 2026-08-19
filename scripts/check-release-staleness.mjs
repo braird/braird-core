@@ -932,6 +932,21 @@ const CORPUS = [
     },
     detail: /in the FUTURE/,
   },
+  // ── an UNTERMINATED comment marker is prose, not a comment that eats the file ──
+  // This one shipped and broke the real CHANGELOG: the entry describing the comment handling
+  // contained a literal marker, which opened a comment that never closed and masked every heading
+  // after it. The checker could not read its own file.
+  {
+    name: 'a changelog mentioning a comment marker in prose still parses its sections',
+    input: {
+      changelog:
+        '## [Unreleased]\n\n### Security\n- a fix that mentions <!-- in prose and never closes it\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
+      published: new Map([['1.1.0', rel('1.1.0', '2025-12-01T00:00:00Z')]]),
+      unreleasedSecuritySince: '2026-01-01T00:00:00Z',
+      now: '2026-03-01T00:00:00Z',
+    },
+    expect: ['unreleased'], // and crucially NOT 27 "undocumented release" findings
+  },
   // ── comment syntax is literal INSIDE a fence (Codex P2, fifteenth round) ──
   {
     name: 'a comment marker inside a fenced example does not swallow the fence closer',
@@ -1178,8 +1193,29 @@ function checkConsumerPlumbing() {
   return problems;
 }
 
+/**
+ * The corpus is entirely synthetic, and that is a gap it cannot see past: every fixture is a handful
+ * of lines written to exercise one rule. The parser shipped unable to read this repository's ACTUAL
+ * CHANGELOG — 1,954 lines, zero sections found — with all 47 cases green.
+ *
+ * So when a real CHANGELOG is at hand, parse it too. Not for its content, just for the one property
+ * no fixture can assert: that the parser still works on the genuine article.
+ */
+function checkRealChangelog() {
+  if (!existsSync('CHANGELOG.md')) return [];
+  const { released, hasUnreleasedHeading } = parseChangelog(readFileSync('CHANGELOG.md', 'utf8'));
+  const problems = [];
+  if (!hasUnreleasedHeading) problems.push('the real CHANGELOG.md has no [Unreleased] heading');
+  if (released.length === 0) problems.push('the real CHANGELOG.md parsed to ZERO released sections');
+  return problems;
+}
+
 function selfCheck() {
   let failed = 0;
+  for (const problem of checkRealChangelog()) {
+    failed += 1;
+    console.error(`  FAIL real-file smoke — ${problem}`);
+  }
   for (const problem of checkConsumerPlumbing()) {
     failed += 1;
     console.error(`  FAIL consumer plumbing — ${problem}`);
@@ -1245,6 +1281,17 @@ function main() {
   }
   if (published.size === 0) {
     console.error('check-release-staleness: no published release with assets found — refusing to guess.');
+    process.exit(2);
+  }
+
+  // A CHANGELOG that parses to ZERO released sections is a parser failure, not a repository with no
+  // releases — and it does not present as an error. It presents as every published release being
+  // reported "undocumented", which reads like 27 real findings. Fail loudly instead: the one time
+  // this happened, the misleading findings cost more than the bug.
+  const parsed = parseChangelog(readFileSync('CHANGELOG.md', 'utf8'));
+  if (parsed.released.length === 0 && published.size > 0) {
+    console.error('check-release-staleness: parsed 0 released sections from a CHANGELOG that should have many.');
+    console.error('  That is a PARSER failure, not a finding. Refusing to report staleness from it.');
     process.exit(2);
   }
 

@@ -6,6 +6,26 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Fixed
+- **The release-staleness checker could not read its own CHANGELOG (SUR-1070 follow-up).** An
+  unterminated `<!--` marker masked every line after it to end of file, and the likeliest source
+  of one is an entry DESCRIBING comment handling — which is exactly what happened: the entry
+  documenting this parser contained a literal marker, so the parser found zero sections in the file
+  it had just been merged into. It did not fail as an error, either. It reported all 27 published
+  releases as "published but has no CHANGELOG section", which reads like 27 real findings.
+  A marker with no closer anywhere in the document is now treated as prose. That direction is
+  deliberate: masking fails toward SILENCE, which is the failure mode this checker exists to avoid,
+  while treating it as text fails toward noise — a genuinely forgotten closer surfaces as findings
+  rather than as quiet.
+  Two guards were added with it, because the bug was cheap and the diagnosis was not. Parsing zero
+  released sections from a CHANGELOG while published releases exist is now a hard error rather than
+  a pile of findings — it is a parser failure, and saying so costs one line instead of an
+  investigation. And the self-check now parses the repository's REAL CHANGELOG, not only its
+  synthetic fixtures: 48 hand-written cases were green while the parser could not read 1,954 lines of
+  the genuine article, which is a gap no amount of further fixtures would have closed.
+  This entry deliberately contains the literal marker rather than escaping it, so the CHANGELOG is
+  its own regression fixture: revert the fix and the self-check's real-file smoke fails here.
+
 ### Added
 - **A daily check that fails when finished work has stopped moving toward a device (SUR-1070
   follow-up).** braird-core reaches a phone through two deliberately manual hops — merge to a
