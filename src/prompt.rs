@@ -166,20 +166,32 @@ fn is_active(q: &QuestionMeta) -> bool {
 }
 
 /// Bound an interaction stamp to the window it could possibly have happened in: no earlier than the
-/// thing it acts on was born, and NOT IN THE FUTURE.
+/// thing it acts on was born, and never in the future.
 ///
 /// Every anchor here answers "when did the user last do something", so a future stamp is never
 /// meaningful — but it is very reachable. `resolved_at` and `checkin_at` are host-supplied, and a
 /// row pulled from a device with a fast clock carries its stamp; `updated_at` is worse still,
 /// because it is deliberately clamped PAST a pulled row's stamp on write (the `t01_lww_guard`
 /// rule), so a dismissal that never set `resolved_at` inherits that inflated value. Unbounded, the
-/// next prompt is postponed by the remote skew plus a cadence — months or years of silence from one
-/// wrong clock, with nothing to explain it. Bounding to `now` degrades that to "it closed at worst
-/// just now", which costs one cadence and stays legible.
+/// next prompt is postponed by the remote skew plus a cadence — months of silence from one wrong
+/// clock, with nothing to explain it.
 ///
-/// `birth` wins ties when `now` precedes it, so the result is always a real point on the timeline.
+/// A FUTURE STAMP FALLS BACK TO `birth`, NOT TO `now`, and that difference is the whole subtlety.
+/// Clamping to `now` looks equivalent and is not: the hosts re-run this after every pull, answer and
+/// settings change, so each call would re-clamp to a later `now` and push `due_at` out another full
+/// cadence — a prompt permanently one cadence away, never arriving, for as long as the skew lasts.
+/// `birth` is fixed, so repeated evaluation of unchanged state returns the same answer, which is the
+/// property the whole module is built on. It also fails toward SHOWING the prompt (an anchor in the
+/// past) rather than hiding it, which is the safer direction for a signal the user can dismiss.
+///
+/// Both regimes are stable, and the crossover is one-way: once the local clock passes the stamp it
+/// stops being "future" and the real value takes over.
 fn bound_interaction(stamp: i64, birth: i64, now_ms: i64) -> i64 {
-    stamp.max(birth).min(now_ms.max(birth))
+    if stamp > now_ms {
+        birth
+    } else {
+        stamp.max(birth)
+    }
 }
 
 /// The next prompt(s) to act on, sorted by `due_at`.
@@ -511,48 +523,93 @@ mod tests {
         assert_eq!(events[0].due_at, CREATED + CADENCE_MS);
     }
 
+    const SKEW: i64 = 5 * 365 * 24 * HOUR_MS;
+
     #[test]
-    fn a_dismissal_carrying_a_future_bookkeeping_stamp_waits_one_cadence_from_now() {
+    fn a_dismissal_carrying_a_future_bookkeeping_stamp_falls_back_to_the_question_birth() {
         // The regression the LWW clamp introduced: `updated_at` is deliberately pushed PAST a
         // pulled row's stamp on write, so a dismissal with no `resolved_at` inherits a far-future
         // value. Unbounded, the next prompt is postponed by the remote skew — years of silence.
-        let now = CREATED + 60_000;
         let mut q = question("dismissed", CREATED);
         q.resolved_at = None;
-        q.updated_at = CREATED + 5 * 365 * 24 * HOUR_MS;
+        q.updated_at = CREATED + SKEW;
         let events = next_events(
             &state(vec![q], None),
             &settings(PromptTone::Introspective),
-            now,
+            CREATED + 60_000,
         );
         assert_eq!(kinds(&events), vec![PromptEventKind::Initial]);
-        assert_eq!(events[0].due_at, now + CADENCE_MS, "at worst it closed now");
+        assert_eq!(events[0].due_at, CREATED + CADENCE_MS);
     }
 
     #[test]
     fn a_future_check_in_stamp_cannot_silence_the_loop() {
-        let now = CREATED + 60_000;
         let mut q = question("active", CREATED);
-        q.checkin_at = Some(CREATED + 5 * 365 * 24 * HOUR_MS);
+        q.checkin_at = Some(CREATED + SKEW);
         let events = next_events(
             &state(vec![q], None),
             &settings(PromptTone::Introspective),
-            now,
+            CREATED + 60_000,
         );
-        assert_eq!(events[0].due_at, now + CADENCE_MS);
+        assert_eq!(events[0].due_at, CREATED + CADENCE_MS);
     }
 
     #[test]
     fn a_future_skip_stamp_cannot_silence_the_prompt() {
         // `prompt_skipped_at` is host-supplied AND synced, so one device with a fast clock could
         // otherwise mute every other device for the length of its skew.
-        let now = CREATED + 60_000;
         let events = next_events(
-            &state(vec![], Some(CREATED + 5 * 365 * 24 * HOUR_MS)),
+            &state(vec![], Some(CREATED + SKEW)),
             &settings(PromptTone::Introspective),
-            now,
+            CREATED + 60_000,
         );
-        assert_eq!(events[0].due_at, now + CADENCE_MS);
+        assert_eq!(events[0].due_at, CREATED + CADENCE_MS);
+    }
+
+    #[test]
+    fn a_future_stamp_does_not_push_the_prompt_out_on_every_evaluation() {
+        // The trap in bounding to `now` instead of to the birth: hosts re-run this after every
+        // pull, answer and settings change, so each call would re-clamp to a later `now` and move
+        // `due_at` out another full cadence — a prompt permanently one cadence away, never
+        // arriving. Unchanged state must give an unchanged answer however often it is asked.
+        let with_future_stamp = |checkin: bool| {
+            let mut q = question("active", CREATED);
+            if checkin {
+                q.checkin_at = Some(CREATED + SKEW);
+            }
+            q
+        };
+        for skipped in [None, Some(CREATED + SKEW)] {
+            for checkin in [true, false] {
+                let at = |now| {
+                    next_events(
+                        &state(vec![with_future_stamp(checkin)], skipped),
+                        &settings(PromptTone::Introspective),
+                        now,
+                    )[0]
+                    .due_at
+                };
+                assert_eq!(
+                    at(CREATED + 60_000),
+                    at(CREATED + 60_000 + 30 * 24 * HOUR_MS),
+                    "due_at slid forward with now (checkin={checkin}, skipped={skipped:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_crossover_is_one_way_once_the_clock_catches_up() {
+        // While the stamp is "future" the anchor is the birth; once the local clock passes it, the
+        // real stamp takes over. Both regimes are stable — only the transition moves.
+        let mut q = question("active", CREATED);
+        q.checkin_at = Some(CREATED + SKEW);
+        let events = next_events(
+            &state(vec![q], None),
+            &settings(PromptTone::Introspective),
+            CREATED + SKEW + 1,
+        );
+        assert_eq!(events[0].due_at, CREATED + SKEW + CADENCE_MS);
     }
 
     #[test]

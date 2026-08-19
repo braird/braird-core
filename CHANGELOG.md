@@ -86,6 +86,11 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   dismissal that never set `resolved_at` inherits it, and an unbounded anchor postpones the next
   prompt by the remote clock's skew — months of silence from one wrong clock. The same bound covers
   a `checkin_at` or a synced `prompt_skipped_at` written by a device running fast.
+  A future stamp falls back to the BIRTH, not to `now`, and the difference is the whole subtlety:
+  hosts re-run the machine after every pull, answer and settings change, so clamping to `now` would
+  re-clamp on each call and push the prompt out another cadence every time — permanently one cadence
+  away, never arriving. The birth is fixed, so unchanged state gives an unchanged answer however
+  often it is asked, and the failure direction is showing the prompt rather than hiding it.
   Both question-derived anchors are clamped to the question's own `created_at`, matching the window
   clamp `question_notes` already applies. A device whose clock runs behind can stamp a `checkin_at`
   or `resolved_at` earlier than a `created_at` written by another device, and the raw stamp would
