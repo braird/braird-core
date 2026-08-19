@@ -64,7 +64,10 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   `CHANGELOG.md` now fails the self-check instead of leaving it green with nothing to validate. The
   document-level section split uses the same line-bounded whitespace as every per-line grammar — its
   `\s+` matched a newline, so a bare `##` line joined the next line into a phantom section the
-  classifier never saw and the validator never audited. One blank line was inserted before a `### Fixed`
+  classifier never saw and the validator never audited. The ambiguity detector now shares the
+  parser's own regex objects instead of transcribing them — the transcription required exactly one
+  space after `##` where the parser accepts any run, so a two-space heading was real to one
+  grammar and invisible to the other. One blank line was inserted before a `### Fixed`
   in the 0.13.1 section — whitespace-only, no entry text changed — where a formatting slip in
   shipped history was the sole exception to the rule across 47 subsection headings.
 

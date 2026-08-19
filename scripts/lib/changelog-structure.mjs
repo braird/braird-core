@@ -176,7 +176,18 @@ export function classifyChangelogLines(text) {
 }
 
 /** A line that would read as structure if it were live: a section heading or a subsection heading. */
-const HEADING_SHAPED = /^ {0,3}(## \[|###[ \t])/;
+const SUBSECTION_HEADING = /^ {0,3}###[ \t]/;
+
+/**
+ * Heading-shaped = matches THE PARSER'S OWN grammars, not a parallel literal. The previous version
+ * was a second copy that required exactly one space after `##` while `VERSION_HEADING` accepts any
+ * `[ \t]+` run — so `##  [0.16.0]` was a real heading to the parser and invisible to the ambiguity
+ * detector, exactly one commit after "one alphabet everywhere" was written down. A shared regex
+ * object cannot drift; a transcription of one can and did.
+ */
+function isHeadingShaped(line) {
+  return VERSION_HEADING.test(line) || SUBSECTION_HEADING.test(line);
+}
 
 /**
  * Every line the classifier HID whose raw text is heading-shaped — the ambiguity detector that lets
@@ -193,7 +204,7 @@ export function maskedHeadingShapedLines(text) {
   return text
     .split('\n')
     .map((raw, i) => ({ raw, i, s: structure[i] }))
-    .filter(({ raw, s }) => HEADING_SHAPED.test(raw) && (s.insideFence || !HEADING_SHAPED.test(s.masked)))
+    .filter(({ raw, s }) => isHeadingShaped(raw) && (s.insideFence || !isHeadingShaped(s.masked)))
     .map(({ raw, i }) => ({ line: i + 1, text: raw.trim() }));
 }
 

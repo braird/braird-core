@@ -1501,6 +1501,18 @@ const VALIDATION_CORPUS = [
     expect: /starts with raw HTML/,
   },
   {
+    name: 'a two-space `##  [v]` heading hidden under a mask is still heading-shaped',
+    // The ambiguity detector was a TRANSCRIPTION of the heading grammar requiring exactly one
+    // space, while the parser accepts any [ \t]+ run — so this heading was real to one and
+    // invisible to the other. The detector now shares the parser's regex objects.
+    changelog:
+      '## [Unreleased]\n\n### Fixed\n- quoting `a span <!--\n##  [0.16.0] - 2026-08-01\n\n' +
+      '### Security\n- hidden\n\nspan` with --> closer\n\n## [0.14.0] - 2026-07-29\n\n### Added\n- x\n',
+    // Pinned to the TWO-SPACE line specifically: the masked `### Security` fires too, and an
+    // expectation satisfied by it would let a one-space transcription of the grammar survive.
+    expect: /heading-shaped but sits inside a fence or comment \("##  \[0\.16\.0\]/,
+  },
+  {
     name: 'headings between raw comment markers are loud, whatever shielded the opener',
     // Reported bypass: backslash-escaped backticks pair as a phantom code span, shield the real
     // opener, and the comment interior — which CAN contain blank lines, unlike a span — is exposed
