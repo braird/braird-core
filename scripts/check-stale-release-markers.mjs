@@ -29,6 +29,8 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, wr
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { classifyChangelogLines } from './lib/changelog-structure.mjs';
+
 // Markers that always mean "not finished yet", wherever they appear. They fire UNCONDITIONALLY,
 // descriptive prose included ("CI verifies the checksums before the release ships" trips): an
 // earlier cue heuristic that tried to wave descriptive uses through failed open on any imperative
@@ -148,30 +150,23 @@ function sourceFiles(root) {
  * real would mask the rest of [Unreleased] and fail open.
  */
 function maskReleasedChangelogSections(text, version) {
-  const lines = text.split('\n');
-  // Structure detection (fences, headings) runs on a comment-blanked PROBE: an example heading
-  // or fence inside an HTML editor comment is invisible prose, not a section boundary. The
-  // returned lines stay original — the allow-token's carrier is itself a comment and must
-  // survive into the scan.
-  const detect = text.replace(/<!--[\s\S]*?-->/g, (c) => c.replace(/[^\n]/g, ' ')).split('\n');
+  // Structure detection (fences, comments, headings) lives in `lib/changelog-structure` and is
+  // SHARED with `check-release-staleness.mjs`. It was extracted FROM this function: that script had
+  // grown three progressively better copies of these rules while the complete set sat here, and two
+  // implementations of one rule fail open — the newer copy is always the one missing a case, and the
+  // older one keeps passing its own tests, so nobody looks. A fix now lands on both gates or
+  // neither.
+  //
+  // The returned LINES stay original: the allow-token's carrier is itself an HTML comment and must
+  // survive into the scan, which is why this masks by line rather than returning the probe text.
+  const structure = classifyChangelogLines(text);
   let active = true; // the file preamble, before any section heading
-  let fence = null; // the opening delimiter of the fence we are inside, if any
-  return lines
+  return text
+    .split('\n')
     .map((line, i) => {
-      const probe = detect[i];
-      // A fence delimiter takes AT MOST three leading spaces (four is indented code content),
-      // closes only on AT LEAST the opener's length in the same character, and a closer carries
-      // nothing but whitespace after the run — CommonMark's rules, and what lets a ```` block
-      // quote a ``` snippet, a visible ```rust line, or an indented backtick run without the
-      // state desyncing. An OPENER may carry an info string; a closer may not.
-      const f = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(probe);
-      if (f) {
-        if (!fence) fence = f[1];
-        else if (f[1][0] === fence[0] && f[1].length >= fence.length && f[2].trim() === '') fence = null;
-      }
-      const heading = !fence && /^##\s+\[([^\]]+)\]/.exec(probe);
-      if (heading) {
-        const label = heading[1].trim().toLowerCase();
+      const { heading } = structure[i];
+      if (heading !== null) {
+        const label = heading.toLowerCase();
         active = label === 'unreleased' || (!!version && label === version.toLowerCase());
       }
       return active ? line : '';

@@ -206,6 +206,36 @@ The bump is **one hand-made PR in the app repo** — and that PR *is* the integr
    JVM-against-desktop-jar suite run against the new core. Green means the new binding+native pair
    works end to end. That PR is where a core upgrade is reviewed and gated — nothing auto-updates.
 
+Both steps are manual on purpose, and both are therefore places work can simply stop. Nothing in
+this repo used to notice: `[Unreleased]` reads the same for a typo and for a security fix, and a
+published tag no consumer has pinned looks identical to one every consumer has taken.
+`.github/workflows/release-staleness.yml` runs daily and puts a clock on each hop — it reports when
+security work has sat unreleased, when a CHANGELOG section names a version with no consumable
+release, or when a consumer's pin trails a published release, past a deadline set by whether the
+stalled range contains a `### Security` section (7 days if it does, 30 if it does not). It judges
+against published Releases rather than `git tag`, because a tag whose release build failed leaves a
+tag with no artifacts behind it, and the clock on a lagging pin starts at the OLDEST stalled release
+so a steady stream of new tags cannot suppress an old one.
+It reports; it never opens a PR and never blocks a merge, because not having shipped something yet
+is not a reason to reject the next commit.
+
+The consumer-pin half reads `braird-core.lock` from braird-android and braird-ios, both private, so
+it needs a `CONSUMER_PINS_READ_PAT` — a read-only PAT with `contents: read` on those two
+repositories. Without it the check reports "pin could not be read" and fails, which is the intended
+behaviour: a reader that cannot see the consumers has not confirmed they are current. It is a
+separate credential from `SURFC_READ_PAT` on purpose — that one is scoped to surfc, and widening it
+would extend an unrelated workflow's reach to save creating one secret.
+
+**Store it as an ENVIRONMENT secret in an environment named `consumer-pins`, with a deployment
+branch policy of `main` only — not as a repository secret.** braird-core is public and that token
+reads two private repositories, so where it lives is a security boundary rather than a preference. A
+repository secret is readable by any branch's revision of a workflow, and on a `push` GitHub runs
+the *pushed* revision — so a filter or an `if:` guard written inside the workflow can be deleted by
+the same commit that adds an exfiltration step. The environment's branch policy is enforced in
+repository settings, where a branch push cannot reach it, which is why it is the control that holds.
+The privileged workflow is correspondingly `schedule` + `workflow_dispatch` only; the script's own
+rule self-check lives in a separate, secret-free workflow so it can still run on every PR.
+
 ## Scope
 
 Android AAR + desktop jar (SUR-760), the iOS xcframework + Swift wrapper (SUR-745), and the

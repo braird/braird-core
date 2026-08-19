@@ -1,0 +1,44 @@
+name: Release staleness rules self-check
+
+# The unprivileged half of the staleness gate, and the split is the point.
+#
+# `release-staleness.yml` holds `CONSUMER_PINS_READ_PAT` — a token for two PRIVATE repositories,
+# living in a PUBLIC one — so it must never be startable from a branch: on a `push` or a PR, GitHub
+# runs the PUSHED revision of the workflow, and a control written inside a file an attacker can edit
+# in the same commit is not a control. That file is therefore schedule/dispatch-only and gated on an
+# environment whose branch policy is enforced in repository settings.
+#
+# But the checker's RULES still need exercising when someone edits them, and that check needs no
+# credential at all — `--self-check` reads nothing but its own in-file corpus. Splitting it out is
+# what lets it run per-PR safely: this file references NO secret, so a malicious branch that rewrites
+# it gains exactly nothing. Privilege, not convenience, decides which file a trigger belongs in.
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/check-release-staleness.mjs'
+      # The shared parser decides which lines are sections and which are prose, so a change here can
+      # break every signal without touching the checker itself. Omitting it meant a parser-only PR
+      # merged without the corpus ever running.
+      - 'scripts/lib/changelog-structure.mjs'
+      - '.github/workflows/release-staleness.yml'
+      - '.github/workflows/release-staleness-selfcheck.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/check-release-staleness.mjs'
+      - 'scripts/lib/changelog-structure.mjs'
+
+jobs:
+  self-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.15.0'
+      - name: The staleness rules must hold before they are applied to anything
+        run: node scripts/check-release-staleness.mjs --self-check

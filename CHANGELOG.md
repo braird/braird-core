@@ -6,6 +6,108 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **A daily check that fails when finished work has stopped moving toward a device (SUR-1070
+  follow-up).** braird-core reaches a phone through two deliberately manual hops — merge to a
+  release tag, then release tag to `braird-core.lock` in each app repo — and nothing watched either.
+  Every existing gate asks whether the tree is CONSISTENT; none asked whether consistent work was
+  STUCK, and `[Unreleased]` reads identically for a typo and for a security fix. SUR-1070's
+  note-tombstoning fix merged, then was released, and the only thing that surfaced "this is still not
+  on a phone" was somebody asking.
+  `scripts/check-release-staleness.mjs` reports three signals, because work stops in three places and
+  none implies the others: security work sitting in `[Unreleased]`, a CHANGELOG section naming a
+  version with no consumable release, and a consumer pin trailing a published release. A fix that
+  merges but is never released is invisible to the third — with no new release, every consumer agrees
+  with the newest one and looks current.
+  **A tag is never treated as a release.** `release.yml` publishes create-only at the end of its job
+  DAG, so a tag whose build failed leaves a tag with no release behind it; every judgement is made
+  against the published GitHub Releases, so that state is reported rather than silently ending the
+  first signal while the third starts telling consumers to pin something they cannot fetch.
+  **The deadline runs from the oldest stalled release, never the newest** — otherwise each new tag
+  resets the clock to zero and an old unpinned security release stays suppressed indefinitely, which
+  an actively released repo would do to itself forever.
+  **Severity sets the deadline, and that is what makes it usable rather than noise:** a stalled range
+  containing a `### Security` section is due in 7 days, anything else in 30, so a routine patch can
+  wait for the next feature pin without anyone hearing about it. The unreleased signal is dated from
+  when the entry FIRST appeared, not from the previous tag — dating it from the tag would accuse a
+  fix merged this morning of being weeks late, which is how a gate earns being switched off.
+  It runs on a schedule and never in the merge path: "you have not shipped this yet" is never a
+  reason to reject the next commit. A consumer whose pin cannot be read is REPORTED, never skipped —
+  a clone that failed must not read as "nothing to pin". A date that is not a real calendar date is
+  reported too: `NaN > limit` is false, so `2026-13-01` would have disabled the signal it feeds, and
+  `Date.parse` NORMALISES `2026-02-30` to 2026-03-02 rather than rejecting it, so the components have
+  to round-trip. Completeness of a release is judged PER CONSUMER, against the artifacts that
+  consumer pins, rather than against a fixed asset count — the published set is 3, 5 and 7 assets
+  across 27 releases because it grew with the product, so a fixed count would call nine historical
+  releases broken. The consumer config reaches the rules by SPREAD rather than being rebuilt field by
+  field, because rebuilding it silently dropped the asset requirements and left the rule dead in
+  production while the corpus — whose fixtures construct consumers by hand — went on passing. A
+  plumbing assertion now covers that seam directly, and the required artifacts are named for the
+  release's OWN version, since a match on extension alone would accept a release carrying only the
+  previous version's file. Deadlines compare with `>=`: `ageDays` floors, so a strict comparison
+  let 7 days 23 hours read as 7 and stay quiet, pushing an advertised 7-day deadline out to nearly
+  9 on a daily schedule. And a pin naming no published release — `v9.9.9`, from a typo or a pin
+  written ahead of its release — is reported rather than sorting above every section and reading
+  as permanently current, and the release a consumer is ALREADY ON is checked for that consumer's
+  artifacts too — an asset deleted from the pinned release left nothing to compare, so a clean
+  build that could no longer fetch its own dependency produced a green run. A section dated in the
+  FUTURE is reported rather than read as young: a mistyped `2099-01-01` would otherwise postpone
+  the failed-release alarm by seventy years, and postponement is indistinguishable from a grace
+  period. One day of slack, since a maintainer east of UTC writing "today" is legitimately ahead
+  of it.
+  **The recurring shape of every review finding on this checker was silence, not error** — six in
+  a row where the condition held and it reported nothing. So the remaining paths were audited
+  with that question rather than the usual one, which found three more: a CHANGELOG whose
+  `[Unreleased]` heading is renamed away (the signal reads an empty string and never fires), a
+  release whose `published_at` is in the future, and `--consumers` omitted, which disabled the
+  pin signal entirely while still exiting 0. All three are now findings or hard errors.
+  The consumer lag range is derived from the PUBLISHED RELEASES rather than the CHANGELOG, since a
+  release published with a missing or misspelled heading is still one a consumer must pin — the
+  CHANGELOG supplies only severity, and an undocumented release takes the short deadline because
+  unknown severity must not buy the long one. Fenced blocks are excluded from section parsing so a
+  fenced example heading cannot steal an entry; HTML comments and exotic Markdown are an accepted
+  miss pinned by a corpus row, following the boundary `check-stale-release-markers.mjs` set. A
+  version heading written twice has its severities MERGED rather than overwritten — a plain map
+  keeps the last section, so a security entry written first was silently downgraded to the 30-day
+  deadline — and the duplicate is reported as well as merged. The merge happens once in the parser,
+  for EVERY version including `[Unreleased]`: doing it at the call site left two `## [Unreleased]`
+  headings (a badly resolved merge conflict) hiding everything under the second one from both
+  signals.
+  Consumer requirements cover **everything the lock pins**, canon payloads included, not just the
+  platform binary — both locks carry `idea-tree.yaml` and `great-ideas.json` checksums, so a
+  release missing them cannot complete the documented pin flow. And the hand-maintained list is
+  cross-checked against each lock at run time: if a lock pins more checksums than this script
+  requires assets, the difference is reported as unwatched rather than left to a comment asking
+  the next person to remember — by CHECKSUM KEY rather than by count, since a renamed artifact
+  leaves the cardinality unchanged. Every timestamp the checker ages goes through one helper that
+  reports unparseable and future dates alike, because the three sources (a CHANGELOG heading, a
+  release's `published_at`, and a git committer timestamp) were each guarded separately and the
+  third was missed twice. Fence tracking follows CommonMark's rule that a block closes only on
+  its own delimiter, and the rules themselves are now SHARED with `check-stale-release-markers.mjs`
+  (`scripts/lib/changelog-structure.mjs`) rather than reimplemented — three progressively better
+  copies had grown in the new script while a complete implementation sat one directory away, and
+  two copies of one rule fail open because the newer is always the one missing a case. Adopting
+  it also closed a miss recorded as accepted: HTML-comment example headings are masked too, and a
+  backtick fence's info string may not itself contain a backtick, so an ordinary line cannot open
+  a block that masks the rest of the file. Fence and comment state are resolved in ONE interleaved
+  pass, because each can hide the other's syntax: blanking comments first let a `<!--` inside a
+  fenced example swallow that fence's closing delimiter, after which every following line was
+  masked to end of file. Heading detection tolerates up to three leading spaces
+  everywhere, `### Security` included, along with an optional ATX closing hash run — an
+  exact-column match made an indented or `### Security ###` heading invisible. The release list is
+  fully paginated rather than capped at one page: a silently exceeded ceiling turns every omitted
+  release into a false finding and fails the check permanently. Both
+  scripts import the shared module — the release gate was refactored onto it rather than left
+  with its own copy — and `release.yml` stages both files, since the judge it copies out of the
+  workflow revision is now two files rather than one.
+  **The privileged and unprivileged halves are separate workflows**, and that split is a security
+  boundary rather than tidiness. The staleness run reads a token for two private repositories from a
+  public repo, so it is `schedule` + `workflow_dispatch` only and takes the token from an environment
+  whose branch policy GitHub enforces outside the workflow file — on a `push`, GitHub runs the pushed
+  branch's revision, so any filter or `if:` guard written in the file can be deleted by the same
+  commit that adds an exfiltration step. The rule self-check holds no secret and therefore runs on
+  every PR.
+
 ## [0.15.1] - 2026-08-18
 
 ### Changed
