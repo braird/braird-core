@@ -53,7 +53,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { classifyChangelogLines, maskedForSectionSplit, maskedHeadingShapedLines } from './lib/changelog-structure.mjs';
+import { classifyChangelogLines, isHeadingShaped, isSubsectionShaped, maskedForSectionSplit, maskedHeadingShapedLines } from './lib/changelog-structure.mjs';
 
 const DAY_MS = 86_400_000;
 
@@ -232,7 +232,7 @@ export function validateChangelog(text) {
     // puts the first bullet directly under the heading, so only blank-ABOVE is required. That still
     // closes the quote case, because a code span cannot contain a blank line — the span's opening
     // text is always the line directly above the quoted heading.
-    if (!st.insideFence && /^ {0,3}###[ 	]/.test(st.masked) && !aboveBlank) {
+    if (!st.insideFence && isSubsectionShaped(st.masked) && !aboveBlank) {
       violations.push(
         `line ${i + 1} parses as a subsection heading but touches the text above it — a real ` +
           'subsection heading follows a blank line; an exposed quotation does not',
@@ -254,9 +254,11 @@ export function validateChangelog(text) {
   // reported case), so heading-shaped text at that indent is two things at once: a heading to the
   // renderer, a stray line to this format. The daily run stays permissive (an indented
   // `### Security` still counts, erring toward firing); the write-time gate refuses the shape.
+  // `isHeadingShaped` + a leading-space test, never a third transcription of the grammar — the
+  // first two transcriptions each drifted from `[ \t]+` and each drift was a review finding.
   structure.forEach((st, i) => {
     if (st.insideFence) return;
-    if (/^ {1,3}(## \[|###[ 	])/.test(st.masked)) {
+    if (/^ {1,3}/.test(st.masked) && isHeadingShaped(st.masked)) {
       violations.push(
         `line ${i + 1} is a heading indented ${st.masked.match(/^ +/)[0].length} space(s) — structural ` +
           'headings sit at column 0 in this format; indent an example four spaces or quote it inline',
@@ -291,7 +293,7 @@ export function validateChangelog(text) {
       const closeLine = text.slice(0, close).split('\n').length - 1;
       structure.forEach((st, i) => {
         if (i <= openLine || i > closeLine) return;
-        const headingLike = st.heading !== null || (!st.insideFence && /^ {0,3}###[ \t]/.test(st.masked));
+        const headingLike = st.heading !== null || (!st.insideFence && isHeadingShaped(st.masked));
         if (headingLike) {
           violations.push(
             `line ${i + 1} parses as a heading but sits between comment markers (lines ` +
@@ -1483,6 +1485,16 @@ const VALIDATION_CORPUS = [
       '## [Unreleased]\n\n### Fixed\n- x\n\n## [1.2.0] - 2026-01-01\n\n### Added\n- an example follows\n\n' +
       '## [0.9.0] - 2020-01-01\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- y\n',
     expect: /not in decreasing order/,
+  },
+  {
+    name: 'a nested heading with TWO spaces after ## is still caught by the indent rule',
+    // Third transcription drift: the indent guard hand-copied `## [` with one space while the
+    // parser accepts any [ \t]+ run, so `  ##  [0.14.1]` parsed as a real section and the guard
+    // missed it. The guard now consults the shared grammar; this row pins the two-space form.
+    changelog:
+      '## [Unreleased]\n\n### Fixed\n- a nested example:\n\n  ##  [0.14.1] - 2026-07-30\n\n' +
+      '### Security\n- the real fix\n\n## [0.14.0] - 2026-07-29\n\n### Added\n- x\n',
+    expect: /is a heading indented 2 space/,
   },
   {
     name: 'a heading nested in a list by 2-space indent is loud — structure sits at column 0',

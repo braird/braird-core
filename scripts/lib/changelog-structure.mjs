@@ -185,7 +185,12 @@ const SUBSECTION_HEADING = /^ {0,3}###[ \t]/;
  * detector, exactly one commit after "one alphabet everywhere" was written down. A shared regex
  * object cannot drift; a transcription of one can and did.
  */
-function isHeadingShaped(line) {
+/** The subsection half alone, for rules that treat section and subsection headings differently. */
+export function isSubsectionShaped(line) {
+  return SUBSECTION_HEADING.test(line);
+}
+
+export function isHeadingShaped(line) {
   return VERSION_HEADING.test(line) || SUBSECTION_HEADING.test(line);
 }
 

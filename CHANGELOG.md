@@ -67,7 +67,10 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   classifier never saw and the validator never audited. The ambiguity detector now shares the
   parser's own regex objects instead of transcribing them — the transcription required exactly one
   space after `##` where the parser accepts any run, so a two-space heading was real to one
-  grammar and invisible to the other. One blank line was inserted before a `### Fixed`
+  grammar and invisible to the other. The indent guard was a third transcription with the same
+  drift; every heading-shape decision in the validator now calls the shared testers
+  (`isHeadingShaped`, `isSubsectionShaped`), and no copied heading grammar remains outside the
+  shared module. One blank line was inserted before a `### Fixed`
   in the 0.13.1 section — whitespace-only, no entry text changed — where a formatting slip in
   shipped history was the sole exception to the rule across 47 subsection headings.
 
