@@ -53,7 +53,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { maskedForSectionSplit, maskedHeadingShapedLines } from './lib/changelog-structure.mjs';
+import { classifyChangelogLines, maskedForSectionSplit, maskedHeadingShapedLines } from './lib/changelog-structure.mjs';
 
 const DAY_MS = 86_400_000;
 
@@ -201,6 +201,26 @@ export function parseChangelog(text) {
  */
 export function validateChangelog(text) {
   const violations = [];
+  // A real heading stands alone between blank lines — every Keep a Changelog heading does, and all
+  // 28 in this repository do. A heading TOUCHING text is a quotation the parser exposed: review
+  // disproved the assumption that an exposed quote must break version order (a plausible version
+  // slots right in), but a CommonMark code span cannot contain a blank line, so whatever quoting
+  // construct carried the heading, its delimiter text is adjacent. This closes the exposed
+  // direction UNCONDITIONALLY, the way maskedHeadingShapedLines closes the hidden one: neither
+  // rule needs to know WHICH Markdown subtlety was mismodelled.
+  const rawLines = text.split('\n');
+  const structure = classifyChangelogLines(text);
+  structure.forEach((st, i) => {
+    if (st.heading === null) return;
+    const aboveBlank = i === 0 || rawLines[i - 1].trim() === '';
+    const belowBlank = i === rawLines.length - 1 || rawLines[i + 1].trim() === '';
+    if (!aboveBlank || !belowBlank) {
+      violations.push(
+        `line ${i + 1} parses as section heading [${st.heading}] but touches adjacent text — a real ` +
+          'heading stands alone between blank lines; an exposed quotation does not',
+      );
+    }
+  });
   for (const { line, text: t } of maskedHeadingShapedLines(text)) {
     violations.push(
       `line ${line} is heading-shaped but sits inside a fence or comment (${JSON.stringify(t)}) — ` +
@@ -1337,6 +1357,16 @@ const VALIDATION_CORPUS = [
       '## [Unreleased]\n\n### Fixed\n- quoting <!-- an opener\n\n### Security\n- the real fix\n' +
       '- and `-->` quoted later\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- x\n',
     expect: /heading-shaped but sits inside a fence or comment/,
+  },
+  {
+    name: 'an exposed quote that keeps versions ORDERED is still loud — headings stand alone',
+    // Review disproved "every exposed quote breaks an invariant" with a plausible version that
+    // slots into the order. The blank-line rule is unconditional: a code span cannot contain a
+    // blank line, so the quoted heading necessarily touches its quoting text.
+    changelog:
+      '## [Unreleased]\n\n### Fixed\n- quoting `a span\n## [0.14.1] - 2026-07-30\nspan text` here\n\n' +
+      '### Security\n- the real fix\n\n## [0.14.0] - 2026-07-29\n\n### Added\n- x\n',
+    expect: /touches adjacent text/,
   },
   {
     name: 'a quoted example heading EXPOSED as real breaks monotonicity and is loud',

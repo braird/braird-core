@@ -41,7 +41,11 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   runs (it triggers on `CHANGELOG.md`, and every PR must touch it). The `### Security` check also
   stopped being a bespoke regex: subsection headings are extracted once, ATX decorations
   normalized, and anything outside the Keep a Changelog vocabulary is an error — so a typo like
-  `### Securty` is refused rather than silently taking the 30-day deadline.
+  `### Securty` is refused rather than silently taking the 30-day deadline. Review then disproved
+  the claim that an exposed quotation must break one of those invariants — a plausible version
+  slots into the order — so the exposed direction got its own unconditional rule: a real heading
+  stands alone between blank lines (all 28 in this file do), and a heading quoted inside a code
+  span necessarily touches its quoting text, because a span cannot contain a blank line.
 
 ### Added
 - **A daily check that fails when finished work has stopped moving toward a device (SUR-1070
