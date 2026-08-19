@@ -243,6 +243,21 @@ export function validateChangelog(text) {
   // mid-line cannot span a blank line, so it cannot carry a blank-surrounded heading, and `<!--`
   // is exempt because the comment machinery and the region rule below govern it. The real
   // CHANGELOG has zero line-initial `<` across 2,000 lines — this bans nothing anyone writes.
+  // Structure in THIS document lives at column 0 — all 28 section headings and 47 subsection
+  // headings do, and release.yml's own heading check is an exact column-0 match. CommonMark still
+  // renders a 1-3-space-indented heading AS a heading (including nested inside a list item, the
+  // reported case), so heading-shaped text at that indent is two things at once: a heading to the
+  // renderer, a stray line to this format. The daily run stays permissive (an indented
+  // `### Security` still counts, erring toward firing); the write-time gate refuses the shape.
+  structure.forEach((st, i) => {
+    if (st.insideFence) return;
+    if (/^ {1,3}(## \[|###[ 	])/.test(st.masked)) {
+      violations.push(
+        `line ${i + 1} is a heading indented ${st.masked.match(/^ +/)[0].length} space(s) — structural ` +
+          'headings sit at column 0 in this format; indent an example four spaces or quote it inline',
+      );
+    }
+  });
   structure.forEach((st, i) => {
     if (st.insideFence) return;
     if (/^ {0,3}(<[A-Za-z]|<\/|<\?|<!(?!--))/.test(st.masked)) {
@@ -1399,7 +1414,11 @@ function checkConsumerPlumbing() {
  * no fixture can assert: that the parser still works on the genuine article.
  */
 function checkRealChangelog() {
-  if (!existsSync('CHANGELOG.md')) return [];
+  // Missing is FAILURE, not skip. Review demonstrated a PR deleting CHANGELOG.md sails through:
+  // the changelog gate only checks whether the file appears in the diff (a deletion does), and an
+  // early return here made the self-check green with nothing to validate. Every context this runs
+  // in checks out the repository, so absence only ever means deleted or renamed.
+  if (!existsSync('CHANGELOG.md')) return ['CHANGELOG.md does not exist — deleted or renamed?'];
   const text = readFileSync('CHANGELOG.md', 'utf8');
   const { released, hasUnreleasedHeading } = parseChangelog(text);
   const problems = [];
@@ -1442,6 +1461,15 @@ const VALIDATION_CORPUS = [
       '## [Unreleased]\n\n### Fixed\n- x\n\n## [1.2.0] - 2026-01-01\n\n### Added\n- an example follows\n\n' +
       '## [0.9.0] - 2020-01-01\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- y\n',
     expect: /not in decreasing order/,
+  },
+  {
+    name: 'a heading nested in a list by 2-space indent is loud — structure sits at column 0',
+    // CommonMark renders it as a heading inside the list item; this format does not recognize it.
+    // Plausibly ordered and published, so no other invariant fires — the indent rule must.
+    changelog:
+      '## [Unreleased]\n\n### Fixed\n- a nested example:\n\n  ## [0.14.1] - 2026-07-30\n\n' +
+      '### Security\n- the real fix\n\n## [0.14.0] - 2026-07-29\n\n### Added\n- x\n',
+    expect: /indented .*structural headings sit at column 0/,
   },
   {
     name: 'a heading quoted inside a <pre> block is loud — line-initial raw HTML is refused',
