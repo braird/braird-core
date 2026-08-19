@@ -10,15 +10,17 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 - **The open-question prompt state machine + typed `PromptSettings` (SUR-1043, SUR-996 R2–R4).**
   Core now owns the prompt timing rules, so iOS and Android cannot drift on them: clients render
   the sheet for a past-due event and schedule a local notification for a future one, and that is
-  their whole share of the logic. Five exports — `prompt_settings`, `set_prompt_settings`,
-  `next_prompt_events`, `skip_prompt`, `skip_checkin` — over two new records (`PromptSettings`,
-  `PromptEvent`) and two new enums (`PromptTone`, `PromptEventKind`). All additive; a host on an
-  older pin keeps working until it takes the new one.
+  their whole share of the logic. Six exports — `prompt_settings`, `set_prompt_cadence`,
+  `set_prompt_tone`, `next_prompt_events`, `skip_prompt`, `skip_checkin` — over two new records
+  (`PromptSettings`, `PromptEvent`) and two new enums (`PromptTone`, `PromptEventKind`). All
+  additive; a host on an older pin keeps working until it takes the new one.
   `set_user_setting` (SUR-1042) shipped untyped and named this ticket as the owner of the key
   constants and the 72..=672 clamp; those now exist, along with the READ leg the KV table never
-  had — `user_settings` could be written and never read back. Kept crate-internal on purpose: the
-  FFI exposes the typed façade, so no host can typo a key or store an unclamped cadence past it.
-  The clamp runs on read as well as write, so a value stored by an older build still arrives legal.
+  had — `user_settings` could be written and never read back. That read stays crate-internal, so
+  reading a setting goes through the typed façade. Note what this does NOT buy: `set_user_setting`
+  remains exported, so a host can still write `prompt_cadence` directly and store a value outside
+  72..=672. The clamp therefore runs on READ as well as write, which is what actually guarantees a
+  legal cadence — from an older build, a newer client, or a host that bypassed the façade.
   `next_prompt_events` returns a sorted list (never empty, at most two) rather than a single event,
   because the opening 24 hours have two pending at once: the initial prompt is due immediately AND
   its one nudge must already be scheduled for +24h. The user that nudge exists for is precisely the
@@ -78,6 +80,12 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   silently-cancelled skip leaves the other devices prompting, which is the multi-device promise the
   key exists to keep. Migration 0050's §4.1 monotonicity assumption ("every edit stamps
   `Date.now()`") holds only while no local clock lags a pulled stamp; this restores it.
+  Every interaction anchor is bounded to `[birth, now]` — no earlier than the thing it acts on was
+  born, and never in the future. The upper bound is what the monotonic write clamp above makes
+  necessary: `updated_at` is a bookkeeping stamp deliberately pushed past a pulled row's, so a
+  dismissal that never set `resolved_at` inherits it, and an unbounded anchor postpones the next
+  prompt by the remote clock's skew — months of silence from one wrong clock. The same bound covers
+  a `checkin_at` or a synced `prompt_skipped_at` written by a device running fast.
   Both question-derived anchors are clamped to the question's own `created_at`, matching the window
   clamp `question_notes` already applies. A device whose clock runs behind can stamp a `checkin_at`
   or `resolved_at` earlier than a `created_at` written by another device, and the raw stamp would

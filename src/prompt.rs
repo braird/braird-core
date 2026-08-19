@@ -165,6 +165,23 @@ fn is_active(q: &QuestionMeta) -> bool {
     !matches!(q.status.as_deref(), Some("resolved") | Some("dismissed"))
 }
 
+/// Bound an interaction stamp to the window it could possibly have happened in: no earlier than the
+/// thing it acts on was born, and NOT IN THE FUTURE.
+///
+/// Every anchor here answers "when did the user last do something", so a future stamp is never
+/// meaningful — but it is very reachable. `resolved_at` and `checkin_at` are host-supplied, and a
+/// row pulled from a device with a fast clock carries its stamp; `updated_at` is worse still,
+/// because it is deliberately clamped PAST a pulled row's stamp on write (the `t01_lww_guard`
+/// rule), so a dismissal that never set `resolved_at` inherits that inflated value. Unbounded, the
+/// next prompt is postponed by the remote skew plus a cadence — months or years of silence from one
+/// wrong clock, with nothing to explain it. Bounding to `now` degrades that to "it closed at worst
+/// just now", which costs one cadence and stays legible.
+///
+/// `birth` wins ties when `now` precedes it, so the result is always a real point on the timeline.
+fn bound_interaction(stamp: i64, birth: i64, now_ms: i64) -> i64 {
+    stamp.max(birth).min(now_ms.max(birth))
+}
+
 /// The next prompt(s) to act on, sorted by `due_at`.
 ///
 /// NEVER EMPTY, and at most two: there is always a next prompt, and the only phase with two is the
@@ -211,12 +228,13 @@ pub fn next_events(
     if let Some(q) = active {
         // No `checkin_at` yet = just answered, so the first check-in is one cadence from birth.
         //
-        // Clamped to the question's birth, matching `read::question_notes`' window clamp: a device
-        // whose clock runs behind can stamp a `checkin_at` EARLIER than a `created_at` written by
-        // another device, and the raw stamp would then shorten the interval by the skew. Past one
-        // cadence of skew it would go further and make the check-in immediately overdue — the sheet
-        // reappearing the moment the user answered one, which is precisely the nagging R3 forbids.
-        let anchor = q.checkin_at.unwrap_or(q.created_at).max(q.created_at);
+        // Bounded to [birth, now]. Below birth, matching `read::question_notes`' window clamp: a
+        // device whose clock runs behind can stamp a `checkin_at` EARLIER than a `created_at`
+        // written by another device, and the raw stamp would shorten the interval by the skew —
+        // past one cadence of it, the sheet reappears the moment the user answered one, the nagging
+        // R3 forbids. Above now, because a check-in cannot have happened later than this instant,
+        // and a stamp from a fast remote clock would otherwise silence the loop for that skew.
+        let anchor = bound_interaction(q.checkin_at.unwrap_or(q.created_at), q.created_at, now_ms);
         return vec![PromptEvent {
             kind: PromptEventKind::CheckIn,
             due_at: anchor.saturating_add(cadence_ms),
@@ -227,26 +245,28 @@ pub fn next_events(
 
     // A question that was answered and then closed anchors the next initial-style prompt on its
     // close. `resolved_at` is the intended stamp; `updated_at` covers a dismissal that never set
-    // one. Each is clamped to its own question's birth for the same skew reason as the check-in
-    // anchor above — an inverted close would cut short the quiet period a resolve is promised. The
-    // outer `max` is a different job: the log accumulates, and only the most recent close matters.
+    // one — and that fallback is why the upper bound matters most here: `updated_at` is a
+    // BOOKKEEPING stamp, deliberately pushed past a pulled row's on write, so a dismissal can
+    // inherit a far-future value and postpone the next prompt by the remote skew. The outer `max`
+    // is a different job: the log accumulates, and only the most recent close matters.
     let closed_at = state
         .questions
         .iter()
-        .map(|q| q.resolved_at.unwrap_or(q.updated_at).max(q.created_at))
+        .map(|q| bound_interaction(q.resolved_at.unwrap_or(q.updated_at), q.created_at, now_ms))
         .max();
 
-    let initial_due = match closed_at
-        .into_iter()
-        .chain(state.prompt_skipped_at_ms)
-        .max()
-    {
+    // The skip is bounded against the ACCOUNT's birth rather than a question's — it is account-level
+    // and can precede every question. Its lower bound is slack (a skew-early skip only makes the
+    // prompt due sooner, which is where it sits with no skip at all), but the upper bound is not:
+    // the value is host-supplied and synced, so a device with a fast clock can record a skip dated
+    // years out and silence the prompt on every other device for that long.
+    let skipped_at = state
+        .prompt_skipped_at_ms
+        .map(|t| bound_interaction(t, state.account_created_at_ms, now_ms));
+
+    let initial_due = match closed_at.into_iter().chain(skipped_at).max() {
         // The one-cadence wait anchors on the most recent interaction, whichever kind it was —
         // skipping the re-offer after a resolve must not be overruled by the older close.
-        // `prompt_skipped_at_ms` is deliberately NOT clamped the same way: it is account-level, so
-        // there is no birth stamp to clamp it against, and a skew-early skip only makes the initial
-        // prompt due sooner — which is where it sits with no skip recorded at all. The failure
-        // direction is the safe one, unlike a skewed check-in.
         Some(anchor) => anchor.saturating_add(cadence_ms),
         // Never answered, never skipped: due since the account existed, and it STAYS due (founder,
         // 2026-08-19). The spec's one-cadence wait keys off an interaction, and a user who never
@@ -488,6 +508,63 @@ mod tests {
             CREATED + 1,
         );
         assert_eq!(kinds(&events), vec![PromptEventKind::Initial]);
+        assert_eq!(events[0].due_at, CREATED + CADENCE_MS);
+    }
+
+    #[test]
+    fn a_dismissal_carrying_a_future_bookkeeping_stamp_waits_one_cadence_from_now() {
+        // The regression the LWW clamp introduced: `updated_at` is deliberately pushed PAST a
+        // pulled row's stamp on write, so a dismissal with no `resolved_at` inherits a far-future
+        // value. Unbounded, the next prompt is postponed by the remote skew — years of silence.
+        let now = CREATED + 60_000;
+        let mut q = question("dismissed", CREATED);
+        q.resolved_at = None;
+        q.updated_at = CREATED + 5 * 365 * 24 * HOUR_MS;
+        let events = next_events(
+            &state(vec![q], None),
+            &settings(PromptTone::Introspective),
+            now,
+        );
+        assert_eq!(kinds(&events), vec![PromptEventKind::Initial]);
+        assert_eq!(events[0].due_at, now + CADENCE_MS, "at worst it closed now");
+    }
+
+    #[test]
+    fn a_future_check_in_stamp_cannot_silence_the_loop() {
+        let now = CREATED + 60_000;
+        let mut q = question("active", CREATED);
+        q.checkin_at = Some(CREATED + 5 * 365 * 24 * HOUR_MS);
+        let events = next_events(
+            &state(vec![q], None),
+            &settings(PromptTone::Introspective),
+            now,
+        );
+        assert_eq!(events[0].due_at, now + CADENCE_MS);
+    }
+
+    #[test]
+    fn a_future_skip_stamp_cannot_silence_the_prompt() {
+        // `prompt_skipped_at` is host-supplied AND synced, so one device with a fast clock could
+        // otherwise mute every other device for the length of its skew.
+        let now = CREATED + 60_000;
+        let events = next_events(
+            &state(vec![], Some(CREATED + 5 * 365 * 24 * HOUR_MS)),
+            &settings(PromptTone::Introspective),
+            now,
+        );
+        assert_eq!(events[0].due_at, now + CADENCE_MS);
+    }
+
+    #[test]
+    fn bounding_survives_a_now_that_precedes_the_birth() {
+        // A device whose own clock trails the question's creation: the bound must still land on a
+        // real point of the timeline rather than inverting.
+        let q = question("active", CREATED);
+        let events = next_events(
+            &state(vec![q], None),
+            &settings(PromptTone::Introspective),
+            CREATED - 10_000,
+        );
         assert_eq!(events[0].due_at, CREATED + CADENCE_MS);
     }
 
