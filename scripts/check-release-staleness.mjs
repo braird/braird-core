@@ -932,6 +932,22 @@ const CORPUS = [
     },
     detail: /in the FUTURE/,
   },
+  // ── code spans resolve in DOCUMENT ORDER, never as overlapping leftover pairs ──
+  // Run lengths 1,2,1,2 with a real comment opener between the 3rd and 4th runs: CommonMark pairs
+  // the two length-1 runs (consuming the length-2 run between them) and leaves the trailing run as
+  // literal text, so the marker IS a comment. Independent pairing built a second, overlapping span
+  // that shielded it, and the heading inside the comment surfaced as a phantom release.
+  {
+    name: 'leftover backtick runs do not form an overlapping span that shields a real comment',
+    input: {
+      changelog:
+        '## [Unreleased]\n\n### Fixed\n- `a ``b` <!-- ``\n## [9.9.9] - 2026-01-01\n-->\n\n' +
+        '## [1.1.0] - 2025-12-01\n\n### Added\n- y\n',
+      published: new Map([['1.1.0', rel('1.1.0', '2025-12-01T00:00:00Z')]]),
+      now: '2026-03-01T00:00:00Z',
+    },
+    expect: [], // 9.9.9 stays inside the comment; no phantom "undocumented release"
+  },
   // ── a marker inside `backticks` is a quotation, whatever appears later in the file ──
   // The lookahead alone was not enough: quoted syntax became a real opener the moment any later
   // entry added an ordinary comment. Measured on the real CHANGELOG, one such comment cost two

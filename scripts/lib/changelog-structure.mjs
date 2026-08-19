@@ -40,15 +40,20 @@ function codeSpanRanges(line) {
   const runs = [];
   for (const m of line.matchAll(/`+/g)) runs.push({ at: m.index, len: m[0].length });
   const ranges = [];
-  const used = new Array(runs.length).fill(false);
-  for (let i = 0; i < runs.length; i += 1) {
-    if (used[i]) continue;
-    for (let j = i + 1; j < runs.length; j += 1) {
-      if (used[j] || runs[j].len !== runs[i].len) continue;
+  // Runs are consumed IN DOCUMENT ORDER: an opener pairs with the next equal-length run, and every
+  // run between the two is spent inside that span — it can never open or close anything else. The
+  // previous version paired leftovers independently, so run lengths 1,2,1,2 produced OVERLAPPING
+  // spans and the second one shielded a real `<`+`!--` sitting after the first span's closer.
+  // CommonMark resolves spans left-to-right; so must we.
+  let i = 0;
+  while (i < runs.length) {
+    let j = i + 1;
+    while (j < runs.length && runs[j].len !== runs[i].len) j += 1;
+    if (j < runs.length) {
       ranges.push([runs[i].at, runs[j].at + runs[j].len]);
-      used[i] = true;
-      used[j] = true;
-      break;
+      i = j + 1; // everything through the closer is consumed
+    } else {
+      i += 1; // an unmatched run is literal text; later runs may still pair among themselves
     }
   }
   return ranges;
