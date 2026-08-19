@@ -234,6 +234,25 @@ export function validateChangelog(text) {
       );
     }
   });
+  // Raw HTML at line start is refused outright, which retires the whole carrier family instead of
+  // chasing it one tag at a time. Every CommonMark HTML block (types 1–7: <pre>, <script>, <div>,
+  // <details>, <!DOCTYPE, <?…, <![CDATA[ …) begins with `<` at the start of a line, blocks can
+  // contain blank lines, and their interiors do not render as Markdown — so a quoted heading inside
+  // one is exposed by this parser while every adjacency and ordering invariant holds. <pre> was the
+  // reported instance; banning the line shape closes the other six types unseen. Inline HTML
+  // mid-line cannot span a blank line, so it cannot carry a blank-surrounded heading, and `<!--`
+  // is exempt because the comment machinery and the region rule below govern it. The real
+  // CHANGELOG has zero line-initial `<` across 2,000 lines — this bans nothing anyone writes.
+  structure.forEach((st, i) => {
+    if (st.insideFence) return;
+    if (/^ {0,3}(<[A-Za-z]|<\/|<\?|<!(?!--))/.test(st.masked)) {
+      violations.push(
+        `line ${i + 1} starts with raw HTML (${JSON.stringify(rawLines[i].trim().slice(0, 40))}) — ` +
+          'HTML blocks can hide or expose heading-shaped text; indent the example four spaces or quote it inline',
+      );
+    }
+  });
+
   // A live heading between a raw comment-opener and a raw closer is ambiguous NO MATTER WHAT the
   // classifier decided about those markers. Comments — unlike code spans — can contain blank lines,
   // so the adjacency rules above cannot reach an exposed comment interior; and deciding whether a
@@ -1423,6 +1442,13 @@ const VALIDATION_CORPUS = [
       '## [Unreleased]\n\n### Fixed\n- x\n\n## [1.2.0] - 2026-01-01\n\n### Added\n- an example follows\n\n' +
       '## [0.9.0] - 2020-01-01\n\n## [1.1.0] - 2025-12-01\n\n### Added\n- y\n',
     expect: /not in decreasing order/,
+  },
+  {
+    name: 'a heading quoted inside a <pre> block is loud — line-initial raw HTML is refused',
+    changelog:
+      '## [Unreleased]\n\n### Fixed\n- x\n\n<pre>\n\n## [0.14.1] - 2026-07-30\n\n### Security\n- phantom\n\n</pre>\n\n' +
+      '## [0.14.0] - 2026-07-29\n\n### Added\n- x\n',
+    expect: /starts with raw HTML/,
   },
   {
     name: 'headings between raw comment markers are loud, whatever shielded the opener',

@@ -53,7 +53,12 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   refused outright — comments, unlike code spans, can contain blank lines, so the adjacency rules
   cannot reach an exposed comment interior, and the region rule deliberately does not model WHY
   the markers were mishandled (the reported bypass was backslash-escaped backticks shielding a
-  real opener; the next one would be something else). One blank line was inserted before a `### Fixed`
+  real opener; the next one would be something else). Line-initial raw HTML is refused outright:
+  every CommonMark HTML block type begins with `<` at line start, blocks can contain blank lines,
+  and their interiors do not render as Markdown — one line-shape ban retires the whole carrier
+  family (`<pre>` was the reported instance) instead of chasing it one tag at a time. The real
+  file has zero line-initial `<` across two thousand lines, so the ban costs nothing anyone
+  writes. One blank line was inserted before a `### Fixed`
   in the 0.13.1 section — whitespace-only, no entry text changed — where a formatting slip in
   shipped history was the sole exception to the rule across 47 subsection headings.
 
