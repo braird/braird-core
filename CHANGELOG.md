@@ -54,6 +54,11 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   the STORED string rather than the defaulted read — "absent" and "happens to equal the default" are
   different, and only the former may skip the write, or a user who deliberately chose the defaults
   would never sync that choice.
+  The nudge is spent by having ever answered, tombstones included, not by the live rows in hand. A
+  soft-deleted question disappears from every ordinary read, so after a delete the live surface is
+  indistinguishable from a brand-new account — and the onboarding nudge would have fired again at
+  +24h for someone who had already answered one. New `Store::count_all` answers the one question a
+  live count cannot: did this ever exist.
   Both question-derived anchors are clamped to the question's own `created_at`, matching the window
   clamp `question_notes` already applies. A device whose clock runs behind can stamp a `checkin_at`
   or `resolved_at` earlier than a `created_at` written by another device, and the raw stamp would

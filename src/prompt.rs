@@ -113,6 +113,13 @@ pub struct PromptState {
     pub account_created_at_ms: i64,
     /// Every live question row, any status.
     pub questions: Vec<QuestionMeta>,
+    /// Whether a question has EVER existed on this account, tombstones included.
+    ///
+    /// Distinct from `!questions.is_empty()` on purpose: a soft-deleted question disappears from
+    /// every ordinary read, and reading "no questions" as "never answered" would restart onboarding
+    /// for someone who has been through it. Deletion is the only thing that separates the two, and
+    /// a tombstone is still proof the user answered once.
+    pub has_ever_answered: bool,
     pub prompt_skipped_at_ms: Option<i64>,
 }
 
@@ -240,10 +247,14 @@ pub fn next_events(
 
     let mut events = vec![event(PromptEventKind::Initial, initial_due)];
 
-    // ONE nudge, ever, and it needs no fired-flag: the window closes on its own at +24h, and any
-    // question row at all — live or archived — means the user has answered once and is past the
-    // phase the nudge serves. The client schedules a one-shot notification for `due_at`; the OS
-    // does not repeat it.
+    // ONE nudge, ever, and it needs no fired-flag: the window closes on its own at +24h, and having
+    // ever answered — even if that question was since resolved, dismissed or DELETED — puts the
+    // user past the phase the nudge serves. The client schedules a one-shot notification for
+    // `due_at`; the OS does not repeat it.
+    //
+    // Keyed on `has_ever_answered` rather than on the live rows in hand, because a soft-deleted
+    // question vanishes from every ordinary read: reading that absence as "never answered" would
+    // re-run onboarding, and notify someone who finished it, on the strength of a row they deleted.
     //
     // A RECORDED SKIP CANCELS IT (founder, 2026-08-19). R2's sentence covers the skipper and the
     // leaver in one breath, but the two have not done the same thing: the nudge exists so a user
@@ -253,7 +264,7 @@ pub fn next_events(
     // explicit non-goal of the feature. So the quiet period a skip earns is quiet, not quieter-
     // except-once.
     let nudge_at = state.account_created_at_ms.saturating_add(NUDGE_DELAY_MS);
-    if state.questions.is_empty() && state.prompt_skipped_at_ms.is_none() && now_ms < nudge_at {
+    if !state.has_ever_answered && state.prompt_skipped_at_ms.is_none() && now_ms < nudge_at {
         events.push(event(PromptEventKind::Nudge, nudge_at));
     }
 
@@ -290,8 +301,20 @@ mod tests {
     fn state(questions: Vec<QuestionMeta>, skipped_at: Option<i64>) -> PromptState {
         PromptState {
             account_created_at_ms: CREATED,
+            has_ever_answered: !questions.is_empty(),
             questions,
             prompt_skipped_at_ms: skipped_at,
+        }
+    }
+
+    /// The state a user reaches by answering and then DELETING the question: no live rows survive,
+    /// but onboarding did happen.
+    fn state_after_deleting_the_only_question() -> PromptState {
+        PromptState {
+            account_created_at_ms: CREATED,
+            questions: vec![],
+            has_ever_answered: true,
+            prompt_skipped_at_ms: None,
         }
     }
 
@@ -509,6 +532,23 @@ mod tests {
             dismissed + 1,
         );
         assert_eq!(events[0].due_at, dismissed + CADENCE_MS);
+    }
+
+    #[test]
+    fn deleting_the_only_question_does_not_restart_onboarding() {
+        // A soft-deleted question vanishes from every ordinary read, so the live rows look exactly
+        // like a brand-new account. Nudging here would notify someone who finished onboarding, on
+        // the strength of a row they deleted.
+        let events = next_events(
+            &state_after_deleting_the_only_question(),
+            &settings(PromptTone::Introspective),
+            CREATED + 60_000,
+        );
+        assert_eq!(
+            kinds(&events),
+            vec![PromptEventKind::Initial],
+            "the prompt returns, but the onboarding nudge is spent"
+        );
     }
 
     #[test]

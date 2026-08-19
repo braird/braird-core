@@ -1651,6 +1651,9 @@ impl SyncEngine {
         let state = PromptState {
             account_created_at_ms,
             questions: read::question_metas(&store).map_err(store_err)?,
+            // Counted with tombstones, unlike every other read here: a deleted question still
+            // proves onboarding happened (see [`PromptState::has_ever_answered`]).
+            has_ever_answered: store.count_all("questions").map_err(store_err)? > 0,
             prompt_skipped_at_ms: read::user_setting(&store, PROMPT_SKIPPED_AT_KEY)
                 .map_err(store_err)?
                 .and_then(|v| v.parse().ok()),
@@ -5315,6 +5318,44 @@ mod tests {
 
         assert!(after[0].due_at < before);
         assert_eq!(after[0].tone, PromptTone::Productive);
+    }
+
+    #[test]
+    fn a_deleted_question_still_spends_the_onboarding_nudge() {
+        // End-to-end, because the bug lives in the gap between the store and the machine: every
+        // ordinary read filters tombstones, so after a delete the live rows are indistinguishable
+        // from a fresh account — and the nudge would fire again at +24h for someone who has already
+        // answered one.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+        let created = 1_000_000_i64;
+        let draft = |deleted: bool| QuestionUpsert {
+            id: "q1".into(),
+            plaintext: Some("what am I sitting with?".into()),
+            status: Some("active".into()),
+            tone: None,
+            resolved_at: None,
+            checkin_at: None,
+            checkin_response: None,
+            created_at: created + 1_000,
+            deleted,
+        };
+
+        engine.enqueue_question(draft(false)).unwrap();
+        engine.enqueue_question(draft(true)).unwrap();
+
+        // The live surface is empty again...
+        assert!(engine.list_questions(50, 0).unwrap().is_empty());
+
+        // ...but onboarding still happened, so only the prompt returns — never the nudge.
+        let events = engine
+            .next_prompt_events(created + 60_000, created)
+            .unwrap();
+        assert_eq!(
+            events.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            vec![PromptEventKind::Initial]
+        );
     }
 
     #[test]
