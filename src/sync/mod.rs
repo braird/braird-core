@@ -1420,7 +1420,21 @@ impl SyncEngine {
             deleted,
         } = draft;
 
-        let now = epoch_ms();
+        // MONOTONE OVER THE ROW IT PATCHES (SUR-1043), the [`SyncEngine::stage_signal_write`] rule
+        // (SUR-976). The server's `t01_lww_guard` SILENTLY cancels a strictly-older write while the
+        // flush clears the outbox as if it landed, so a device whose clock trails the stamp on a
+        // just-pulled question would reset its own check-in timer and no one else's — the rest of
+        // the fleet keeps prompting, and nothing is left to retry. Read and stage under ONE guard,
+        // so a concurrent pull cannot land a newer row between the two.
+        let store = lock!(self.store);
+        let now = epoch_ms().max(
+            store
+                .get_row("questions", &id)
+                .map_err(store_err)?
+                .and_then(|r| r.get("updated_at").and_then(Value::as_i64))
+                .unwrap_or(0)
+                .saturating_add(1),
+        );
         let mut row = Map::new();
         row.insert("id".into(), json!(id));
         insert_opt(&mut row, "status", status);
@@ -1438,7 +1452,11 @@ impl SyncEngine {
                 let ciphertext = self.vault.encrypt_note(Some(id.clone()), plaintext);
                 row.insert("text".into(), json!(ciphertext));
                 row.insert("created_at".into(), json!(created_at));
-                self.stage_write("questions", &id, row)?;
+                store
+                    .stage_local_write("questions", &id, row, now)
+                    .map_err(store_err)?;
+                // The marker write below takes the store lock itself, so this guard must go first.
+                drop(store);
                 // Authoring a question is what "onboarded" MEANS, so record it here rather than
                 // leaving SUR-1043 to infer it from rows that a delete or the pull path's
                 // tombstone-skip can take away (see `prompt::PROMPT_ANSWERED_AT_KEY`). Written
@@ -1466,7 +1484,7 @@ impl SyncEngine {
                 // legitimately empty one — while its sparse PATCH matches no server row and stays
                 // queued forever. Failing loudly costs one typed error the host already handles for
                 // notes; the alternative is a question the user never wrote.
-                lock!(self.store)
+                store
                     .stage_local_write_existing_live("questions", &id, row, Vec::new(), now)
                     .map_err(|e| match e {
                         crate::store::StageExistingWriteError::TargetMissing => {
@@ -1682,18 +1700,31 @@ impl SyncEngine {
         now_ms: i64,
         account_created_at_ms: i64,
     ) -> Result<Vec<PromptEvent>, SyncError> {
+        // Heal a legacy account before reading it: question history written by a core that predates
+        // the marker proves onboarding on THIS device, but the proof is local — the row it rests on
+        // can be deleted, and the pull path then hands the next device nothing (it discards a
+        // tombstone for a row it never had). Recording the marker now turns a device-local fact into
+        // an account-wide one, while the history that evidences it still exists. Fires at most once
+        // per account: after this the marker is present and the branch is dead.
+        let legacy_history = {
+            let store = lock!(self.store);
+            read::user_setting(&store, PROMPT_ANSWERED_AT_KEY)
+                .map_err(store_err)?
+                .is_none()
+                && store.count_all("questions").map_err(store_err)? > 0
+        };
+        if legacy_history {
+            self.set_user_setting(PROMPT_ANSWERED_AT_KEY.into(), now_ms.to_string())?;
+        }
+
         let store = lock!(self.store);
         let settings = Self::read_prompt_settings(&store).map_err(store_err)?;
         let state = PromptState {
             account_created_at_ms,
             questions: read::question_metas(&store).map_err(store_err)?,
-            // The recorded marker first; the local row count only as a fallback for a question
-            // authored by a core that predates it. See [`PromptState::has_ever_answered`] for why
-            // the count alone cannot answer this on a device that missed the writing.
             has_ever_answered: read::user_setting(&store, PROMPT_ANSWERED_AT_KEY)
                 .map_err(store_err)?
-                .is_some()
-                || store.count_all("questions").map_err(store_err)? > 0,
+                .is_some(),
             prompt_skipped_at_ms: read::user_setting(&store, PROMPT_SKIPPED_AT_KEY)
                 .map_err(store_err)?
                 .and_then(|v| v.parse().ok()),
@@ -5445,6 +5476,88 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![PromptEventKind::Initial],
             "a device with no question rows at all must still see onboarding as done"
+        );
+    }
+
+    #[test]
+    fn legacy_question_history_backfills_the_marker_before_it_can_vanish() {
+        // A question authored by a core that predates the marker proves onboarding only LOCALLY:
+        // delete it and the next device gets nothing, because the pull path discards a tombstone
+        // for a row it never had. Reading the state heals the account while the evidence exists.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        // A question in the store with NO marker — the pre-SUR-1043 shape.
+        let store = Store::open(db_path).unwrap();
+        let mut legacy = Map::new();
+        legacy.insert("id".into(), json!("legacy"));
+        legacy.insert("text".into(), json!("enc:v2:whatever"));
+        legacy.insert("status".into(), json!("resolved"));
+        legacy.insert("created_at".into(), json!(1_000));
+        legacy.insert("updated_at".into(), json!(2_000));
+        legacy.insert("deleted".into(), json!(false));
+        store.apply_row("questions", &legacy).unwrap();
+        assert!(read::user_setting(&store, PROMPT_ANSWERED_AT_KEY)
+            .unwrap()
+            .is_none());
+        drop(store);
+
+        engine.next_prompt_events(3_000, 1_000).unwrap();
+
+        assert!(
+            Store::open(db_path)
+                .unwrap()
+                .get_row("user_settings", PROMPT_ANSWERED_AT_KEY)
+                .unwrap()
+                .is_some(),
+            "legacy history must be recorded as a marker, not left as a local-only inference"
+        );
+    }
+
+    #[test]
+    fn a_check_in_patch_outruns_a_pulled_question_from_a_faster_clock() {
+        // Same silent-cancel as the settings path: a skip stamped older than the pulled row is
+        // dropped by t01_lww_guard while the flush clears the outbox, so the timer resets on this
+        // device and the rest of the fleet keeps prompting.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_question(QuestionUpsert {
+                id: "q1".into(),
+                plaintext: Some("q".into()),
+                status: Some("active".into()),
+                tone: None,
+                resolved_at: None,
+                checkin_at: None,
+                checkin_response: None,
+                created_at: 1_000,
+                deleted: false,
+            })
+            .unwrap();
+
+        // The same question, pulled back from a device whose clock is years ahead.
+        let far_future = epoch_ms() + 5 * 365 * 24 * 60 * 60 * 1000;
+        let store = Store::open(db_path).unwrap();
+        let mut pulled = store.get_row("questions", "q1").unwrap().unwrap();
+        pulled.insert("updated_at".into(), json!(far_future));
+        store.apply_row("questions", &pulled).unwrap();
+        drop(store);
+
+        engine.skip_checkin("q1".into(), 9_000).unwrap();
+
+        let after = Store::open(db_path)
+            .unwrap()
+            .get_row("questions", "q1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after["checkin_at"], json!(9_000));
+        assert!(
+            after["updated_at"].as_i64().unwrap() > far_future,
+            "a check-in patch must outrank the row it patches, or the server cancels it in silence"
         );
     }
 

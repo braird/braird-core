@@ -62,6 +62,14 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   device inside the opening 24 hours saw a pristine account and re-ran onboarding. A settings row IS
   meant to answer it, and it is live-forever, so no tombstone rule can drop it. `Store::count_all`
   stays as a fallback for a question authored by a core that predates the marker.
+  The same monotonic clamp applies to `enqueue_question`, so a check-in skip or any other metadata
+  patch outranks the row it patches — otherwise the timer reset landed on one device while the rest
+  of the fleet kept prompting. Two call sites now carry this rule and `stage_signal_write` was the
+  first; whether it belongs in `stage_local_write` for every table is a repo-wide question raised on
+  the PR rather than answered here.
+  The onboarding marker is backfilled from legacy question history the first time the state is read,
+  so an account whose only question predates the marker is healed while that history still exists —
+  a local-only inference dies with the row it rests on.
   `set_user_setting` now stamps `updated_at` monotonically over the row it replaces — the SUR-976
   rule applied to settings. The server's `t01_lww_guard` silently cancels a strictly-older write
   (statement still 2xx, no `change_seq` bump) while the flush clears the outbox as if it landed, so
