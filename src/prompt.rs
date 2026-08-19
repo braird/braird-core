@@ -192,7 +192,13 @@ pub fn next_events(
 
     if let Some(q) = active {
         // No `checkin_at` yet = just answered, so the first check-in is one cadence from birth.
-        let anchor = q.checkin_at.unwrap_or(q.created_at);
+        //
+        // Clamped to the question's birth, matching `read::question_notes`' window clamp: a device
+        // whose clock runs behind can stamp a `checkin_at` EARLIER than a `created_at` written by
+        // another device, and the raw stamp would then shorten the interval by the skew. Past one
+        // cadence of skew it would go further and make the check-in immediately overdue — the sheet
+        // reappearing the moment the user answered one, which is precisely the nagging R3 forbids.
+        let anchor = q.checkin_at.unwrap_or(q.created_at).max(q.created_at);
         return vec![PromptEvent {
             kind: PromptEventKind::CheckIn,
             due_at: anchor.saturating_add(cadence_ms),
@@ -203,11 +209,13 @@ pub fn next_events(
 
     // A question that was answered and then closed anchors the next initial-style prompt on its
     // close. `resolved_at` is the intended stamp; `updated_at` covers a dismissal that never set
-    // one. `max` because the log accumulates and only the most recent close matters.
+    // one. Each is clamped to its own question's birth for the same skew reason as the check-in
+    // anchor above — an inverted close would cut short the quiet period a resolve is promised. The
+    // outer `max` is a different job: the log accumulates, and only the most recent close matters.
     let closed_at = state
         .questions
         .iter()
-        .map(|q| q.resolved_at.unwrap_or(q.updated_at))
+        .map(|q| q.resolved_at.unwrap_or(q.updated_at).max(q.created_at))
         .max();
 
     let initial_due = match closed_at
@@ -217,6 +225,10 @@ pub fn next_events(
     {
         // The one-cadence wait anchors on the most recent interaction, whichever kind it was —
         // skipping the re-offer after a resolve must not be overruled by the older close.
+        // `prompt_skipped_at_ms` is deliberately NOT clamped the same way: it is account-level, so
+        // there is no birth stamp to clamp it against, and a skew-early skip only makes the initial
+        // prompt due sooner — which is where it sits with no skip recorded at all. The failure
+        // direction is the safe one, unlike a skewed check-in.
         Some(anchor) => anchor.saturating_add(cadence_ms),
         // Never answered, never skipped: due since the account existed, and it STAYS due (founder,
         // 2026-08-19). The spec's one-cadence wait keys off an interaction, and a user who never
@@ -396,6 +408,53 @@ mod tests {
             skipped_at + 1,
         );
         assert_eq!(events[0].due_at, skipped_at + CADENCE_MS);
+    }
+
+    #[test]
+    fn a_skew_inverted_check_in_anchors_on_the_question_birth() {
+        // A device whose clock runs behind stamps `checkin_at` before the `created_at` another
+        // device wrote. The raw stamp would shorten the interval by the skew.
+        let mut q = question("active", CREATED);
+        q.checkin_at = Some(CREATED - 5 * 60 * 60 * 1000);
+        let events = next_events(
+            &state(vec![q], None),
+            &settings(PromptTone::Introspective),
+            CREATED + 1,
+        );
+        assert_eq!(events[0].due_at, CREATED + CADENCE_MS);
+    }
+
+    #[test]
+    fn extreme_skew_cannot_make_a_check_in_immediately_overdue() {
+        // Past one cadence of skew the raw stamp would put `due_at` in the past, so the sheet would
+        // reappear the instant the user answered one — the nagging R3 forbids.
+        let mut q = question("active", CREATED);
+        q.checkin_at = Some(CREATED - 10 * CADENCE_MS);
+        let now = CREATED + 1;
+        let events = next_events(
+            &state(vec![q], None),
+            &settings(PromptTone::Introspective),
+            now,
+        );
+        assert!(
+            events[0].due_at > now,
+            "a skewed check-in must not fall due immediately"
+        );
+        assert_eq!(events[0].due_at, CREATED + CADENCE_MS);
+    }
+
+    #[test]
+    fn a_skew_inverted_close_keeps_the_full_quiet_period() {
+        let mut q = question("resolved", CREATED);
+        q.resolved_at = Some(CREATED - 9 * 60 * 60 * 1000);
+        q.updated_at = CREATED;
+        let events = next_events(
+            &state(vec![q], None),
+            &settings(PromptTone::Introspective),
+            CREATED + 1,
+        );
+        assert_eq!(kinds(&events), vec![PromptEventKind::Initial]);
+        assert_eq!(events[0].due_at, CREATED + CADENCE_MS);
     }
 
     #[test]

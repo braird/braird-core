@@ -54,6 +54,13 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   the STORED string rather than the defaulted read — "absent" and "happens to equal the default" are
   different, and only the former may skip the write, or a user who deliberately chose the defaults
   would never sync that choice.
+  Both question-derived anchors are clamped to the question's own `created_at`, matching the window
+  clamp `question_notes` already applies. A device whose clock runs behind can stamp a `checkin_at`
+  or `resolved_at` earlier than a `created_at` written by another device, and the raw stamp would
+  shorten the next interval by the skew — past one cadence of it, the check-in would fall due
+  immediately and the sheet would reappear the moment the user answered one. The account-level skip
+  stamp is deliberately not clamped: it has no birth stamp to clamp against, and a skew-early skip
+  only makes the initial prompt due sooner, which is where it sits with no skip recorded at all.
   A recorded skip cancels the nudge as well as earning the quiet period (founder, 2026-08-19). R2
   covers the skipper and the leaver in one sentence, but they have not done the same thing: the
   nudge exists so a user who wandered off mid-onboarding does not lose the moment, while a skip is
