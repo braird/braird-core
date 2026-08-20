@@ -422,8 +422,13 @@ pub fn collection_ids_for_note(store: &Store, note_id: &str) -> rusqlite::Result
 /// correct count (the effective set is defined on rows, not on plaintext). Founder-decided
 /// 2026-08-20: a hidden row is a lost question.
 ///
-/// No `limit`/`offset`. Sorting active-first AFTER a SQL `LIMIT` would page over the wrong order,
-/// and the log grows by roughly one row per cadence period — see [`QUESTION_SCAN_LIMIT`].
+/// No `limit`/`offset`, and no scan bound either. Sorting active-first AFTER a SQL `LIMIT` would
+/// page over the wrong order, so any cut has to happen after the sort — and since this API is
+/// unpaginated, a cut is not a page the caller can step past but history it can never ask for
+/// again. `list_live` orders by `created_at` DESC, so a bound would also drop an OLD ACTIVE
+/// question behind newer resolved ones, contradicting the active-first contract outright. Scans
+/// with `-1` like the notes and overrides reads above; contrast [`QUESTION_META_SCAN_LIMIT`],
+/// where bounding is safe because the scheduler only wants the newest active question.
 ///
 /// ponytail: the tally is O(questions × notes) after those three scans. Fine while v1 keeps one
 /// active question at a time; if a log ever gets long, sort the notes by `created_at` once and
@@ -447,7 +452,7 @@ pub fn list_questions(
     let by_question = curation_by_question(&overrides);
 
     let mut out: Vec<QuestionLogEntry> = store
-        .list_live("questions", None, QUESTION_SCAN_LIMIT, 0)?
+        .list_live("questions", None, -1, 0)?
         .iter()
         .map(|row| {
             let question = question_record(row, vault);
@@ -867,7 +872,7 @@ pub fn user_setting(store: &Store, key: &str) -> rusqlite::Result<Option<String>
 /// would only discard it.
 pub fn question_metas(store: &Store) -> rusqlite::Result<Vec<QuestionMeta>> {
     Ok(store
-        .list_live("questions", None, QUESTION_SCAN_LIMIT, 0)?
+        .list_live("questions", None, QUESTION_META_SCAN_LIMIT, 0)?
         .iter()
         .map(|row| QuestionMeta {
             id: string_field(row, "id").unwrap_or_default(),
@@ -881,11 +886,15 @@ pub fn question_metas(store: &Store) -> rusqlite::Result<Vec<QuestionMeta>> {
 }
 
 /// v1 has ONE live question at a time and archives the rest, so the log grows by roughly one row
-/// per cadence period — a decade of weekly questions is ~520 rows. Shared by [`question_metas`] and
-/// [`list_questions`] (SUR-1071): the scheduler and the Lexicon section must not disagree about how
-/// far back the log goes. ponytail: a bounded scan; narrow it to the newest N by `created_at` only
-/// if a log ever gets big enough to measure.
-const QUESTION_SCAN_LIMIT: i64 = 5_000;
+/// per cadence period — a decade of weekly questions is ~520 rows. ponytail: a bounded scan of
+/// three plaintext columns; narrow it to the newest N by `created_at` only if a log ever gets big
+/// enough to measure.
+///
+/// Bounding is safe HERE and nowhere else. [`question_metas`] feeds the scheduler, which only ever
+/// wants the newest active question, so a cut at the oldest end cannot change its answer.
+/// [`list_questions`] is a user-facing, unpaginated list, where the same cut would delete history
+/// the caller has no way to ask for again — it scans with `-1` (SUR-1071).
+const QUESTION_META_SCAN_LIMIT: i64 = 5_000;
 
 fn custom_idea_record(row: &Map<String, Value>) -> CustomIdeaRecord {
     CustomIdeaRecord {
@@ -2275,6 +2284,45 @@ mod tests {
                 .iter()
                 .any(|n| n.decrypt_failed),
             "a note that fails to decrypt is counted and returned, not dropped"
+        );
+    }
+
+    #[test]
+    fn the_log_scans_every_live_question_not_the_newest_page() {
+        // The log is UNPAGINATED, so a scan bound here is not a page the caller can step past —
+        // it is history the user can never reach again. Worse, `list_live` cuts by `created_at`
+        // DESC *before* the active-first sort, so an old ACTIVE question would be dropped in
+        // favour of newer resolved ones, contradicting the ordering contract outright.
+        let vault = Vault::generate();
+        let (_d, store) = store_with(&[]);
+        // One old active question, buried under more resolved rows than any fixed bound.
+        store
+            .apply_row(
+                "questions",
+                &question_row("the-oldest-active", &vault, "still open", "active", 1, None),
+            )
+            .unwrap();
+        for i in 0..6_000 {
+            store
+                .apply_row(
+                    "questions",
+                    &question_row(
+                        &format!("resolved-{i:05}"),
+                        &vault,
+                        "closed",
+                        "resolved",
+                        1_000 + i,
+                        Some(1_000 + i),
+                    ),
+                )
+                .unwrap();
+        }
+
+        let log = list_questions(&store, &vault, Q_NOW).unwrap();
+        assert_eq!(log.len(), 6_001, "every live question is in the log");
+        assert_eq!(
+            log[0].question.id, "the-oldest-active",
+            "the only active question sorts first no matter how many rows precede it"
         );
     }
 
