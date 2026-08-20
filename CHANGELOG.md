@@ -22,8 +22,13 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   The clamp rewrites the PARTIAL, not just the merged row, and that distinction is the whole point:
   the outbox payload is built from the partial, and the payload is what the server compares.
   Clamping only the local row would repair this device's copy and leave the cancellation untouched.
-  Overflow is now `saturating_add` everywhere; the five call-site clamps disagreed three ways on it
-  (bare `+ 1`, which panics in debug, in three of them).
+  An exhausted stamp is REFUSED, not saturated. `i64::MAX` is a valid `bigint`, and saturating there
+  would hand back a stamp equal to the stored one — silently not strictly-newer, which is the exact
+  condition being guarded against, and unrepairable afterwards because `pull` keeps the local row on
+  an exact tie. The write now errors before anything is applied, so the transaction rolls back and
+  the caller learns. That settles an overflow policy the five call-site clamps disagreed on three
+  ways (bare `+ 1`, which panics in debug, in three of them) — and lands on the one the snapshot
+  import had already chosen.
   Two paths stay deliberately outside it. Every `apply_row` caller — the pull merge sink, the
   server-fetched cover backfill, and the two local-only repairs that must not bump `updated_at` —
   because clamping a PULLED row would leave the local copy carrying a stamp the fleet never wrote,

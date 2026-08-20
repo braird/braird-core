@@ -1183,10 +1183,23 @@ impl Store {
             .and_then(Value::as_i64)
             .unwrap_or(0);
         if let Some(stamp) = partial.get("updated_at").and_then(Value::as_i64) {
-            // `saturating_add` rather than `+ 1`: an i64 within one of overflow is already a
-            // corrupt stamp, and panicking inside a sync write helps nobody. (The five call-site
-            // clamps this replaces disagreed three ways on exactly this point.)
-            let clamped = stamp.max(stored_updated.saturating_add(1));
+            // FAIL rather than saturate. `saturating_add` would return `i64::MAX` unchanged for a
+            // row already stamped `i64::MAX` (a valid `bigint`), so the "clamp" would hand back a
+            // stamp EQUAL to the stored one — silently not strictly-newer, which is the exact
+            // condition this whole function exists to prevent. The server's guard would cancel the
+            // write, the 2xx would clear its outbox entry, and `pull` keeps local on an exact tie
+            // (`incoming > local`), so no later pull could repair the divergence either. Erroring
+            // before `apply_row` means the transaction rolls back and the caller learns, rather
+            // than the store quietly diverging forever. `checked_add` matches what the snapshot
+            // import already does for the same reason (`export_import::merge`).
+            let Some(floor) = stored_updated.checked_add(1) else {
+                return Err(rusqlite::Error::InvalidParameterName(format!(
+                    "{table}/{record_id}: stored updated_at is i64::MAX, so no strictly-newer \
+                     stamp can be represented — refusing to stage a write the server would \
+                     silently cancel"
+                )));
+            };
+            let clamped = stamp.max(floor);
             if clamped != stamp {
                 // Rare and diagnostic: reaching here means this device's clock trails a stamp it
                 // pulled from the fleet. Silent by default is how the bug above stayed invisible.
@@ -2110,6 +2123,46 @@ mod tests {
                 .get("updated_at")
                 .is_none(),
             "and none added to the payload either"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_stamp_is_refused_rather_than_staged_unclamped() {
+        use serde_json::json;
+        // Codex review, PR #97. `i64::MAX` is a valid `bigint`, and `saturating_add(1)` returns it
+        // unchanged — so a "clamp" there yields a stamp EQUAL to the stored one. That is precisely
+        // the not-strictly-newer condition this function exists to prevent: the server cancels the
+        // write, the 2xx clears the outbox entry, and `pull` keeps local on an exact tie, so the
+        // divergence is unrepairable. Fail loudly instead, and leave the store untouched.
+        let store = Store::open_in_memory().unwrap();
+        let mut stored = Map::new();
+        stored.insert("id".into(), Value::from("n1"));
+        stored.insert("updated_at".into(), Value::from(i64::MAX));
+        stored.insert("source".into(), Value::from("before"));
+        store.apply_row("notes", &stored).unwrap();
+
+        let mut partial = Map::new();
+        partial.insert("id".into(), Value::from("n1"));
+        partial.insert("updated_at".into(), Value::from(1_000_i64));
+        partial.insert("source".into(), Value::from("after"));
+        let err = store
+            .stage_local_write("notes", "n1", partial, 1)
+            .expect_err("a write that cannot be stamped strictly-newer must not be staged");
+        assert!(
+            err.to_string().contains("i64::MAX"),
+            "the error must name the cause, got: {err}"
+        );
+
+        let row = store.get_row("notes", "n1").unwrap().unwrap();
+        assert_eq!(
+            row["source"],
+            json!("before"),
+            "the local row must be untouched"
+        );
+        assert_eq!(row["updated_at"], json!(i64::MAX));
+        assert!(
+            store.outbox_items().unwrap().is_empty(),
+            "and nothing may be queued for push — the transaction rolls back"
         );
     }
 
