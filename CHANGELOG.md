@@ -7,6 +7,41 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 ## [Unreleased]
 
 ### Changed
+- **BREAKING (FFI): `list_questions` is now the question log, and takes `now_ms` (SUR-1071).**
+  `list_questions(limit, offset) -> Vec<QuestionRecord>` becomes
+  `list_questions(now_ms) -> Vec<QuestionLogEntry>`, where `QuestionLogEntry` pairs the existing
+  `QuestionRecord` with `note_count`, the size of that question's effective note set. Rows come back
+  **active first**, then newest-first. No host consumes the old form (no `listQuestions` call site
+  exists in braird-android or braird-ios), so this is a rename-in-place rather than a migration —
+  but it is a signature change on a shipped export, so the next release is a MINOR bump.
+  A second `question_log()` beside `list_questions()` was the alternative and was rejected: two
+  near-synonym list functions for one concept is the drift `naming-reviewer` exists to stop, and
+  the Lexicon section needs exactly one of them.
+  `note_count` equals `question_notes(id, now_ms).len()` **by construction**, not by agreement. Both
+  are now the single predicate `in_effective_set` — excludes win, then includes, then the active
+  window — lifted out of `question_notes`, which is rewritten on it with identical behaviour. Two
+  implementations of one rule is how a Lexicon row's subtitle ends up disagreeing with the detail
+  page it opens; the tests assert both numbers on every fixture so they cannot be checked apart.
+  The count is computed **set-wise**: live questions, live notes and live overrides are each scanned
+  once and tallied in memory (the `collection_note_counts` shape), and the tally reads only
+  `(id, created_at)` off each note — **no decryption at all**. The alternative a host had before this
+  was calling `question_notes` once per question: N full scans, each decrypting the whole archive, to
+  produce N integers.
+  Ordering is core's, not the host's. Two clients sorting independently is how one store starts
+  rendering two different sections, and the acceptance criterion is that both platforms agree.
+  "Active" is now the single `prompt::is_active` the check-in loop already schedules on — including
+  its rule that an **unknown** status from a newer client counts as active — so the section the user
+  reads and the loop that prompts them cannot disagree about which question is open.
+  Deliberately **unpaginated**. Active-first ordering has to be applied before any page is cut, so a
+  SQL `LIMIT` would page over the wrong order; the log grows by about one row per cadence period, and
+  the scan bound it already shared with `question_metas` is now named `QUESTION_SCAN_LIMIT` for both.
+  Deliberately **no date-range field**, though SUR-1071 asked for one: `created_at`, `resolved_at` and
+  `status` already ride on `QuestionRecord`, and only the host can render "12 Jul – now" in the user's
+  locale. A `closed_at` would have restated `resolved_at` and given the range a second source of truth.
+  A question whose own text fails to decrypt still appears, with `text: None`,
+  `decrypt_failed: true` and a correct count — the effective set is defined on rows, not on plaintext
+  (founder, 2026-08-20: a hidden row is a lost question).
+  `question_notes` keeps its exported signature and its behaviour; only its internals moved.
 - **The LWW monotonic `updated_at` stamp now lives in one place (SUR-1074).** Every local write
   staged through `Store` is stamped strictly after the row it replaces, for every synced table, by
   construction. This closes a defect that had been patched at **five** separate call sites — each

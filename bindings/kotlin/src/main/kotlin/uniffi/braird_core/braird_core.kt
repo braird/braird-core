@@ -1002,7 +1002,7 @@ internal interface UniffiLib : Library {
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_list_notes(`ptr`: Pointer,`bookId`: RustBuffer.ByValue,`limit`: Int,`offset`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    fun uniffi_braird_core_fn_method_syncengine_list_questions(`ptr`: Pointer,`limit`: Int,`offset`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_braird_core_fn_method_syncengine_list_questions(`ptr`: Pointer,`nowMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_merge_books(`ptr`: Pointer,`survivorId`: RustBuffer.ByValue,`loserIds`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1461,7 +1461,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_list_notes() != 26133.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_list_questions() != 7468.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_list_questions() != 33394.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_merge_books() != 55148.toShort()) {
@@ -2750,9 +2750,20 @@ public interface SyncEngineInterface {
     fun `listNotes`(`bookId`: kotlin.String?, `limit`: kotlin.UInt, `offset`: kotlin.UInt): List<NoteRecord>
     
     /**
-     * The SUR-996 question log, newest-first — every status, decrypted in core (SUR-1042).
+     * The SUR-996 question log — every live question, **active first** then newest-first, each
+     * with the size of its effective note set (SUR-1071). Decrypted in core. This is the Lexicon
+     * Questions section; there is no separate log view.
+     *
+     * `note_count` equals `question_notes(id, now_ms).len()` by construction — the same predicate
+     * produces both — so a row's subtitle can never disagree with the detail page it opens.
+     * `now_ms` closes the window of a question that has no `resolved_at`; the host supplies it so
+     * this stays a pure function of its inputs, exactly as [`Self::question_notes`] does. Pass the
+     * same `now_ms` to both if you render them together.
+     *
+     * Unpaginated on purpose: active-first ordering has to be applied before any page is cut, and
+     * the log grows by about one row per cadence period.
      */
-    fun `listQuestions`(`limit`: kotlin.UInt, `offset`: kotlin.UInt): List<QuestionRecord>
+    fun `listQuestions`(`nowMs`: kotlin.Long): List<QuestionLogEntry>
     
     /**
      * Merge duplicate source books into `survivor_id` (SUR-915): rehome the losers' notes, keep the
@@ -3883,14 +3894,25 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
 
     
     /**
-     * The SUR-996 question log, newest-first — every status, decrypted in core (SUR-1042).
+     * The SUR-996 question log — every live question, **active first** then newest-first, each
+     * with the size of its effective note set (SUR-1071). Decrypted in core. This is the Lexicon
+     * Questions section; there is no separate log view.
+     *
+     * `note_count` equals `question_notes(id, now_ms).len()` by construction — the same predicate
+     * produces both — so a row's subtitle can never disagree with the detail page it opens.
+     * `now_ms` closes the window of a question that has no `resolved_at`; the host supplies it so
+     * this stays a pure function of its inputs, exactly as [`Self::question_notes`] does. Pass the
+     * same `now_ms` to both if you render them together.
+     *
+     * Unpaginated on purpose: active-first ordering has to be applied before any page is cut, and
+     * the log grows by about one row per cadence period.
      */
-    @Throws(SyncException::class)override fun `listQuestions`(`limit`: kotlin.UInt, `offset`: kotlin.UInt): List<QuestionRecord> {
-            return FfiConverterSequenceTypeQuestionRecord.lift(
+    @Throws(SyncException::class)override fun `listQuestions`(`nowMs`: kotlin.Long): List<QuestionLogEntry> {
+            return FfiConverterSequenceTypeQuestionLogEntry.lift(
     callWithPointer {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_list_questions(
-        it, FfiConverterUInt.lower(`limit`),FfiConverterUInt.lower(`offset`),_status)
+        it, FfiConverterLong.lower(`nowMs`),_status)
 }
     }
     )
@@ -6347,6 +6369,52 @@ public object FfiConverterTypePullSummary: FfiConverterRustBuffer<PullSummary> {
 
 
 /**
+ * One row of the Lexicon Questions section (SUR-1071) — a question plus the size of its effective
+ * note set, shaped like [`CollectionNoteCount`] but carrying its subject rather than pointing at it
+ * (the section renders both together, and a host that had to zip two lists would also have to
+ * re-derive the ordering).
+ *
+ * `note_count` is `question_notes(id, now_ms).len()` **by construction** — both are
+ * [`in_effective_set`] over the same rows — so the subtitle can never disagree with the detail page
+ * it opens. It is a function of `now_ms`: an active question's window runs to the caller's clock,
+ * so its count grows; a resolved one is frozen at `resolved_at`.
+ *
+ * No date-range field. `question.created_at`, `question.resolved_at` and `question.status` already
+ * carry it, and only the host knows how to render "12 Jul – now" in the user's locale.
+ */
+data class QuestionLogEntry (
+    var `question`: QuestionRecord, 
+    var `noteCount`: kotlin.UInt
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeQuestionLogEntry: FfiConverterRustBuffer<QuestionLogEntry> {
+    override fun read(buf: ByteBuffer): QuestionLogEntry {
+        return QuestionLogEntry(
+            FfiConverterTypeQuestionRecord.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: QuestionLogEntry) = (
+            FfiConverterTypeQuestionRecord.allocationSize(value.`question`) +
+            FfiConverterUInt.allocationSize(value.`noteCount`)
+    )
+
+    override fun write(value: QuestionLogEntry, buf: ByteBuffer) {
+            FfiConverterTypeQuestionRecord.write(value.`question`, buf)
+            FfiConverterUInt.write(value.`noteCount`, buf)
+    }
+}
+
+
+
+/**
  * One question↔note curation override (SUR-996 R1) — the user pinning a note onto a question, or
  * excluding one the active-window join offered.
  *
@@ -6420,8 +6488,9 @@ public object FfiConverterTypeQuestionNoteOverride: FfiConverterRustBuffer<Quest
  * `enqueue_question` always writes a status: the vocabulary is client-authored with no server
  * CHECK, so a row written by a newer client must not panic an older read.
  *
- * Deliberately NO note count or active-date-range field — those are Lexicon presentation shapes and
- * belong to SUR-1044, which builds them on [`question_notes`] rather than beside it.
+ * Deliberately NO note count or active-date-range field — those are Lexicon presentation shapes.
+ * The count rides on [`QuestionLogEntry`] (SUR-1071), because it is a function of `now`; the range
+ * needs no field at all, since `created_at` + `resolved_at` + `status` already say it.
  */
 data class QuestionRecord (
     var `id`: kotlin.String, 
@@ -8175,24 +8244,24 @@ public object FfiConverterSequenceTypePromptEvent: FfiConverterRustBuffer<List<P
 /**
  * @suppress
  */
-public object FfiConverterSequenceTypeQuestionRecord: FfiConverterRustBuffer<List<QuestionRecord>> {
-    override fun read(buf: ByteBuffer): List<QuestionRecord> {
+public object FfiConverterSequenceTypeQuestionLogEntry: FfiConverterRustBuffer<List<QuestionLogEntry>> {
+    override fun read(buf: ByteBuffer): List<QuestionLogEntry> {
         val len = buf.getInt()
-        return List<QuestionRecord>(len) {
-            FfiConverterTypeQuestionRecord.read(buf)
+        return List<QuestionLogEntry>(len) {
+            FfiConverterTypeQuestionLogEntry.read(buf)
         }
     }
 
-    override fun allocationSize(value: List<QuestionRecord>): ULong {
+    override fun allocationSize(value: List<QuestionLogEntry>): ULong {
         val sizeForLength = 4UL
-        val sizeForItems = value.map { FfiConverterTypeQuestionRecord.allocationSize(it) }.sum()
+        val sizeForItems = value.map { FfiConverterTypeQuestionLogEntry.allocationSize(it) }.sum()
         return sizeForLength + sizeForItems
     }
 
-    override fun write(value: List<QuestionRecord>, buf: ByteBuffer) {
+    override fun write(value: List<QuestionLogEntry>, buf: ByteBuffer) {
         buf.putInt(value.size)
         value.iterator().forEach {
-            FfiConverterTypeQuestionRecord.write(it, buf)
+            FfiConverterTypeQuestionLogEntry.write(it, buf)
         }
     }
 }

@@ -1173,9 +1173,20 @@ public protocol SyncEngineProtocol : AnyObject {
     func listNotes(bookId: String?, limit: UInt32, offset: UInt32) throws  -> [NoteRecord]
     
     /**
-     * The SUR-996 question log, newest-first — every status, decrypted in core (SUR-1042).
+     * The SUR-996 question log — every live question, **active first** then newest-first, each
+     * with the size of its effective note set (SUR-1071). Decrypted in core. This is the Lexicon
+     * Questions section; there is no separate log view.
+     *
+     * `note_count` equals `question_notes(id, now_ms).len()` by construction — the same predicate
+     * produces both — so a row's subtitle can never disagree with the detail page it opens.
+     * `now_ms` closes the window of a question that has no `resolved_at`; the host supplies it so
+     * this stays a pure function of its inputs, exactly as [`Self::question_notes`] does. Pass the
+     * same `now_ms` to both if you render them together.
+     *
+     * Unpaginated on purpose: active-first ordering has to be applied before any page is cut, and
+     * the log grows by about one row per cadence period.
      */
-    func listQuestions(limit: UInt32, offset: UInt32) throws  -> [QuestionRecord]
+    func listQuestions(nowMs: Int64) throws  -> [QuestionLogEntry]
     
     /**
      * Merge duplicate source books into `survivor_id` (SUR-915): rehome the losers' notes, keep the
@@ -2191,13 +2202,23 @@ open func listNotes(bookId: String?, limit: UInt32, offset: UInt32)throws  -> [N
 }
     
     /**
-     * The SUR-996 question log, newest-first — every status, decrypted in core (SUR-1042).
+     * The SUR-996 question log — every live question, **active first** then newest-first, each
+     * with the size of its effective note set (SUR-1071). Decrypted in core. This is the Lexicon
+     * Questions section; there is no separate log view.
+     *
+     * `note_count` equals `question_notes(id, now_ms).len()` by construction — the same predicate
+     * produces both — so a row's subtitle can never disagree with the detail page it opens.
+     * `now_ms` closes the window of a question that has no `resolved_at`; the host supplies it so
+     * this stays a pure function of its inputs, exactly as [`Self::question_notes`] does. Pass the
+     * same `now_ms` to both if you render them together.
+     *
+     * Unpaginated on purpose: active-first ordering has to be applied before any page is cut, and
+     * the log grows by about one row per cadence period.
      */
-open func listQuestions(limit: UInt32, offset: UInt32)throws  -> [QuestionRecord] {
-    return try  FfiConverterSequenceTypeQuestionRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+open func listQuestions(nowMs: Int64)throws  -> [QuestionLogEntry] {
+    return try  FfiConverterSequenceTypeQuestionLogEntry.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_list_questions(self.uniffiClonePointer(),
-        FfiConverterUInt32.lower(limit),
-        FfiConverterUInt32.lower(offset),$0
+        FfiConverterInt64.lower(nowMs),$0
     )
 })
 }
@@ -5407,6 +5428,86 @@ public func FfiConverterTypePullSummary_lower(_ value: PullSummary) -> RustBuffe
 
 
 /**
+ * One row of the Lexicon Questions section (SUR-1071) — a question plus the size of its effective
+ * note set, shaped like [`CollectionNoteCount`] but carrying its subject rather than pointing at it
+ * (the section renders both together, and a host that had to zip two lists would also have to
+ * re-derive the ordering).
+ *
+ * `note_count` is `question_notes(id, now_ms).len()` **by construction** — both are
+ * [`in_effective_set`] over the same rows — so the subtitle can never disagree with the detail page
+ * it opens. It is a function of `now_ms`: an active question's window runs to the caller's clock,
+ * so its count grows; a resolved one is frozen at `resolved_at`.
+ *
+ * No date-range field. `question.created_at`, `question.resolved_at` and `question.status` already
+ * carry it, and only the host knows how to render "12 Jul – now" in the user's locale.
+ */
+public struct QuestionLogEntry {
+    public var question: QuestionRecord
+    public var noteCount: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(question: QuestionRecord, noteCount: UInt32) {
+        self.question = question
+        self.noteCount = noteCount
+    }
+}
+
+
+
+extension QuestionLogEntry: Equatable, Hashable {
+    public static func ==(lhs: QuestionLogEntry, rhs: QuestionLogEntry) -> Bool {
+        if lhs.question != rhs.question {
+            return false
+        }
+        if lhs.noteCount != rhs.noteCount {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(question)
+        hasher.combine(noteCount)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeQuestionLogEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> QuestionLogEntry {
+        return
+            try QuestionLogEntry(
+                question: FfiConverterTypeQuestionRecord.read(from: &buf), 
+                noteCount: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: QuestionLogEntry, into buf: inout [UInt8]) {
+        FfiConverterTypeQuestionRecord.write(value.question, into: &buf)
+        FfiConverterUInt32.write(value.noteCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQuestionLogEntry_lift(_ buf: RustBuffer) throws -> QuestionLogEntry {
+    return try FfiConverterTypeQuestionLogEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQuestionLogEntry_lower(_ value: QuestionLogEntry) -> RustBuffer {
+    return FfiConverterTypeQuestionLogEntry.lower(value)
+}
+
+
+/**
  * One question↔note curation override (SUR-996 R1) — the user pinning a note onto a question, or
  * excluding one the active-window join offered.
  *
@@ -5529,8 +5630,9 @@ public func FfiConverterTypeQuestionNoteOverride_lower(_ value: QuestionNoteOver
  * `enqueue_question` always writes a status: the vocabulary is client-authored with no server
  * CHECK, so a row written by a newer client must not panic an older read.
  *
- * Deliberately NO note count or active-date-range field — those are Lexicon presentation shapes and
- * belong to SUR-1044, which builds them on [`question_notes`] rather than beside it.
+ * Deliberately NO note count or active-date-range field — those are Lexicon presentation shapes.
+ * The count rides on [`QuestionLogEntry`] (SUR-1071), because it is a function of `now`; the range
+ * needs no field at all, since `created_at` + `resolved_at` + `status` already say it.
  */
 public struct QuestionRecord {
     public var id: String
@@ -7879,23 +7981,23 @@ fileprivate struct FfiConverterSequenceTypePromptEvent: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterSequenceTypeQuestionRecord: FfiConverterRustBuffer {
-    typealias SwiftType = [QuestionRecord]
+fileprivate struct FfiConverterSequenceTypeQuestionLogEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [QuestionLogEntry]
 
-    public static func write(_ value: [QuestionRecord], into buf: inout [UInt8]) {
+    public static func write(_ value: [QuestionLogEntry], into buf: inout [UInt8]) {
         let len = Int32(value.count)
         writeInt(&buf, len)
         for item in value {
-            FfiConverterTypeQuestionRecord.write(item, into: &buf)
+            FfiConverterTypeQuestionLogEntry.write(item, into: &buf)
         }
     }
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [QuestionRecord] {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [QuestionLogEntry] {
         let len: Int32 = try readInt(&buf)
-        var seq = [QuestionRecord]()
+        var seq = [QuestionLogEntry]()
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
-            seq.append(try FfiConverterTypeQuestionRecord.read(from: &buf))
+            seq.append(try FfiConverterTypeQuestionLogEntry.read(from: &buf))
         }
         return seq
     }
@@ -8145,7 +8247,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_list_notes() != 26133) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_list_questions() != 7468) {
+    if (uniffi_braird_core_checksum_method_syncengine_list_questions() != 33394) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_merge_books() != 55148) {

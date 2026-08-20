@@ -1037,7 +1037,10 @@ class RoundTripTest {
         engine.enqueueQuestion(question("q1", "what am I avoiding?", "active"))
 
         // Round-trips as plaintext, and the sealed column never crosses in its enc: form.
-        val listed = engine.listQuestions(50u, 0u).single()
+        // SUR-1071: `listQuestions` returns a NESTED record — a QuestionRecord inside a
+        // QuestionLogEntry inside a sequence. That lowering is new to this surface, so reading the
+        // inner fields back is the assertion, not a formality.
+        val listed = engine.listQuestions(10_000L).single().question
         assertEquals("q1", listed.id)
         assertEquals("what am I avoiding?", listed.text)
         assertEquals(false, listed.decryptFailed)
@@ -1072,6 +1075,20 @@ class RoundTripTest {
             listOf("in-window", "too-early"),
             engine.questionNotes("q2", 10_000L).map { it.id }.sorted(),
         )
+
+        // SUR-1071: the log over the ABI — active first, and each count equal to the effective set
+        // the detail page would show. `q1` was resolved above; `q2` is still open, so the older
+        // active question outranks the newer closed one.
+        val log = engine.listQuestions(10_000L)
+        assertEquals(listOf("q2", "q1"), log.map { it.question.id }, "active first, then newest")
+        assertEquals(2u, log.first { it.question.id == "q2" }.noteCount)
+        for (entry in log) {
+            assertEquals(
+                engine.questionNotes(entry.question.id, 10_000L).size.toUInt(),
+                entry.noteCount,
+                "count and effective set must agree for ${entry.question.id}",
+            )
+        }
 
         // The first synced setting, keyed by name (no id column).
         engine.setUserSetting("prompt_cadence", "168")

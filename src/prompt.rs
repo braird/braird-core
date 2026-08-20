@@ -161,8 +161,12 @@ pub fn tone_value(tone: PromptTone) -> &'static str {
 /// A question still counts as live unless it says otherwise. An unknown status is treated as
 /// ACTIVE on purpose: mistaking a newer client's status for "no question" would prompt the user to
 /// start a second one and silently fork the log, which is worse than a check-in they can skip.
-fn is_active(q: &QuestionMeta) -> bool {
-    !matches!(q.status.as_deref(), Some("resolved") | Some("dismissed"))
+///
+/// Crate-visible because the Lexicon question log orders on it too (SUR-1071). One definition, so
+/// the section the user reads and the loop that schedules their check-in cannot disagree about
+/// which question is open — least of all about a status neither of them recognises.
+pub(crate) fn is_active(status: Option<&str>) -> bool {
+    !matches!(status, Some("resolved") | Some("dismissed"))
 }
 
 /// Bound an interaction stamp to the window it could possibly have happened in: no earlier than the
@@ -234,7 +238,7 @@ pub fn next_events(
     let active = state
         .questions
         .iter()
-        .filter(|q| is_active(q))
+        .filter(|q| is_active(q.status.as_deref()))
         .max_by_key(|q| q.created_at);
 
     if let Some(q) = active {
