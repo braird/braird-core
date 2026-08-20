@@ -1083,11 +1083,25 @@ class RoundTripTest {
      * enforced in CORE, not by the picker, and the opening phase returns BOTH the initial prompt
      * and its nudge in one call. */
     @Test
-    fun promptSurfaceOverFfi() {
+    fun promptSurfaceOverFfi() = EmptyJsonLoopbackServer().use { server ->
         val db = File.createTempFile("braird-p", ".sqlite").apply { deleteOnExit() }
-        val engine = SyncEngine.open(db.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
+        val engine = SyncEngine.open(db.absolutePath, server.baseUrl, "anon", Vault.generate())
         val created = 1_000_000L
         val hourMs = 3_600_000L
+        // `nextPromptEvents` is nullable on purpose (SUR-1075), so unwrapping here is the test
+        // asserting the answer exists — a silent empty list would prove nothing.
+        fun events(e: SyncEngine, now: Long, birth: Long) = e.nextPromptEvents(now, birth)!!
+
+        // Before any pull core cannot tell an empty table from an un-pulled one, so it declines.
+        // Kotlin's type system is what enforces the host rule: you cannot reach the events without
+        // handling this, and "do nothing" is the only correct response.
+        assertEquals(null, engine.nextPromptEvents(created + 60_000L, created))
+
+        // One completed pull — every table answers `[]`, which is a SUCCESS, not an absence — and
+        // the surface opens up. This is exactly the case a cursor could not detect: an empty page
+        // advances no cursor, so the receipt is the only thing that changed here.
+        engine.setAccessToken(testJwt())
+        engine.pull()
 
         // Nothing stored yet: the defaults cross intact.
         assertEquals(PromptSettings(168u, PromptTone.INTROSPECTIVE), engine.promptSettings())
@@ -1101,7 +1115,7 @@ class RoundTripTest {
         assertEquals(PromptTone.PRODUCTIVE, clamped.tone)
 
         // A fresh account: the prompt is due now AND the nudge is already scheduled for +24h.
-        val opening = engine.nextPromptEvents(created + 60_000L, created)
+        val opening = events(engine, created + 60_000L, created)
         assertEquals(listOf(PromptEventKind.INITIAL, PromptEventKind.NUDGE), opening.map { it.kind })
         assertEquals(created, opening[0].dueAt)
         assertEquals(created + 24 * hourMs, opening[1].dueAt)
@@ -1115,7 +1129,7 @@ class RoundTripTest {
                 createdAt = created, deleted = false,
             )
         )
-        val live = engine.nextPromptEvents(created + 60_000L, created)
+        val live = events(engine, created + 60_000L, created)
         assertEquals(listOf(PromptEventKind.CHECK_IN), live.map { it.kind })
         assertEquals(created + 72 * hourMs, live[0].dueAt)
         // The event names its question, so the client never re-derives the pick.
@@ -1125,15 +1139,17 @@ class RoundTripTest {
         // Skipping the check-in resets the timer and leaves the sealed text alone.
         val skippedAt = created + 80 * hourMs
         engine.skipCheckin("q1", skippedAt)
-        assertEquals(skippedAt + 72 * hourMs, engine.nextPromptEvents(skippedAt + 1, created)[0].dueAt)
+        assertEquals(skippedAt + 72 * hourMs, events(engine, skippedAt + 1, created)[0].dueAt)
         assertEquals("what am I sitting with?", engine.getQuestion("q1")!!.text)
 
         // A recorded skip earns the quiet period on a fresh account, and cancels the nudge with it:
         // a user who declined is not pinged 24h later.
         val other = File.createTempFile("braird-p2", ".sqlite").apply { deleteOnExit() }
-        val fresh = SyncEngine.open(other.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
+        val fresh = SyncEngine.open(other.absolutePath, server.baseUrl, "anon", Vault.generate())
+        fresh.setAccessToken(testJwt())
+        fresh.pull()
         fresh.skipPrompt(created + 5_000L)
-        val quiet = fresh.nextPromptEvents(created + 6_000L, created)
+        val quiet = events(fresh, created + 6_000L, created)
         assertEquals(listOf(PromptEventKind.INITIAL), quiet.map { it.kind })
         assertEquals(created + 5_000L + 168 * hourMs, quiet[0].dueAt)
     }

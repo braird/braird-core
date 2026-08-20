@@ -1225,6 +1225,35 @@ impl Store {
         self.meta_delete(&sync_cursor_key(table))
     }
 
+    /// Whether this device has ever COMPLETED a pull of `table` (SUR-1075) — a receipt, not a
+    /// watermark, and the two are not interchangeable. [`Store::get_seq_cursor`] answers "how far
+    /// did we get", and it stays `None` after a perfectly successful pull of an empty table
+    /// (`sync::pull` advances the cursor only past merged rows). So cursor-absence cannot separate
+    /// "this device never pulled the table" from "pulled fine, there is genuinely nothing there" —
+    /// and on a brand-new account the second is the primary flow, so gating on the cursor would
+    /// suppress a first-run experience forever.
+    ///
+    /// That distinction matters to any consumer reading meaning into an EMPTY table, because
+    /// [`crate::sync::SyncEngine::pull`] returns `Ok` on a partial failure by design (per-table
+    /// isolation) and reports no per-table outcome. Absent a receipt, a table that silently failed
+    /// to pull is indistinguishable from one the account never had rows in.
+    ///
+    /// Device-local on purpose (in `meta`, keyed `sync:pulled:<table>`): "has THIS device pulled"
+    /// is a device-local question. Contrast the prompt markers, which are synced `user_settings`
+    /// rows precisely because they answer account-level ones.
+    pub fn has_completed_pull(&self, table: &str) -> rusqlite::Result<bool> {
+        Ok(self.meta_get(&sync_pulled_key(table))?.is_some())
+    }
+
+    /// Record that a pull of `table` ran through to its last page.
+    ///
+    /// LATCHING: set once, never cleared. Past the first completed pull the local rows are a valid
+    /// LWW merge base, so a later failure leaves the table STALE — the pre-existing accepted
+    /// condition every consumer already lives with — rather than unknown. Idempotent.
+    pub fn mark_pull_complete(&self, table: &str) -> rusqlite::Result<()> {
+        self.meta_set(&sync_pulled_key(table), "1")
+    }
+
     // ── sealed embedding store (SUR-997) ─────────────────────────────────────
     // The local-only `embeddings` table's read/write surface. DEVICE-LOCAL by construction:
     // nothing here touches the outbox, so vectors can never sync (the mirror of the PWA's
@@ -1414,6 +1443,13 @@ fn sync_seq_key(table: &str) -> String {
 /// delete it on the first change_seq pull.
 fn sync_cursor_key(table: &str) -> String {
     format!("sync:cursor:{table}")
+}
+
+/// The `meta` key recording that a table's pull completed at least once on this device (SUR-1075).
+/// A separate key from [`sync_seq_key`] on purpose — a receipt and a watermark answer different
+/// questions, and an empty page produces one without the other.
+fn sync_pulled_key(table: &str) -> String {
+    format!("sync:pulled:{table}")
 }
 
 /// The SQL expression for a note's embedding staleness token, parameterized on the notes
@@ -1854,6 +1890,29 @@ mod tests {
         assert_eq!(store.get_seq_cursor("notes").unwrap(), Some(42));
         // Per-table isolation: advancing notes must not touch the books cursor.
         assert_eq!(store.get_seq_cursor("books").unwrap(), None);
+    }
+
+    #[test]
+    fn pull_receipts_default_false_and_stay_per_table() {
+        // SUR-1075. Per-table like the cursor, and INDEPENDENT of it: a receipt without a cursor is
+        // the ordinary shape of a successful empty pull, which is the whole reason the two are
+        // separate keys.
+        let store = Store::open_in_memory().unwrap();
+        assert!(!store.has_completed_pull("questions").unwrap());
+
+        store.mark_pull_complete("questions").unwrap();
+        store.mark_pull_complete("questions").unwrap(); // idempotent
+
+        assert!(store.has_completed_pull("questions").unwrap());
+        assert!(
+            !store.has_completed_pull("user_settings").unwrap(),
+            "one table's receipt must not answer for another"
+        );
+        assert_eq!(
+            store.get_seq_cursor("questions").unwrap(),
+            None,
+            "a receipt is not a watermark"
+        );
     }
 
     #[test]

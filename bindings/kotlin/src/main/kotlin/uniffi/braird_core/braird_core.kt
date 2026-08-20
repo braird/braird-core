@@ -1470,7 +1470,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_merge_content_duplicates() != 26022.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_next_prompt_events() != 21888.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_next_prompt_events() != 63384.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_note_ids_for_collection() != 25011.toShort()) {
@@ -2776,8 +2776,12 @@ public interface SyncEngineInterface {
      * every answer, settings change, and sync pull that touched a question — that is what makes
      * answering on the phone silence the tablet (SUR-996 R5).
      *
-     * Never empty, at most two (the opening 24h returns the initial prompt AND its nudge; see
-     * [`prompt::next_events`] for the full rule table).
+     * `None` means CORE CANNOT TELL YET — this device has not completed a pull of the tables the
+     * answer rests on, so its empty `questions`/`user_settings` prove nothing (SUR-1075). Hosts
+     * MUST then do nothing at all: show no prompt, and — the part that is easy to get wrong —
+     * do NOT cancel pending notifications. Re-run after the next successful pull. `Some` is never
+     * empty and holds at most two events (the opening 24h returns the initial prompt AND its
+     * nudge; see [`prompt::next_events`] for the full rule table).
      *
      * Both timestamps are host-supplied. `now_ms` follows the read-surface convention
      * ([`SyncEngine::question_notes`]) — core reads no clock, so the result is a pure function of
@@ -2786,7 +2790,7 @@ public interface SyncEngineInterface {
      * server-authoritative and stays outside the client sync surface. Both platforms read it from
      * the same GoTrue user object.
      */
-    fun `nextPromptEvents`(`nowMs`: kotlin.Long, `accountCreatedAtMs`: kotlin.Long): List<PromptEvent>
+    fun `nextPromptEvents`(`nowMs`: kotlin.Long, `accountCreatedAtMs`: kotlin.Long): List<PromptEvent>?
     
     /**
      * Live member note ids of a collection (SUR-923) — feeds the host-side collection-delete
@@ -3945,8 +3949,12 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * every answer, settings change, and sync pull that touched a question — that is what makes
      * answering on the phone silence the tablet (SUR-996 R5).
      *
-     * Never empty, at most two (the opening 24h returns the initial prompt AND its nudge; see
-     * [`prompt::next_events`] for the full rule table).
+     * `None` means CORE CANNOT TELL YET — this device has not completed a pull of the tables the
+     * answer rests on, so its empty `questions`/`user_settings` prove nothing (SUR-1075). Hosts
+     * MUST then do nothing at all: show no prompt, and — the part that is easy to get wrong —
+     * do NOT cancel pending notifications. Re-run after the next successful pull. `Some` is never
+     * empty and holds at most two events (the opening 24h returns the initial prompt AND its
+     * nudge; see [`prompt::next_events`] for the full rule table).
      *
      * Both timestamps are host-supplied. `now_ms` follows the read-surface convention
      * ([`SyncEngine::question_notes`]) — core reads no clock, so the result is a pure function of
@@ -3955,8 +3963,8 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * server-authoritative and stays outside the client sync surface. Both platforms read it from
      * the same GoTrue user object.
      */
-    @Throws(SyncException::class)override fun `nextPromptEvents`(`nowMs`: kotlin.Long, `accountCreatedAtMs`: kotlin.Long): List<PromptEvent> {
-            return FfiConverterSequenceTypePromptEvent.lift(
+    @Throws(SyncException::class)override fun `nextPromptEvents`(`nowMs`: kotlin.Long, `accountCreatedAtMs`: kotlin.Long): List<PromptEvent>? {
+            return FfiConverterOptionalSequenceTypePromptEvent.lift(
     callWithPointer {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_next_prompt_events(
@@ -7775,6 +7783,38 @@ public object FfiConverterOptionalTypeQuestionRecord: FfiConverterRustBuffer<Que
         } else {
             buf.put(1)
             FfiConverterTypeQuestionRecord.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalSequenceTypePromptEvent: FfiConverterRustBuffer<List<PromptEvent>?> {
+    override fun read(buf: ByteBuffer): List<PromptEvent>? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterSequenceTypePromptEvent.read(buf)
+    }
+
+    override fun allocationSize(value: List<PromptEvent>?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterSequenceTypePromptEvent.allocationSize(value)
+        }
+    }
+
+    override fun write(value: List<PromptEvent>?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterSequenceTypePromptEvent.write(value, buf)
         }
     }
 }

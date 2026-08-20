@@ -304,6 +304,21 @@ async fn pull_table<S: PostgrestSink>(
         }
     }
 
+    // The pagination loop reached its last page — the `break` above is its only normal exit, so
+    // arriving here means every page this table had was fetched and merged. Record the receipt
+    // (SUR-1075).
+    //
+    // Deliberately NOT inferable from the cursor: an empty page advances no cursor (see the comment
+    // above the advance), so a successful pull of an empty table writes none. A consumer that reads
+    // meaning into an empty table would then treat a silently-failed pull as authoritative, because
+    // `SyncEngine::pull` returns `Ok` on a partial failure and names no table.
+    //
+    // Written HERE rather than in `pull`'s `Ok(stats)` arm so no caller can mint a receipt for a
+    // table whose pagination it never drove to the end.
+    store
+        .mark_pull_complete(table)
+        .map_err(|e| format!("record pull receipt {table}: {e}"))?;
+
     Ok(stats)
 }
 
@@ -696,6 +711,114 @@ mod tests {
         let sink = MapSink::new().with("notes", vec![]);
         block(pull(&store, &sink, &["notes"])).unwrap();
         assert_eq!(store.get_seq_cursor("notes").unwrap(), None);
+    }
+
+    // ── SUR-1075 pull receipts (a receipt is not a watermark) ─────────────────
+
+    #[test]
+    fn a_successful_empty_pull_records_a_receipt_without_a_cursor() {
+        // THE case the receipt exists for. An empty page advances no cursor, so cursor-absence
+        // cannot tell "never pulled" from "pulled, nothing there" — and on a new account the
+        // second is the normal flow. The receipt separates them; gating on the cursor instead
+        // would suppress every first-run experience forever.
+        let store = Store::open_in_memory().unwrap();
+        let sink = MapSink::new().with("notes", vec![]);
+
+        block(pull(&store, &sink, &["notes"])).unwrap();
+
+        assert_eq!(
+            store.get_seq_cursor("notes").unwrap(),
+            None,
+            "an empty page still advances nothing"
+        );
+        assert!(
+            store.has_completed_pull("notes").unwrap(),
+            "but the pull DID complete, and that is the fact consumers need"
+        );
+    }
+
+    #[test]
+    fn a_failed_table_records_no_receipt_while_its_sibling_does() {
+        // Per-table isolation extends to the receipt: `pull` returns Ok on a partial failure, so
+        // the receipt is the only per-table outcome a later reader can see.
+        let store = Store::open_in_memory().unwrap();
+        let sink = MapSink::new()
+            .with(
+                "books",
+                vec![json!({ "id": "b1", "title": "T", "updated_at": 1000, "deleted": false })],
+            )
+            .failing("notes");
+
+        let res = block(pull(&store, &sink, &["books", "notes"])).unwrap();
+
+        assert_eq!(res.failed_tables.len(), 1, "a PARTIAL failure, still Ok");
+        assert!(store.has_completed_pull("books").unwrap());
+        assert!(
+            !store.has_completed_pull("notes").unwrap(),
+            "the failed table must not look pulled"
+        );
+    }
+
+    #[test]
+    fn a_mid_pagination_failure_records_no_receipt_despite_a_merged_page() {
+        // Partial progress is not completion. The first page merges and advances the cursor; the
+        // second fetch fails. A receipt here would claim the table is fully known when its tail
+        // never arrived.
+        let store = Store::open_in_memory().unwrap();
+        let rows: Vec<Value> = (1..=4)
+            .map(|i| {
+                json!({ "id": format!("n{i}"), "text": format!("enc:v2:{i}"), "content_tag": "t",
+                        "updated_at": 1000 + i, "deleted": false, "change_seq": i })
+            })
+            .collect();
+        let sink = PagingSink::new(rows).failing_after(1);
+
+        assert!(block(pull_table(&store, &sink, "notes", 2)).is_err());
+
+        assert_eq!(
+            store.get_seq_cursor("notes").unwrap(),
+            Some(2),
+            "the first page really did merge"
+        );
+        assert!(
+            !store.has_completed_pull("notes").unwrap(),
+            "a partly-pulled table is not a pulled table"
+        );
+    }
+
+    #[test]
+    fn a_receipt_latches_through_a_later_failure() {
+        // Once a table has completed a pull, its rows are a valid LWW merge base. A later failure
+        // makes it STALE — what every consumer already tolerates — not unknown. Clearing the
+        // receipt would flip a working device back to "cannot tell" on one flaky request.
+        let store = Store::open_in_memory().unwrap();
+        block(pull(
+            &store,
+            &MapSink::new().with("notes", vec![]),
+            &["notes"],
+        ))
+        .unwrap();
+        assert!(store.has_completed_pull("notes").unwrap());
+
+        block(pull(&store, &MapSink::new().failing("notes"), &["notes"])).unwrap();
+
+        assert!(
+            store.has_completed_pull("notes").unwrap(),
+            "a failure after a completed pull means stale, not unknown"
+        );
+    }
+
+    #[test]
+    fn the_absorbed_transient_retry_still_records_a_receipt() {
+        // The SUR-1031 one-shot retry makes the table succeed, so it must also make it complete —
+        // the receipt tracks the outcome, not whether the first request happened to land.
+        let store = Store::open_in_memory().unwrap();
+        let sink = MapSink::new().with("notes", vec![]).failing_once("notes");
+
+        let res = block(pull(&store, &sink, &["notes"])).unwrap();
+
+        assert!(res.failed_tables.is_empty());
+        assert!(store.has_completed_pull("notes").unwrap());
     }
 
     // ── SUR-652 keyset pagination (the pull loops fetch_page until a short page) ───
