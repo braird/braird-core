@@ -973,7 +973,10 @@ final class RoundTripTests: XCTestCase {
 
         try engine.enqueueQuestion(draft: question("q1", "what am I avoiding?", "active"))
 
-        let listed = try engine.listQuestions(limit: 50, offset: 0)
+        // SUR-1071: `listQuestions` hands back a NESTED record — a QuestionRecord inside a
+        // QuestionLogEntry inside an array. That lowering is new to this surface, so reading the
+        // inner fields back is the assertion, not a formality.
+        let listed = try engine.listQuestions(nowMs: 10_000).map { $0.question }
         XCTAssertEqual(listed.count, 1)
         XCTAssertEqual(listed[0].id, "q1")
         XCTAssertEqual(listed[0].text, "what am I avoiding?")
@@ -1009,6 +1012,19 @@ final class RoundTripTests: XCTestCase {
         XCTAssertEqual(
             try engine.questionNotes(questionId: "q2", nowMs: 10_000).map { $0.id }.sorted(),
             ["in-window", "too-early"])
+
+        // SUR-1071: the log over the ABI — active first, and every count equal to the effective set
+        // the detail page would show. `q1` was resolved above; `q2` is still open, so the older
+        // active question outranks the newer closed one.
+        let log = try engine.listQuestions(nowMs: 10_000)
+        XCTAssertEqual(log.map { $0.question.id }, ["q2", "q1"], "active first, then newest")
+        XCTAssertEqual(log.first { $0.question.id == "q2" }?.noteCount, 2)
+        for entry in log {
+            XCTAssertEqual(
+                UInt32(try engine.questionNotes(questionId: entry.question.id, nowMs: 10_000).count),
+                entry.noteCount,
+                "count and effective set must agree for \(entry.question.id)")
+        }
 
         // The first synced setting, keyed by name (no id column).
         try engine.setUserSetting(key: "prompt_cadence", value: "168")

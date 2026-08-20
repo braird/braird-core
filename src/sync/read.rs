@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Map, Value};
 
 use crate::note_encryption::is_encrypted_v2;
-use crate::prompt::QuestionMeta;
+use crate::prompt::{is_active, QuestionMeta};
 use crate::search::{SearchDoc, SearchDocKind};
 use crate::store::Store;
 use crate::vault::Vault;
@@ -164,8 +164,9 @@ pub struct CollectionNoteCount {
 /// `enqueue_question` always writes a status: the vocabulary is client-authored with no server
 /// CHECK, so a row written by a newer client must not panic an older read.
 ///
-/// Deliberately NO note count or active-date-range field — those are Lexicon presentation shapes and
-/// belong to SUR-1044, which builds them on [`question_notes`] rather than beside it.
+/// Deliberately NO note count or active-date-range field — those are Lexicon presentation shapes.
+/// The count rides on [`QuestionLogEntry`] (SUR-1071), because it is a function of `now`; the range
+/// needs no field at all, since `created_at` + `resolved_at` + `status` already say it.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct QuestionRecord {
     pub id: String,
@@ -178,6 +179,24 @@ pub struct QuestionRecord {
     pub checkin_response: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// One row of the Lexicon Questions section (SUR-1071) — a question plus the size of its effective
+/// note set, shaped like [`CollectionNoteCount`] but carrying its subject rather than pointing at it
+/// (the section renders both together, and a host that had to zip two lists would also have to
+/// re-derive the ordering).
+///
+/// `note_count` is `question_notes(id, now_ms).len()` **by construction** — both are
+/// [`in_effective_set`] over the same rows — so the subtitle can never disagree with the detail page
+/// it opens. It is a function of `now_ms`: an active question's window runs to the caller's clock,
+/// so its count grows; a resolved one is frozen at `resolved_at`.
+///
+/// No date-range field. `question.created_at`, `question.resolved_at` and `question.status` already
+/// carry it, and only the host knows how to render "12 Jul – now" in the user's locale.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct QuestionLogEntry {
+    pub question: QuestionRecord,
+    pub note_count: u32,
 }
 
 // ── store reads → DTOs ───────────────────────────────────────────────────────
@@ -385,18 +404,79 @@ pub fn collection_ids_for_note(store: &Store, note_id: &str) -> rusqlite::Result
         .collect())
 }
 
-/// The question log, newest-first (SUR-1042) — live rows only, every status. Decrypted in core.
+/// The question log — every live question, **active first**, then newest-first, each with the size
+/// of its effective note set (SUR-1071). Decrypted in core. This IS the log: SUR-1044 renders no
+/// separate view.
+///
+/// Ordering is core's, not the host's, because two clients sorting independently is how the same
+/// store starts rendering two different sections. "Active" is [`crate::prompt::is_active`] — the one
+/// the check-in loop schedules on — so a status neither recognises sorts as open in both.
+///
+/// **Three store reads, not one per question.** Live questions, live notes and live overrides are
+/// each scanned once and tallied in memory, the [`collection_note_counts`] shape. The count also
+/// does no vault work — only `(id, created_at)` is read off each note — so a log of any length never
+/// pays to decrypt the archive. Calling [`question_notes`] per question would do both: N full scans,
+/// each decrypting every note, to produce N integers.
+///
+/// A question that fails to decrypt still appears, with `text: None, decrypt_failed: true` and a
+/// correct count (the effective set is defined on rows, not on plaintext). Founder-decided
+/// 2026-08-20: a hidden row is a lost question.
+///
+/// No `limit`/`offset`, and no scan bound either. Sorting active-first AFTER a SQL `LIMIT` would
+/// page over the wrong order, so any cut has to happen after the sort — and since this API is
+/// unpaginated, a cut is not a page the caller can step past but history it can never ask for
+/// again. `list_live` orders by `created_at` DESC, so a bound would also drop an OLD ACTIVE
+/// question behind newer resolved ones, contradicting the active-first contract outright. Scans
+/// with `-1` like the notes and overrides reads above; contrast [`QUESTION_META_SCAN_LIMIT`],
+/// where bounding is safe because the scheduler only wants the newest active question.
+///
+/// ponytail: the tally is O(questions × notes) after those three scans. Fine while v1 keeps one
+/// active question at a time; if a log ever gets long, sort the notes by `created_at` once and
+/// `partition_point` the window instead of re-walking them per question.
 pub fn list_questions(
     store: &Store,
     vault: &Vault,
-    limit: i64,
-    offset: i64,
-) -> rusqlite::Result<Vec<QuestionRecord>> {
-    Ok(store
-        .list_live("questions", None, limit, offset)?
+    now_ms: i64,
+) -> rusqlite::Result<Vec<QuestionLogEntry>> {
+    let notes: Vec<(String, i64)> = store
+        .list_live("notes", None, -1, 0)?
         .iter()
-        .map(|row| question_record(row, vault))
-        .collect())
+        .map(|row| {
+            (
+                string_field(row, "id").unwrap_or_default(),
+                int_field(row, "created_at"),
+            )
+        })
+        .collect();
+    let overrides = store.list_live("question_note_overrides", None, -1, 0)?;
+    let by_question = curation_by_question(&overrides);
+
+    let mut out: Vec<QuestionLogEntry> = store
+        .list_live("questions", None, -1, 0)?
+        .iter()
+        .map(|row| {
+            let question = question_record(row, vault);
+            let window = active_window(row, now_ms);
+            let curation = by_question.get(&question.id);
+            let note_count = notes
+                .iter()
+                .filter(|(id, created_at)| in_effective_set(id, *created_at, window, curation))
+                .count() as u32;
+            QuestionLogEntry {
+                question,
+                note_count,
+            }
+        })
+        .collect();
+    // Active first, then newest-first within each group; `id` breaks a same-millisecond tie so the
+    // order is total — two devices holding the same rows must render the same list.
+    out.sort_by(|a, b| {
+        is_active(b.question.status.as_deref())
+            .cmp(&is_active(a.question.status.as_deref()))
+            .then(b.question.created_at.cmp(&a.question.created_at))
+            .then(a.question.id.cmp(&b.question.id))
+    });
+    Ok(out)
 }
 
 pub fn get_question(
@@ -410,22 +490,88 @@ pub fn get_question(
     }
 }
 
-/// The EFFECTIVE note set of one question (SUR-996 R1): `(auto ∪ includes) − excludes`,
-/// newest-first, decrypted in core.
-///
-/// `auto` is the active-window join — every live note whose `created_at` falls inside the
-/// question's active window, `[created_at, resolved_at ?? now]`. A resolved or dismissed question
-/// closes its window at `resolved_at`, so its set stops growing; a still-active one runs to `now`,
-/// which the HOST supplies rather than core reading a clock, matching [`notes_this_week`]. That
-/// keeps this a pure function of (store, question, now) — the property the acceptance criterion
-/// "converges across devices" is actually testable against.
+/// The live curation overrides of one question — the authored half of its effective note set.
+#[derive(Default)]
+struct Curation {
+    includes: HashSet<String>,
+    excludes: HashSet<String>,
+}
+
+/// Bucket live `question_note_overrides` rows by question id.
 ///
 /// `excludes` beats `includes` only by being the later write: the two are not ranks but the same
 /// deterministic `question_id:note_id` row under whole-row LWW, so the surviving `kind` IS the
-/// answer. A pair with a live `exclude` row is dropped even if the window would have offered it; a
-/// live `include` adds a note the window missed. Soft-deleted override rows are simply absent, which
-/// returns the pair to whatever the window says — the reason `enqueue_question_note_override` must
-/// resurrect rather than let a re-add collapse into a tombstone.
+/// answer. Soft-deleted override rows are simply absent, which returns the pair to whatever the
+/// window says — the reason [`super::SyncEngine::enqueue_question_note_override`] must resurrect
+/// rather than let a re-add collapse into a tombstone.
+///
+/// Takes rows rather than reading them, so one filtered scan ([`question_notes`]) and one
+/// whole-table scan ([`list_questions`]) share this bucketing instead of each rolling their own.
+fn curation_by_question(rows: &[Map<String, Value>]) -> HashMap<String, Curation> {
+    let mut out: HashMap<String, Curation> = HashMap::new();
+    for row in rows {
+        let (Some(question_id), Some(note_id)) = (
+            string_field(row, "question_id"),
+            string_field(row, "note_id"),
+        ) else {
+            continue;
+        };
+        let curation = out.entry(question_id).or_default();
+        match string_field(row, "kind").as_deref() {
+            Some("exclude") => curation.excludes.insert(note_id),
+            // Anything else that survived LWW is treated as an include. An unknown `kind` from a
+            // newer client should widen the set, never silently drop a note the user pinned.
+            _ => curation.includes.insert(note_id),
+        };
+    }
+    out
+}
+
+/// A question's active window, `[created_at, resolved_at ?? now]`.
+///
+/// A resolved or dismissed question closes its window at `resolved_at`, so its set stops growing; a
+/// still-active one runs to `now`, which the HOST supplies rather than core reading a clock,
+/// matching [`notes_this_week`]. That keeps every reader built on this a pure function of
+/// (store, question, now) — the property the acceptance criterion "converges across devices" is
+/// actually testable against.
+///
+/// A `resolved_at` BEFORE `created_at` (clock skew across devices) would invert the window and
+/// silently empty the set, so the end is clamped to at least the start.
+fn active_window(question: &Map<String, Value>, now_ms: i64) -> (i64, i64) {
+    let opened_at = int_field(question, "created_at");
+    let closed_at = opt_int_field(question, "resolved_at")
+        .unwrap_or(now_ms)
+        .max(opened_at);
+    (opened_at, closed_at)
+}
+
+/// Does one note belong to one question's effective set (SUR-996 R1)? `(auto ∪ includes) − excludes`
+/// for a single note: an `exclude` drops a note the window would have offered, an `include` adds one
+/// the window missed, and everything else is decided by the window alone.
+///
+/// **This is the only place that rule exists.** [`question_notes`] returns the set and
+/// [`list_questions`] counts it; two implementations of one definition would let the Lexicon
+/// subtitle and the detail page disagree, which is exactly what SUR-1071's acceptance criterion
+/// ("counts match the effective-set definition exactly") forbids.
+fn in_effective_set(
+    note_id: &str,
+    created_at: i64,
+    (opened_at, closed_at): (i64, i64),
+    curation: Option<&Curation>,
+) -> bool {
+    if let Some(curation) = curation {
+        if curation.excludes.contains(note_id) {
+            return false;
+        }
+        if curation.includes.contains(note_id) {
+            return true;
+        }
+    }
+    created_at >= opened_at && created_at <= closed_at
+}
+
+/// The EFFECTIVE note set of one question (SUR-996 R1) — [`in_effective_set`] over every live note,
+/// newest-first, decrypted in core. An absent or soft-deleted question yields an empty set.
 ///
 /// ponytail: scan-then-filter over live notes and this question's overrides, no index. Same posture
 /// as [`notes_by_idea`] and correct at personal-archive scale; revisit only if a profile says so.
@@ -441,43 +587,26 @@ pub fn question_notes(
     if is_deleted(&question) {
         return Ok(Vec::new());
     }
-    let opened_at = int_field(&question, "created_at");
-    // An unresolved question's window runs to `now`; `resolved_at` closes it. A `resolved_at`
-    // BEFORE `created_at` (clock skew across devices) would invert the window and silently empty
-    // the set, so the window end is clamped to at least its start.
-    let closed_at = opt_int_field(&question, "resolved_at")
-        .unwrap_or(now_ms)
-        .max(opened_at);
-
-    let mut includes = HashSet::new();
-    let mut excludes = HashSet::new();
-    for row in store.list_live(
+    let window = active_window(&question, now_ms);
+    let overrides = store.list_live(
         "question_note_overrides",
         Some(("question_id", question_id)),
         -1,
         0,
-    )? {
-        let Some(note_id) = string_field(&row, "note_id") else {
-            continue;
-        };
-        match string_field(&row, "kind").as_deref() {
-            Some("exclude") => excludes.insert(note_id),
-            // Anything else that survived LWW is treated as an include. An unknown `kind` from a
-            // newer client should widen the set, never silently drop a note the user pinned.
-            _ => includes.insert(note_id),
-        };
-    }
+    )?;
+    let by_question = curation_by_question(&overrides);
+    let curation = by_question.get(question_id);
 
     Ok(store
         .list_live("notes", None, -1, 0)?
         .into_iter()
         .filter(|row| {
-            let id = string_field(row, "id").unwrap_or_default();
-            if excludes.contains(&id) {
-                return false;
-            }
-            let created = int_field(row, "created_at");
-            includes.contains(&id) || (created >= opened_at && created <= closed_at)
+            in_effective_set(
+                &string_field(row, "id").unwrap_or_default(),
+                int_field(row, "created_at"),
+                window,
+                curation,
+            )
         })
         .map(|row| note_record(&row, vault))
         .collect())
@@ -760,6 +889,11 @@ pub fn question_metas(store: &Store) -> rusqlite::Result<Vec<QuestionMeta>> {
 /// per cadence period — a decade of weekly questions is ~520 rows. ponytail: a bounded scan of
 /// three plaintext columns; narrow it to the newest N by `created_at` only if a log ever gets big
 /// enough to measure.
+///
+/// Bounding is safe HERE and nowhere else. [`question_metas`] feeds the scheduler, which only ever
+/// wants the newest active question, so a cut at the oldest end cannot change its answer.
+/// [`list_questions`] is a user-facing, unpaginated list, where the same cut would delete history
+/// the caller has no way to ask for again — it scans with `-1` (SUR-1071).
 const QUESTION_META_SCAN_LIMIT: i64 = 5_000;
 
 fn custom_idea_record(row: &Map<String, Value>) -> CustomIdeaRecord {
@@ -1717,5 +1851,528 @@ mod tests {
             vec![("alpha", 1), ("beta", 2)],
             "collection-id asc; dead/absent notes and dead memberships excluded; pair deduped"
         );
+    }
+
+    // ── SUR-1071: the question log ───────────────────────────────────────────
+    // Every count case asserts the log's `note_count` AND `question_notes(...).len()` on the same
+    // fixture. That pairing is the point: the acceptance criterion is that the Lexicon subtitle and
+    // the detail page it opens agree, and only a shared predicate can make that true by
+    // construction. A test that checked one of them would pass while they diverged.
+
+    fn question_row(
+        id: &str,
+        vault: &Vault,
+        text: &str,
+        status: &str,
+        created_at: i64,
+        resolved_at: Option<i64>,
+    ) -> Map<String, Value> {
+        let mut r = Map::new();
+        r.insert("id".into(), json!(id));
+        r.insert("text".into(), json!(seal(vault, id, text)));
+        r.insert("status".into(), json!(status));
+        r.insert("tone".into(), json!("introspective"));
+        r.insert("resolved_at".into(), json!(resolved_at));
+        r.insert("created_at".into(), json!(created_at));
+        r.insert("updated_at".into(), json!(created_at));
+        r.insert("deleted".into(), json!(false));
+        r
+    }
+
+    fn override_row(
+        question_id: &str,
+        note_id: &str,
+        kind: &str,
+        deleted: bool,
+    ) -> Map<String, Value> {
+        let mut r = Map::new();
+        r.insert(
+            "id".into(),
+            json!(crate::store::override_id(question_id, note_id)),
+        );
+        r.insert("question_id".into(), json!(question_id));
+        r.insert("note_id".into(), json!(note_id));
+        r.insert("kind".into(), json!(kind));
+        r.insert("created_at".into(), json!(1));
+        r.insert("updated_at".into(), json!(1));
+        r.insert("deleted".into(), json!(deleted));
+        r
+    }
+
+    /// The log's count for one question, and the length of the set the detail page would show.
+    /// Every effective-set case goes through here so the two can never be asserted apart.
+    fn counted_both_ways(
+        store: &Store,
+        vault: &Vault,
+        question_id: &str,
+        now_ms: i64,
+    ) -> (u32, u32) {
+        let entry = list_questions(store, vault, now_ms)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.question.id == question_id)
+            .unwrap_or_else(|| panic!("{question_id} missing from the log"));
+        let set = question_notes(store, vault, question_id, now_ms)
+            .unwrap()
+            .len() as u32;
+        (entry.note_count, set)
+    }
+
+    fn store_with(rows: &[(&str, Map<String, Value>)]) -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("t.sqlite").to_str().unwrap()).unwrap();
+        for (table, row) in rows {
+            store.apply_row(table, row).unwrap();
+        }
+        (dir, store)
+    }
+
+    const Q_BIRTH: i64 = 1_000;
+    const Q_NOW: i64 = 9_000;
+
+    #[test]
+    fn effective_count_is_the_active_window_and_matches_the_note_set() {
+        let vault = Vault::generate();
+        let (_d, store) = store_with(&[
+            (
+                "questions",
+                question_row("q", &vault, "what am I avoiding?", "active", Q_BIRTH, None),
+            ),
+            (
+                "notes",
+                note_row("before", None, &seal(&vault, "before", "a"), Q_BIRTH - 1),
+            ),
+            (
+                "notes",
+                note_row("opening", None, &seal(&vault, "opening", "b"), Q_BIRTH),
+            ),
+            (
+                "notes",
+                note_row("inside", None, &seal(&vault, "inside", "c"), Q_BIRTH + 500),
+            ),
+            (
+                "notes",
+                note_row("now", None, &seal(&vault, "now", "d"), Q_NOW),
+            ),
+            (
+                "notes",
+                note_row("after", None, &seal(&vault, "after", "e"), Q_NOW + 1),
+            ),
+        ]);
+
+        // The window is INCLUSIVE at both ends: a note written in the same millisecond the question
+        // was asked belongs to it, and so does one written at `now`.
+        assert_eq!(counted_both_ways(&store, &vault, "q", Q_NOW), (3, 3));
+        assert_eq!(
+            question_notes(&store, &vault, "q", Q_NOW)
+                .unwrap()
+                .iter()
+                .map(|n| n.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["now", "inside", "opening"],
+            "newest-first, window-bounded"
+        );
+    }
+
+    #[test]
+    fn an_include_adds_a_note_the_window_never_offered() {
+        let vault = Vault::generate();
+        let (_d, store) = store_with(&[
+            (
+                "questions",
+                question_row("q", &vault, "q?", "active", Q_BIRTH, None),
+            ),
+            (
+                "notes",
+                note_row(
+                    "ancient",
+                    None,
+                    &seal(&vault, "ancient", "a"),
+                    Q_BIRTH - 5_000,
+                ),
+            ),
+            (
+                "question_note_overrides",
+                override_row("q", "ancient", "include", false),
+            ),
+        ]);
+
+        assert_eq!(counted_both_ways(&store, &vault, "q", Q_NOW), (1, 1));
+    }
+
+    #[test]
+    fn an_exclude_drops_a_note_the_window_would_have_offered() {
+        let vault = Vault::generate();
+        let (_d, store) = store_with(&[
+            (
+                "questions",
+                question_row("q", &vault, "q?", "active", Q_BIRTH, None),
+            ),
+            (
+                "notes",
+                note_row("kept", None, &seal(&vault, "kept", "a"), Q_BIRTH + 1),
+            ),
+            (
+                "notes",
+                note_row("dropped", None, &seal(&vault, "dropped", "b"), Q_BIRTH + 2),
+            ),
+            (
+                "question_note_overrides",
+                override_row("q", "dropped", "exclude", false),
+            ),
+        ]);
+
+        assert_eq!(counted_both_ways(&store, &vault, "q", Q_NOW), (1, 1));
+        assert_eq!(
+            question_notes(&store, &vault, "q", Q_NOW).unwrap()[0].id,
+            "kept"
+        );
+    }
+
+    #[test]
+    fn a_resolved_questions_window_is_closed_and_its_count_stops_growing() {
+        // The superseded case: the user answered, started a new question, and kept writing. The old
+        // row must freeze at `resolved_at` — an archived question whose count still climbed would
+        // mean the log rewrites its own history every time it is opened.
+        let vault = Vault::generate();
+        let resolved_at = Q_BIRTH + 1_000;
+        let (_d, store) = store_with(&[
+            (
+                "questions",
+                question_row("q", &vault, "q?", "resolved", Q_BIRTH, Some(resolved_at)),
+            ),
+            (
+                "notes",
+                note_row("during", None, &seal(&vault, "during", "a"), Q_BIRTH + 500),
+            ),
+            (
+                "notes",
+                note_row(
+                    "at-close",
+                    None,
+                    &seal(&vault, "at-close", "b"),
+                    resolved_at,
+                ),
+            ),
+            (
+                "notes",
+                note_row("after", None, &seal(&vault, "after", "c"), resolved_at + 1),
+            ),
+        ]);
+
+        assert_eq!(counted_both_ways(&store, &vault, "q", Q_NOW), (2, 2));
+        assert_eq!(
+            counted_both_ways(&store, &vault, "q", Q_NOW * 1_000),
+            (2, 2),
+            "a closed window ignores `now` entirely"
+        );
+    }
+
+    #[test]
+    fn an_inverted_window_clamps_instead_of_silently_emptying_the_set() {
+        // `resolved_at` BEFORE `created_at` — a row pulled from a device with a trailing clock.
+        // Clamping keeps the question's own birth millisecond; NOT clamping would make every count
+        // zero, which reads as "you wrote nothing about this" rather than as a clock fault.
+        let vault = Vault::generate();
+        let (_d, store) = store_with(&[
+            (
+                "questions",
+                question_row("q", &vault, "q?", "resolved", Q_BIRTH, Some(Q_BIRTH - 500)),
+            ),
+            (
+                "notes",
+                note_row("at-birth", None, &seal(&vault, "at-birth", "a"), Q_BIRTH),
+            ),
+            (
+                "notes",
+                note_row("later", None, &seal(&vault, "later", "b"), Q_BIRTH + 1),
+            ),
+        ]);
+
+        assert_eq!(counted_both_ways(&store, &vault, "q", Q_NOW), (1, 1));
+    }
+
+    #[test]
+    fn a_tombstoned_override_returns_the_pair_to_the_window() {
+        let vault = Vault::generate();
+        let (_d, store) = store_with(&[
+            (
+                "questions",
+                question_row("q", &vault, "q?", "active", Q_BIRTH, None),
+            ),
+            (
+                "notes",
+                note_row("inside", None, &seal(&vault, "inside", "a"), Q_BIRTH + 1),
+            ),
+            (
+                "notes",
+                note_row("outside", None, &seal(&vault, "outside", "b"), Q_BIRTH - 1),
+            ),
+            // Both overrides are dead, so neither speaks: the window decides both pairs.
+            (
+                "question_note_overrides",
+                override_row("q", "inside", "exclude", true),
+            ),
+            (
+                "question_note_overrides",
+                override_row("q", "outside", "include", true),
+            ),
+        ]);
+
+        assert_eq!(counted_both_ways(&store, &vault, "q", Q_NOW), (1, 1));
+        assert_eq!(
+            question_notes(&store, &vault, "q", Q_NOW).unwrap()[0].id,
+            "inside"
+        );
+    }
+
+    #[test]
+    fn an_unknown_override_kind_widens_the_set_rather_than_dropping_a_pinned_note() {
+        let vault = Vault::generate();
+        let (_d, store) = store_with(&[
+            (
+                "questions",
+                question_row("q", &vault, "q?", "active", Q_BIRTH, None),
+            ),
+            (
+                "notes",
+                note_row(
+                    "ancient",
+                    None,
+                    &seal(&vault, "ancient", "a"),
+                    Q_BIRTH - 5_000,
+                ),
+            ),
+            (
+                "question_note_overrides",
+                override_row("q", "ancient", "pinned-by-a-newer-client", false),
+            ),
+        ]);
+
+        assert_eq!(counted_both_ways(&store, &vault, "q", Q_NOW), (1, 1));
+    }
+
+    #[test]
+    fn the_log_and_its_counts_see_only_live_rows() {
+        let vault = Vault::generate();
+        let mut dead_note = note_row("dead", None, &seal(&vault, "dead", "a"), Q_BIRTH + 1);
+        dead_note.insert("deleted".into(), json!(true));
+        let mut dead_question = question_row("gone", &vault, "gone?", "active", Q_BIRTH, None);
+        dead_question.insert("deleted".into(), json!(true));
+        let (_d, store) = store_with(&[
+            (
+                "questions",
+                question_row("q", &vault, "q?", "active", Q_BIRTH, None),
+            ),
+            ("questions", dead_question),
+            (
+                "notes",
+                note_row("live", None, &seal(&vault, "live", "b"), Q_BIRTH + 1),
+            ),
+            ("notes", dead_note),
+        ]);
+
+        let log = list_questions(&store, &vault, Q_NOW).unwrap();
+        assert_eq!(
+            log.iter()
+                .map(|e| e.question.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["q"],
+            "a soft-deleted question is not in the log"
+        );
+        assert_eq!(counted_both_ways(&store, &vault, "q", Q_NOW), (1, 1));
+        assert!(
+            question_notes(&store, &vault, "gone", Q_NOW)
+                .unwrap()
+                .is_empty(),
+            "and its effective set is empty, not an error"
+        );
+    }
+
+    #[test]
+    fn the_log_puts_active_questions_first_then_newest_first() {
+        let vault = Vault::generate();
+        let (_d, store) = store_with(&[
+            (
+                "questions",
+                question_row("old-active", &vault, "a", "active", 100, None),
+            ),
+            (
+                "questions",
+                question_row("newest-resolved", &vault, "b", "resolved", 900, Some(950)),
+            ),
+            (
+                "questions",
+                question_row("new-active", &vault, "c", "active", 800, None),
+            ),
+            (
+                "questions",
+                question_row("dismissed", &vault, "d", "dismissed", 700, Some(750)),
+            ),
+            // No status at all: unknown vocabulary sorts as ACTIVE, matching the check-in loop.
+            ("questions", {
+                let mut r = question_row("unknown", &vault, "e", "active", 50, None);
+                r.remove("status");
+                r
+            }),
+            // Two questions born in the SAME millisecond: `id` ascending breaks the tie, so the
+            // order is total. Without it two devices could render the same rows in two orders.
+            (
+                "questions",
+                question_row("tie-b", &vault, "f", "active", 800, None),
+            ),
+        ]);
+
+        assert_eq!(
+            list_questions(&store, &vault, Q_NOW)
+                .unwrap()
+                .iter()
+                .map(|e| e.question.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "new-active",
+                "tie-b",
+                "old-active",
+                "unknown",
+                "newest-resolved",
+                "dismissed"
+            ],
+            "active block newest-first, then the closed block newest-first — a newer resolved \
+             question never outranks an older active one"
+        );
+    }
+
+    #[test]
+    fn a_question_that_fails_to_decrypt_still_appears_and_still_counts() {
+        // Founder-decided 2026-08-20: a hidden row is a lost question. The effective set is defined
+        // on rows, so the count does not depend on any text opening — the question's or the notes'.
+        let foreign = Vault::generate();
+        let vault = Vault::generate();
+        let (_d, store) = store_with(&[
+            (
+                "questions",
+                question_row(
+                    "q",
+                    &foreign,
+                    "sealed to another vault",
+                    "active",
+                    Q_BIRTH,
+                    None,
+                ),
+            ),
+            (
+                "notes",
+                note_row("mine", None, &seal(&vault, "mine", "a"), Q_BIRTH + 1),
+            ),
+            (
+                "notes",
+                note_row("theirs", None, &seal(&foreign, "theirs", "b"), Q_BIRTH + 2),
+            ),
+        ]);
+
+        let entry = &list_questions(&store, &vault, Q_NOW).unwrap()[0];
+        assert_eq!(entry.question.id, "q");
+        assert!(entry.question.decrypt_failed);
+        assert_eq!(
+            entry.question.text, None,
+            "ciphertext never crosses in enc: form"
+        );
+        assert_eq!(counted_both_ways(&store, &vault, "q", Q_NOW), (2, 2));
+        assert!(
+            question_notes(&store, &vault, "q", Q_NOW)
+                .unwrap()
+                .iter()
+                .any(|n| n.decrypt_failed),
+            "a note that fails to decrypt is counted and returned, not dropped"
+        );
+    }
+
+    #[test]
+    fn the_log_scans_every_live_question_not_the_newest_page() {
+        // The log is UNPAGINATED, so a scan bound here is not a page the caller can step past —
+        // it is history the user can never reach again. Worse, `list_live` cuts by `created_at`
+        // DESC *before* the active-first sort, so an old ACTIVE question would be dropped in
+        // favour of newer resolved ones, contradicting the ordering contract outright.
+        let vault = Vault::generate();
+        let (_d, store) = store_with(&[]);
+        // One old active question, buried under more resolved rows than any fixed bound.
+        store
+            .apply_row(
+                "questions",
+                &question_row("the-oldest-active", &vault, "still open", "active", 1, None),
+            )
+            .unwrap();
+        for i in 0..6_000 {
+            store
+                .apply_row(
+                    "questions",
+                    &question_row(
+                        &format!("resolved-{i:05}"),
+                        &vault,
+                        "closed",
+                        "resolved",
+                        1_000 + i,
+                        Some(1_000 + i),
+                    ),
+                )
+                .unwrap();
+        }
+
+        let log = list_questions(&store, &vault, Q_NOW).unwrap();
+        assert_eq!(log.len(), 6_001, "every live question is in the log");
+        assert_eq!(
+            log[0].question.id, "the-oldest-active",
+            "the only active question sorts first no matter how many rows precede it"
+        );
+    }
+
+    #[test]
+    fn an_empty_store_yields_an_empty_log() {
+        let vault = Vault::generate();
+        let (_d, store) = store_with(&[]);
+        assert!(list_questions(&store, &vault, Q_NOW).unwrap().is_empty());
+    }
+
+    #[test]
+    fn one_questions_curation_never_leaks_into_another() {
+        // The log buckets EVERY override row in one scan, unlike `question_notes`, which asks the
+        // store for one question's rows. Bucketing by the wrong key would be invisible with a
+        // single question in the fixture and wrong for every real user.
+        let vault = Vault::generate();
+        let (_d, store) = store_with(&[
+            (
+                "questions",
+                question_row("q1", &vault, "a", "active", Q_BIRTH, None),
+            ),
+            (
+                "questions",
+                question_row("q2", &vault, "b", "active", Q_BIRTH, None),
+            ),
+            (
+                "notes",
+                note_row("shared", None, &seal(&vault, "shared", "a"), Q_BIRTH + 1),
+            ),
+            (
+                "notes",
+                note_row(
+                    "ancient",
+                    None,
+                    &seal(&vault, "ancient", "b"),
+                    Q_BIRTH - 5_000,
+                ),
+            ),
+            // q1 drops the shared note; q2 pins the ancient one. Neither may affect the other.
+            (
+                "question_note_overrides",
+                override_row("q1", "shared", "exclude", false),
+            ),
+            (
+                "question_note_overrides",
+                override_row("q2", "ancient", "include", false),
+            ),
+        ]);
+
+        assert_eq!(counted_both_ways(&store, &vault, "q1", Q_NOW), (0, 0));
+        assert_eq!(counted_both_ways(&store, &vault, "q2", Q_NOW), (2, 2));
     }
 }

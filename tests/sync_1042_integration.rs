@@ -235,3 +235,81 @@ fn a_reversed_override_converges_on_the_later_write_not_on_both() {
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn the_question_log_renders_identically_on_both_devices() {
+    // SUR-1071's acceptance criterion — "same outputs on both platforms via the shared core" — is a
+    // convergence claim like the two above, so it is proved the same way: two engines, one cloud,
+    // and a byte-for-byte comparison of what each would render. The unit tests pin the derivation;
+    // only this pins that two devices holding synced rows produce the SAME list, in the SAME order,
+    // with the SAME counts. Both platforms consume this one function, so agreeing here is what
+    // "identical on iOS and Android" actually reduces to.
+    let vault = braird_core::Vault::generate();
+    let cloud = SharedCloud::new();
+    let a = Device::new(vault.clone());
+    let b = Device::new(vault.clone());
+
+    // An older question the user has since resolved, and the current one. `q1` is born at 100 (the
+    // `question` helper) and `q0` earlier, so newest-first and active-first disagree about the
+    // order — which is what makes the assertion worth making.
+    a.engine
+        .enqueue_question(QuestionUpsert {
+            created_at: 400,
+            status: Some("resolved".into()),
+            resolved_at: Some(500),
+            ..question("q0", "the question I closed")
+        })
+        .unwrap();
+    a.engine
+        .enqueue_question(question("q1", "the question I am sitting with"))
+        .unwrap();
+    a.engine.enqueue_note(note("n-in", 150)).unwrap();
+    a.engine.enqueue_note(note("n-old", 50)).unwrap();
+    a.engine
+        .enqueue_question_note_override(override_row("n-old", "include", false))
+        .unwrap();
+    sync(&a, &cloud);
+    sync(&b, &cloud);
+
+    let log = |d: &Device| {
+        d.engine
+            .list_questions(NOW)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.question.id, e.question.text, e.note_count))
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        log(&a),
+        vec![
+            (
+                "q1".to_string(),
+                Some("the question I am sitting with".to_string()),
+                2
+            ),
+            (
+                "q0".to_string(),
+                Some("the question I closed".to_string()),
+                0
+            ),
+        ],
+        "active first even though the resolved question is not the oldest; q1 counts the \
+         in-window note plus the pinned one, and q0's closed window caught neither"
+    );
+    assert_eq!(log(&a), log(&b), "the log must converge, order included");
+
+    // And the count is the set: what the section says agrees with what the detail page opens, on
+    // the device that only ever saw these rows over the wire.
+    for entry in b.engine.list_questions(NOW).unwrap() {
+        assert_eq!(
+            entry.note_count as usize,
+            b.engine
+                .question_notes(entry.question.id.clone(), NOW)
+                .unwrap()
+                .len(),
+            "count and effective set disagree for {}",
+            entry.question.id
+        );
+    }
+}
