@@ -34,6 +34,56 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   the wrong secret fails loudly instead of passing by re-proving a database that is already green
   — the SUR-1076 blind spot restored in a form nobody would think to question. Every message now
   names the database it actually asked, rather than saying `braird-staging` unconditionally.
+- **BREAKING (FFI): `list_questions` is now the question log, and takes `now_ms` (SUR-1071).**
+  `list_questions(limit, offset) -> Vec<QuestionRecord>` becomes
+  `list_questions(now_ms) -> Vec<QuestionLogEntry>`, where `QuestionLogEntry` pairs the existing
+  `QuestionRecord` with `note_count`, the size of that question's effective note set. Rows come back
+  **active first**, then newest-first. No host consumes the old form (no `listQuestions` call site
+  exists in braird-android or braird-ios), so this is a rename-in-place rather than a migration —
+  but it is a signature change on a shipped export, so the next release is a MINOR bump.
+  A second `question_log()` beside `list_questions()` was the alternative and was rejected: two
+  near-synonym list functions for one concept is the drift `naming-reviewer` exists to stop, and
+  the Lexicon section needs exactly one of them.
+  `note_count` equals `question_notes(id, now_ms).len()` **by construction**, not by agreement. Both
+  are now the single predicate `in_effective_set` — excludes win, then includes, then the active
+  window — lifted out of `question_notes`, which is rewritten on it with identical behaviour. Two
+  implementations of one rule is how a Lexicon row's subtitle ends up disagreeing with the detail
+  page it opens; the tests assert both numbers on every fixture so they cannot be checked apart.
+  The count is computed **set-wise**: live questions, live notes and live overrides are each scanned
+  once and tallied in memory (the `collection_note_counts` shape), and the tally reads only
+  `(id, created_at)` off each note — **no decryption at all**. The alternative a host had before this
+  was calling `question_notes` once per question: N full scans, each decrypting the whole archive, to
+  produce N integers.
+  Ordering is core's, not the host's. Two clients sorting independently is how one store starts
+  rendering two different sections, and the acceptance criterion is that both platforms agree.
+  "Active" is now the single `prompt::is_active` the check-in loop already schedules on — including
+  its rule that an **unknown** status from a newer client counts as active — so the section the user
+  reads and the loop that prompts them cannot disagree about which question is open.
+  Deliberately **unpaginated, and unbounded**. Active-first ordering has to be applied before any
+  page is cut, so a SQL `LIMIT` would page over the wrong order. An early revision reused
+  `question_metas`' 5,000-row scan bound and that was wrong twice over: on an unpaginated API a cut
+  is not a page the caller can step past but history it can never ask for again, and because
+  `list_live` orders by `created_at` DESC the cut would drop an OLD ACTIVE question behind newer
+  resolved ones — contradicting the active-first contract outright. It now scans with `-1`, the same
+  convention the notes and overrides reads in this function already use.
+- **`question_metas` loses the same 5,000-row bound, and the constant is deleted (SUR-1071).** A
+  first pass kept the bound here on the reasoning that the scheduler only ever wants the newest
+  ACTIVE question, so a cut at the oldest end could not change its answer. That reasoning was wrong,
+  and review caught it: `list_live` cuts by `created_at` DESC, but `prompt::next_events` filters
+  `is_active` **after** this read returns. A user whose newest rows are all resolved therefore loses
+  the older question that is still open — the scheduler sees none and emits an initial-style prompt
+  instead of the check-in the user is owed, silently, and more likely the longer the log gets.
+  Filtering by status before the cut is not available either: "active" is `!resolved && !dismissed`,
+  so an unknown status from a newer client counts as active, and no equality filter expresses that.
+  A cut that cannot see `status` is unsafe for any reader that cares about it, which is both of
+  them. One 6,001-row fixture now proves both readers keep the old active question.
+  Deliberately **no date-range field**, though SUR-1071 asked for one: `created_at`, `resolved_at` and
+  `status` already ride on `QuestionRecord`, and only the host can render "12 Jul – now" in the user's
+  locale. A `closed_at` would have restated `resolved_at` and given the range a second source of truth.
+  A question whose own text fails to decrypt still appears, with `text: None`,
+  `decrypt_failed: true` and a correct count — the effective set is defined on rows, not on plaintext
+  (founder, 2026-08-20: a hidden row is a lost question).
+  `question_notes` keeps its exported signature and its behaviour; only its internals moved.
 - **The LWW monotonic `updated_at` stamp now lives in one place (SUR-1074).** Every local write
   staged through `Store` is stamped strictly after the row it replaces, for every synced table, by
   construction. This closes a defect that had been patched at **five** separate call sites — each

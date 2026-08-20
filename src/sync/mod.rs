@@ -48,7 +48,7 @@ use export_import::import::{compute_importance, source_prior};
 use http::{user_id_from_jwt, PostgrestClient};
 use read::{
     BookRecord, CollectionNoteCount, CollectionRecord, CustomIdeaRecord, IdeaCount, LensRecord,
-    NoteLinkRecord, NoteRecord, QuestionRecord, StoreCounts,
+    NoteLinkRecord, NoteRecord, QuestionLogEntry, QuestionRecord, StoreCounts,
 };
 use reconcile::BookMergeUndo;
 
@@ -2007,14 +2007,21 @@ impl SyncEngine {
         read::get_book(&store, &id).map_err(store_err)
     }
 
-    /// The SUR-996 question log, newest-first — every status, decrypted in core (SUR-1042).
-    pub fn list_questions(
-        &self,
-        limit: u32,
-        offset: u32,
-    ) -> Result<Vec<QuestionRecord>, SyncError> {
+    /// The SUR-996 question log — every live question, **active first** then newest-first, each
+    /// with the size of its effective note set (SUR-1071). Decrypted in core. This is the Lexicon
+    /// Questions section; there is no separate log view.
+    ///
+    /// `note_count` equals `question_notes(id, now_ms).len()` by construction — the same predicate
+    /// produces both — so a row's subtitle can never disagree with the detail page it opens.
+    /// `now_ms` closes the window of a question that has no `resolved_at`; the host supplies it so
+    /// this stays a pure function of its inputs, exactly as [`Self::question_notes`] does. Pass the
+    /// same `now_ms` to both if you render them together.
+    ///
+    /// Unpaginated on purpose: active-first ordering has to be applied before any page is cut, and
+    /// the log grows by about one row per cadence period.
+    pub fn list_questions(&self, now_ms: i64) -> Result<Vec<QuestionLogEntry>, SyncError> {
         let store = lock!(self.store);
-        read::list_questions(&store, &self.vault, limit as i64, offset as i64).map_err(store_err)
+        read::list_questions(&store, &self.vault, now_ms).map_err(store_err)
     }
 
     /// One question by id, or `None` if absent or soft-deleted.
@@ -4494,6 +4501,10 @@ mod tests {
     // ── SUR-1042: the question entity ────────────────────────────────────────
 
     /// A minimal live question. Override with struct-update, as [`note_upsert`] is used.
+    /// A fixed read-side clock for the question log. `question_upsert` births rows at
+    /// `created_at: 0`, so any positive `now_ms` leaves an active question's window open.
+    const QUESTION_NOW: i64 = 1_000;
+
     fn question_upsert(id: &str, plaintext: &str) -> QuestionUpsert {
         QuestionUpsert {
             id: id.into(),
@@ -4548,11 +4559,11 @@ mod tests {
             .enqueue_question(question_upsert("q1", "what am I avoiding?"))
             .unwrap();
 
-        let got = engine.list_questions(10, 0).unwrap();
+        let got = engine.list_questions(QUESTION_NOW).unwrap();
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].text.as_deref(), Some("what am I avoiding?"));
-        assert!(!got[0].decrypt_failed);
-        assert_eq!(got[0].status.as_deref(), Some("active"));
+        assert_eq!(got[0].question.text.as_deref(), Some("what am I avoiding?"));
+        assert!(!got[0].question.decrypt_failed);
+        assert_eq!(got[0].question.status.as_deref(), Some("active"));
     }
 
     #[test]
@@ -4736,7 +4747,7 @@ mod tests {
         assert!(matches!(err, SyncError::PatchTargetMissing), "got {err:?}");
 
         assert!(
-            engine.list_questions(10, 0).unwrap().is_empty(),
+            engine.list_questions(QUESTION_NOW).unwrap().is_empty(),
             "no ghost question may appear in the log"
         );
         assert!(
@@ -5444,7 +5455,7 @@ mod tests {
         engine.enqueue_question(draft(true)).unwrap();
 
         // The live surface is empty again...
-        assert!(engine.list_questions(50, 0).unwrap().is_empty());
+        assert!(engine.list_questions(created + 60_000).unwrap().is_empty());
 
         // ...but onboarding still happened, so only the prompt returns — never the nudge.
         let events = events_of(&engine, created + 60_000, created);
@@ -5491,7 +5502,7 @@ mod tests {
             .apply_row("user_settings", &marker)
             .unwrap();
 
-        assert!(fresh.list_questions(50, 0).unwrap().is_empty());
+        assert!(fresh.list_questions(created + 60_000).unwrap().is_empty());
         assert_eq!(
             events_of(&fresh, created + 60_000, created)
                 .iter()
