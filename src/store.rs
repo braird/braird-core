@@ -1137,14 +1137,68 @@ impl Store {
 
     /// Non-transactional core of [`stage_local_write`]: merge `partial` onto the existing row,
     /// upsert the merged row, and enqueue the partial payload. The caller owns the transaction.
+    ///
+    /// # The monotonic `updated_at` clamp (SUR-1074)
+    ///
+    /// Every local write staged here is stamped STRICTLY AFTER the row it replaces. This is not a
+    /// nicety — it is what keeps a local edit from vanishing without a trace. surfc migration
+    /// `0050_sur740_lww_guard`'s `t01_lww_guard` SILENTLY CANCELS an UPDATE carrying a stamp that
+    /// is not strictly newer (`RETURN NULL`; the statement still returns 2xx, no error). Because
+    /// `t01` sorts before `t02_change_seq` the cancelled row never bumps the watermark either, and
+    /// the flush — seeing 2xx — clears the outbox row as if it had landed. The edit then exists on
+    /// this device and nowhere else, with nothing left to retry it. 0050's own §4.1 note calls the
+    /// guard safe *because* "every edit stamps `Date.now()`" — an assumption that holds only while
+    /// no local clock trails the stamp on a just-pulled row. Clamping here restores it by
+    /// construction, for every synced table, instead of asking each caller to remember (it was
+    /// patched at FIVE separate call sites before this, each found by review rather than a gate).
+    ///
+    /// **The clamp rewrites `partial`, not just the merged row, and that distinction is the whole
+    /// point.** The outbox payload below is built from `partial`, and the payload is what the
+    /// server's guard compares. Clamping only `merged` would repair this device's copy and leave
+    /// the silent cancellation exactly as it was.
+    ///
+    /// A `partial` with no `updated_at` is left alone: the clamp raises a claim, it never
+    /// manufactures one.
+    ///
+    /// Two write paths deliberately sit outside this and must stay outside it:
+    /// - [`Store::apply_row`] callers — the pull merge sink, the server-fetched cover backfill, and
+    ///   the two local-only repairs that must NOT bump `updated_at` (a detach or a tag heal that
+    ///   propagated would overwrite truth another device is still converging toward). Clamping a
+    ///   PULLED row would be the worst case of all: the local row would carry a stamp the fleet
+    ///   never wrote, and the next pull would refuse a genuinely newer remote row forever.
+    /// - [`Store::stage_import_batch`], which stamps every row in a batch with one shared
+    ///   `max(import_now, max(local, server, archive) + 1)` — already strictly stronger than this
+    ///   clamp, because it outranks the SERVER row too, not just the local one.
     fn stage_write_inner(
         &self,
         table: &str,
         record_id: &str,
-        partial: Map<String, Value>,
+        mut partial: Map<String, Value>,
         created_at: i64,
     ) -> rusqlite::Result<()> {
-        let mut merged = self.get_row(table, record_id)?.unwrap_or_default();
+        let existing = self.get_row(table, record_id)?;
+        let stored_updated = existing
+            .as_ref()
+            .and_then(|r| r.get("updated_at"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        if let Some(stamp) = partial.get("updated_at").and_then(Value::as_i64) {
+            // `saturating_add` rather than `+ 1`: an i64 within one of overflow is already a
+            // corrupt stamp, and panicking inside a sync write helps nobody. (The five call-site
+            // clamps this replaces disagreed three ways on exactly this point.)
+            let clamped = stamp.max(stored_updated.saturating_add(1));
+            if clamped != stamp {
+                // Rare and diagnostic: reaching here means this device's clock trails a stamp it
+                // pulled from the fleet. Silent by default is how the bug above stayed invisible.
+                eprintln!(
+                    "stage {table}/{record_id}: local clock trails the stored stamp \
+                     ({stamp} <= {stored_updated}); clamping updated_at to {clamped} so the \
+                     server's t01 LWW guard cannot silently cancel this write"
+                );
+                partial.insert("updated_at".into(), Value::from(clamped));
+            }
+        }
+        let mut merged = existing.unwrap_or_default();
         for (k, v) in &partial {
             merged.insert(k.clone(), v.clone());
         }
@@ -1890,6 +1944,205 @@ mod tests {
         assert_eq!(store.get_seq_cursor("notes").unwrap(), Some(42));
         // Per-table isolation: advancing notes must not touch the books cursor.
         assert_eq!(store.get_seq_cursor("books").unwrap(), None);
+    }
+
+    // ── SUR-1074 the central monotonic `updated_at` clamp ────────────────────
+
+    /// The queued outbox payload for `(table, record_id)`, which is what the SERVER's `t01` guard
+    /// actually compares — distinct from the local row, and the half the five per-call-site clamps
+    /// this replaces never had a test for.
+    fn queued_payload(store: &Store, table: &str, record_id: &str) -> Value {
+        let (_, _, _, payload, _) = store
+            .outbox_items()
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|(_, t, r, _, _)| t == table && r.as_deref() == Some(record_id))
+            .unwrap_or_else(|| panic!("no queued outbox row for {table}/{record_id}"));
+        serde_json::from_str(&payload).unwrap()
+    }
+
+    #[test]
+    fn no_synced_table_can_stage_a_write_older_than_the_row_it_replaces() {
+        use serde_json::json;
+        // THE gate that stops instance six. The rule was patched at five separate call sites, each
+        // found by review rather than by a check like this one; asserting it per-table means a new
+        // synced table or a new enqueue path is covered the day it appears.
+        //
+        // A strictly-older stamp is silently cancelled by surfc's `t01_lww_guard` (2xx, no error,
+        // no change_seq bump) while the flush clears the outbox as if it landed — so the write
+        // lives on this device alone with nothing left to retry it.
+        let future = 9_999_999_999_999_i64; // far past any test-run wall clock
+        for table in synced_table_names() {
+            let store = Store::open_in_memory().unwrap();
+            let pk = table_schema(table).unwrap().pk[0];
+
+            let mut stored = Map::new();
+            stored.insert(pk.into(), Value::from("r1"));
+            stored.insert("updated_at".into(), Value::from(future));
+            stored.insert("deleted".into(), Value::from(false));
+            store.apply_row(table, &stored).unwrap();
+
+            let mut partial = Map::new();
+            partial.insert(pk.into(), Value::from("r1"));
+            partial.insert("updated_at".into(), Value::from(1_000_i64));
+            partial.insert("deleted".into(), Value::from(false));
+            store
+                .stage_local_write(table, "r1", partial, 1_000)
+                .unwrap();
+
+            assert_eq!(
+                store.get_row(table, "r1").unwrap().unwrap()["updated_at"],
+                json!(future + 1),
+                "{table}: the local row must be stamped strictly above the row it replaced"
+            );
+            assert_eq!(
+                queued_payload(&store, table, "r1")["updated_at"],
+                json!(future + 1),
+                "{table}: THE PAYLOAD is what the server's t01 guard compares — clamping only the \
+                 local row would leave the silent cancellation exactly as it was"
+            );
+        }
+    }
+
+    #[test]
+    fn an_exact_tie_still_advances() {
+        use serde_json::json;
+        // `t01_lww_guard` cancels on `<=`, not `<`, so matching the stored stamp is not enough.
+        let store = Store::open_in_memory().unwrap();
+        let mut stored = Map::new();
+        stored.insert("id".into(), Value::from("n1"));
+        stored.insert("updated_at".into(), Value::from(500_i64));
+        store.apply_row("notes", &stored).unwrap();
+
+        let mut partial = Map::new();
+        partial.insert("id".into(), Value::from("n1"));
+        partial.insert("updated_at".into(), Value::from(500_i64));
+        store.stage_local_write("notes", "n1", partial, 1).unwrap();
+
+        assert_eq!(
+            store.get_row("notes", "n1").unwrap().unwrap()["updated_at"],
+            json!(501)
+        );
+    }
+
+    #[test]
+    fn the_clamp_reaches_every_staging_entry_point() {
+        use serde_json::json;
+        // Four public entry points share `stage_write_inner`. If one ever grew its own body, this
+        // is what would catch it.
+        let future = 9_999_999_999_999_i64;
+        let seed = |store: &Store, id: &str| {
+            let mut r = Map::new();
+            r.insert("id".into(), Value::from(id));
+            r.insert("updated_at".into(), Value::from(future));
+            r.insert("deleted".into(), Value::from(false));
+            store.apply_row("notes", &r).unwrap();
+        };
+        let partial = |id: &str| {
+            let mut p = Map::new();
+            p.insert("id".into(), Value::from(id));
+            p.insert("updated_at".into(), Value::from(1_i64));
+            p.insert("deleted".into(), Value::from(false));
+            p
+        };
+        let stamp = |store: &Store, id: &str| {
+            store.get_row("notes", id).unwrap().unwrap()["updated_at"].clone()
+        };
+
+        let store = Store::open_in_memory().unwrap();
+        seed(&store, "a");
+        store
+            .stage_local_write("notes", "a", partial("a"), 1)
+            .unwrap();
+        assert_eq!(stamp(&store, "a"), json!(future + 1), "stage_local_write");
+
+        seed(&store, "b");
+        store
+            .stage_local_writes(vec![("notes", "b".into(), partial("b"))], 1)
+            .unwrap();
+        assert_eq!(stamp(&store, "b"), json!(future + 1), "stage_local_writes");
+
+        seed(&store, "c");
+        store
+            .stage_local_write_existing_live("notes", "c", partial("c"), vec![], 1)
+            .unwrap();
+        assert_eq!(
+            stamp(&store, "c"),
+            json!(future + 1),
+            "stage_local_write_existing_live"
+        );
+
+        seed(&store, "d");
+        store
+            .stage_local_write_resurrecting("notes", "d", partial("d"), 1)
+            .unwrap();
+        assert_eq!(
+            stamp(&store, "d"),
+            json!(future + 1),
+            "stage_local_write_resurrecting"
+        );
+    }
+
+    #[test]
+    fn a_partial_without_updated_at_is_staged_unchanged() {
+        use serde_json::json;
+        // The clamp RAISES a claim; it never manufactures one. A partial that names no stamp keeps
+        // the stored row's, exactly as before.
+        let store = Store::open_in_memory().unwrap();
+        let mut stored = Map::new();
+        stored.insert("id".into(), Value::from("n1"));
+        stored.insert("updated_at".into(), Value::from(7_i64));
+        store.apply_row("notes", &stored).unwrap();
+
+        let mut partial = Map::new();
+        partial.insert("id".into(), Value::from("n1"));
+        partial.insert("source".into(), Value::from("book"));
+        store.stage_local_write("notes", "n1", partial, 1).unwrap();
+
+        assert_eq!(
+            store.get_row("notes", "n1").unwrap().unwrap()["updated_at"],
+            json!(7),
+            "no stamp in, no stamp invented"
+        );
+        assert!(
+            queued_payload(&store, "notes", "n1")
+                .get("updated_at")
+                .is_none(),
+            "and none added to the payload either"
+        );
+    }
+
+    #[test]
+    fn stage_import_batch_is_deliberately_outside_the_clamp() {
+        use serde_json::json;
+        // A DECISION, not an oversight (SUR-1074). Import bypasses `stage_write_inner` and stamps
+        // every row in a batch with one shared `max(import_now, max(local, server, archive) + 1)` —
+        // already stronger than this clamp, because it outranks the SERVER row too. Applying a
+        // per-row `stored + 1` here would de-synchronise a batch that is meant to land as one
+        // generation. If this test ever fails, someone routed import through the clamp; check
+        // whether the shared-stamp invariant was meant to go with it.
+        let store = Store::open_in_memory().unwrap();
+        let mut older = Map::new();
+        older.insert("id".into(), Value::from("b1"));
+        older.insert("updated_at".into(), Value::from(9_000_i64));
+        store.apply_row("books", &older).unwrap();
+
+        let mut row = Map::new();
+        row.insert("id".into(), Value::from("b1"));
+        row.insert("title".into(), Value::from("T"));
+        row.insert("updated_at".into(), Value::from(50_i64)); // strictly OLDER than stored
+        row.insert("deleted".into(), Value::from(false));
+        store
+            .stage_import_batch(&[ImportWrite::new("books", "b1", row)], 50)
+            .unwrap();
+
+        assert_eq!(
+            store.get_row("books", "b1").unwrap().unwrap()["updated_at"],
+            json!(50),
+            "import writes its own batch stamp through untouched — the import coordinator, \
+             not this layer, owns that clamp"
+        );
     }
 
     #[test]
