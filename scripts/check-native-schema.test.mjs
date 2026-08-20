@@ -15,6 +15,12 @@ import { fileURLToPath } from 'node:url';
 import { checkDdl, checkManifest } from './check-native-schema.mjs';
 import { logicalType } from './logical-type.mjs';
 
+// Pin the label the in-process checks below build their messages from. `db()` reads the ambient
+// environment, so without this every assertion on message text would depend on whether the shell
+// happened to export BRAIRD_DB_TARGET — green on a bare terminal, red inside the CI job that sets
+// it. Found by running these in the same container as the real gate, not on a dev box.
+process.env.BRAIRD_DB_TARGET = 'braird-staging';
+
 const SCRIPT = fileURLToPath(new URL('./check-native-schema.mjs', import.meta.url));
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
@@ -215,7 +221,7 @@ test('a cloud-only column is a notice, not a failure', () => {
 test('a live table absent from the target database fails', () => {
   const { errors } = run(manifest('live'), staged({}, { absent: true }));
   assert.equal(errors.length, 1);
-  assert.match(errors[0], /ABSENT from the target database/);
+  assert.match(errors[0], /ABSENT from braird-staging/);
 });
 
 test('a pending table that is absent is skipped with a notice', () => {
