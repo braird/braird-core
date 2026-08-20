@@ -25,6 +25,12 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   per-environment, so a per-PR trigger would turn every unrelated core PR red until someone
   applied a migration in a different repo. It is also a separate job rather than a matrix leg,
   because a skipped matrix leg reports green and a skipped job reports skipped.
+  The secret lives in a `prod-db` **environment** whose deployment-branch policy is `main`, not at
+  repository level. On a dispatch or a push GitHub runs the pushed branch's copy of the workflow,
+  so the job's own `if:` is a convenience and not a control — anyone with write access could
+  rewrite it and the steps together. Only the environment's branch policy binds, because GitHub
+  enforces it outside the file. Same shape as `consumer-pins` in `release-staleness.yml`, whose
+  header already wrote this lesson down (raised by Codex on PR #100).
 
 ### Changed
 - **`check-native-schema.mjs` is parameterised over its target project, and refuses to guess

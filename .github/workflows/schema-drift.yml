@@ -148,10 +148,34 @@ jobs:
   # yet. On a per-PR trigger that state turns every unrelated core PR red until someone applies a
   # migration in another repo. Weekly is the right cadence for drift nobody is actively causing —
   # and a separate job means a skipped run reads as SKIPPED, never as a green gate that never ran.
+  # The `if:` above is a convenience, NOT a control — on a push or a dispatch GitHub runs the
+  # PUSHED BRANCH'S copy of this file, so anyone with write access can rewrite that line and the
+  # steps below in one commit and walk off with the production credential. release-staleness.yml
+  # §"WRONG (v2)" already wrote this lesson down: a control a branch can edit is not a control.
+  #
+  # What holds is enforced OUTSIDE this file. `prod-db` is an environment whose deployment-branch
+  # policy is `main` only, and BRAIRD_PROD_DB_URL is stored THERE as an environment secret, not at
+  # repository level. A dispatch against any other ref cannot reach the environment, so it cannot
+  # reach the credential, and that decision lives in repository settings where no branch can touch
+  # it. Same shape as `consumer-pins` in release-staleness.yml — see its header for the full
+  # threat model and the two answers that look sufficient and are not.
+  #
+  # SETUP, required, and this job fails closed without it: create an environment named `prod-db`,
+  # set its deployment branch rule to `main` only, and store BRAIRD_PROD_DB_URL in it. A
+  # repository-level secret of the same name is NOT equivalent and must be deleted — it stays
+  # readable from any branch.
+  #
+  # Consequence worth knowing: this job can no longer be proved green by dispatching a feature
+  # branch. That is the protection working. Verify it on `main`, or wait for the weekly run.
+  #
+  # The staging leg above deliberately does NOT take an environment: it runs per-PR, and a
+  # main-only branch policy would block every PR. Staging's exposure is the same in kind and much
+  # smaller in consequence; raising it is a founder call, not something to decide here.
   native-prod:
     name: native-first schema lock vs braird-prod
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    environment: prod-db
     permissions:
       contents: read
     steps:
@@ -170,8 +194,9 @@ jobs:
       - name: Assert native-schema.json matches braird-prod's information_schema
         env:
           BRAIRD_DB_TARGET: braird-prod
-          # Same environment-scoped handling as the staging secret: a SESSION-POOLER URI for the
-          # dedicated read-only `schema_checker` role, never the migration/service credential.
+          # An ENVIRONMENT secret on `prod-db` (see the job header) — unlike the staging URI above,
+          # which is a repository secret. Holds a SESSION-POOLER URI for the dedicated read-only
+          # `schema_checker` role, never the migration/service credential.
           # Fails closed when unset — there is no skip path.
           BRAIRD_DB_URL: ${{ secrets.BRAIRD_PROD_DB_URL }}
         run: node scripts/check-native-schema.mjs --check
