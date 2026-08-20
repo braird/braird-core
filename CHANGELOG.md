@@ -38,9 +38,18 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   is not a page the caller can step past but history it can never ask for again, and because
   `list_live` orders by `created_at` DESC the cut would drop an OLD ACTIVE question behind newer
   resolved ones — contradicting the active-first contract outright. It now scans with `-1`, the same
-  convention the notes and overrides reads in this function already use. The bound stays on
-  `question_metas`, where it is safe: the scheduler only ever wants the newest active question, so a
-  cut at the oldest end cannot change its answer.
+  convention the notes and overrides reads in this function already use.
+- **`question_metas` loses the same 5,000-row bound, and the constant is deleted (SUR-1071).** A
+  first pass kept the bound here on the reasoning that the scheduler only ever wants the newest
+  ACTIVE question, so a cut at the oldest end could not change its answer. That reasoning was wrong,
+  and review caught it: `list_live` cuts by `created_at` DESC, but `prompt::next_events` filters
+  `is_active` **after** this read returns. A user whose newest rows are all resolved therefore loses
+  the older question that is still open — the scheduler sees none and emits an initial-style prompt
+  instead of the check-in the user is owed, silently, and more likely the longer the log gets.
+  Filtering by status before the cut is not available either: "active" is `!resolved && !dismissed`,
+  so an unknown status from a newer client counts as active, and no equality filter expresses that.
+  A cut that cannot see `status` is unsafe for any reader that cares about it, which is both of
+  them. One 6,001-row fixture now proves both readers keep the old active question.
   Deliberately **no date-range field**, though SUR-1071 asked for one: `created_at`, `resolved_at` and
   `status` already ride on `QuestionRecord`, and only the host can render "12 Jul – now" in the user's
   locale. A `closed_at` would have restated `resolved_at` and given the range a second source of truth.
