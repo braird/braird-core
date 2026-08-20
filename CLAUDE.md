@@ -70,8 +70,10 @@ That is why parity vectors, not functional tests, are the real gate.
   fails until you change the other. That test also enforces the no-third-category rule (every table in
   `sqlite_master` is in exactly one of: the derived fixture, the native fixture, or
   `store::LOCAL_ONLY_TABLES`). `scripts/check-native-schema.mjs` closes the cloud side, asserting the
-  native fixture against `braird-staging`'s `information_schema` — the only check that can catch a
-  migration written but never applied. A table whose migration has not landed carries
+  native fixture against a real project's `information_schema` — the only check that can catch a
+  migration written but never applied. It runs against `braird-staging` on every PR and against
+  `braird-prod` on the weekly cron (SUR-1076); `BRAIRD_DB_TARGET` names the project each run
+  certifies, and the run aborts if the URI carries a different project's ref. A table whose migration has not landed carries
   `backend: pending` + a tracking ticket; the DDL leg skips it loudly and **fails if it finds it
   present anyway**, so pending can't become a silent permanent exemption. When adding a native-first
   table: `native_schema()` + `native-schema.json` + a `native-manifest.json` row, in one diff.
@@ -90,7 +92,7 @@ That is why parity vectors, not functional tests, are the real gate.
 - `docs/adr/` — architecture decision records.
 - `.github/workflows/` — `parity.yml` (per-PR Linux + WASM + fuzz + mobile cross-compile),
   `vendored-drift.yml`, `schema-drift.yml` (SUR-723 derived leg + the SUR-1048 native-first leg
-  against `braird-staging`), `native-parity-drift.yml` (SUR-842),
+  against `braird-staging`, plus the SUR-1076 weekly leg against `braird-prod`), `native-parity-drift.yml` (SUR-842),
   `changelog-check.yml`, `nightly-macos.yml` (iOS Swift + xcframework).
 
 ## Toolchain & commands (develop on macOS)

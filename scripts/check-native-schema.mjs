@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// check-native-schema — prove the native-first schema lock against the DDL actually applied to
-// braird-staging (SUR-1048).
+// check-native-schema — prove the native-first schema lock against the DDL actually applied to a
+// real Supabase project (SUR-1048; parameterised over braird-staging and braird-prod by SUR-1076).
 //
 // `vendored/schema/sync-schema.json` is DERIVED from surfc, so `schema-drift.yml` can re-derive it
 // and catch drift by construction. The native-first tables (SUR-996: questions,
@@ -15,7 +15,7 @@
 // Two checks (fail-loud, no silent fallback — ADR 0001 discipline):
 //   (a) MANIFEST — every fixture table has exactly one `native-manifest.json` row, no orphans,
 //       every row names an owning ticket, and a `pending` row names the backend ticket.
-//   (b) DDL — for each `backend: live` table, every fixture column exists in braird-staging with a
+//   (b) DDL — for each `backend: live` table, every fixture column exists in the target with a
 //       matching logical type, and row-level security is ENABLED. For each `backend: pending`
 //       table, the table must be ABSENT — finding it means the migration landed and the row is
 //       stale, which fails with "flip it to live". That is what stops `pending` from rotting into
@@ -31,7 +31,10 @@
 // ubuntu-latest), no npm dependency, the Rust core is untouched. Sibling of
 // scripts/check-native-parity.mjs.
 //
-// Usage: BRAIRD_STAGING_DB_URL=postgres://... node scripts/check-native-schema.mjs --check
+// Usage: BRAIRD_DB_TARGET=braird-staging BRAIRD_DB_URL=postgres://... \
+//        node scripts/check-native-schema.mjs --check
+//   BRAIRD_DB_TARGET names the project this run certifies; the URI must carry that project's ref
+//   or the run aborts (see PROJECTS). Every message then names the database it actually asked.
 //   The connection string is read from the environment ONLY — never a CLI arg, never logged, and
 //   redacted out of any psql error before it reaches the CI log. Fails closed when unset: a schema
 //   gate that passes because a secret went missing is worse than no gate at all.
@@ -62,7 +65,25 @@ import { logicalType } from './logical-type.mjs';
 
 const FIXTURE = 'vendored/schema/native-schema.json';
 const MANIFEST = 'vendored/schema/native-manifest.json';
-const DB_URL_ENV = 'BRAIRD_STAGING_DB_URL';
+const DB_URL_ENV = 'BRAIRD_DB_URL';
+const TARGET_ENV = 'BRAIRD_DB_TARGET';
+
+// SUR-1076. This gate now runs against TWO databases, and the failure mode that matters is a leg
+// wired to the wrong secret: a "production" job holding the staging URI reports green having
+// re-proved staging a second time — which is precisely the blind spot SUR-1076 exists to close,
+// restored in a form nobody would think to question. So the caller must DECLARE which database it
+// believes it is talking to, and this script refuses to run unless the connection agrees.
+// Supabase project refs are public identifiers (they are the API hostname every client ships),
+// not secrets, so naming them here leaks nothing.
+const PROJECTS = {
+  'braird-staging': 'sdqtglnqfhgnwzmymcng',
+  'braird-prod': 'klwxefgzzbwvzwsybkpx',
+};
+
+// The database this run asserts against, for message text. A function rather than a module const so
+// the unit tests can exercise the comparison logic with no environment at all — they inject
+// `introspect`, so nothing there ever resolves a URI. The fallback only ever surfaces in that path.
+const db = () => process.env[TARGET_ENV] || 'the target database';
 
 const VALID_BACKEND = new Set(['live', 'pending']);
 const VALID_PK_SCOPE = new Set(['global', 'per_user']);
@@ -176,16 +197,53 @@ export function checkManifest(fixture, errors, manifest = readJson(MANIFEST)) {
   return rows;
 }
 
-// --- braird-staging introspection --------------------------------------------------
-function queryStaging(tables) {
+// Fail closed on a mis-wired secret (see PROJECTS): an unset target, an unknown target, or a URI
+// whose pooler username does not carry that project's ref. Cheaper than any of the schema checks
+// and it runs before all of them, because every one of their verdicts is meaningless if this is
+// the wrong database.
+function assertTargetMatchesUrl(url) {
+  const target = process.env[TARGET_ENV];
+  if (!target) {
+    throw new Error(
+      `${TARGET_ENV} is not set — refusing to run without knowing which database this is.\n` +
+        `  Set it to one of: ${Object.keys(PROJECTS).join(', ')}.`
+    );
+  }
+  const ref = PROJECTS[target];
+  if (!ref) {
+    throw new Error(
+      `${TARGET_ENV}="${target}" is not a known project.\n` +
+        `  Known: ${Object.keys(PROJECTS).join(', ')}. Add it to PROJECTS if a new one exists.`
+    );
+  }
+  let user;
+  try {
+    // The session pooler encodes the project ref in the username: `<role>.<project-ref>`.
+    user = decodeURIComponent(new URL(url).username);
+  } catch {
+    throw new Error(`${DB_URL_ENV} is not a parseable connection URI.`);
+  }
+  if (!user.endsWith(`.${ref}`)) {
+    // Name the ref we FOUND — it is not a secret, and it is the entire diagnosis. Never the URI.
+    throw new Error(
+      `${DB_URL_ENV} connects to project "${user.split('.').pop()}", but ${TARGET_ENV} says ` +
+        `${target} (${ref}). Refusing to certify one database under another's name — a leg wired ` +
+        `to the wrong secret would otherwise pass by re-proving a database that is already green.`
+    );
+  }
+}
+
+// --- target-database introspection --------------------------------------------------
+function queryTarget(tables) {
   const url = process.env[DB_URL_ENV];
   if (!url) {
     throw new Error(
-      `${DB_URL_ENV} is not set — cannot reach braird-staging.\n` +
+      `${DB_URL_ENV} is not set — cannot reach ${db()}.\n` +
         `  This check fails closed on purpose: a green schema gate that never opened a connection ` +
         `is worse than no gate. Set the secret (CI) or export it locally.`
     );
   }
+  assertTargetMatchesUrl(url);
   for (const t of tables) {
     if (!IDENT_RE.test(t)) throw new Error(`refusing to query non-identifier table name: "${t}"`);
   }
@@ -246,7 +304,7 @@ function queryStaging(tables) {
   } catch (e) {
     // psql echoes the connection string in its own errors — never let it reach a CI log.
     const detail = `${e.stderr || e.message}`.split(url).join('<redacted>');
-    throw new Error(`psql failed against braird-staging:\n${detail}`);
+    throw new Error(`psql failed against ${db()}:\n${detail}`);
   }
   return JSON.parse(out.trim());
 }
@@ -286,7 +344,7 @@ function checkKey(table, row, constraints, errors) {
       .map((c) => `(${c.split(',').join(', ')})`)
       .join(' or ');
     errors.push(
-      `braird-staging "${table}" has no PRIMARY KEY or UNIQUE constraint on ${wanted}.\n` +
+      `${db()} "${table}" has no PRIMARY KEY or UNIQUE constraint on ${wanted}.\n` +
         `  Found: ${found.length ? found.map((c) => `(${c.split(',').join(', ')})`).join(' ') : 'none'}.\n` +
         (perUser
           ? `  This table is pk_scope:per_user — "${row.pk.join(', ')}" repeats across users, so the ` +
@@ -312,7 +370,7 @@ function checkRls(table, policies, errors) {
   const mine = policies.filter((p) => p.table === table);
   if (!mine.length) {
     errors.push(
-      `braird-staging "${table}" has RLS ENABLED but NO policies — that is deny-all.\n` +
+      `${db()} "${table}" has RLS ENABLED but NO policies — that is deny-all.\n` +
         `  Every native sync read returns zero rows and every write is rejected, with no error that ` +
         `names RLS as the cause.`
     );
@@ -325,7 +383,7 @@ function checkRls(table, policies, errors) {
     // Read side: a bare `true` USING hands every row to every caller.
     if (p.qual != null && String(p.qual).trim().toLowerCase() === 'true' && exposed) {
       errors.push(
-        `braird-staging "${table}" policy "${p.name}" is USING (true) for role(s) ` +
+        `${db()} "${table}" policy "${p.name}" is USING (true) for role(s) ` +
           `${roles.join(', ')} — that grants every user read access to every other user's rows.`
       );
     }
@@ -342,7 +400,7 @@ function checkRls(table, policies, errors) {
       const effective = p.with_check ?? p.qual;
       if (effective == null || !String(effective).includes('auth.uid()')) {
         errors.push(
-          `braird-staging "${table}" policy "${p.name}" governs writes (${p.cmd}) but its ` +
+          `${db()} "${table}" policy "${p.name}" governs writes (${p.cmd}) but its ` +
             `effective WITH CHECK predicate does not reference auth.uid()` +
             (p.with_check == null ? ' (none set, and USING does not either)' : `: ${p.with_check}`) +
             `.\n  A user could INSERT or UPDATE rows owned by another user even though reads are ` +
@@ -380,7 +438,7 @@ function checkRls(table, policies, errors) {
     if (!covering.length) {
       const backendOnly = forCmd;
       errors.push(
-        `braird-staging "${table}" has no RLS policy covering ${cmd} for a client role — RLS denies ` +
+        `${db()} "${table}" has no RLS policy covering ${cmd} for a client role — RLS denies ` +
           `any command no policy grants, so this ${cmd === 'SELECT' ? 'makes every pull return nothing' : 'rejects every push'}.` +
           (backendOnly.length
             ? `\n  There ${backendOnly.length === 1 ? 'is a policy' : 'are policies'} for ${cmd}, but ` +
@@ -396,7 +454,7 @@ function checkRls(table, policies, errors) {
     // The read side needs its own scoping assertion; the write side is checked above.
     if (cmd === 'SELECT' && !covering.some((p) => String(p.qual ?? '').includes('auth.uid()'))) {
       errors.push(
-        `braird-staging "${table}" has a SELECT policy, but its USING predicate does not reference ` +
+        `${db()} "${table}" has a SELECT policy, but its USING predicate does not reference ` +
           `auth.uid() — nothing ties a readable row to its owner, and get_page sends no user_id filter.`
       );
     }
@@ -417,7 +475,7 @@ function checkPhysicalType(table, column, want, found, errors) {
   const t = String(found.data_type).toLowerCase();
   if (want === 'int' && (t === 'integer' || t === 'smallint')) {
     errors.push(
-      `braird-staging "${table}"."${column}" is ${found.data_type}, which cannot hold an ` +
+      `${db()} "${table}"."${column}" is ${found.data_type}, which cannot hold an ` +
         `epoch-millisecond value (~1.8e12 today; ${t} caps at ${t === 'smallint' ? '32767' : '2.1e9'}).\n` +
         `  Native tables use bigint for every integer column — the first upsert would fail with a ` +
         `numeric range error despite a green logical-type compare.`
@@ -430,7 +488,7 @@ function checkPhysicalType(table, column, want, found, errors) {
   // the schema gate stays green (raised on review).
   if (want === 'text' && t === 'uuid') {
     errors.push(
-      `braird-staging "${table}"."${column}" is uuid, but the native store treats it as opaque ` +
+      `${db()} "${table}"."${column}" is uuid, but the native store treats it as opaque ` +
         `text.\n  Core does not guarantee uuid-shaped values here (deterministic ids and settings ` +
         `keys are not uuids), so every upsert carrying one would be rejected. Use text.`
     );
@@ -470,7 +528,7 @@ function checkChangeSeqTrigger(table, triggers, errors) {
       (type & TG_UPDATE) === 0 && 'it does not fire on UPDATE, so edited rows keep a stale watermark',
     ].filter(Boolean);
     errors.push(
-      `braird-staging "${table}" has a change_seq trigger ("${t.name}") that cannot stamp writes: ` +
+      `${db()} "${table}" has a change_seq trigger ("${t.name}") that cannot stamp writes: ` +
         `${why.join('; ')}.\n  It must be BEFORE INSERT OR UPDATE FOR EACH ROW and enabled, or ` +
         `pushed rows carry no watermark and never come back on a pull.`
     );
@@ -479,7 +537,7 @@ function checkChangeSeqTrigger(table, triggers, errors) {
 
   if (!stamps.length) {
     errors.push(
-      `braird-staging "${table}" has no change_seq stamping trigger.\n` +
+      `${db()} "${table}" has no change_seq stamping trigger.\n` +
         `  The column alone is not enough: pushes never supply change_seq, so without the ` +
         `server-side trigger (surfc migration 0051, t02_change_seq) rows are either rejected ` +
         `(NOT NULL) or invisible to every pull (NULL fails change_seq > cursor).`
@@ -490,8 +548,8 @@ function checkChangeSeqTrigger(table, triggers, errors) {
 // --- (b) DDL ----------------------------------------------------------------------
 // `introspect` is injected so the comparison can be exercised against recorded payloads
 // (scripts/check-native-schema.test.mjs) — the DDL leg is the half no fixture in this repo can
-// prove, so it gets the unit test. The CLI always passes the real `queryStaging`.
-export function checkDdl(fixture, rows, errors, notices, introspect = queryStaging) {
+// prove, so it gets the unit test. The CLI always passes the real `queryTarget`.
+export function checkDdl(fixture, rows, errors, notices, introspect = queryTarget) {
   const tables = Object.keys(fixture).filter((t) => VALID_BACKEND.has(rows.get(t)?.backend));
   if (!tables.length) return;
 
@@ -511,13 +569,13 @@ export function checkDdl(fixture, rows, errors, notices, introspect = queryStagi
     if (row.backend === 'pending') {
       if (present.has(table)) {
         errors.push(
-          `${MANIFEST} marks "${table}" backend:pending, but it EXISTS in braird-staging.\n` +
+          `${MANIFEST} marks "${table}" backend:pending, but it EXISTS in ${db()}.\n` +
             `  ${row.backend_ticket} has landed — flip the row to "backend": "live" so the DDL check ` +
             `actually runs against it.`
         );
       } else {
         notices.push(
-          `"${table}" skipped — backend:pending, awaiting ${row.backend_ticket}'s migration on braird-staging.`
+          `"${table}" skipped — backend:pending, awaiting ${row.backend_ticket}'s migration on ${db()}.`
         );
       }
       continue;
@@ -525,7 +583,7 @@ export function checkDdl(fixture, rows, errors, notices, introspect = queryStagi
 
     if (!present.has(table)) {
       errors.push(
-        `${MANIFEST} marks "${table}" backend:live, but it is ABSENT from braird-staging.\n` +
+        `${MANIFEST} marks "${table}" backend:live, but it is ABSENT from ${db()}.\n` +
           `  Either the migration was never applied, or the row should be "pending" with a backend_ticket.`
       );
       continue;
@@ -533,7 +591,7 @@ export function checkDdl(fixture, rows, errors, notices, introspect = queryStagi
 
     if (present.get(table) !== true) {
       errors.push(
-        `braird-staging table "${table}" has row-level security DISABLED.\n` +
+        `${db()} table "${table}" has row-level security DISABLED.\n` +
           `  Every user-scoped native table ships with RLS (SUR-1047); without it one user's rows are ` +
           `readable by another's token.`
       );
@@ -547,7 +605,7 @@ export function checkDdl(fixture, rows, errors, notices, introspect = queryStagi
       const found = actual.get(column);
       if (!found) {
         errors.push(
-          `braird-staging "${table}" is MISSING column "${column}" (fixture says ${want}).\n` +
+          `${db()} "${table}" is MISSING column "${column}" (fixture says ${want}).\n` +
             `  The local mirror writes it on push; the cloud would drop it silently.`
         );
         continue;
@@ -556,12 +614,12 @@ export function checkDdl(fixture, rows, errors, notices, introspect = queryStagi
       try {
         got = logicalType(pgTypeOf(found));
       } catch (e) {
-        errors.push(`braird-staging "${table}"."${column}": ${e.message}`);
+        errors.push(`${db()} "${table}"."${column}": ${e.message}`);
         continue;
       }
       if (got !== want) {
         errors.push(
-          `braird-staging "${table}"."${column}" is ${found.data_type} (logical "${got}"), but ` +
+          `${db()} "${table}"."${column}" is ${found.data_type} (logical "${got}"), but ` +
             `${FIXTURE} says "${want}".`
         );
         continue;
@@ -576,7 +634,7 @@ export function checkDdl(fixture, rows, errors, notices, introspect = queryStagi
       const found = actual.get(column);
       if (!found) {
         errors.push(
-          `braird-staging "${table}" is MISSING the server-side column "${column}".\n` +
+          `${db()} "${table}" is MISSING the server-side column "${column}".\n` +
             `  It is absent from the fixture by design (the local store never holds it), but the ` +
             `cloud table cannot work without it: push injects user_id into every row, and every ` +
             `pull filters and orders on change_seq.`
@@ -589,7 +647,7 @@ export function checkDdl(fixture, rows, errors, notices, introspect = queryStagi
       const physical = String(found.data_type).toLowerCase();
       if (physical !== spec.physical && !spec.aliases?.has(physical)) {
         errors.push(
-          `braird-staging "${table}"."${column}" is ${found.data_type}, but the sync engine ` +
+          `${db()} "${table}"."${column}" is ${found.data_type}, but the sync engine ` +
             `requires ${spec.physical}.\n  ${spec.why}`
         );
         continue;
@@ -598,12 +656,12 @@ export function checkDdl(fixture, rows, errors, notices, introspect = queryStagi
       try {
         got = logicalType(pgTypeOf(found));
       } catch (e) {
-        errors.push(`braird-staging "${table}"."${column}": ${e.message}`);
+        errors.push(`${db()} "${table}"."${column}": ${e.message}`);
         continue;
       }
       if (got !== want) {
         errors.push(
-          `braird-staging "${table}"."${column}" is ${found.data_type} (logical "${got}"), but the ` +
+          `${db()} "${table}"."${column}" is ${found.data_type} (logical "${got}"), but the ` +
             `sync engine needs "${want}".`
         );
       }
@@ -633,7 +691,7 @@ export function checkDdl(fixture, rows, errors, notices, introspect = queryStagi
     });
     if (unfillable.length) {
       errors.push(
-        `braird-staging "${table}" has NOT NULL cloud-only column(s) ${unfillable.join(', ')} with ` +
+        `${db()} "${table}" has NOT NULL cloud-only column(s) ${unfillable.join(', ')} with ` +
           `no default.\n` +
           `  A push sends only the fixture columns plus user_id, so every insert for this table ` +
           `would be rejected. Give the column a default, make it nullable, populate it from a ` +
@@ -661,7 +719,8 @@ if (isMain) {
   const [, , checkFlag] = process.argv;
   if (checkFlag !== '--check') {
     console.error(
-      `usage: ${DB_URL_ENV}=postgres://... node scripts/check-native-schema.mjs --check`
+      `usage: ${TARGET_ENV}=<${Object.keys(PROJECTS).join('|')}> ${DB_URL_ENV}=postgres://... ` +
+        `node scripts/check-native-schema.mjs --check`
     );
     process.exit(2);
   }
@@ -689,6 +748,6 @@ if (isMain) {
   }
   console.log(
     `native-schema: ${Object.keys(fixture).length} registered table(s), manifest complete, ` +
-      `braird-staging agrees with the fixture.`
+      `${db()} agrees with the fixture.`
   );
 }

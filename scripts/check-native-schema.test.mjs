@@ -1,8 +1,8 @@
 // Unit checks for the native-schema gate (SUR-1048). `node --test scripts/`.
 //
 // The Rust side of the lock is proved by tests/schema_parity.rs against real fixtures. The DDL leg
-// is the half nothing in this repo can prove — it only ever runs against braird-staging — so its
-// comparison logic is exercised here against recorded `information_schema` payloads. Without this,
+// is the half nothing in this repo can prove — it only ever runs against a real Supabase project —
+// so its comparison logic is exercised here against recorded `information_schema` payloads. Without this,
 // every branch that reports a MISSING column, a retyped column, disabled RLS, or a stale
 // backend:pending row would ship never having been executed.
 //
@@ -18,14 +18,19 @@ import { logicalType } from './logical-type.mjs';
 const SCRIPT = fileURLToPath(new URL('./check-native-schema.mjs', import.meta.url));
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
-// Run the CLI for real, with BRAIRD_STAGING_DB_URL scrubbed so the assertion holds in CI (where the
-// secret IS set) exactly as it does locally.
-const runCli = (args) =>
+// Run the CLI for real. Both env vars are scrubbed by default so these assertions hold identically
+// in CI (where the workflow sets them) and locally. Callers opt back in per test.
+const runCli = (args, env = {}) =>
   spawnSync(process.execPath, [SCRIPT, ...args], {
     cwd: REPO_ROOT,
     encoding: 'utf8',
-    env: { ...process.env, BRAIRD_STAGING_DB_URL: '' },
+    env: { ...process.env, BRAIRD_DB_URL: '', BRAIRD_DB_TARGET: '', ...env },
   });
+
+// Refs from PROJECTS. Real values on purpose: the whole point of the guard is that it compares
+// against these, so a test using placeholders would pass against a broken comparison.
+const STAGING_URI =
+  'postgres://schema_checker.sdqtglnqfhgnwzmymcng:pw@pooler.example:5432/postgres';
 
 // --- exit-code discipline (SUR-1048 review, release-integrity-reviewer) ---
 // GATING §3.1 on scripts/: "a check that can pass without running is worse than no check". These
@@ -41,7 +46,40 @@ test('the CLI refuses to run without --check instead of exiting 0', () => {
 test('the CLI exits non-zero when the DB secret is missing — it never skips silently', () => {
   const { status, stderr } = runCli(['--check']);
   assert.equal(status, 1);
-  assert.match(stderr, /BRAIRD_STAGING_DB_URL is not set/);
+  assert.match(stderr, /BRAIRD_DB_URL is not set/);
+});
+
+// --- wrong-database discipline (SUR-1076) ---
+// The gate now runs against two projects. A leg wired to the wrong secret would pass by re-proving
+// a database that is already green — a green result certifying nothing, which is the exact failure
+// this ticket exists to close. These three pin the guard shut. None of them opens a connection:
+// the check runs before psql is spawned, which is also why it is safe to assert here at all.
+
+test('the CLI refuses to run when it is not told which database it is talking to', () => {
+  const { status, stderr } = runCli(['--check'], { BRAIRD_DB_URL: STAGING_URI });
+  assert.equal(status, 1);
+  assert.match(stderr, /BRAIRD_DB_TARGET is not set/);
+});
+
+test('the CLI refuses an unknown target rather than guessing', () => {
+  const { status, stderr } = runCli(['--check'], {
+    BRAIRD_DB_URL: STAGING_URI,
+    BRAIRD_DB_TARGET: 'braird-preprod',
+  });
+  assert.equal(status, 1);
+  assert.match(stderr, /is not a known project/);
+});
+
+test('the CLI refuses to certify staging under the production name', () => {
+  const { status, stderr } = runCli(['--check'], {
+    BRAIRD_DB_URL: STAGING_URI,
+    BRAIRD_DB_TARGET: 'braird-prod',
+  });
+  assert.equal(status, 1);
+  assert.match(stderr, /Refusing to certify one database under another's name/);
+  // The diagnosis names the ref it FOUND, and never the URI.
+  assert.match(stderr, /sdqtglnqfhgnwzmymcng/);
+  assert.doesNotMatch(stderr, /pw@/, 'the connection URI must never reach the log');
 });
 
 const FIXTURE = {
@@ -62,7 +100,7 @@ const manifest = (backend, extra = {}) => ({
   ],
 });
 
-// Build a `queryStaging`-shaped payload. `cols` is { column: pg data_type }. `key` is the cloud
+// Build a `queryTarget`-shaped payload. `cols` is { column: pg data_type }. `key` is the cloud
 // constraint's column set (default: a plain PK on the local pk).
 // `cols` values may be a bare pg type string, or {type, nullable, default} for the NOT NULL cases.
 const OK_POLICY = {
@@ -132,7 +170,7 @@ function run(manifestDoc, introspect) {
   return { errors, notices };
 }
 
-test('a live table matching braird-staging passes clean', () => {
+test('a live table matching the target database passes clean', () => {
   const { errors, notices } = run(manifest('live'), staged(CLOUD_OK));
   assert.deepEqual(errors, []);
   // user_id + change_seq are server-only by construction — they must NOT be reported as extras,
@@ -174,10 +212,10 @@ test('a cloud-only column is a notice, not a failure', () => {
   assert.match(notices[0], /cloud-only column\(s\) colour/);
 });
 
-test('a live table absent from braird-staging fails', () => {
+test('a live table absent from the target database fails', () => {
   const { errors } = run(manifest('live'), staged({}, { absent: true }));
   assert.equal(errors.length, 1);
-  assert.match(errors[0], /ABSENT from braird-staging/);
+  assert.match(errors[0], /ABSENT from the target database/);
 });
 
 test('a pending table that is absent is skipped with a notice', () => {

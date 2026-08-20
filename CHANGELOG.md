@@ -6,7 +6,34 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **The native-first schema gate now watches PRODUCTION, not only staging (SUR-1076).**
+  `schema-drift.yml` gains a `native-prod` job that runs `scripts/check-native-schema.mjs` against
+  `braird-prod` on the weekly cron (and on `workflow_dispatch`), reading a new `BRAIRD_PROD_DB_URL`
+  secret. Until now every green result in this stack proved staging only: the existing DDL leg
+  reads `braird-staging` and SUR-1049's behavioural round-trip runs on an ephemeral local stack,
+  so nothing anywhere watched the database real users sync against. Migrations 0055 + 0056 were
+  applied to production by hand, which is exactly the case this checker exists for — written,
+  merged and applied are three different states, and staging's own apply surfaced defects
+  (un-fireable trigger wiring, `service_role`-only RLS policies) that only the script caught.
+  What it prevents is not a missing feature. As of v0.15.0 the three native-first tables sit in
+  `table_schema()`, the flush AND the pull scope, and per SUR-736 a failed pull aborts the
+  account's whole flush — so a production-pointed native build meeting a missing table has broken
+  sync on *every* table.
+  The production leg runs **weekly only, never per-PR**. Production lags staging by design
+  (SUR-1047 held prod until clients shipped) and `backend: live|pending` is per-table, not
+  per-environment, so a per-PR trigger would turn every unrelated core PR red until someone
+  applied a migration in a different repo. It is also a separate job rather than a matrix leg,
+  because a skipped matrix leg reports green and a skipped job reports skipped.
+
 ### Changed
+- **`check-native-schema.mjs` is parameterised over its target project, and refuses to guess
+  (SUR-1076).** `BRAIRD_STAGING_DB_URL` becomes `BRAIRD_DB_URL`, and a new required
+  `BRAIRD_DB_TARGET` names the project the run certifies. The script resolves that name to a
+  Supabase project ref and aborts unless the URI's pooler username carries it, so a leg wired to
+  the wrong secret fails loudly instead of passing by re-proving a database that is already green
+  — the SUR-1076 blind spot restored in a form nobody would think to question. Every message now
+  names the database it actually asked, rather than saying `braird-staging` unconditionally.
 - **The LWW monotonic `updated_at` stamp now lives in one place (SUR-1074).** Every local write
   staged through `Store` is stamped strictly after the row it replaces, for every synced table, by
   construction. This closes a defect that had been patched at **five** separate call sites — each

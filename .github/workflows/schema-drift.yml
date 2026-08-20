@@ -78,7 +78,8 @@ jobs:
   # vendored/schema/native-schema.json is a hand-authored lock of it, reconciled by
   # tests/schema_parity.rs on every `cargo test`. This job covers the one thing the Rust build
   # cannot see — the DDL actually applied to braird-staging. A migration written but never applied
-  # (or applied with a different type) is invisible everywhere else in the stack.
+  # (or applied with a different type) is invisible everywhere else in the stack. `native-prod`
+  # below runs the same check against production, on the weekly cron only.
   #
   # No surfc clone: this leg talks to the database, not to the PWA. Runs on the same triggers as
   # the derived leg — per-PR (a fixture edit is checked immediately) plus the weekly cron, which is
@@ -99,9 +100,10 @@ jobs:
         with:
           node-version: '24.15.0'
 
-      # The DDL leg only ever executes against braird-staging, so its comparison logic (missing
-      # column, retyped column, RLS off, a stale backend:pending row) would otherwise ship having
-      # never run. These exercise it against recorded information_schema payloads.
+      # The DDL leg only ever executes against a real Supabase project, so its comparison logic
+      # (missing column, retyped column, RLS off, a stale backend:pending row) would otherwise ship
+      # having never run. These exercise it against recorded information_schema payloads — and,
+      # since SUR-1076, the wrong-database guard both legs now depend on.
       - name: Unit-check the gate's own comparison logic
         run: node --test scripts/check-native-schema.test.mjs
 
@@ -112,6 +114,11 @@ jobs:
 
       - name: Assert native-schema.json matches braird-staging's information_schema
         env:
+          # SUR-1076 parameterised this script over more than one project, so the leg must now
+          # DECLARE which database it believes the secret points at. The script refuses to run if
+          # the URI carries a different project's ref — without that, wiring this leg to the wrong
+          # secret would report green having proved the other database twice.
+          BRAIRD_DB_TARGET: braird-staging
           # Secret referenced by name only (GATING §4). The script reads it from the environment,
           # never from argv, and redacts it out of any psql error before printing. It fails closed
           # when unset — no skip path, because a schema gate that passes without opening a
@@ -122,5 +129,49 @@ jobs:
           # column of a live table as missing, suspect the grant before the schema:
           # information_schema.columns is privilege-filtered, and tables created AFTER the role's
           # GRANT need ALTER DEFAULT PRIVILEGES to be visible at all.
-          BRAIRD_STAGING_DB_URL: ${{ secrets.BRAIRD_STAGING_DB_URL }}
+          BRAIRD_DB_URL: ${{ secrets.BRAIRD_STAGING_DB_URL }}
+        run: node scripts/check-native-schema.mjs --check
+
+  # SUR-1076. The same gate, against PRODUCTION. Everything above proves braird-staging only, and
+  # SUR-1049's behavioural round-trip runs on an ephemeral local stack — so before this job nothing
+  # in the stack watched the database real users sync against. Migrations 0055 + 0056 were applied
+  # to production by hand on 2026-08-20; a hand-applied migration is exactly the case this checker
+  # exists for, because written, merged and applied are three different states.
+  #
+  # The risk is not a missing feature. As of v0.15.0 the three native-first tables are in the pull
+  # scope, and per SUR-736 a failed pull aborts the account's WHOLE flush — so a production-pointed
+  # native build hitting a missing table has broken sync on every table, not just this one.
+  #
+  # Deliberately NOT a matrix leg of the job above, and deliberately NOT run per-PR. Production
+  # lags staging by design (SUR-1047 held prod until clients shipped), so the next native-first
+  # table will be `backend: live` and present on staging while production has not been migrated
+  # yet. On a per-PR trigger that state turns every unrelated core PR red until someone applies a
+  # migration in another repo. Weekly is the right cadence for drift nobody is actively causing —
+  # and a separate job means a skipped run reads as SKIPPED, never as a green gate that never ran.
+  native-prod:
+    name: native-first schema lock vs braird-prod
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.15.0'
+
+      # No unit-check step here: the job above already runs it on every trigger this job fires on.
+
+      - name: Assert the psql client is available
+        run: psql --version
+
+      - name: Assert native-schema.json matches braird-prod's information_schema
+        env:
+          BRAIRD_DB_TARGET: braird-prod
+          # Same environment-scoped handling as the staging secret: a SESSION-POOLER URI for the
+          # dedicated read-only `schema_checker` role, never the migration/service credential.
+          # Fails closed when unset — there is no skip path.
+          BRAIRD_DB_URL: ${{ secrets.BRAIRD_PROD_DB_URL }}
         run: node scripts/check-native-schema.mjs --check
