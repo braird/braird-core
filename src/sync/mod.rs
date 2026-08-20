@@ -1426,21 +1426,13 @@ impl SyncEngine {
             deleted,
         } = draft;
 
-        // MONOTONE OVER THE ROW IT PATCHES (SUR-1043), the [`SyncEngine::stage_signal_write`] rule
-        // (SUR-976). The server's `t01_lww_guard` SILENTLY cancels a strictly-older write while the
-        // flush clears the outbox as if it landed, so a device whose clock trails the stamp on a
-        // just-pulled question would reset its own check-in timer and no one else's — the rest of
-        // the fleet keeps prompting, and nothing is left to retry. Read and stage under ONE guard,
-        // so a concurrent pull cannot land a newer row between the two.
+        // The monotonic `updated_at` clamp that used to live here moved into
+        // [`Store::stage_write_inner`] (SUR-1074), which now applies it to every local write to
+        // every synced table. It was patched at five separate call sites before that, each found
+        // by review rather than by a gate — including this one, where a silently-cancelled patch
+        // reset this device's check-in timer and no one else's.
         let store = lock!(self.store);
-        let now = epoch_ms().max(
-            store
-                .get_row("questions", &id)
-                .map_err(store_err)?
-                .and_then(|r| r.get("updated_at").and_then(Value::as_i64))
-                .unwrap_or(0)
-                .saturating_add(1),
-        );
+        let now = epoch_ms();
         let mut row = Map::new();
         row.insert("id".into(), json!(id));
         insert_opt(&mut row, "status", status);
@@ -1586,25 +1578,13 @@ impl SyncEngine {
     /// `prompt_tone`) always carry a value, and `deleted` already expresses removal — so the
     /// ambiguity is removed rather than defined. If a setting ever genuinely needs null-versus-absent,
     /// widen it then and write the `None` as an explicit JSON null, never as an omission.
-    /// MONOTONE OVER THE ROW IT REPLACES (SUR-1043), the [`SyncEngine::stage_signal_write`] rule
-    /// (SUR-976) applied to settings. The server's `t01_lww_guard` SILENTLY cancels a strictly-older
-    /// write — statement still 2xx, no `change_seq` bump — while the flush clears the outbox row as
-    /// if it landed. A setting written by a device whose clock trails the stamp on a just-pulled
-    /// row would therefore apply locally and reach no other device, with nothing left to retry it.
-    /// Migration 0050's §4.1 monotonicity assumption ("every edit stamps `Date.now()`") holds only
-    /// while no local clock lags a pulled stamp, which is exactly the case this restores.
-    ///
-    /// It matters most for `prompt_skipped_at`: a silently-cancelled skip leaves the OTHER devices
-    /// prompting, which is the multi-device promise this key exists to keep. Read and stage under
-    /// ONE guard, so a concurrent pull cannot land a newer row between the two and re-open the hole.
+    /// The write is stamped MONOTONE over the row it replaces by [`Store::stage_write_inner`]
+    /// (SUR-1074) — the clamp used to be applied here and now holds for every synced table. It
+    /// matters most for `prompt_skipped_at`: a silently-cancelled skip leaves the OTHER devices
+    /// prompting, which is the multi-device promise this key exists to keep.
     pub fn set_user_setting(&self, key: String, value: String) -> Result<(), SyncError> {
         let store = lock!(self.store);
-        let stored_updated = store
-            .get_row("user_settings", &key)
-            .map_err(store_err)?
-            .and_then(|r| r.get("updated_at").and_then(Value::as_i64))
-            .unwrap_or(0);
-        let now = epoch_ms().max(stored_updated.saturating_add(1));
+        let now = epoch_ms();
         let mut row = Map::new();
         row.insert("key".into(), json!(key));
         row.insert("value".into(), json!(value));
@@ -2497,18 +2477,10 @@ impl SyncEngine {
             )),
         );
         tomb.insert("created_at".into(), json!(int_or("created_at", now)));
-        // MONOTONE OVER THE ROW IT RETIRES (SUR-976 sync-reviewer): the server's `t01_lww_guard`
-        // SILENTLY cancels a strictly-older write (statement still 2xx, no change_seq bump), and
-        // the flush would clear the outbox row as if it landed — with this device already locally
-        // tombstoned, nothing would ever retry: a retry-immune divergence. Reachable whenever this
-        // device's clock trails the stamp on a just-pulled foreign row (the reconcile retirement
-        // races a stamp only seconds old; the delete paths share the smaller human-scale window).
-        // Clamping to strictly-after the stored stamp restores the 0050 §4.1 monotonicity
-        // assumption for every signals-tombstone path.
-        tomb.insert(
-            "updated_at".into(),
-            json!(now.max(int_or("updated_at", 0) + 1)),
-        );
+        // Stamped MONOTONE over the row it retires by `Store::stage_write_inner` (SUR-1074) — this
+        // was the first site to need the clamp (SUR-976) and it is now applied to every staged
+        // write. `existing`/`int_or` stay: they also drive the already-tombstoned no-op above.
+        tomb.insert("updated_at".into(), json!(now));
         tomb.insert("deleted".into(), json!(true));
         Ok(Some(tomb))
     }
@@ -2643,12 +2615,8 @@ impl SyncEngine {
                     .unwrap_or_else(|| HANDWRITTEN.into())),
             );
             tomb.insert("created_at".into(), json!(edge.created_at));
-            // MONOTONE over the row it retires (SUR-976, as `build_signals_tombstone`): the server's
-            // `t01_lww_guard` SILENTLY cancels a strictly-older write and the flush clears the outbox
-            // as if it landed — with the edge already locally tombstoned nothing retries, a
-            // retry-immune divergence that leaves the edge live fleet-wide. Reachable when this
-            // device's clock trails a just-pulled foreign edge's stamp.
-            tomb.insert("updated_at".into(), json!(now.max(edge.updated_at + 1)));
+            // Stamped MONOTONE over the edge it retires by `Store::stage_write_inner` (SUR-1074).
+            tomb.insert("updated_at".into(), json!(now));
             tomb.insert("deleted".into(), json!(true));
             writes.push(("note_links", edge.id.clone(), tomb));
         }
@@ -2684,7 +2652,8 @@ impl SyncEngine {
                         && is_handwritten(&l.relation_type)
                         && !retiring_ids.contains(l.id.as_str())
                 });
-            // Read the stored parent signals row once — for the skip-create guard AND the stamp clamp.
+            // Read the stored parent signals row for the skip-create guard below. (It also used to
+            // feed a stamp clamp here; that moved into `Store::stage_write_inner` — SUR-1074.)
             let parent_sig = store
                 .get_row("note_signals", parent_id)
                 .map_err(store_err)?;
@@ -2695,22 +2664,15 @@ impl SyncEngine {
             }
             let parent_source = parent_note
                 .and_then(|r| r.get("source").and_then(Value::as_str).map(str::to_string));
-            if let Some(mut sig) =
+            if let Some(sig) =
                 self.stage_signal_write(store, parent_id, parent_source.as_deref(), now, |s| {
                     s.has_annotation = has_live;
                 })?
             {
-                // MONOTONE over the stored parent signals row (SUR-976, as `build_signals_tombstone`).
-                // `stage_signal_write` stamps `updated_at = now`; a recompute-to-false is a
-                // convergence-required reconcile, not a best-effort behavioural bump, so if this
-                // device's clock trails the pulled parent stamp an unclamped `now` is SILENTLY
-                // cancelled by the server's t01 LWW guard and never retried (the outbox clears) —
-                // leaving the cloud parent at `has_annotation: true`. Clamp strictly above the stored.
-                let stored_updated = parent_sig
-                    .as_ref()
-                    .and_then(|r| r.get("updated_at").and_then(Value::as_i64))
-                    .unwrap_or(0);
-                sig.insert("updated_at".into(), json!(now.max(stored_updated + 1)));
+                // This used to re-stamp `sig` to clamp it monotone over the stored parent row —
+                // patching, one frame later, a stamp `stage_signal_write` had just set. That was
+                // the clearest sign the rule belonged lower down; `Store::stage_write_inner` now
+                // owns it for every staged write (SUR-1074).
                 writes.push(("note_signals", parent_id.to_string(), sig));
             }
         }

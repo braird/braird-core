@@ -1526,17 +1526,10 @@ public protocol SyncEngineProtocol : AnyObject {
      * `prompt_tone`) always carry a value, and `deleted` already expresses removal — so the
      * ambiguity is removed rather than defined. If a setting ever genuinely needs null-versus-absent,
      * widen it then and write the `None` as an explicit JSON null, never as an omission.
-     * MONOTONE OVER THE ROW IT REPLACES (SUR-1043), the [`SyncEngine::stage_signal_write`] rule
-     * (SUR-976) applied to settings. The server's `t01_lww_guard` SILENTLY cancels a strictly-older
-     * write — statement still 2xx, no `change_seq` bump — while the flush clears the outbox row as
-     * if it landed. A setting written by a device whose clock trails the stamp on a just-pulled
-     * row would therefore apply locally and reach no other device, with nothing left to retry it.
-     * Migration 0050's §4.1 monotonicity assumption ("every edit stamps `Date.now()`") holds only
-     * while no local clock lags a pulled stamp, which is exactly the case this restores.
-     *
-     * It matters most for `prompt_skipped_at`: a silently-cancelled skip leaves the OTHER devices
-     * prompting, which is the multi-device promise this key exists to keep. Read and stage under
-     * ONE guard, so a concurrent pull cannot land a newer row between the two and re-open the hole.
+     * The write is stamped MONOTONE over the row it replaces by [`Store::stage_write_inner`]
+     * (SUR-1074) — the clamp used to be applied here and now holds for every synced table. It
+     * matters most for `prompt_skipped_at`: a silently-cancelled skip leaves the OTHER devices
+     * prompting, which is the multi-device promise this key exists to keep.
      */
     func setUserSetting(key: String, value: String) throws 
     
@@ -2691,17 +2684,10 @@ open func setPromptTone(tone: PromptTone)throws  {try rustCallWithError(FfiConve
      * `prompt_tone`) always carry a value, and `deleted` already expresses removal — so the
      * ambiguity is removed rather than defined. If a setting ever genuinely needs null-versus-absent,
      * widen it then and write the `None` as an explicit JSON null, never as an omission.
-     * MONOTONE OVER THE ROW IT REPLACES (SUR-1043), the [`SyncEngine::stage_signal_write`] rule
-     * (SUR-976) applied to settings. The server's `t01_lww_guard` SILENTLY cancels a strictly-older
-     * write — statement still 2xx, no `change_seq` bump — while the flush clears the outbox row as
-     * if it landed. A setting written by a device whose clock trails the stamp on a just-pulled
-     * row would therefore apply locally and reach no other device, with nothing left to retry it.
-     * Migration 0050's §4.1 monotonicity assumption ("every edit stamps `Date.now()`") holds only
-     * while no local clock lags a pulled stamp, which is exactly the case this restores.
-     *
-     * It matters most for `prompt_skipped_at`: a silently-cancelled skip leaves the OTHER devices
-     * prompting, which is the multi-device promise this key exists to keep. Read and stage under
-     * ONE guard, so a concurrent pull cannot land a newer row between the two and re-open the hole.
+     * The write is stamped MONOTONE over the row it replaces by [`Store::stage_write_inner`]
+     * (SUR-1074) — the clamp used to be applied here and now holds for every synced table. It
+     * matters most for `prompt_skipped_at`: a silently-cancelled skip leaves the OTHER devices
+     * prompting, which is the multi-device promise this key exists to keep.
      */
 open func setUserSetting(key: String, value: String)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_set_user_setting(self.uniffiClonePointer(),
@@ -8225,7 +8211,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_set_prompt_tone() != 45506) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_set_user_setting() != 15452) {
+    if (uniffi_braird_core_checksum_method_syncengine_set_user_setting() != 33641) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_similar_notes() != 52094) {

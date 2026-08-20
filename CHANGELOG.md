@@ -6,6 +6,43 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Changed
+- **The LWW monotonic `updated_at` stamp now lives in one place (SUR-1074).** Every local write
+  staged through `Store` is stamped strictly after the row it replaces, for every synced table, by
+  construction. This closes a defect that had been patched at **five** separate call sites — each
+  found by review rather than by a gate, and each requiring the caller to remember the rule
+  independently.
+  The failure it prevents is silent and unrecoverable. surfc's `t01_lww_guard` CANCELS an UPDATE
+  carrying a stamp that is not strictly newer (`RETURN NULL`; the statement still returns 2xx, no
+  error). Because `t01` sorts before `t02_change_seq` the cancelled row never bumps the watermark,
+  and the flush — seeing 2xx — clears the outbox row as if it had landed. The edit then exists on
+  one device and nowhere else, with nothing left to retry it. Migration 0050's own §4.1 note calls
+  the guard safe *because* "every edit stamps `Date.now()`", which holds only while no local clock
+  trails the stamp on a just-pulled row.
+  The clamp rewrites the PARTIAL, not just the merged row, and that distinction is the whole point:
+  the outbox payload is built from the partial, and the payload is what the server compares.
+  Clamping only the local row would repair this device's copy and leave the cancellation untouched.
+  An exhausted stamp is REFUSED, not saturated. `i64::MAX` is a valid `bigint`, and saturating there
+  would hand back a stamp equal to the stored one — silently not strictly-newer, which is the exact
+  condition being guarded against, and unrepairable afterwards because `pull` keeps the local row on
+  an exact tie. The write now errors before anything is applied, so the transaction rolls back and
+  the caller learns. That settles an overflow policy the five call-site clamps disagreed on three
+  ways (bare `+ 1`, which panics in debug, in three of them) — and lands on the one the snapshot
+  import had already chosen.
+  Two paths stay deliberately outside it. Every `apply_row` caller — the pull merge sink, the
+  server-fetched cover backfill, and the two local-only repairs that must not bump `updated_at` —
+  because clamping a PULLED row would leave the local copy carrying a stamp the fleet never wrote,
+  and the next pull would then refuse a genuinely newer remote row forever. And `stage_import_batch`,
+  which already stamps a whole batch with one shared `max(import_now, max(local, server, archive) + 1)`
+  — strictly stronger, because it outranks the server row too. Both exclusions now have a test.
+  One accepted behaviour change: `replace_handwritten_annotations` writes `updated_at == created_at`
+  for PWA stamp parity, and on a re-replace that reuses a child id inside a single millisecond the
+  two now differ. On a re-replace the child is not new, so the later stamp is the more truthful
+  record.
+  The clamp logs when it fires, naming both stamps. It fires only under genuine clock skew, and it
+  was the invisibility of this failure class that let it recur five times.
+  No exported signature changed; the regenerated bindings carry doc-comment and checksum edits only.
+
 ### Added
 - **Per-table pull receipts, so core stops answering from unknown state (SUR-1075).** `pull` returns
   `Ok` on a PARTIAL table failure by design — per-table isolation means the failed table simply
