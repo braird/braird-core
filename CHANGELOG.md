@@ -7,6 +7,50 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 ## [Unreleased]
 
 ### Added
+- **Per-table pull receipts, so core stops answering from unknown state (SUR-1075).** `pull` returns
+  `Ok` on a PARTIAL table failure by design — per-table isolation means the failed table simply
+  re-pulls next call — and `PullSummary` names no table, so a host cannot tell a complete pull from
+  one that silently missed something. Any consumer that reads meaning into an EMPTY table therefore
+  treated an un-pulled table as authoritative. `pull` now records `sync:pulled:<table>` in the
+  local-only `meta` KV when a table's pagination runs through to its last page, and
+  `Store::has_completed_pull` reports it. Generic bookkeeping: every synced table gets one.
+  This is deliberately NOT the pull cursor, which looks like a free readiness signal and is not one.
+  A cursor is a watermark: an empty page advances nothing, so a perfectly successful pull of an
+  empty table leaves no cursor at all. `get_seq_cursor(...).is_none()` therefore cannot separate
+  "this device never pulled the table" from "pulled fine, there is nothing there" — and on a
+  brand-new account the second is the normal flow, so gating on it would have suppressed the initial
+  prompt forever for every new user. A receipt answers the question a watermark cannot.
+  The receipt LATCHES: set once, never cleared. Past the first completed pull the local rows are a
+  valid LWW merge base, so a later failure leaves the table stale — the condition every consumer
+  already tolerates — rather than unknown, and one flaky request cannot flip a working device back
+  to "cannot tell".
+  Not a regression introduced by SUR-1043; `pull`'s partial-Ok behaviour long predates it. SUR-1043
+  is simply the first feature to make onboarding decisions from absence, which is what surfaced it.
+
+### Changed
+- **`next_prompt_events` now returns an optional list; `None` means "core cannot tell yet"
+  (SUR-1075).** BREAKING against the SUR-1043 signature above, and intentionally landed before
+  either reaches a release, so no host ever pins the never-empty contract. The prompt rules decide
+  from absence — no live question means offer one, no `prompt_answered_at` means the onboarding
+  nudge is unspent — and each reading is sound only once the table it rests on has actually arrived.
+  Until `questions` and `user_settings` both carry a pull receipt, core declines to answer. Hosts
+  must then do nothing at all: show no prompt, and do NOT cancel pending notifications. That second
+  half is the one worth stating, because the documented host flow is "cancel everything, reschedule
+  from the result" — under a partial pull failure that flow actively destroys correct scheduling,
+  handing a long-time user an immediately-due initial prompt for a question they already have and
+  restoring a nudge they spent months ago.
+  An optional list rather than a `{ready, events}` record on purpose: Kotlin's `List<PromptEvent>?`
+  and Swift's `[PromptEvent]?` make the host unwrap before it can reach the events, so the mistake
+  is unrepresentable. With a record, reading `.events` past a false `ready` compiles fine, yields an
+  empty list, and cancels every pending notification — the exact harm. Not an error variant either:
+  a first launch that has not synced yet is a normal state, not a fault.
+  The gate runs BEFORE the legacy `prompt_answered_at` backfill, not merely before the read. That
+  backfill fires on "no marker AND questions exist", which is precisely how a device looks when
+  `questions` pulled and `user_settings` did not; stamping the marker there would record a permanent
+  account-wide claim from a table that never arrived, and no later pull could undo it.
+  `prompt_settings` is deliberately NOT gated. A settings screen showing the defaults before
+  `user_settings` arrives is wrong but harmless: the per-field setters skip an unchanged value, so a
+  passive read cannot stomp the real one, and only a deliberate edit writes.
 - **The open-question prompt state machine + typed `PromptSettings` (SUR-1043, SUR-996 R2–R4).**
   Core now owns the prompt timing rules, so iOS and Android cannot drift on them: clients render
   the sheet for a past-due event and schedule a local notification for a future one, and that is
@@ -21,7 +65,8 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   remains exported, so a host can still write `prompt_cadence` directly and store a value outside
   72..=672. The clamp therefore runs on READ as well as write, which is what actually guarantees a
   legal cadence — from an older build, a newer client, or a host that bypassed the façade.
-  `next_prompt_events` returns a sorted list (never empty, at most two) rather than a single event,
+  `next_prompt_events` returns a sorted list (at most two — and see SUR-1075 below, which made the
+  return optional before either shipped) rather than a single event,
   because the opening 24 hours have two pending at once: the initial prompt is due immediately AND
   its one nudge must already be scheduled for +24h. The user that nudge exists for is precisely the
   one who never reopens the app, so there is no later call in which to learn about it; the

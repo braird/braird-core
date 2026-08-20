@@ -1199,8 +1199,12 @@ public protocol SyncEngineProtocol : AnyObject {
      * every answer, settings change, and sync pull that touched a question — that is what makes
      * answering on the phone silence the tablet (SUR-996 R5).
      *
-     * Never empty, at most two (the opening 24h returns the initial prompt AND its nudge; see
-     * [`prompt::next_events`] for the full rule table).
+     * `None` means CORE CANNOT TELL YET — this device has not completed a pull of the tables the
+     * answer rests on, so its empty `questions`/`user_settings` prove nothing (SUR-1075). Hosts
+     * MUST then do nothing at all: show no prompt, and — the part that is easy to get wrong —
+     * do NOT cancel pending notifications. Re-run after the next successful pull. `Some` is never
+     * empty and holds at most two events (the opening 24h returns the initial prompt AND its
+     * nudge; see [`prompt::next_events`] for the full rule table).
      *
      * Both timestamps are host-supplied. `now_ms` follows the read-surface convention
      * ([`SyncEngine::question_notes`]) — core reads no clock, so the result is a pure function of
@@ -1209,7 +1213,7 @@ public protocol SyncEngineProtocol : AnyObject {
      * server-authoritative and stays outside the client sync surface. Both platforms read it from
      * the same GoTrue user object.
      */
-    func nextPromptEvents(nowMs: Int64, accountCreatedAtMs: Int64) throws  -> [PromptEvent]
+    func nextPromptEvents(nowMs: Int64, accountCreatedAtMs: Int64) throws  -> [PromptEvent]?
     
     /**
      * Live member note ids of a collection (SUR-923) — feeds the host-side collection-delete
@@ -2242,8 +2246,12 @@ open func mergeContentDuplicates(survivorId: String, loserIds: [String], allowCr
      * every answer, settings change, and sync pull that touched a question — that is what makes
      * answering on the phone silence the tablet (SUR-996 R5).
      *
-     * Never empty, at most two (the opening 24h returns the initial prompt AND its nudge; see
-     * [`prompt::next_events`] for the full rule table).
+     * `None` means CORE CANNOT TELL YET — this device has not completed a pull of the tables the
+     * answer rests on, so its empty `questions`/`user_settings` prove nothing (SUR-1075). Hosts
+     * MUST then do nothing at all: show no prompt, and — the part that is easy to get wrong —
+     * do NOT cancel pending notifications. Re-run after the next successful pull. `Some` is never
+     * empty and holds at most two events (the opening 24h returns the initial prompt AND its
+     * nudge; see [`prompt::next_events`] for the full rule table).
      *
      * Both timestamps are host-supplied. `now_ms` follows the read-surface convention
      * ([`SyncEngine::question_notes`]) — core reads no clock, so the result is a pure function of
@@ -2252,8 +2260,8 @@ open func mergeContentDuplicates(survivorId: String, loserIds: [String], allowCr
      * server-authoritative and stays outside the client sync surface. Both platforms read it from
      * the same GoTrue user object.
      */
-open func nextPromptEvents(nowMs: Int64, accountCreatedAtMs: Int64)throws  -> [PromptEvent] {
-    return try  FfiConverterSequenceTypePromptEvent.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+open func nextPromptEvents(nowMs: Int64, accountCreatedAtMs: Int64)throws  -> [PromptEvent]? {
+    return try  FfiConverterOptionSequenceTypePromptEvent.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_next_prompt_events(self.uniffiClonePointer(),
         FfiConverterInt64.lower(nowMs),
         FfiConverterInt64.lower(accountCreatedAtMs),$0
@@ -7536,6 +7544,30 @@ fileprivate struct FfiConverterOptionTypeQuestionRecord: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionSequenceTypePromptEvent: FfiConverterRustBuffer {
+    typealias SwiftType = [PromptEvent]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceTypePromptEvent.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceTypePromptEvent.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceFloat: FfiConverterRustBuffer {
     typealias SwiftType = [Float]
 
@@ -8136,7 +8168,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_merge_content_duplicates() != 26022) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_next_prompt_events() != 21888) {
+    if (uniffi_braird_core_checksum_method_syncengine_next_prompt_events() != 63384) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_note_ids_for_collection() != 25011) {

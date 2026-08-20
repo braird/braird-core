@@ -1020,13 +1020,32 @@ final class RoundTripTests: XCTestCase {
     /// itself: the cadence clamp lives in CORE, not in the picker, and the opening phase hands back
     /// BOTH the initial prompt and its nudge in one call.
     func testPromptSurfaceOverFfi() throws {
+        let server = try EmptyJSONLoopbackServer()
+        defer { server.stop() }
         let db = FileManager.default.temporaryDirectory
             .appendingPathComponent("braird-p-\(UUID().uuidString).sqlite")
         let engine = try SyncEngine.open(
-            dbPath: db.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
+            dbPath: db.path, supabaseUrl: server.baseURL, anonKey: "anon",
             vault: Vault.generate())
         let created: Int64 = 1_000_000
         let hourMs: Int64 = 3_600_000
+        // `nextPromptEvents` is Optional on purpose (SUR-1075); unwrapping is this test asserting
+        // the answer exists, since a silent empty array would prove nothing.
+        func events(_ e: SyncEngine, _ now: Int64, _ birth: Int64) throws -> [PromptEvent] {
+            try XCTUnwrap(try e.nextPromptEvents(nowMs: now, accountCreatedAtMs: birth))
+        }
+
+        // Before any pull core cannot tell an empty table from an un-pulled one, so it declines.
+        // Swift's Optional is what enforces the host rule: the events are unreachable without
+        // handling this, and "do nothing" is the only correct response.
+        XCTAssertNil(
+            try engine.nextPromptEvents(nowMs: created + 60_000, accountCreatedAtMs: created))
+
+        // One completed pull — every table answers `[]`, which is a SUCCESS, not an absence — and
+        // the surface opens up. This is exactly the case a cursor could not detect: an empty page
+        // advances no cursor, so the receipt is the only thing that changed here.
+        engine.setAccessToken(jwt: testJWT())
+        _ = try engine.pull()
 
         // Nothing stored yet: the defaults cross intact.
         let defaults = try engine.promptSettings()
@@ -1042,8 +1061,7 @@ final class RoundTripTests: XCTestCase {
         XCTAssertEqual(clamped.tone, .productive)
 
         // A fresh account: the prompt is due now AND the nudge is already scheduled for +24h.
-        let opening = try engine.nextPromptEvents(
-            nowMs: created + 60_000, accountCreatedAtMs: created)
+        let opening = try events(engine, created + 60_000, created)
         XCTAssertEqual(opening.map { $0.kind }, [.initial, .nudge])
         XCTAssertEqual(opening[0].dueAt, created)
         XCTAssertEqual(opening[1].dueAt, created + 24 * hourMs)
@@ -1055,8 +1073,7 @@ final class RoundTripTests: XCTestCase {
                 id: "q1", plaintext: "what am I sitting with?", status: "active",
                 tone: "productive", resolvedAt: nil, checkinAt: nil, checkinResponse: nil,
                 createdAt: created, deleted: false))
-        let live = try engine.nextPromptEvents(
-            nowMs: created + 60_000, accountCreatedAtMs: created)
+        let live = try events(engine, created + 60_000, created)
         XCTAssertEqual(live.map { $0.kind }, [.checkIn])
         XCTAssertEqual(live[0].dueAt, created + 72 * hourMs)
         // The event names its question, so the client never re-derives the pick.
@@ -1067,7 +1084,7 @@ final class RoundTripTests: XCTestCase {
         let skippedAt = created + 80 * hourMs
         try engine.skipCheckin(questionId: "q1", nowMs: skippedAt)
         XCTAssertEqual(
-            try engine.nextPromptEvents(nowMs: skippedAt + 1, accountCreatedAtMs: created)[0].dueAt,
+            try events(engine, skippedAt + 1, created)[0].dueAt,
             skippedAt + 72 * hourMs)
         XCTAssertEqual(try engine.getQuestion(id: "q1")?.text, "what am I sitting with?")
 
@@ -1076,11 +1093,12 @@ final class RoundTripTests: XCTestCase {
         let other = FileManager.default.temporaryDirectory
             .appendingPathComponent("braird-p2-\(UUID().uuidString).sqlite")
         let fresh = try SyncEngine.open(
-            dbPath: other.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
+            dbPath: other.path, supabaseUrl: server.baseURL, anonKey: "anon",
             vault: Vault.generate())
+        fresh.setAccessToken(jwt: testJWT())
+        _ = try fresh.pull()
         try fresh.skipPrompt(nowMs: created + 5_000)
-        let quiet = try fresh.nextPromptEvents(
-            nowMs: created + 6_000, accountCreatedAtMs: created)
+        let quiet = try events(fresh, created + 6_000, created)
         XCTAssertEqual(quiet.map { $0.kind }, [.initial])
         XCTAssertEqual(quiet[0].dueAt, created + 5_000 + 168 * hourMs)
     }

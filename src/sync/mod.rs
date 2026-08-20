@@ -385,6 +385,12 @@ struct SignalState {
 /// class) is orders of magnitude larger.
 const IMPORTANCE_EPSILON: f64 = 1e-9;
 
+/// The tables [`SyncEngine::next_prompt_events`] reads, and therefore the ones that must have
+/// completed a pull before it can answer at all (SUR-1075). Keep this list in step with the reads
+/// in that method: a table whose absence the prompt rules interpret, but which is missing here,
+/// re-opens exactly the hole this gate closes.
+const PROMPT_SOURCE_TABLES: [&str; 2] = ["questions", "user_settings"];
+
 /// The change-detection compare (SUR-977): exact on every counter/stamp/prior, epsilon-tolerant
 /// on the derived `importance` only. NaN-safe by construction — a NaN `importance` (a live row's
 /// laundered non-numeric stored value) fails the epsilon test against everything, so the row
@@ -1686,8 +1692,12 @@ impl SyncEngine {
     /// every answer, settings change, and sync pull that touched a question — that is what makes
     /// answering on the phone silence the tablet (SUR-996 R5).
     ///
-    /// Never empty, at most two (the opening 24h returns the initial prompt AND its nudge; see
-    /// [`prompt::next_events`] for the full rule table).
+    /// `None` means CORE CANNOT TELL YET — this device has not completed a pull of the tables the
+    /// answer rests on, so its empty `questions`/`user_settings` prove nothing (SUR-1075). Hosts
+    /// MUST then do nothing at all: show no prompt, and — the part that is easy to get wrong —
+    /// do NOT cancel pending notifications. Re-run after the next successful pull. `Some` is never
+    /// empty and holds at most two events (the opening 24h returns the initial prompt AND its
+    /// nudge; see [`prompt::next_events`] for the full rule table).
     ///
     /// Both timestamps are host-supplied. `now_ms` follows the read-surface convention
     /// ([`SyncEngine::question_notes`]) — core reads no clock, so the result is a pure function of
@@ -1699,7 +1709,20 @@ impl SyncEngine {
         &self,
         now_ms: i64,
         account_created_at_ms: i64,
-    ) -> Result<Vec<PromptEvent>, SyncError> {
+    ) -> Result<Option<Vec<PromptEvent>>, SyncError> {
+        // The readiness gate runs FIRST — ahead of the legacy heal below, not merely ahead of the
+        // read. ORDER IS LOAD-BEARING: that heal fires on "no marker AND questions exist", which is
+        // exactly the shape a device presents when it pulled `questions` but not `user_settings`.
+        // Stamping the marker from that state would record a permanent account-wide claim derived
+        // from a table that never arrived, and no later pull could undo it.
+        let ready = {
+            let store = lock!(self.store);
+            Self::prompt_state_ready(&store).map_err(store_err)?
+        };
+        if !ready {
+            return Ok(None);
+        }
+
         // Heal a legacy account before reading it: question history written by a core that predates
         // the marker proves onboarding on THIS device, but the proof is local — the row it rests on
         // can be deleted, and the pull path then hands the next device nothing (it discards a
@@ -1729,7 +1752,7 @@ impl SyncEngine {
                 .map_err(store_err)?
                 .and_then(|v| v.parse().ok()),
         };
-        Ok(prompt::next_events(&state, &settings, now_ms))
+        Ok(Some(prompt::next_events(&state, &settings, now_ms)))
     }
 
     /// Record that the user dismissed a prompt without answering it (SUR-996 R2).
@@ -2235,6 +2258,24 @@ impl SyncEngine {
 }
 
 impl SyncEngine {
+    /// Whether the prompt machine's inputs are knowable on this device (SUR-1075).
+    ///
+    /// The prompt rules decide from ABSENCE — no live question means "offer one", no
+    /// `prompt_answered_at` means "the onboarding nudge is unspent", no `prompt_skipped_at` means
+    /// "no quiet period is running". Each of those readings is only sound once the table it rests
+    /// on has actually arrived, and [`SyncEngine::pull`] returns `Ok` on a partial failure while
+    /// naming no table. Without this check a long-time user on a fresh device gets an
+    /// immediately-due initial prompt for a question they already have, and a nudge they spent
+    /// months ago comes back.
+    fn prompt_state_ready(store: &Store) -> rusqlite::Result<bool> {
+        for table in PROMPT_SOURCE_TABLES {
+            if !store.has_completed_pull(table)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Assemble [`PromptSettings`] from an ALREADY-HELD store guard (SUR-1043) — the shared body of
     /// [`SyncEngine::prompt_settings`] and [`SyncEngine::next_prompt_events`]. Taking the guard
     /// rather than re-locking keeps the settings and the question rows behind ONE acquisition, so a
@@ -4310,6 +4351,30 @@ mod tests {
         .unwrap()
     }
 
+    /// An engine whose prompt inputs are KNOWABLE. [`SyncEngine::next_prompt_events`] answers
+    /// `None` until both source tables have completed a pull (SUR-1075); these tests are about
+    /// what it answers once they have. `sync::pull` normally writes the receipts, but an
+    /// engine-level test cannot pull — the concrete `PostgrestClient` inside `SyncEngine` has no
+    /// stub seam (see `pull_and_reconcile`) — so seed them on a second connection, the same way
+    /// these tests already seed rows.
+    fn prompt_ready_engine_at(db_path: &str) -> Arc<SyncEngine> {
+        let engine = engine_at(db_path);
+        let store = Store::open(db_path).unwrap();
+        for table in PROMPT_SOURCE_TABLES {
+            store.mark_pull_complete(table).unwrap();
+        }
+        engine
+    }
+
+    /// `next_prompt_events` past the readiness gate. Unwrapping loudly matters: a test that
+    /// silently accepted `None` would assert nothing at all about the prompt rules.
+    fn events_of(engine: &SyncEngine, now_ms: i64, account_created_at_ms: i64) -> Vec<PromptEvent> {
+        engine
+            .next_prompt_events(now_ms, account_created_at_ms)
+            .unwrap()
+            .expect("this test's engine must have both prompt source tables marked pulled")
+    }
+
     /// Test builder for a note upsert — `id` + `plaintext` with every other field at its "unset"
     /// default (no book/page/tags/source/meta, `created_at` 0, live). Override specific fields with
     /// struct-update: `NoteUpsert { book_id: Some("b1".into()), ..note_upsert("n1", "text") }`.
@@ -5120,7 +5185,7 @@ mod tests {
         // is exactly the drift this state machine removes.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.sqlite");
-        let engine = engine_at(db.to_str().unwrap());
+        let engine = prompt_ready_engine_at(db.to_str().unwrap());
         let draft = |id: &str, created_at: i64, status: &str| QuestionUpsert {
             id: id.into(),
             plaintext: Some("q".into()),
@@ -5139,7 +5204,7 @@ mod tests {
             .enqueue_question(draft("newer", 2_000, "active"))
             .unwrap();
 
-        let events = engine.next_prompt_events(2_001, 500).unwrap();
+        let events = events_of(&engine, 2_001, 500);
 
         assert_eq!(events[0].kind, PromptEventKind::CheckIn);
         assert_eq!(
@@ -5279,11 +5344,11 @@ mod tests {
         // The whole loop over a real store, one host clock reading at a time.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.sqlite");
-        let engine = engine_at(db.to_str().unwrap());
+        let engine = prompt_ready_engine_at(db.to_str().unwrap());
         let created = 1_000_000_i64;
         let hour = 60 * 60 * 1000_i64;
         let cadence = prompt::CADENCE_DEFAULT_HOURS as i64 * hour;
-        let events = |now: i64| engine.next_prompt_events(now, created).unwrap();
+        let events = |now: i64| events_of(&engine, now, created);
 
         // 1. Fresh account: the prompt is due and the nudge is already scheduled.
         let opening = events(created + 60_000);
@@ -5365,7 +5430,7 @@ mod tests {
         // is that the SAME state yields a new `due_at` — the clients re-run this after a pull.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.sqlite");
-        let engine = engine_at(db.to_str().unwrap());
+        let engine = prompt_ready_engine_at(db.to_str().unwrap());
         engine
             .enqueue_question(QuestionUpsert {
                 id: "q1".into(),
@@ -5380,12 +5445,12 @@ mod tests {
             })
             .unwrap();
 
-        let before = engine.next_prompt_events(500_001, 1_000).unwrap()[0].due_at;
+        let before = events_of(&engine, 500_001, 1_000)[0].due_at;
         engine
             .set_prompt_cadence(prompt::CADENCE_MIN_HOURS)
             .unwrap();
         engine.set_prompt_tone(PromptTone::Productive).unwrap();
-        let after = engine.next_prompt_events(500_001, 1_000).unwrap();
+        let after = events_of(&engine, 500_001, 1_000);
 
         assert!(after[0].due_at < before);
         assert_eq!(after[0].tone, PromptTone::Productive);
@@ -5399,7 +5464,7 @@ mod tests {
         // answered one.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.sqlite");
-        let engine = engine_at(db.to_str().unwrap());
+        let engine = prompt_ready_engine_at(db.to_str().unwrap());
         let created = 1_000_000_i64;
         let draft = |deleted: bool| QuestionUpsert {
             id: "q1".into(),
@@ -5420,9 +5485,7 @@ mod tests {
         assert!(engine.list_questions(50, 0).unwrap().is_empty());
 
         // ...but onboarding still happened, so only the prompt returns — never the nudge.
-        let events = engine
-            .next_prompt_events(created + 60_000, created)
-            .unwrap();
+        let events = events_of(&engine, created + 60_000, created);
         assert_eq!(
             events.iter().map(|e| e.kind).collect::<Vec<_>>(),
             vec![PromptEventKind::Initial]
@@ -5460,7 +5523,7 @@ mod tests {
 
         // A fresh device: it pulls the settings row, but the question's tombstone never arrives.
         let second = dir.path().join("second.sqlite");
-        let fresh = engine_at(second.to_str().unwrap());
+        let fresh = prompt_ready_engine_at(second.to_str().unwrap());
         Store::open(second.to_str().unwrap())
             .unwrap()
             .apply_row("user_settings", &marker)
@@ -5468,9 +5531,7 @@ mod tests {
 
         assert!(fresh.list_questions(50, 0).unwrap().is_empty());
         assert_eq!(
-            fresh
-                .next_prompt_events(created + 60_000, created)
-                .unwrap()
+            events_of(&fresh, created + 60_000, created)
                 .iter()
                 .map(|e| e.kind)
                 .collect::<Vec<_>>(),
@@ -5487,7 +5548,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
-        let engine = engine_at(db_path);
+        let engine = prompt_ready_engine_at(db_path);
 
         // A question in the store with NO marker — the pre-SUR-1043 shape.
         let store = Store::open(db_path).unwrap();
@@ -5504,7 +5565,7 @@ mod tests {
             .is_none());
         drop(store);
 
-        engine.next_prompt_events(3_000, 1_000).unwrap();
+        events_of(&engine, 3_000, 1_000);
 
         assert!(
             Store::open(db_path)
@@ -5513,6 +5574,93 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "legacy history must be recorded as a marker, not left as a local-only inference"
+        );
+    }
+
+    // ── SUR-1075 readiness gate ──────────────────────────────────────────────
+
+    #[test]
+    fn a_device_that_has_not_pulled_cannot_answer_at_all() {
+        // `pull` returns Ok on a PARTIAL failure and names no table, so on a fresh device an empty
+        // `questions` means either "this account has none" or "it never arrived" — and the two want
+        // opposite answers. Absent the receipts core must decline, not guess. `None` is what stops
+        // the host cancelling notifications it cannot re-derive.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+
+        assert!(engine.next_prompt_events(2_000, 1_000).unwrap().is_none());
+    }
+
+    #[test]
+    fn one_pulled_table_is_not_enough() {
+        // The answer reads BOTH tables: `questions` decides the check-in, `user_settings` decides
+        // whether the nudge is spent and whether a quiet period is running. Either one missing
+        // makes the whole answer unsound, so readiness is an AND.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        Store::open(db_path)
+            .unwrap()
+            .mark_pull_complete("questions")
+            .unwrap();
+
+        assert!(
+            engine.next_prompt_events(2_000, 1_000).unwrap().is_none(),
+            "questions alone cannot answer a question about user_settings"
+        );
+    }
+
+    #[test]
+    fn both_receipts_restore_the_ordinary_fresh_account_answer() {
+        // The gate must change WHEN core answers, never WHAT it answers. Same empty store as the
+        // test above, receipts added: the opening pair comes back unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = prompt_ready_engine_at(db.to_str().unwrap());
+        let created = 1_000_000_i64;
+
+        let events = events_of(&engine, created + 1_000, created);
+
+        assert_eq!(
+            events.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            vec![PromptEventKind::Initial, PromptEventKind::Nudge]
+        );
+    }
+
+    #[test]
+    fn the_gate_runs_before_the_legacy_backfill_can_stamp_the_marker() {
+        // ORDER IS THE WHOLE TEST. The legacy heal fires on "no marker AND questions exist" — which
+        // is precisely how a device looks when `questions` pulled and `user_settings` did not. Heal
+        // first and the marker records a permanent account-wide claim ("onboarding happened")
+        // derived from a table that never arrived, and NO later pull can undo it: the marker is a
+        // synced row that now wins by LWW everywhere.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        let store = Store::open(db_path).unwrap();
+        let mut legacy = Map::new();
+        legacy.insert("id".into(), json!("legacy"));
+        legacy.insert("text".into(), json!("enc:v2:whatever"));
+        legacy.insert("status".into(), json!("resolved"));
+        legacy.insert("created_at".into(), json!(1_000));
+        legacy.insert("updated_at".into(), json!(2_000));
+        legacy.insert("deleted".into(), json!(false));
+        store.apply_row("questions", &legacy).unwrap();
+        store.mark_pull_complete("questions").unwrap();
+        // `user_settings` deliberately un-pulled: this device cannot see whether the marker exists.
+        drop(store);
+
+        assert!(engine.next_prompt_events(3_000, 1_000).unwrap().is_none());
+
+        assert!(
+            read::user_setting(&Store::open(db_path).unwrap(), PROMPT_ANSWERED_AT_KEY)
+                .unwrap()
+                .is_none(),
+            "the heal must not fire from a state the device cannot see"
         );
     }
 
@@ -5640,7 +5788,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
-        let engine = engine_at(db_path);
+        let engine = prompt_ready_engine_at(db_path);
         engine
             .enqueue_question(QuestionUpsert {
                 id: "q1".into(),
@@ -5656,7 +5804,7 @@ mod tests {
             .unwrap();
 
         // A different engine means a different Vault, so the stored ciphertext will not open.
-        let other = engine_at(db_path);
+        let other = prompt_ready_engine_at(db_path);
         assert!(
             other
                 .get_question("q1".into())
@@ -5665,7 +5813,7 @@ mod tests {
                 .decrypt_failed
         );
         assert_eq!(
-            other.next_prompt_events(500_001, 1_000).unwrap()[0].kind,
+            events_of(&other, 500_001, 1_000)[0].kind,
             PromptEventKind::CheckIn
         );
     }
