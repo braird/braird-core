@@ -1772,18 +1772,13 @@ impl SyncEngine {
     ///
     /// `now_ms` is host-supplied, for the [`SyncEngine::skip_prompt`] reason.
     pub fn complete_checkin(&self, now_ms: i64) -> Result<(), SyncError> {
-        // MONOTONE ON THE VALUE, not only on `updated_at`. The stamp is when the pass happened, and
-        // a later pass never un-happens an earlier one: a device whose clock trails the one that
-        // wrote the stored value would otherwise move the anchor BACK (its row wins LWW on the
-        // bookkeeping stamp) and make the next check-in come due early on every device.
-        let stored = {
-            let store = lock!(self.store);
-            read::user_setting(&store, prompt::CHECKIN_COMPLETED_AT_KEY)
-                .map_err(store_err)?
-                .and_then(|v| v.parse::<i64>().ok())
-        };
-        let at = stored.map_or(now_ms, |s| s.max(now_ms));
-        self.set_user_setting(prompt::CHECKIN_COMPLETED_AT_KEY.into(), at.to_string())
+        // Plain `now_ms`, deliberately NOT `max(stored, now_ms)`. A device whose clock trails the
+        // one that wrote the stored value moves the anchor back by the skew, so the next check-in
+        // comes that much early — bounded and self-healing. Keeping the larger value was tried and
+        // is worse: it re-writes a FUTURE stamp on every pass, `checkin_anchor` reads a future
+        // stamp as the oldest question's birth, and the check-in stays overdue for as long as the
+        // skew lasts (sync-reviewer, SUR-1101 review round 2).
+        self.set_user_setting(prompt::CHECKIN_COMPLETED_AT_KEY.into(), now_ms.to_string())
     }
 
     /// The check-in's backstop section (SUR-1101): live notes captured since the current check-in
@@ -5594,20 +5589,22 @@ mod tests {
     }
 
     #[test]
-    fn a_pass_from_a_trailing_clock_never_moves_the_anchor_back() {
+    fn a_pass_always_records_this_devices_now_even_behind_a_future_stamp() {
+        // A stored FUTURE stamp must not survive a pass: the anchor would read it as the oldest
+        // birth and keep the check-in overdue until the clock catches up.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
         let engine = engine_at(db_path);
         engine.complete_checkin(10_000).unwrap();
-        engine.complete_checkin(9_000).unwrap(); // a device whose clock runs behind
+        engine.complete_checkin(9_000).unwrap(); // this device's clock trails the stored value
         assert_eq!(
             read::user_setting(
                 &Store::open(db_path).unwrap(),
                 prompt::CHECKIN_COMPLETED_AT_KEY
             )
             .unwrap(),
-            Some("10000".into())
+            Some("9000".into())
         );
     }
 

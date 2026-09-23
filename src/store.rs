@@ -662,14 +662,19 @@ impl Store {
     /// `question_notes` (cursor 0) brings those rows here. A first version re-staged this device's
     /// whole effective set stamped `now`, and review showed that loses writes both ways: a device
     /// upgrading late would out-stamp a detach the user made on an already-upgraded device, and an
-    /// exclude another device had flushed (then hard-deleted by 0058) would come back attached.
-    /// So only two things are written:
+    /// exclude another device had flushed would come back attached, out-stamping 0058's row for it.
+    /// 0058 keeps each live exclude as a TOMBSTONE for the same reason: a stamp-1 row below can
+    /// only lose to a row that exists. So only two things are written:
     ///
     /// 1. **Curation this device never flushed** — an old row still in the outbox. The server never
     ///    saw it, so the pull cannot restore it. Each such pair gets the old rule's answer AS A
     ///    ROW: attached if the pair was in the effective set, a TOMBSTONE otherwise (an exclude, or
     ///    an un-pin). Stamped `now_ms`, because it is the user's latest intent on this device and
-    ///    must outrank the server's materialised row for the same pair.
+    ///    must outrank the server's materialised row for the same pair. ACCEPTED TRADEOFF: it also
+    ///    outranks an opposite edit of the SAME pair made on another, already-upgraded device
+    ///    between 0058 and this upgrade. The device cannot know when 0058 ran, and any stamp low
+    ///    enough to lose to that edit could also lose to 0058's own row — which is the unflushed
+    ///    exclude this rule exists to keep.
     /// 2. **Window pairs of a note or question this device never flushed.** The server could not
     ///    materialise a pair whose endpoint it did not have. Stamped `1` — the lowest possible —
     ///    so any row the server does hold for the pair (from 0058, or a later attach or detach on

@@ -14,8 +14,9 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   - **`question_note_overrides` is replaced by `question_notes`** — the same deterministic
     `question_id:note_id` row with `kind` gone, because a row IS an attachment. surfc migration
     0058 renames the cloud table in place and materialises every question's then-current note set
-    (`(window ∪ includes) − excludes`) as rows, so no count changes. The native-schema registry,
-    manifest (`live`, SUR-1101), push arms and parity test move with it.
+    (`(window ∪ includes) − excludes`) as rows, so no count changes, and keeps each exclude as a
+    tombstone so a device's lowest-stamped attachment for that pair loses to it. The native-schema
+    registry, manifest (`live`, SUR-1101), push arms and parity test move with it.
   - **Existing stores are converted on open, writing only what the server cannot know.**
     `Store::convert_question_note_overrides` runs the retired rule once, in SQL. Curation this
     device never flushed becomes a row carrying the user's answer — attached, or a TOMBSTONE for an
@@ -34,8 +35,9 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     `PromptEvent` loses `question_id`; the CheckIn is due one cadence after `prompt::checkin_anchor`
     — the latest pass (`checkin_completed_at`, a new synced setting) or legacy per-question
     `checkin_at`, bounded to [oldest active birth, now]. `skip_checkin(question_id, now_ms)` →
-    `complete_checkin(now_ms)`, one call per pass, which never moves the stamp backwards (a device
-    with a trailing clock would otherwise pull the next check-in early on every device).
+    `complete_checkin(now_ms)`, one call per pass, which records this device's `now_ms` as given.
+    (Keeping the larger stored value was tried in review and reverted: it re-wrote a future stamp on
+    every pass, which the anchor reads as the oldest birth, keeping the check-in overdue.)
   - New: `unattached_since_last_checkin(now_ms)` — the check-in's backstop section, notes since the
     anchor that no live question holds; gated on the prompt pull receipts, which now include
     `question_notes`. `question_nudge_due(now_ms)` / `dismiss_question_nudge(now_ms)` — the

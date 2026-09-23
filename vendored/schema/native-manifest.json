@@ -18,7 +18,7 @@
       "pk_scope": "global",
       "backend": "live",
       "backend_ticket": "SUR-1101",
-      "note": "SUR-1101 question<->note attachment, explicit and many-to-many. Was `question_note_overrides` (SUR-1042/SUR-1047: include/exclude curation over an automatic date window); surfc migration 0058 renamed it in place, materialised every question's then-current note set as rows, deleted excludes and tombstones, and dropped `kind`. Plaintext metadata (id pairs + timestamps), same trade-off as collection_memberships. Deterministic `question_id:note_id` pk so concurrent attachment of one pair converges to a single row (OR-set, not the note_links bag)."
+      "note": "SUR-1101 question<->note attachment, explicit and many-to-many. Was `question_note_overrides` (SUR-1042/SUR-1047: include/exclude curation over an automatic date window); surfc migration 0058 renamed it in place, materialised every question's then-current note set as rows, kept each exclude as a tombstone, deleted the old tombstones, and dropped `kind`. Plaintext metadata (id pairs + timestamps), same trade-off as collection_memberships. Deterministic `question_id:note_id` pk so concurrent attachment of one pair converges to a single row (OR-set, not the note_links bag)."
     },
     {
       "table": "user_settings",
