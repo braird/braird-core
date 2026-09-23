@@ -41,6 +41,17 @@ pub const PROMPT_SKIPPED_AT_KEY: &str = "prompt_skipped_at";
 /// onboarding. Each fix was a better inference from data that was never meant to answer the
 /// question; a settings row is meant to, and it is live-forever, so no tombstone rule can drop it.
 pub const PROMPT_ANSWERED_AT_KEY: &str = "prompt_answered_at";
+/// When the user last completed or skipped a check-in pass (epoch ms, decimal string) — SUR-1101.
+///
+/// ONE stamp for the whole pass, because a check-in now covers every active question at once on a
+/// single global cadence. The per-question `questions.checkin_at` still records each question's own
+/// last answer and is still read as a legacy anchor (see [`checkin_anchor`]), but no single
+/// question's row can say when the PASS happened — a pass that answered nothing (all skipped) writes
+/// no question at all. Synced for the [`PROMPT_SKIPPED_AT_KEY`] reason: the newest pass wins across
+/// devices, so checking in on the phone silences the tablet.
+pub const CHECKIN_LAST_AT_KEY: &str = "checkin_last_at";
+/// When the user last dismissed the too-many-questions nudge (epoch ms, decimal string) — SUR-1101.
+pub const QUESTION_NUDGE_DISMISSED_AT_KEY: &str = "question_nudge_dismissed_at";
 
 /// Cadence bounds (SUR-996 R4): 72 hours to 4 weeks, defaulting to one week. Clamped in core on
 /// BOTH read and write, so an out-of-range value from any client — or one already stored by an
@@ -53,6 +64,12 @@ const HOUR_MS: i64 = 60 * 60 * 1000;
 /// The single nudge fires 24h after account creation (SUR-996 R2).
 pub const NUDGE_DELAY_MS: i64 = 24 * HOUR_MS;
 
+/// The too-many-questions nudge (SUR-1101) fires once MORE than this many questions are active —
+/// at the 9th, not the 8th. Unrelated to [`NUDGE_DELAY_MS`]'s onboarding nudge despite the word.
+pub const QUESTION_NUDGE_THRESHOLD: usize = 8;
+/// A dismissed too-many-questions nudge stays silent this long, then re-fires if still over.
+pub const QUESTION_NUDGE_QUIET_MS: i64 = 28 * 24 * HOUR_MS;
+
 /// Which phrasing a prompt uses (SUR-996). The strings themselves stay client-side (SUR-996 Q1 —
 /// localization lives with the clients); core owns only the choice, so both platforms cannot
 /// disagree about which tone is in force.
@@ -64,7 +81,7 @@ pub enum PromptTone {
 
 /// What a due prompt is. `Initial` asks for a question (and doubles as the tone picker on first
 /// use), `Nudge` is the one-and-only reminder for an unanswered initial prompt, `CheckIn` revisits
-/// the live question at cadence.
+/// EVERY active question in one pass at cadence (SUR-1101).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum PromptEventKind {
     Initial,
@@ -88,17 +105,14 @@ pub struct PromptSettings {
 /// reaches a lock screen — SUR-996 R5). It rides on every event anyway because a non-optional
 /// field is simpler across three binding languages than an `Option` two of three kinds ignore.
 ///
-/// `question_id` names the question a `CheckIn` is ABOUT, and is `None` for the other two kinds
-/// (neither has a question yet). Carried rather than left for the client to work out: the machine
-/// already picked which question wins when several are momentarily active, and a client re-deriving
-/// that pick is exactly the cross-platform drift this module exists to prevent. It is the id the
-/// host passes back to [`crate::sync::SyncEngine::skip_checkin`] or `enqueue_question`.
+/// No question id. Until SUR-1101 a `CheckIn` named the one question it was about; a check-in now
+/// covers every active question, so the host lists them from `list_questions` (active first) and
+/// records the pass with [`crate::sync::SyncEngine::complete_checkin`].
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct PromptEvent {
     pub kind: PromptEventKind,
     pub due_at: i64,
     pub tone: PromptTone,
-    pub question_id: Option<String>,
 }
 
 /// The metadata of one stored question, as the machine needs it. Internal — not a UniFFI type:
@@ -132,6 +146,8 @@ pub struct PromptState {
     /// discards a tombstone for a row it never had, so the second reads zero on a fresh install.
     pub has_ever_answered: bool,
     pub prompt_skipped_at_ms: Option<i64>,
+    /// The [`CHECKIN_LAST_AT_KEY`] stamp, raw — [`checkin_anchor`] bounds it.
+    pub checkin_last_at_ms: Option<i64>,
 }
 
 /// Force a cadence into 72..=672 hours. Total: there is no invalid input, only clamping.
@@ -198,6 +214,59 @@ fn bound_interaction(stamp: i64, birth: i64, now_ms: i64) -> i64 {
     }
 }
 
+/// When the current check-in period began, or `None` when no question is active (so there is no
+/// check-in to schedule). The CheckIn event is due one cadence after it, and the check-in's
+/// "notes captured since the last check-in with no attachment" section reads from it — ONE
+/// definition, so the section always covers exactly the period the check-in closes (SUR-1101).
+///
+/// The anchor is the latest recorded check-in: the pass stamp [`CHECKIN_LAST_AT_KEY`], or any
+/// active question's own `checkin_at` (the pre-SUR-1101 per-question stamp, still written when a
+/// question's check-in is answered, and the only record an upgrading account has). With no record
+/// at all it is the OLDEST active question's birth — the first check-in comes one cadence after the
+/// user first had something to check in on, and a question opened later joins that pass rather
+/// than restarting the clock.
+///
+/// Every stamp is bounded to `[oldest active birth, now]` by [`bound_interaction`]. Below, because
+/// a check-in recorded before the current run of questions began (the user resolved everything,
+/// went quiet, then opened a new question) must not make the new question's check-in instantly
+/// overdue. Above, for the fast-remote-clock reason that function records.
+pub fn checkin_anchor(state: &PromptState, now_ms: i64) -> Option<i64> {
+    let active = || {
+        state
+            .questions
+            .iter()
+            .filter(|q| is_active(q.status.as_deref()))
+    };
+    let birth = active().map(|q| q.created_at).min()?;
+    Some(
+        state
+            .checkin_last_at_ms
+            .into_iter()
+            .chain(active().filter_map(|q| q.checkin_at))
+            .map(|stamp| bound_interaction(stamp, birth, now_ms))
+            .max()
+            .unwrap_or(birth),
+    )
+}
+
+/// Whether the too-many-questions nudge should show (SUR-1101): more than
+/// [`QUESTION_NUDGE_THRESHOLD`] active questions, and no dismissal inside the last
+/// [`QUESTION_NUDGE_QUIET_MS`]. Independent of the check-in cadence.
+///
+/// A dismissal stamped in the future (a fast remote clock) reads as NO dismissal, not as "silent
+/// until then plus four weeks": the nudge is dismissable in one tap, and failing toward showing it
+/// is the [`bound_interaction`] posture. It is also stable under re-evaluation, unlike clamping the
+/// stamp to `now`, which would slide the quiet period forward on every call.
+pub fn question_nudge_due(active_count: usize, dismissed_at: Option<i64>, now_ms: i64) -> bool {
+    if active_count <= QUESTION_NUDGE_THRESHOLD {
+        return false;
+    }
+    match dismissed_at {
+        Some(at) if at <= now_ms => now_ms >= at.saturating_add(QUESTION_NUDGE_QUIET_MS),
+        _ => true,
+    }
+}
+
 /// The next prompt(s) to act on, sorted by `due_at`.
 ///
 /// NEVER EMPTY, and at most two: there is always a next prompt, and the only phase with two is the
@@ -210,7 +279,7 @@ fn bound_interaction(stamp: i64, birth: i64, now_ms: i64) -> i64 {
 ///
 /// | State | Event(s) |
 /// |---|---|
-/// | a live question exists | `CheckIn` at `(checkin_at ?? created_at) + cadence` |
+/// | any question is active | ONE `CheckIn`, covering them all, at [`checkin_anchor`] `+ cadence` |
 /// | nothing ever answered, no skip | `Initial` at account creation, `+ Nudge` while `now < +24h` |
 /// | nothing ever answered, skipped at `t` | `Initial` at `t + cadence` — the skip cancels the nudge |
 /// | only archived questions | `Initial` at `max(last close, skip) + cadence` — never a `Nudge` again |
@@ -224,39 +293,15 @@ pub fn next_events(
 ) -> Vec<PromptEvent> {
     let cadence_ms = clamp_cadence(settings.cadence_hours) as i64 * HOUR_MS;
     let tone = settings.tone;
-    // Initial and Nudge name no question — neither exists yet when they fire.
-    let event = |kind, due_at| PromptEvent {
-        kind,
-        due_at,
-        tone,
-        question_id: None,
-    };
+    let event = |kind, due_at| PromptEvent { kind, due_at, tone };
 
-    // The NEWEST live question wins. A "New question" supersede archives the old row and creates a
-    // new one, and both are live rows until the tombstone flushes; picking the newest keeps the
-    // check-in on the question the user is actually sitting with.
-    let active = state
-        .questions
-        .iter()
-        .filter(|q| is_active(q.status.as_deref()))
-        .max_by_key(|q| q.created_at);
-
-    if let Some(q) = active {
-        // No `checkin_at` yet = just answered, so the first check-in is one cadence from birth.
-        //
-        // Bounded to [birth, now]. Below birth, matching `read::question_notes`' window clamp: a
-        // device whose clock runs behind can stamp a `checkin_at` EARLIER than a `created_at`
-        // written by another device, and the raw stamp would shorten the interval by the skew —
-        // past one cadence of it, the sheet reappears the moment the user answered one, the nagging
-        // R3 forbids. Above now, because a check-in cannot have happened later than this instant,
-        // and a stamp from a fast remote clock would otherwise silence the loop for that skew.
-        let anchor = bound_interaction(q.checkin_at.unwrap_or(q.created_at), q.created_at, now_ms);
-        return vec![PromptEvent {
-            kind: PromptEventKind::CheckIn,
-            due_at: anchor.saturating_add(cadence_ms),
-            tone,
-            question_id: Some(q.id.clone()),
-        }];
+    // Any number of questions may be active at once (SUR-1101), and one check-in covers them all
+    // on the single global cadence — so there is one CheckIn, never one per question.
+    if let Some(anchor) = checkin_anchor(state, now_ms) {
+        return vec![event(
+            PromptEventKind::CheckIn,
+            anchor.saturating_add(cadence_ms),
+        )];
     }
 
     // A question that was answered and then closed anchors the next initial-style prompt on its
@@ -351,6 +396,7 @@ mod tests {
             has_ever_answered: !questions.is_empty(),
             questions,
             prompt_skipped_at_ms: skipped_at,
+            checkin_last_at_ms: None,
         }
     }
 
@@ -362,6 +408,7 @@ mod tests {
             questions: vec![],
             has_ever_answered: true,
             prompt_skipped_at_ms: None,
+            checkin_last_at_ms: None,
         }
     }
 
@@ -742,30 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_check_in_names_a_question() {
-        let live = next_events(
-            &state(vec![question("active", CREATED)], None),
-            &settings(PromptTone::Introspective),
-            CREATED + 1,
-        );
-        assert_eq!(live[0].question_id.as_deref(), Some("q-1000000"));
-
-        // Initial and Nudge fire when there is no question to name.
-        for event in next_events(
-            &state(vec![], None),
-            &settings(PromptTone::Introspective),
-            CREATED,
-        ) {
-            assert_eq!(
-                event.question_id, None,
-                "{:?} must name no question",
-                event.kind
-            );
-        }
-    }
-
-    #[test]
-    fn a_superseding_question_takes_over_the_check_in() {
+    fn a_resolved_predecessor_does_not_anchor_the_new_questions_check_in() {
         let mut old = question("resolved", CREATED + 1_000);
         old.resolved_at = Some(CREATED + 5_000);
         let fresh = question("active", CREATED + 5_000);
@@ -776,6 +800,123 @@ mod tests {
         );
         assert_eq!(kinds(&events), vec![PromptEventKind::CheckIn]);
         assert_eq!(events[0].due_at, CREATED + 5_000 + CADENCE_MS);
+    }
+
+    // ── concurrent questions (SUR-1101) ──────────────────────────────────────
+
+    #[test]
+    fn several_active_questions_share_one_check_in_from_the_oldest_birth() {
+        // Q2 opened three days into Q1's period joins Q1's pass; it does not restart the clock and
+        // it does not get a check-in of its own.
+        let events = next_events(
+            &state(
+                vec![
+                    question("active", CREATED),
+                    question("active", CREATED + 3 * 24 * HOUR_MS),
+                ],
+                None,
+            ),
+            &settings(PromptTone::Introspective),
+            CREATED + 4 * 24 * HOUR_MS,
+        );
+        assert_eq!(kinds(&events), vec![PromptEventKind::CheckIn]);
+        assert_eq!(events[0].due_at, CREATED + CADENCE_MS);
+    }
+
+    #[test]
+    fn a_completed_pass_anchors_the_next_check_in() {
+        let mut s = state(
+            vec![
+                question("active", CREATED),
+                question("active", CREATED + 10),
+            ],
+            None,
+        );
+        let pass = CREATED + CADENCE_MS + 60_000;
+        s.checkin_last_at_ms = Some(pass);
+        let events = next_events(&s, &settings(PromptTone::Introspective), pass + 1);
+        assert_eq!(events[0].due_at, pass + CADENCE_MS);
+    }
+
+    #[test]
+    fn a_legacy_per_question_check_in_still_anchors_an_upgraded_account() {
+        // An account upgrading from the one-question model has no pass stamp, only `checkin_at` on
+        // its question. Ignoring it would make the check-in due again the moment the user upgrades.
+        let answered = CREATED + CADENCE_MS + 5_000;
+        let mut q = question("active", CREATED);
+        q.checkin_at = Some(answered);
+        let events = next_events(
+            &state(vec![q], None),
+            &settings(PromptTone::Introspective),
+            answered + 1,
+        );
+        assert_eq!(events[0].due_at, answered + CADENCE_MS);
+    }
+
+    #[test]
+    fn a_pass_recorded_before_the_current_questions_existed_does_not_make_them_overdue() {
+        // Everything resolved, a long quiet spell, then a new question: the old pass stamp is older
+        // than anything active, so it is bounded up to the new question's birth.
+        let born = CREATED + 10 * CADENCE_MS;
+        let mut s = state(vec![question("active", born)], None);
+        s.checkin_last_at_ms = Some(CREATED + CADENCE_MS);
+        let events = next_events(&s, &settings(PromptTone::Introspective), born + 1);
+        assert_eq!(events[0].due_at, born + CADENCE_MS);
+    }
+
+    #[test]
+    fn a_future_pass_stamp_falls_back_to_the_oldest_birth_and_stays_there() {
+        let mut s = state(vec![question("active", CREATED)], None);
+        s.checkin_last_at_ms = Some(CREATED + 50 * CADENCE_MS);
+        let first = next_events(&s, &settings(PromptTone::Introspective), CREATED + 1_000);
+        let again = next_events(&s, &settings(PromptTone::Introspective), CREATED + 9_000);
+        assert_eq!(first[0].due_at, CREATED + CADENCE_MS);
+        assert_eq!(
+            first, again,
+            "re-evaluating unchanged state must not slide the due time"
+        );
+    }
+
+    #[test]
+    fn the_anchor_is_none_without_an_active_question() {
+        let mut resolved = question("resolved", CREATED);
+        resolved.resolved_at = Some(CREATED + 1);
+        let mut s = state(vec![resolved], None);
+        s.checkin_last_at_ms = Some(CREATED + 2);
+        assert_eq!(checkin_anchor(&s, CREATED + 3), None);
+    }
+
+    #[test]
+    fn the_too_many_questions_nudge_fires_at_the_ninth_not_the_eighth() {
+        assert!(!question_nudge_due(8, None, CREATED));
+        assert!(question_nudge_due(9, None, CREATED));
+    }
+
+    #[test]
+    fn a_dismissed_nudge_is_silent_for_exactly_four_weeks() {
+        let dismissed = CREATED;
+        assert!(!question_nudge_due(9, Some(dismissed), dismissed));
+        assert!(!question_nudge_due(
+            9,
+            Some(dismissed),
+            dismissed + QUESTION_NUDGE_QUIET_MS - 1
+        ));
+        assert!(question_nudge_due(
+            9,
+            Some(dismissed),
+            dismissed + QUESTION_NUDGE_QUIET_MS
+        ));
+        // ...and only if the user is still over the threshold when the quiet period ends.
+        assert!(!question_nudge_due(
+            8,
+            Some(dismissed),
+            dismissed + QUESTION_NUDGE_QUIET_MS
+        ));
+    }
+
+    #[test]
+    fn a_future_nudge_dismissal_reads_as_no_dismissal() {
+        assert!(question_nudge_due(9, Some(CREATED + 1), CREATED));
     }
 
     // ── settings ─────────────────────────────────────────────────────────────

@@ -118,8 +118,8 @@ fn core_native_schema_matches_vendored_fixture() {
 #[test]
 fn native_primary_keys_match_the_manifest() {
     // The column-only compare above is blind to the KEY, and for these tables the key is not
-    // bookkeeping: `question_note_overrides`'s deterministic `question_id:note_id` id is what makes
-    // two devices curating the same pair converge to ONE row instead of two contradictory ones, and
+    // bookkeeping: `question_notes`' deterministic `question_id:note_id` id is what makes two
+    // devices attaching the same pair converge to ONE row instead of two contradictory ones, and
     // `user_settings` is keyed per SETTING so one device's cadence change cannot stomp another key.
     // SUR-1047 authors its migration from this contract, so a wrong key would be invented there and
     // caught by nothing (raised on review; the SUR-723 sibling defers PK coverage on the grounds
@@ -189,16 +189,17 @@ fn native_tables_are_fully_wired() {
     }
 
     // Topological order is the flush's dispatch order, so it is a correctness property, not a
-    // stylistic one: an override dispatched before its question is rejected by the server.
+    // stylistic one: an attachment dispatched before its question is rejected by the server.
+    // `.unwrap()` on every position: an absent table must fail here, not compare as `None`.
     let order = synced_table_names();
-    let pos = |name: &str| order.iter().position(|t| *t == name);
+    let pos = |name: &str| order.iter().position(|t| *t == name).unwrap();
     assert!(
-        pos("questions") < pos("question_note_overrides"),
-        "questions must be dispatched before the overrides that FK it"
+        pos("questions") < pos("question_notes"),
+        "questions must be dispatched before the attachments that FK it"
     );
     assert!(
-        pos("notes") < pos("question_note_overrides"),
-        "notes must be dispatched before the overrides that FK it"
+        pos("notes") < pos("question_notes"),
+        "notes must be dispatched before the attachments that FK it"
     );
 }
 

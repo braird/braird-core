@@ -101,7 +101,7 @@ fn required_insert_columns(table: &str) -> &'static [&'static str] {
         // hollow row over the sealed one — the same lesson SUR-724 established for notes and
         // SUR-1009 for books, applied to a second content column before it can bite.
         "questions" => &["text", "created_at"],
-        "question_note_overrides" => &["question_id", "note_id", "kind", "created_at"],
+        "question_notes" => &["question_id", "note_id", "created_at"],
         // `user_settings` deliberately omitted: `value` is nullable and everything else NOT NULL
         // carries a server default, so no payload it can produce is unfillable.
         _ => &[],
@@ -118,14 +118,14 @@ fn fk_deps(table: &str) -> &'static [(&'static str, &'static str)] {
         "note_links" => &[("from_note_id", "notes"), ("to_note_id", "notes")],
         "collection_memberships" => &[("note_id", "notes"), ("collection_id", "collections")],
         "note_signals" => &[("note_id", "notes")],
-        // SUR-1042 / surfc 0055. Both endpoints are real FKs with ON DELETE CASCADE, so an override
-        // dispatched before its question or its note is a server rejection. This hold-back is what
+        // SUR-1042 / surfc 0055 (renamed by 0058, SUR-1101). Both endpoints are real FKs with ON
+        // DELETE CASCADE, so an attachment dispatched before its question or its note is a server rejection. This hold-back is what
         // satisfies that ordering constraint — and note the rejection would arrive as RLS `42501`,
         // not FK `23503`, because the policy's WITH CHECK requires both endpoints to resolve under
         // the writer's own RLS (SUR-1047 closed a cross-user reference that way). The two cases are
         // now deliberately indistinguishable, which is exactly why the ordering is enforced here
         // rather than classified after the fact from an error code.
-        "question_note_overrides" => &[("question_id", "questions"), ("note_id", "notes")],
+        "question_notes" => &[("question_id", "questions"), ("note_id", "notes")],
         _ => &[],
     }
 }
@@ -740,10 +740,10 @@ mod tests {
         );
         enqueue_row(
             &store,
-            "question_note_overrides",
+            "question_notes",
             "id",
             "q1:n1",
-            json!({ "question_id": "q1", "note_id": "n1", "kind": "include", "created_at": 1 }),
+            json!({ "question_id": "q1", "note_id": "n1", "created_at": 1 }),
         );
         enqueue_row(
             &store,
@@ -826,8 +826,8 @@ mod tests {
     }
 
     #[test]
-    fn an_override_is_held_back_when_its_question_fails() {
-        // The FK ordering constraint surfc 0055 pins. An override whose parents have not reached
+    fn an_attachment_is_held_back_when_its_question_fails() {
+        // The FK ordering constraint surfc 0055 pins. An attachment whose parents have not reached
         // the cloud is rejected — and as RLS 42501, not FK 23503, because the policy requires both
         // endpoints to resolve under the writer's own RLS. Indistinguishable from a permission
         // denial after the fact, so the ordering is enforced BEFORE dispatch, not classified after.
@@ -841,21 +841,18 @@ mod tests {
         );
         enqueue_row(
             &store,
-            "question_note_overrides",
+            "question_notes",
             "id",
             "q1:n1",
-            json!({ "question_id": "q1", "note_id": "n1", "kind": "include", "created_at": 1 }),
+            json!({ "question_id": "q1", "note_id": "n1", "created_at": 1 }),
         );
 
         let s = sink(Some("questions"));
         let res = block(flush(&store, &s, "user-1")).unwrap();
 
         assert!(
-            !s.calls
-                .borrow()
-                .iter()
-                .any(|t| t == "question_note_overrides"),
-            "the override must not be dispatched while its question is unflushed"
+            !s.calls.borrow().iter().any(|t| t == "question_notes"),
+            "the attachment must not be dispatched while its question is unflushed"
         );
         assert_eq!(res.ok.len(), 0);
         assert_eq!(res.failed.len(), 2, "both stay queued for the next flush");

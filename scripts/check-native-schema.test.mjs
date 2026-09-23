@@ -473,7 +473,7 @@ test('separate scoped SELECT + INSERT + UPDATE policies pass', () => {
 // --- uuid is a constraint the client cannot honour (round 5, P1) ---
 
 test('a uuid column where the fixture says text fails', () => {
-  // question_note_overrides.id is the colon-joined `question_id:note_id`, not a uuid.
+  // question_notes.id is the colon-joined `question_id:note_id`, not a uuid.
   const { errors } = run(manifest('live'), staged({ ...CLOUD_OK, id: 'uuid' }));
   assert.equal(errors.length, 1);
   assert.match(errors[0], /is uuid, but the native store treats it as opaque text/);

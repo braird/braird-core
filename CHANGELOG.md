@@ -6,6 +6,40 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING (FFI + schema): several questions can be active at once, and a question's notes are
+  explicit attachments (SUR-1101).** The founder retired the single-active model and the automatic
+  date window (2026-09-18). A note now belongs to a question only because someone attached it, and
+  a note can belong to several.
+  - **`question_note_overrides` is replaced by `question_notes`** — the same deterministic
+    `question_id:note_id` row with `kind` gone, because a row IS an attachment. surfc migration
+    0058 renames the cloud table in place and materialises every question's then-current note set
+    (`(window ∪ includes) − excludes`) as rows, so no count changes. The native-schema registry,
+    manifest (`live`, SUR-1101), push arms and parity test move with it.
+  - **Existing stores are converted on open.** `Store::convert_question_note_overrides` runs the
+    retired rule once, in SQL, over this device's rows — including curation it never flushed —
+    stages a `question_notes` row per pair, then drops the old table, its queued outbox rows
+    (which the flush could never dispatch again) and its pull bookkeeping, in one transaction. The
+    table's absence is the run-once flag. Same rule and same ids as 0058, so device and server rows
+    converge as one row per pair.
+  - `enqueue_question_note_override(QuestionNoteOverride)` → `enqueue_question_note(QuestionNote {
+    question_id, note_id, deleted })`, keeping the re-attach resurrect fork. `question_notes(id)`
+    and `list_questions()` lose `now_ms`: both read one `attachments` definition, so the Lexicon
+    count and the detail list still agree by construction.
+  - **The check-in covers every active question in one pass, on the one global cadence.**
+    `PromptEvent` loses `question_id`; the CheckIn is due one cadence after `prompt::checkin_anchor`
+    — the latest pass (`checkin_last_at`, a new synced setting) or legacy per-question
+    `checkin_at`, bounded to [oldest active birth, now]. `skip_checkin(question_id, now_ms)` →
+    `complete_checkin(now_ms)`, one call per pass.
+  - New: `unattached_since_last_checkin(now_ms)` — the check-in's backstop section, notes since the
+    anchor that no live question holds; gated on the prompt pull receipts, which now include
+    `question_notes`. `question_nudge_due(now_ms)` / `dismiss_question_nudge(now_ms)` — the
+    too-many-questions nudge at the 9th active question, silent for 28 days after a dismissal
+    (`question_nudge_dismissed_at`).
+  - **Rollout (founder, 2026-09-23):** 0058 drops the old table name, and one 404 aborts a flush, so
+    an install on ≤ v0.16.0 stops syncing once 0058 reaches its environment. Production is applied
+    together with the app pin of the release carrying this (SUR-1104).
+
 ## [0.16.0] - 2026-08-20
 
 ### Added

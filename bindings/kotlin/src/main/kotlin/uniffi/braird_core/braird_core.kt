@@ -912,6 +912,12 @@ internal open class UniffiVTableCallbackInterfaceEmbedder(
 
 
 
+
+
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -954,8 +960,12 @@ internal interface UniffiLib : Library {
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_collection_note_counts(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_complete_checkin(`ptr`: Pointer,`nowMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_braird_core_fn_method_syncengine_counts(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_dismiss_question_nudge(`ptr`: Pointer,`nowMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_braird_core_fn_method_syncengine_embed_pending(`ptr`: Pointer,`maxItems`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_enqueue_book(`ptr`: Pointer,`draft`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -976,7 +986,7 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_enqueue_question(`ptr`: Pointer,`draft`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-    fun uniffi_braird_core_fn_method_syncengine_enqueue_question_note_override(`ptr`: Pointer,`draft`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_braird_core_fn_method_syncengine_enqueue_question_note(`ptr`: Pointer,`draft`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_export_snapshot(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1002,7 +1012,7 @@ internal interface UniffiLib : Library {
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_list_notes(`ptr`: Pointer,`bookId`: RustBuffer.ByValue,`limit`: Int,`offset`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    fun uniffi_braird_core_fn_method_syncengine_list_questions(`ptr`: Pointer,`nowMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_braird_core_fn_method_syncengine_list_questions(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_merge_books(`ptr`: Pointer,`survivorId`: RustBuffer.ByValue,`loserIds`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1024,8 +1034,10 @@ internal interface UniffiLib : Library {
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_pull(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    fun uniffi_braird_core_fn_method_syncengine_question_notes(`ptr`: Pointer,`questionId`: RustBuffer.ByValue,`nowMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_braird_core_fn_method_syncengine_question_notes(`ptr`: Pointer,`questionId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_question_nudge_due(`ptr`: Pointer,`nowMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
     fun uniffi_braird_core_fn_method_syncengine_ranked_search(`ptr`: Pointer,`query`: RustBuffer.ByValue,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_recent_note(`ptr`: Pointer,`nowMs`: Long,`seed`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -1050,13 +1062,13 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_similar_notes(`ptr`: Pointer,`noteId`: RustBuffer.ByValue,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    fun uniffi_braird_core_fn_method_syncengine_skip_checkin(`ptr`: Pointer,`questionId`: RustBuffer.ByValue,`nowMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
     fun uniffi_braird_core_fn_method_syncengine_skip_prompt(`ptr`: Pointer,`nowMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_soft_delete_signals_for_note(`ptr`: Pointer,`noteId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_sync(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_unattached_since_last_checkin(`ptr`: Pointer,`nowMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_unmerge_books(`ptr`: Pointer,`undo`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -1218,7 +1230,11 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_collection_note_counts(
     ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_complete_checkin(
+    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_counts(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_dismiss_question_nudge(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_embed_pending(
     ): Short
@@ -1240,7 +1256,7 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_enqueue_question(
     ): Short
-    fun uniffi_braird_core_checksum_method_syncengine_enqueue_question_note_override(
+    fun uniffi_braird_core_checksum_method_syncengine_enqueue_question_note(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_export_snapshot(
     ): Short
@@ -1290,6 +1306,8 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_question_notes(
     ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_question_nudge_due(
+    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_ranked_search(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_recent_note(
@@ -1314,13 +1332,13 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_similar_notes(
     ): Short
-    fun uniffi_braird_core_checksum_method_syncengine_skip_checkin(
-    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_skip_prompt(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_soft_delete_signals_for_note(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_sync(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_unattached_since_last_checkin(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_unmerge_books(
     ): Short
@@ -1389,7 +1407,13 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_collection_note_counts() != 26206.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_complete_checkin() != 4115.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_braird_core_checksum_method_syncengine_counts() != 34830.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_dismiss_question_nudge() != 42537.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_embed_pending() != 57921.toShort()) {
@@ -1419,10 +1443,10 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note_signals() != 65282.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_question() != 36841.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_question() != 31774.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_question_note_override() != 50313.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_question_note() != 27049.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_export_snapshot() != 42276.toShort()) {
@@ -1461,7 +1485,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_list_notes() != 26133.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_list_questions() != 33394.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_list_questions() != 21954.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_merge_books() != 55148.toShort()) {
@@ -1494,7 +1518,10 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_pull() != 8960.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_question_notes() != 6988.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_question_notes() != 50321.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_question_nudge_due() != 22080.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_ranked_search() != 46931.toShort()) {
@@ -1533,9 +1560,6 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_similar_notes() != 52094.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_skip_checkin() != 64973.toShort()) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
     if (lib.uniffi_braird_core_checksum_method_syncengine_skip_prompt() != 15062.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1543,6 +1567,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_sync() != 38790.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_unattached_since_last_checkin() != 51270.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_unmerge_books() != 15809.toShort()) {
@@ -2459,10 +2486,31 @@ public interface SyncEngineInterface {
     fun `collectionNoteCounts`(): List<CollectionNoteCount>
     
     /**
+     * Record that a check-in pass happened (SUR-1101) — whether the user answered every question,
+     * some, or skipped the lot. The next check-in is due one cadence from `now_ms`.
+     *
+     * One call per PASS, not per question: a check-in covers every active question at once, so the
+     * timer is the pass's, stored as the synced [`prompt::CHECKIN_LAST_AT_KEY`]. Per-question
+     * answers still go through [`SyncEngine::enqueue_question`] (`checkin_response`, `status`, and
+     * the question's own `checkin_at`); this replaces `skip_checkin`, which could only stamp one
+     * question. Skipping is still never punished and never visibly counted — nothing records that a
+     * pass answered nothing (founder, 2026-08-19).
+     *
+     * `now_ms` is host-supplied, for the [`SyncEngine::skip_prompt`] reason.
+     */
+    fun `completeCheckin`(`nowMs`: kotlin.Long)
+    
+    /**
      * Live (non-deleted) row totals for books / notes / custom ideas, plus `active_ideas` — the
      * count of distinct idea tags on live notes (the Home stat row, SUR-806).
      */
     fun `counts`(): StoreCounts
+    
+    /**
+     * Record that the user dismissed the too-many-questions nudge (SUR-1101). Synced, so the
+     * dismissal silences every device for the quiet period.
+     */
+    fun `dismissQuestionNudge`(`nowMs`: kotlin.Long)
     
     /**
      * Drain up to `max_items` of the derived embed queue (SUR-997 item 5): per note —
@@ -2640,21 +2688,24 @@ public interface SyncEngineInterface {
      * last-write-wins, so a dismiss on one device and a check-in on another inside the same window
      * resolve to whichever `updated_at` is larger — the loser's field is discarded, not merged. The
      * alternative (a check-in satellite row, the `note_signals`/migration-0047 precedent) was
-     * considered and rejected: v1 has ONE live question and both flows are user-initiated seconds
-     * apart at worst. Documented rather than engineered around, and pinned by a test so it stays a
-     * decision instead of becoming a discovery.
+     * considered and rejected: both flows are user-initiated seconds apart at worst, and the stake
+     * is PER QUESTION — SUR-1101 allowing several active questions multiplies the rows, not the
+     * chance that two devices edit the same one at the same moment. Documented rather than
+     * engineered around, and pinned by a test so it stays a decision instead of becoming a
+     * discovery.
      */
     fun `enqueueQuestion`(`draft`: QuestionUpsert)
     
     /**
-     * Enqueue a question↔note curation override (SUR-1042), keyed by the DETERMINISTIC
-     * `question_id:note_id` ([`crate::store::override_id`]).
+     * Attach a note to a question, or detach it (SUR-1101), keyed by the DETERMINISTIC
+     * `question_id:note_id` ([`crate::store::question_note_id`]). Attaching an already-attached
+     * pair is harmless: it is the same row.
      *
      * THE RE-ADD FORK, and why it is not optional. A deterministic pk makes
-     * `include → remove → include` inside ONE un-flushed batch collapse onto a single outbox key,
+     * `attach → detach → attach` inside ONE un-flushed batch collapse onto a single outbox key,
      * and the collapse makes `deleted` **sticky** across the group (SUR-724, "within a batch,
      * delete wins"). So the re-add would flush as a tombstone: the local mirror reads correctly —
-     * the note still shows pinned — while push sends a delete, every other device drops it, and the
+     * the note still shows attached — while push sends a delete, every other device drops it, and the
      * next pull LWW-overwrites the local copy. A silent lost write whose local read masks it. This
      * is the [`SyncEngine::enqueue_collection_membership`] class (SUR-940), and `store.rs`'s
      * descriptor doc names this table as the case to extend the split for.
@@ -2670,7 +2721,7 @@ public interface SyncEngineInterface {
      * re-add stage `deleted: false` between the lookup and the stage, with this tombstone landing
      * after it and collapsing sticky-deleted — the same loss re-opened as a race.
      */
-    fun `enqueueQuestionNoteOverride`(`draft`: QuestionNoteOverride)
+    fun `enqueueQuestionNote`(`draft`: QuestionNote)
     
     /**
      * Export a plaintext, PWA-compatible snapshot of every live synced row. Note ciphertext is
@@ -2751,19 +2802,18 @@ public interface SyncEngineInterface {
     
     /**
      * The SUR-996 question log — every live question, **active first** then newest-first, each
-     * with the size of its effective note set (SUR-1071). Decrypted in core. This is the Lexicon
-     * Questions section; there is no separate log view.
+     * with the number of notes attached to it (SUR-1071, SUR-1101). Decrypted in core. This is the
+     * Lexicon Questions section; there is no separate log view. It is also the list of questions a
+     * check-in covers: every entry whose status is active.
      *
-     * `note_count` equals `question_notes(id, now_ms).len()` by construction — the same predicate
-     * produces both — so a row's subtitle can never disagree with the detail page it opens.
-     * `now_ms` closes the window of a question that has no `resolved_at`; the host supplies it so
-     * this stays a pure function of its inputs, exactly as [`Self::question_notes`] does. Pass the
-     * same `now_ms` to both if you render them together.
+     * `note_count` equals `question_notes(id).len()` by construction — one definition of
+     * "attached" produces both — so a row's subtitle can never disagree with the detail page it
+     * opens.
      *
      * Unpaginated on purpose: active-first ordering has to be applied before any page is cut, and
      * the log grows by about one row per cadence period.
      */
-    fun `listQuestions`(`nowMs`: kotlin.Long): List<QuestionLogEntry>
+    fun `listQuestions`(): List<QuestionLogEntry>
     
     /**
      * Merge duplicate source books into `survivor_id` (SUR-915): rehome the losers' notes, keep the
@@ -2870,12 +2920,21 @@ public interface SyncEngineInterface {
     fun `pull`(): PullSummary
     
     /**
-     * The effective note set of one question — `(auto ∪ includes) − excludes`, newest-first
-     * (SUR-1042). `now_ms` closes the active window of a question that has no `resolved_at`; the
-     * host supplies it so this stays a pure function of its inputs (see [`read::question_notes`]).
+     * The notes attached to one question, newest-first (SUR-1101 — explicit attachments only).
      * An absent or soft-deleted question yields an empty set, never an error.
      */
-    fun `questionNotes`(`questionId`: kotlin.String, `nowMs`: kotlin.Long): List<NoteRecord>
+    fun `questionNotes`(`questionId`: kotlin.String): List<NoteRecord>
+    
+    /**
+     * Whether to show the too-many-questions nudge now (SUR-1101): more than eight active
+     * questions and no dismissal in the last four weeks. Independent of the check-in cadence, so it
+     * is a separate call rather than a [`PromptEvent`]; re-run it whenever the question log changes.
+     *
+     * `false` before the prompt tables have been pulled (the [`SyncEngine::next_prompt_events`]
+     * gate): an unpulled count reads low, and an unpulled dismissal would re-show a nudge the user
+     * dismissed on another device — not showing a dismissable nudge is the safe side of that.
+     */
+    fun `questionNudgeDue`(`nowMs`: kotlin.Long): kotlin.Boolean
     
     /**
      * Hybrid ranked search (SUR-1019, ADR 0007 — the SUR-157 query path): ONE ranked
@@ -3132,21 +3191,6 @@ public interface SyncEngineInterface {
     fun `similarNotes`(`noteId`: kotlin.String, `limit`: kotlin.UInt): List<SemanticHit>
     
     /**
-     * Record a skipped check-in (SUR-996 R3) — the timer resets, nothing else changes.
-     *
-     * A metadata-only patch of `checkin_at` alone: `plaintext: None` makes no Vault call and
-     * [`insert_opt`] omits every other `None`, so the ciphertext, the status, and the previous
-     * `checkin_response` all survive byte-for-byte. Skipping is never punished and never visibly
-     * counted, so nothing records that this WAS a skip — "still open" and "skip" reset the timer
-     * identically, and the stored vocabulary was deliberately not extended to tell them apart
-     * (founder, 2026-08-19).
-     *
-     * Inherits [`SyncError::PatchTargetMissing`] for an id that has no live row, from the same
-     * precondition [`SyncEngine::enqueue_question`] enforces.
-     */
-    fun `skipCheckin`(`questionId`: kotlin.String, `nowMs`: kotlin.Long)
-    
-    /**
      * Record that the user dismissed a prompt without answering it (SUR-996 R2).
      *
      * Hosts MUST call this when the sheet is dismissed unanswered, not only when Skip is tapped:
@@ -3203,6 +3247,21 @@ public interface SyncEngineInterface {
      * SERVER row before this pull could see it is the server's job, PR-3.)
      */
     fun `sync`(): SyncSummary
+    
+    /**
+     * The check-in's backstop section (SUR-1101): live notes captured since the current check-in
+     * period began that are attached to no live question — including every note whose "attach to
+     * an open question?" sheet was dismissed. Newest-first, decrypted in core.
+     *
+     * The period starts at [`prompt::checkin_anchor`], the same instant the pending CheckIn event is
+     * scheduled from, so the section covers exactly the period that check-in closes. No active
+     * question → `Some(empty)`: there is no check-in for the section to belong to.
+     *
+     * `None` means core cannot tell yet, exactly as for [`SyncEngine::next_prompt_events`] — the
+     * same pull receipts gate both, because before `question_notes` has been pulled every note
+     * would read as unattached.
+     */
+    fun `unattachedSinceLastCheckin`(`nowMs`: kotlin.Long): List<NoteRecord>?
     
     /**
      * Reverse a `merge_books` within the host's undo window (SUR-915). Idempotent.
@@ -3349,6 +3408,31 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
 
     
     /**
+     * Record that a check-in pass happened (SUR-1101) — whether the user answered every question,
+     * some, or skipped the lot. The next check-in is due one cadence from `now_ms`.
+     *
+     * One call per PASS, not per question: a check-in covers every active question at once, so the
+     * timer is the pass's, stored as the synced [`prompt::CHECKIN_LAST_AT_KEY`]. Per-question
+     * answers still go through [`SyncEngine::enqueue_question`] (`checkin_response`, `status`, and
+     * the question's own `checkin_at`); this replaces `skip_checkin`, which could only stamp one
+     * question. Skipping is still never punished and never visibly counted — nothing records that a
+     * pass answered nothing (founder, 2026-08-19).
+     *
+     * `now_ms` is host-supplied, for the [`SyncEngine::skip_prompt`] reason.
+     */
+    @Throws(SyncException::class)override fun `completeCheckin`(`nowMs`: kotlin.Long)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_complete_checkin(
+        it, FfiConverterLong.lower(`nowMs`),_status)
+}
+    }
+    
+    
+
+    
+    /**
      * Live (non-deleted) row totals for books / notes / custom ideas, plus `active_ideas` — the
      * count of distinct idea tags on live notes (the Home stat row, SUR-806).
      */
@@ -3362,6 +3446,22 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     }
     )
     }
+    
+
+    
+    /**
+     * Record that the user dismissed the too-many-questions nudge (SUR-1101). Synced, so the
+     * dismissal silences every device for the quiet period.
+     */
+    @Throws(SyncException::class)override fun `dismissQuestionNudge`(`nowMs`: kotlin.Long)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_dismiss_question_nudge(
+        it, FfiConverterLong.lower(`nowMs`),_status)
+}
+    }
+    
     
 
     
@@ -3632,9 +3732,11 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * last-write-wins, so a dismiss on one device and a check-in on another inside the same window
      * resolve to whichever `updated_at` is larger — the loser's field is discarded, not merged. The
      * alternative (a check-in satellite row, the `note_signals`/migration-0047 precedent) was
-     * considered and rejected: v1 has ONE live question and both flows are user-initiated seconds
-     * apart at worst. Documented rather than engineered around, and pinned by a test so it stays a
-     * decision instead of becoming a discovery.
+     * considered and rejected: both flows are user-initiated seconds apart at worst, and the stake
+     * is PER QUESTION — SUR-1101 allowing several active questions multiplies the rows, not the
+     * chance that two devices edit the same one at the same moment. Documented rather than
+     * engineered around, and pinned by a test so it stays a decision instead of becoming a
+     * discovery.
      */
     @Throws(SyncException::class)override fun `enqueueQuestion`(`draft`: QuestionUpsert)
         = 
@@ -3649,14 +3751,15 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
 
     
     /**
-     * Enqueue a question↔note curation override (SUR-1042), keyed by the DETERMINISTIC
-     * `question_id:note_id` ([`crate::store::override_id`]).
+     * Attach a note to a question, or detach it (SUR-1101), keyed by the DETERMINISTIC
+     * `question_id:note_id` ([`crate::store::question_note_id`]). Attaching an already-attached
+     * pair is harmless: it is the same row.
      *
      * THE RE-ADD FORK, and why it is not optional. A deterministic pk makes
-     * `include → remove → include` inside ONE un-flushed batch collapse onto a single outbox key,
+     * `attach → detach → attach` inside ONE un-flushed batch collapse onto a single outbox key,
      * and the collapse makes `deleted` **sticky** across the group (SUR-724, "within a batch,
      * delete wins"). So the re-add would flush as a tombstone: the local mirror reads correctly —
-     * the note still shows pinned — while push sends a delete, every other device drops it, and the
+     * the note still shows attached — while push sends a delete, every other device drops it, and the
      * next pull LWW-overwrites the local copy. A silent lost write whose local read masks it. This
      * is the [`SyncEngine::enqueue_collection_membership`] class (SUR-940), and `store.rs`'s
      * descriptor doc names this table as the case to extend the split for.
@@ -3672,12 +3775,12 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * re-add stage `deleted: false` between the lookup and the stage, with this tombstone landing
      * after it and collapsing sticky-deleted — the same loss re-opened as a race.
      */
-    @Throws(SyncException::class)override fun `enqueueQuestionNoteOverride`(`draft`: QuestionNoteOverride)
+    @Throws(SyncException::class)override fun `enqueueQuestionNote`(`draft`: QuestionNote)
         = 
     callWithPointer {
     uniffiRustCallWithError(SyncException) { _status ->
-    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_enqueue_question_note_override(
-        it, FfiConverterTypeQuestionNoteOverride.lower(`draft`),_status)
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_enqueue_question_note(
+        it, FfiConverterTypeQuestionNote.lower(`draft`),_status)
 }
     }
     
@@ -3895,24 +3998,23 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     
     /**
      * The SUR-996 question log — every live question, **active first** then newest-first, each
-     * with the size of its effective note set (SUR-1071). Decrypted in core. This is the Lexicon
-     * Questions section; there is no separate log view.
+     * with the number of notes attached to it (SUR-1071, SUR-1101). Decrypted in core. This is the
+     * Lexicon Questions section; there is no separate log view. It is also the list of questions a
+     * check-in covers: every entry whose status is active.
      *
-     * `note_count` equals `question_notes(id, now_ms).len()` by construction — the same predicate
-     * produces both — so a row's subtitle can never disagree with the detail page it opens.
-     * `now_ms` closes the window of a question that has no `resolved_at`; the host supplies it so
-     * this stays a pure function of its inputs, exactly as [`Self::question_notes`] does. Pass the
-     * same `now_ms` to both if you render them together.
+     * `note_count` equals `question_notes(id).len()` by construction — one definition of
+     * "attached" produces both — so a row's subtitle can never disagree with the detail page it
+     * opens.
      *
      * Unpaginated on purpose: active-first ordering has to be applied before any page is cut, and
      * the log grows by about one row per cadence period.
      */
-    @Throws(SyncException::class)override fun `listQuestions`(`nowMs`: kotlin.Long): List<QuestionLogEntry> {
+    @Throws(SyncException::class)override fun `listQuestions`(): List<QuestionLogEntry> {
             return FfiConverterSequenceTypeQuestionLogEntry.lift(
     callWithPointer {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_list_questions(
-        it, FfiConverterLong.lower(`nowMs`),_status)
+        it, _status)
 }
     }
     )
@@ -4135,17 +4237,37 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
 
     
     /**
-     * The effective note set of one question — `(auto ∪ includes) − excludes`, newest-first
-     * (SUR-1042). `now_ms` closes the active window of a question that has no `resolved_at`; the
-     * host supplies it so this stays a pure function of its inputs (see [`read::question_notes`]).
+     * The notes attached to one question, newest-first (SUR-1101 — explicit attachments only).
      * An absent or soft-deleted question yields an empty set, never an error.
      */
-    @Throws(SyncException::class)override fun `questionNotes`(`questionId`: kotlin.String, `nowMs`: kotlin.Long): List<NoteRecord> {
+    @Throws(SyncException::class)override fun `questionNotes`(`questionId`: kotlin.String): List<NoteRecord> {
             return FfiConverterSequenceTypeNoteRecord.lift(
     callWithPointer {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_question_notes(
-        it, FfiConverterString.lower(`questionId`),FfiConverterLong.lower(`nowMs`),_status)
+        it, FfiConverterString.lower(`questionId`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Whether to show the too-many-questions nudge now (SUR-1101): more than eight active
+     * questions and no dismissal in the last four weeks. Independent of the check-in cadence, so it
+     * is a separate call rather than a [`PromptEvent`]; re-run it whenever the question log changes.
+     *
+     * `false` before the prompt tables have been pulled (the [`SyncEngine::next_prompt_events`]
+     * gate): an unpulled count reads low, and an unpulled dismissal would re-show a nudge the user
+     * dismissed on another device — not showing a dismissable nudge is the safe side of that.
+     */
+    @Throws(SyncException::class)override fun `questionNudgeDue`(`nowMs`: kotlin.Long): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_question_nudge_due(
+        it, FfiConverterLong.lower(`nowMs`),_status)
 }
     }
     )
@@ -4535,31 +4657,6 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
 
     
     /**
-     * Record a skipped check-in (SUR-996 R3) — the timer resets, nothing else changes.
-     *
-     * A metadata-only patch of `checkin_at` alone: `plaintext: None` makes no Vault call and
-     * [`insert_opt`] omits every other `None`, so the ciphertext, the status, and the previous
-     * `checkin_response` all survive byte-for-byte. Skipping is never punished and never visibly
-     * counted, so nothing records that this WAS a skip — "still open" and "skip" reset the timer
-     * identically, and the stored vocabulary was deliberately not extended to tell them apart
-     * (founder, 2026-08-19).
-     *
-     * Inherits [`SyncError::PatchTargetMissing`] for an id that has no live row, from the same
-     * precondition [`SyncEngine::enqueue_question`] enforces.
-     */
-    @Throws(SyncException::class)override fun `skipCheckin`(`questionId`: kotlin.String, `nowMs`: kotlin.Long)
-        = 
-    callWithPointer {
-    uniffiRustCallWithError(SyncException) { _status ->
-    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_skip_checkin(
-        it, FfiConverterString.lower(`questionId`),FfiConverterLong.lower(`nowMs`),_status)
-}
-    }
-    
-    
-
-    
-    /**
      * Record that the user dismissed a prompt without answering it (SUR-996 R2).
      *
      * Hosts MUST call this when the sheet is dismissed unanswered, not only when Skip is tapped:
@@ -4641,6 +4738,32 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_sync(
         it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * The check-in's backstop section (SUR-1101): live notes captured since the current check-in
+     * period began that are attached to no live question — including every note whose "attach to
+     * an open question?" sheet was dismissed. Newest-first, decrypted in core.
+     *
+     * The period starts at [`prompt::checkin_anchor`], the same instant the pending CheckIn event is
+     * scheduled from, so the section covers exactly the period that check-in closes. No active
+     * question → `Some(empty)`: there is no check-in for the section to belong to.
+     *
+     * `None` means core cannot tell yet, exactly as for [`SyncEngine::next_prompt_events`] — the
+     * same pull receipts gate both, because before `question_notes` has been pulled every note
+     * would read as unattached.
+     */
+    @Throws(SyncException::class)override fun `unattachedSinceLastCheckin`(`nowMs`: kotlin.Long): List<NoteRecord>? {
+            return FfiConverterOptionalSequenceTypeNoteRecord.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_unattached_since_last_checkin(
+        it, FfiConverterLong.lower(`nowMs`),_status)
 }
     }
     )
@@ -6235,17 +6358,14 @@ public object FfiConverterTypeNoteUpsert: FfiConverterRustBuffer<NoteUpsert> {
  * reaches a lock screen — SUR-996 R5). It rides on every event anyway because a non-optional
  * field is simpler across three binding languages than an `Option` two of three kinds ignore.
  *
- * `question_id` names the question a `CheckIn` is ABOUT, and is `None` for the other two kinds
- * (neither has a question yet). Carried rather than left for the client to work out: the machine
- * already picked which question wins when several are momentarily active, and a client re-deriving
- * that pick is exactly the cross-platform drift this module exists to prevent. It is the id the
- * host passes back to [`crate::sync::SyncEngine::skip_checkin`] or `enqueue_question`.
+ * No question id. Until SUR-1101 a `CheckIn` named the one question it was about; a check-in now
+ * covers every active question, so the host lists them from `list_questions` (active first) and
+ * records the pass with [`crate::sync::SyncEngine::complete_checkin`].
  */
 data class PromptEvent (
     var `kind`: PromptEventKind, 
     var `dueAt`: kotlin.Long, 
-    var `tone`: PromptTone, 
-    var `questionId`: kotlin.String?
+    var `tone`: PromptTone
 ) {
     
     companion object
@@ -6260,22 +6380,19 @@ public object FfiConverterTypePromptEvent: FfiConverterRustBuffer<PromptEvent> {
             FfiConverterTypePromptEventKind.read(buf),
             FfiConverterLong.read(buf),
             FfiConverterTypePromptTone.read(buf),
-            FfiConverterOptionalString.read(buf),
         )
     }
 
     override fun allocationSize(value: PromptEvent) = (
             FfiConverterTypePromptEventKind.allocationSize(value.`kind`) +
             FfiConverterLong.allocationSize(value.`dueAt`) +
-            FfiConverterTypePromptTone.allocationSize(value.`tone`) +
-            FfiConverterOptionalString.allocationSize(value.`questionId`)
+            FfiConverterTypePromptTone.allocationSize(value.`tone`)
     )
 
     override fun write(value: PromptEvent, buf: ByteBuffer) {
             FfiConverterTypePromptEventKind.write(value.`kind`, buf)
             FfiConverterLong.write(value.`dueAt`, buf)
             FfiConverterTypePromptTone.write(value.`tone`, buf)
-            FfiConverterOptionalString.write(value.`questionId`, buf)
     }
 }
 
@@ -6369,15 +6486,14 @@ public object FfiConverterTypePullSummary: FfiConverterRustBuffer<PullSummary> {
 
 
 /**
- * One row of the Lexicon Questions section (SUR-1071) — a question plus the size of its effective
- * note set, shaped like [`CollectionNoteCount`] but carrying its subject rather than pointing at it
- * (the section renders both together, and a host that had to zip two lists would also have to
- * re-derive the ordering).
+ * One row of the Lexicon Questions section (SUR-1071) — a question plus the number of notes
+ * attached to it, shaped like [`CollectionNoteCount`] but carrying its subject rather than pointing
+ * at it (the section renders both together, and a host that had to zip two lists would also have
+ * to re-derive the ordering).
  *
- * `note_count` is `question_notes(id, now_ms).len()` **by construction** — both are
- * [`in_effective_set`] over the same rows — so the subtitle can never disagree with the detail page
- * it opens. It is a function of `now_ms`: an active question's window runs to the caller's clock,
- * so its count grows; a resolved one is frozen at `resolved_at`.
+ * `note_count` is `question_notes(id).len()` **by construction** — both read [`attachments`] — so
+ * the subtitle can never disagree with the detail page it opens. Since SUR-1101 it changes only
+ * when a note is attached, detached or deleted; there is no window running to the caller's clock.
  *
  * No date-range field. `question.created_at`, `question.resolved_at` and `question.status` already
  * carry it, and only the host knows how to render "12 Jul – now" in the user's locale.
@@ -6415,31 +6531,24 @@ public object FfiConverterTypeQuestionLogEntry: FfiConverterRustBuffer<QuestionL
 
 
 /**
- * One question↔note curation override (SUR-996 R1) — the user pinning a note onto a question, or
- * excluding one the active-window join offered.
+ * One question↔note attachment (SUR-1101) — the user attaching a note to a question, explicitly.
+ * A note may belong to any number of questions; there is no automatic attachment by date.
  *
  * Plaintext id pair, the same trade-off as `collection_memberships`: the question's *text* is
  * sealed, the fact that it relates to a note is not. Its row id is **derived**, not carried —
- * [`crate::store::override_id`] makes it `question_id:note_id` so two devices curating the same
- * pair converge on one row.
+ * [`crate::store::question_note_id`] makes it `question_id:note_id` so two devices attaching the
+ * same pair converge on one row.
  *
- * A record by API shape rather than arm64 necessity (four fields is nowhere near the 8-slot limit
- * the SUR-843 guard enforces): the pair + kind is one concept, and passing it as one argument
- * keeps the call site readable and the field names on the wire. Deliberately NOT named
- * `QuestionNoteOverrideUpsert` — there is no `…Record` read model to pair against, because the
- * effective note set is exposed as notes ([`SyncEngine::question_notes`]), never as raw override
- * rows. The ticket specifies this name.
+ * A record by API shape rather than arm64 necessity (three fields is nowhere near the 8-slot limit
+ * the SUR-843 guard enforces): the pair is one concept, and passing it as one argument keeps the
+ * call site readable and the field names on the wire. Named for the table, like the attachments it
+ * writes; the read side is notes ([`SyncEngine::question_notes`]), never raw attachment rows.
  */
-data class QuestionNoteOverride (
+data class QuestionNote (
     var `questionId`: kotlin.String, 
     var `noteId`: kotlin.String, 
     /**
-     * `include` (pin a note the window missed) or `exclude` (drop one it offered). Not validated
-     * here — same forward-extensible-vocabulary reasoning as [`QuestionUpsert::status`].
-     */
-    var `kind`: kotlin.String, 
-    /**
-     * Soft-delete the override, returning the pair to whatever the active-window join says.
+     * Detach the note (soft-delete the attachment). `false` attaches, or re-attaches.
      */
     var `deleted`: kotlin.Boolean
 ) {
@@ -6450,27 +6559,24 @@ data class QuestionNoteOverride (
 /**
  * @suppress
  */
-public object FfiConverterTypeQuestionNoteOverride: FfiConverterRustBuffer<QuestionNoteOverride> {
-    override fun read(buf: ByteBuffer): QuestionNoteOverride {
-        return QuestionNoteOverride(
-            FfiConverterString.read(buf),
+public object FfiConverterTypeQuestionNote: FfiConverterRustBuffer<QuestionNote> {
+    override fun read(buf: ByteBuffer): QuestionNote {
+        return QuestionNote(
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
         )
     }
 
-    override fun allocationSize(value: QuestionNoteOverride) = (
+    override fun allocationSize(value: QuestionNote) = (
             FfiConverterString.allocationSize(value.`questionId`) +
             FfiConverterString.allocationSize(value.`noteId`) +
-            FfiConverterString.allocationSize(value.`kind`) +
             FfiConverterBoolean.allocationSize(value.`deleted`)
     )
 
-    override fun write(value: QuestionNoteOverride, buf: ByteBuffer) {
+    override fun write(value: QuestionNote, buf: ByteBuffer) {
             FfiConverterString.write(value.`questionId`, buf)
             FfiConverterString.write(value.`noteId`, buf)
-            FfiConverterString.write(value.`kind`, buf)
             FfiConverterBoolean.write(value.`deleted`, buf)
     }
 }
@@ -6489,8 +6595,8 @@ public object FfiConverterTypeQuestionNoteOverride: FfiConverterRustBuffer<Quest
  * CHECK, so a row written by a newer client must not panic an older read.
  *
  * Deliberately NO note count or active-date-range field — those are Lexicon presentation shapes.
- * The count rides on [`QuestionLogEntry`] (SUR-1071), because it is a function of `now`; the range
- * needs no field at all, since `created_at` + `resolved_at` + `status` already say it.
+ * The count rides on [`QuestionLogEntry`] (SUR-1071); the range needs no field at all, since
+ * `created_at` + `resolved_at` + `status` already say it.
  */
 data class QuestionRecord (
     var `id`: kotlin.String, 
@@ -7352,7 +7458,7 @@ public object FfiConverterTypeNoteSignalKind: FfiConverterRustBuffer<NoteSignalK
 /**
  * What a due prompt is. `Initial` asks for a question (and doubles as the tone picker on first
  * use), `Nudge` is the one-and-only reminder for an unanswered initial prompt, `CheckIn` revisits
- * the live question at cadence.
+ * EVERY active question in one pass at cadence (SUR-1101).
  */
 
 enum class PromptEventKind {
@@ -7838,6 +7944,38 @@ public object FfiConverterOptionalTypeQuestionRecord: FfiConverterRustBuffer<Que
         } else {
             buf.put(1)
             FfiConverterTypeQuestionRecord.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalSequenceTypeNoteRecord: FfiConverterRustBuffer<List<NoteRecord>?> {
+    override fun read(buf: ByteBuffer): List<NoteRecord>? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterSequenceTypeNoteRecord.read(buf)
+    }
+
+    override fun allocationSize(value: List<NoteRecord>?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterSequenceTypeNoteRecord.allocationSize(value)
+        }
+    }
+
+    override fun write(value: List<NoteRecord>?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterSequenceTypeNoteRecord.write(value, buf)
         }
     }
 }

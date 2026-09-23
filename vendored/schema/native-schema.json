@@ -1,9 +1,8 @@
 {
-  "question_note_overrides": {
+  "question_notes": {
     "created_at": "int",
     "deleted": "bool",
     "id": "text",
-    "kind": "text",
     "note_id": "text",
     "question_id": "text",
     "updated_at": "int"

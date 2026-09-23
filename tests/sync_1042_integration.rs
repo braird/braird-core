@@ -1,23 +1,23 @@
-//! SUR-1042 integration: the question entity's two acceptance criteria, end to end on the
-//! two-engine fixture (`tests/common`) — **"encrypted round-trip identical on both platforms"** and
-//! **"effective note set converges across devices"**.
+//! SUR-1042 integration: the question entity's acceptance criteria, end to end on the two-engine
+//! fixture (`tests/common`) — **"encrypted round-trip identical on both platforms"** and **"a
+//! question's notes converge across devices"** (explicit attachments since SUR-1101).
 //!
 //! Both are convergence claims, and neither is provable from a single engine. A one-device test
-//! shows a seal round-tripping through its own vault, which proves nothing about the wire; and the
-//! effective set is a *derivation over synced rows*, so "it converges" is a statement about what two
-//! devices compute after exchanging override rows, not about the derivation in isolation.
+//! shows a seal round-tripping through its own vault, which proves nothing about the wire; and a
+//! question's notes are read over synced rows, so "they converge" is a statement about what two
+//! devices compute after exchanging attachment rows, not about the read in isolation.
 //!
 //! What this pins that the unit tests cannot:
 //!   (1) a question sealed on A crosses the cloud as `enc:v2` ciphertext and decrypts to the same
 //!       plaintext on B — the server holding a blob it cannot read is the whole E2EE claim;
-//!   (2) contradictory curation of the SAME (question, note) pair on two devices converges to ONE
-//!       row by whole-row LWW, not two rows — the deterministic-pk OR-set property;
-//!   (3) the effective note set is then IDENTICAL on both devices.
+//!   (2) an attach on one device and a detach of the SAME (question, note) pair on the other
+//!       converge to ONE row by whole-row LWW, not two rows — the deterministic-pk OR-set property;
+//!   (3) a question's notes and the log's counts are then IDENTICAL on both devices.
 //!
-//! Deliberately NOT here: the `fk_deps` hold-back that stops an override reaching the cloud before
-//! its endpoints (surfc 0055's RLS `WITH CHECK` would reject it as `42501`). That is pinned twice at
-//! unit level — `flush_dispatches_all_eight_tables_in_topological_order` and
-//! `an_override_is_held_back_when_its_question_fails` — and asserting it here would have meant
+//! Deliberately NOT here: the `fk_deps` hold-back that stops an attachment reaching the cloud
+//! before its endpoints (surfc 0055's RLS `WITH CHECK` would reject it as `42501`). That is pinned
+//! twice at unit level — `flush_dispatches_all_eight_tables_in_topological_order` and
+//! `an_attachment_is_held_back_when_its_question_fails` — and asserting it here would have meant
 //! adding a `change_seq` accessor to the shared fixture to re-prove a settled property.
 //!
 //! OFFLINE + deterministic (no Supabase, no env guard, NOT `#[ignore]`d), like
@@ -27,13 +27,13 @@
 
 mod common;
 
-use braird_core::store::override_id;
-use braird_core::sync::{pull_then_flush, NoteUpsert, QuestionNoteOverride, QuestionUpsert};
+use braird_core::store::question_note_id;
+use braird_core::sync::{pull_then_flush, NoteUpsert, QuestionNote, QuestionUpsert};
 use common::{block, tick, Device, SharedCloud};
 use serde_json::json;
 
 const USER: &str = "user-1";
-const TABLES: &[&str] = &["notes", "questions", "question_note_overrides"];
+const TABLES: &[&str] = &["notes", "questions", "question_notes"];
 
 fn note(id: &str, created_at: i64) -> NoteUpsert {
     NoteUpsert {
@@ -68,11 +68,10 @@ fn question(id: &str, plaintext: &str) -> QuestionUpsert {
     }
 }
 
-fn override_row(note_id: &str, kind: &str, deleted: bool) -> QuestionNoteOverride {
-    QuestionNoteOverride {
-        question_id: "q1".into(),
+fn attachment(question_id: &str, note_id: &str, deleted: bool) -> QuestionNote {
+    QuestionNote {
+        question_id: question_id.into(),
         note_id: note_id.into(),
-        kind: kind.into(),
         deleted,
     }
 }
@@ -87,11 +86,6 @@ fn sync(device: &Device, cloud: &SharedCloud) {
     ))
     .expect("clean pull_then_flush");
 }
-
-/// `now` for the active-window join. Comfortably past every `created_at` the tests use, so an
-/// unresolved question's window is open — the derivation takes it as a parameter precisely so a
-/// convergence test does not depend on a wall clock.
-const NOW: i64 = 10_000;
 
 #[test]
 fn a_question_sealed_on_one_device_decrypts_on_the_other_and_never_crosses_in_plaintext() {
@@ -130,47 +124,42 @@ fn a_question_sealed_on_one_device_decrypts_on_the_other_and_never_crosses_in_pl
 }
 
 #[test]
-fn contradictory_curation_of_one_pair_converges_to_a_single_row_and_the_same_effective_set() {
+fn attachments_made_on_two_devices_converge_to_the_same_notes() {
+    // SUR-1101: one note attached to two questions on A, a second note attached on B concurrently.
     let vault = braird_core::Vault::generate();
     let cloud = SharedCloud::new();
     let a = Device::new(vault.clone());
     let b = Device::new(vault.clone());
 
-    // Shared history: one question and two notes, both captured inside its active window.
     a.engine
-        .enqueue_question(question("q1", "the question"))
+        .enqueue_question(question("q1", "the first question"))
         .unwrap();
-    a.engine.enqueue_note(note("n-in", 150)).unwrap();
-    a.engine.enqueue_note(note("n-pin", 50)).unwrap(); // BEFORE the window opened
+    a.engine
+        .enqueue_question(question("q2", "a second, concurrently active"))
+        .unwrap();
+    a.engine.enqueue_note(note("n-both", 150)).unwrap();
+    a.engine.enqueue_note(note("n-late", 50)).unwrap(); // a date means nothing any more
     sync(&a, &cloud);
     sync(&b, &cloud);
 
-    // A pins the out-of-window note. B, concurrently, excludes the in-window one.
     a.engine
-        .enqueue_question_note_override(override_row("n-pin", "include", false))
+        .enqueue_question_note(attachment("q1", "n-both", false))
+        .unwrap();
+    a.engine
+        .enqueue_question_note(attachment("q2", "n-both", false))
         .unwrap();
     tick();
     b.engine
-        .enqueue_question_note_override(override_row("n-in", "exclude", false))
+        .enqueue_question_note(attachment("q1", "n-late", false))
         .unwrap();
     sync(&a, &cloud);
     sync(&b, &cloud);
     sync(&a, &cloud);
 
-    // (2) One row per pair — the deterministic pk, not a bag of edges.
-    assert!(cloud
-        .row("question_note_overrides", &override_id("q1", "n-pin"))
-        .is_some());
-    assert!(cloud
-        .row("question_note_overrides", &override_id("q1", "n-in"))
-        .is_some());
-
-    // (3) Both devices compute the SAME effective set: the pinned note only — `n-in` was excluded,
-    // and `n-pin` is in solely because of the include.
-    let ids = |d: &Device| {
+    let ids = |d: &Device, q: &str| {
         let mut v: Vec<String> = d
             .engine
-            .question_notes("q1".into(), NOW)
+            .question_notes(q.into())
             .unwrap()
             .into_iter()
             .map(|n| n.id)
@@ -178,15 +167,20 @@ fn contradictory_curation_of_one_pair_converges_to_a_single_row_and_the_same_eff
         v.sort();
         v
     };
-    assert_eq!(ids(&a), vec!["n-pin".to_string()]);
-    assert_eq!(ids(&a), ids(&b), "the effective note set must converge");
+    assert_eq!(
+        ids(&a, "q1"),
+        vec!["n-both".to_string(), "n-late".to_string()]
+    );
+    assert_eq!(ids(&a, "q2"), vec!["n-both".to_string()]);
+    for q in ["q1", "q2"] {
+        assert_eq!(ids(&a, q), ids(&b, q), "{q}'s notes must converge");
+    }
 }
 
 #[test]
-fn a_reversed_override_converges_on_the_later_write_not_on_both() {
-    // Whole-row LWW on a deterministic pk: A includes, then B excludes the same pair later. The
-    // surviving `kind` IS the answer — there is no include-vs-exclude precedence rule, and there
-    // must not be two rows to reconcile.
+fn a_detach_racing_an_attach_converges_on_the_later_write_not_on_both() {
+    // Whole-row LWW on a deterministic pk: A attaches, then B detaches the same pair later. The
+    // surviving row IS the answer, and there must not be two rows to reconcile.
     let vault = braird_core::Vault::generate();
     let cloud = SharedCloud::new();
     let a = Device::new(vault.clone());
@@ -195,53 +189,45 @@ fn a_reversed_override_converges_on_the_later_write_not_on_both() {
     a.engine
         .enqueue_question(question("q1", "the question"))
         .unwrap();
-    a.engine.enqueue_note(note("n1", 50)).unwrap(); // outside the window; only an include puts it in
+    a.engine.enqueue_note(note("n1", 50)).unwrap();
     sync(&a, &cloud);
     sync(&b, &cloud);
 
     a.engine
-        .enqueue_question_note_override(override_row("n1", "include", false))
+        .enqueue_question_note(attachment("q1", "n1", false))
         .unwrap();
     sync(&a, &cloud);
     sync(&b, &cloud);
     assert_eq!(
-        b.engine.question_notes("q1".into(), NOW).unwrap().len(),
+        b.engine.question_notes("q1".into()).unwrap().len(),
         1,
-        "precondition: B sees the pinned note"
+        "precondition: B sees the attached note"
     );
 
     tick();
     b.engine
-        .enqueue_question_note_override(override_row("n1", "exclude", false))
+        .enqueue_question_note(attachment("q1", "n1", true))
         .unwrap();
     sync(&b, &cloud);
     sync(&a, &cloud);
 
     assert_eq!(
         cloud
-            .row("question_note_overrides", &override_id("q1", "n1"))
-            .unwrap()["kind"],
-        json!("exclude"),
+            .row("question_notes", &question_note_id("q1", "n1"))
+            .unwrap()["deleted"],
+        json!(true),
         "the later write wins the whole row"
     );
-    assert!(a
-        .engine
-        .question_notes("q1".into(), NOW)
-        .unwrap()
-        .is_empty());
-    assert!(b
-        .engine
-        .question_notes("q1".into(), NOW)
-        .unwrap()
-        .is_empty());
+    assert!(a.engine.question_notes("q1".into()).unwrap().is_empty());
+    assert!(b.engine.question_notes("q1".into()).unwrap().is_empty());
 }
 
 #[test]
 fn the_question_log_renders_identically_on_both_devices() {
     // SUR-1071's acceptance criterion — "same outputs on both platforms via the shared core" — is a
     // convergence claim like the two above, so it is proved the same way: two engines, one cloud,
-    // and a byte-for-byte comparison of what each would render. The unit tests pin the derivation;
-    // only this pins that two devices holding synced rows produce the SAME list, in the SAME order,
+    // and a byte-for-byte comparison of what each would render. The unit tests pin the read; only
+    // this pins that two devices holding synced rows produce the SAME list, in the SAME order,
     // with the SAME counts. Both platforms consume this one function, so agreeing here is what
     // "identical on iOS and Android" actually reduces to.
     let vault = braird_core::Vault::generate();
@@ -250,8 +236,8 @@ fn the_question_log_renders_identically_on_both_devices() {
     let b = Device::new(vault.clone());
 
     // An older question the user has since resolved, and the current one. `q1` is born at 100 (the
-    // `question` helper) and `q0` earlier, so newest-first and active-first disagree about the
-    // order — which is what makes the assertion worth making.
+    // `question` helper) and `q0` later, so newest-first and active-first disagree about the order
+    // — which is what makes the assertion worth making.
     a.engine
         .enqueue_question(QuestionUpsert {
             created_at: 400,
@@ -265,15 +251,18 @@ fn the_question_log_renders_identically_on_both_devices() {
         .unwrap();
     a.engine.enqueue_note(note("n-in", 150)).unwrap();
     a.engine.enqueue_note(note("n-old", 50)).unwrap();
-    a.engine
-        .enqueue_question_note_override(override_row("n-old", "include", false))
-        .unwrap();
+    a.engine.enqueue_note(note("n-loose", 160)).unwrap();
+    for (q, n) in [("q1", "n-in"), ("q1", "n-old"), ("q0", "n-old")] {
+        a.engine
+            .enqueue_question_note(attachment(q, n, false))
+            .unwrap();
+    }
     sync(&a, &cloud);
     sync(&b, &cloud);
 
     let log = |d: &Device| {
         d.engine
-            .list_questions(NOW)
+            .list_questions()
             .unwrap()
             .into_iter()
             .map(|e| (e.question.id, e.question.text, e.note_count))
@@ -291,24 +280,24 @@ fn the_question_log_renders_identically_on_both_devices() {
             (
                 "q0".to_string(),
                 Some("the question I closed".to_string()),
-                0
+                1
             ),
         ],
-        "active first even though the resolved question is not the oldest; q1 counts the \
-         in-window note plus the pinned one, and q0's closed window caught neither"
+        "active first even though the resolved question is newer; each counts only what was \
+         attached to it, so the unattached note is in neither"
     );
     assert_eq!(log(&a), log(&b), "the log must converge, order included");
 
     // And the count is the set: what the section says agrees with what the detail page opens, on
     // the device that only ever saw these rows over the wire.
-    for entry in b.engine.list_questions(NOW).unwrap() {
+    for entry in b.engine.list_questions().unwrap() {
         assert_eq!(
             entry.note_count as usize,
             b.engine
-                .question_notes(entry.question.id.clone(), NOW)
+                .question_notes(entry.question.id.clone())
                 .unwrap()
                 .len(),
-            "count and effective set disagree for {}",
+            "count and notes disagree for {}",
             entry.question.id
         );
     }

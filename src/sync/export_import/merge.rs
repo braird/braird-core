@@ -1152,7 +1152,7 @@ mod tests {
         // `synced_table_names()`, which SUR-1042 widened to include the native-first three.
         // That exclusion is deliberate, not an oversight of the hardcoded `SnapshotExport` fields:
         // export/import exists for PWA↔native archive interchange, and `questions` /
-        // `question_note_overrides` / `user_settings` have no PWA counterpart to interchange with.
+        // `question_notes` / `user_settings` have no PWA counterpart to interchange with.
         // Asserting against `synced_schema()` is what keeps that a stated scope rather than an
         // accident — if the snapshot ever should carry them, this test fails and asks.
         assert_eq!(

@@ -1,5 +1,6 @@
 //! SUR-1049 — a BEHAVIOURAL round-trip against the native-first cloud tables
-//! (`questions`, `question_note_overrides`, `user_settings`, SUR-1047's migration 0055).
+//! (`questions`, `question_notes`, `user_settings`, SUR-1047's migration 0055; `question_notes` was
+//! `question_note_overrides` until SUR-1101's migration 0058).
 //!
 //! Why this exists, when `scripts/check-native-schema.mjs` already validates the same tables:
 //! that check reads catalogues, and across five review rounds it accumulated thirteen findings of
@@ -95,7 +96,7 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
         "user_id,key",
         &json!([{ "user_id": uid, "key": "prompt_cadence", "value": "168", "updated_at": TS, "deleted": false }]),
     );
-    // question_note_overrides FKs both questions(id) and notes(id), so the note must exist
+    // question_notes FKs both questions(id) and notes(id), so the note must exist
     // first — a real one, owned by the same user, or the FK rejects with 23503.
     test_support::upsert(
         &env,
@@ -110,11 +111,11 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
     test_support::upsert(
         &env,
         &tok,
-        "question_note_overrides",
+        "question_notes",
         "id",
         &json!([{
             "id": ov_id, "user_id": uid, "question_id": q_id, "note_id": note_id,
-            "kind": "include", "created_at": TS, "updated_at": TS, "deleted": false
+            "created_at": TS, "updated_at": TS, "deleted": false
         }]),
     );
 
@@ -126,7 +127,7 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
     // a row that syncs to nobody, forever.
     let seqs: Vec<(&str, String, i64)> = [
         ("questions", format!("id=eq.{q_id}")),
-        ("question_note_overrides", format!("id=eq.{ov_id}")),
+        ("question_notes", format!("id=eq.{ov_id}")),
         ("user_settings", "key=eq.prompt_cadence".to_string()),
     ]
     .into_iter()
@@ -163,11 +164,11 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
             }),
         ),
         (
-            "question_note_overrides",
+            "question_notes",
             "id",
             json!({
                 "id": ov_id, "user_id": uid, "question_id": q_id, "note_id": note_id,
-                "kind": "exclude", "created_at": TS, "updated_at": TS + 1, "deleted": false
+                "created_at": TS, "updated_at": TS + 1, "deleted": false
             }),
         ),
         (
@@ -208,7 +209,7 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
     }
 
     // ── 4b. B SEEDS ROWS IT LEGITIMATELY OWNS ────────────────────────────────────────────────
-    // Needed before the write probes below: an override claiming A's user_id must reference
+    // Needed before the write probes below: an attachment claiming A's user_id must reference
     // parents B CAN see, or the policy's EXISTS clauses reject it and mask the ownership
     // predicate that is actually under test (raised on review). These rows are also what step 6
     // attempts to transfer.
@@ -234,11 +235,11 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
             }),
         ),
         (
-            "question_note_overrides",
+            "question_notes",
             "id",
             json!({
                 "id": b_ov, "user_id": b_uid, "question_id": b_q, "note_id": b_n,
-                "kind": "include", "created_at": TS, "updated_at": TS, "deleted": false
+                "created_at": TS, "updated_at": TS, "deleted": false
             }),
         ),
         (
@@ -280,11 +281,11 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
             // would then mask a weakened `auth.uid() = user_id`, leaving the test green for the
             // exact ownership regression it exists to catch (raised on review). With parents B
             // can see, the EXISTS clauses pass and ownership is the only thing left to reject it.
-            "question_note_overrides",
+            "question_notes",
             "id",
             json!({
                 "id": format!("intruder:{b_ov}"), "user_id": uid,
-                "question_id": b_q, "note_id": b_n, "kind": "include",
+                "question_id": b_q, "note_id": b_n,
                 "created_at": TS, "updated_at": TS, "deleted": false
             }),
         ),
@@ -345,7 +346,7 @@ fn native_tables_accept_writes_stamp_change_seq_and_isolate_users() {
 
     for (table, query) in [
         ("questions", format!("id=eq.{b_q}")),
-        ("question_note_overrides", format!("id=eq.{b_ov}")),
+        ("question_notes", format!("id=eq.{b_ov}")),
         ("user_settings", "key=eq.prompt_tone".to_string()),
     ] {
         let status = test_support::try_patch(

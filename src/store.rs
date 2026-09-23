@@ -379,12 +379,12 @@ pub fn synced_schema() -> &'static [TableSchema] {
 /// separately, with the push legs that make these tables flushable.
 ///
 /// **Convergence (SUR-737 contract, extended).** Whole-row LWW by `updated_at`, like everything
-/// else. `question_note_overrides.id` is the DETERMINISTIC `question_id:note_id` join (the
+/// else. `question_notes.id` is the DETERMINISTIC `question_id:note_id` join (the
 /// `collection_memberships` OR-set pattern, NOT the `note_links` random-uid bag) so two devices
-/// curating the same pair converge to one row and a contradictory `include`/`exclude` resolves by
-/// LWW instead of leaving both. The id is derived by [`override_id`], and the
+/// attaching the same pair converge to one row, and an attach racing a detach resolves by LWW
+/// instead of leaving both. The id is derived by [`question_note_id`], and the
 /// re-add-after-delete-in-one-batch case deterministic pks are prone to is handled in
-/// `SyncEngine::enqueue_question_note_override` (a re-add resurrects past the sticky collapse).
+/// `SyncEngine::enqueue_question_note` (a re-attach resurrects past the sticky collapse).
 /// `user_settings` is a
 /// per-key KV (`key` is the whole local pk; `user_id` is auth-injected at push like every other
 /// table), so LWW lands per SETTING rather than per settings-blob — the reason it is a standalone
@@ -422,13 +422,16 @@ pub fn native_schema() -> &'static [TableSchema] {
             ],
         },
         TableSchema {
-            name: "question_note_overrides",
+            // Was `question_note_overrides` (include/exclude over an automatic date window) until
+            // SUR-1101 made attachment explicit: a row IS an attachment, so `kind` went with the
+            // window. Renamed in place by surfc migration 0058; local stores are converted once by
+            // [`Store::convert_question_note_overrides`].
+            name: "question_notes",
             pk: &["id"],
             columns: &[
                 ("id", Text), // deterministic `question_id:note_id`
                 ("question_id", Text),
                 ("note_id", Text),
-                ("kind", Text), // include | exclude
                 ("created_at", Int),
                 ("updated_at", Int),
                 ("deleted", Bool),
@@ -464,8 +467,8 @@ fn descriptor_tables() -> impl Iterator<Item = &'static TableSchema> {
 ///
 /// **Widened to the native-first tables by SUR-1042**, once their push legs existed
 /// (`on_conflict_for` / `required_insert_columns` / `fk_deps`). The chain order keeps the topo
-/// property: `questions` precedes `question_note_overrides`, and `notes` — the overrides' other
-/// parent — is in the synced half, so it precedes both. `user_settings` has no FK at all.
+/// property: `questions` precedes `question_notes`, and `notes` — the attachments' other parent —
+/// is in the synced half, so it precedes both. `user_settings` has no FK at all.
 ///
 /// This list is load-bearing in THREE places, which is why it moved in its own commit: it is the
 /// flush's dispatch order, the pull's fan-out, and the snapshot-import preflight scope. A single
@@ -485,19 +488,23 @@ pub fn membership_id(collection_id: &str, note_id: &str) -> String {
     format!("{collection_id}:{note_id}")
 }
 
-/// The deterministic primary key of a `question_note_overrides` row — `question_id:note_id`,
-/// **question id first**, the same shape and for the same reason as [`membership_id`]: two devices
-/// curating the same (question, note) pair must converge to ONE row, so the id is derived rather
-/// than host-supplied (the SUR-737 OR-set add, not the `note_links` random-uid bag). A contradictory
-/// `include` / `exclude` on the same pair then resolves by whole-row LWW instead of leaving both.
+/// The deterministic primary key of a `question_notes` row — `question_id:note_id`, **question id
+/// first**, the same shape and for the same reason as [`membership_id`]: two devices attaching the
+/// same (question, note) pair must converge to ONE row, so the id is derived rather than
+/// host-supplied (the SUR-737 OR-set add, not the `note_links` random-uid bag). An attach racing a
+/// detach on the same pair then resolves by whole-row LWW instead of leaving both.
+///
+/// It is also the id surfc migration 0058 and [`Store::convert_question_note_overrides`] write, and
+/// the id the old `question_note_overrides` rows carried — which is what lets a device's converted
+/// rows and the server's materialised rows converge as one row per pair rather than two.
 ///
 /// Same stated assumption as its sibling: neither id contains a `:`. Question ids are host-generated
 /// uuids and note ids are server uuids, so this does not re-validate.
 ///
 /// The pk being deterministic is exactly what makes the re-add-after-delete collapse reachable here
-/// — see [`super::sync::SyncEngine::enqueue_question_note_override`], which routes a re-add through
+/// — see [`super::sync::SyncEngine::enqueue_question_note`], which routes a re-attach through
 /// `stage_local_write_resurrecting` for that reason.
-pub fn override_id(question_id: &str, note_id: &str) -> String {
+pub fn question_note_id(question_id: &str, note_id: &str) -> String {
     format!("{question_id}:{note_id}")
 }
 
@@ -631,6 +638,83 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// One-time conversion of a store written by core <= v0.16.0 (SUR-1101): the retired
+    /// `question_note_overrides` table becomes `question_notes` rows, then goes.
+    ///
+    /// The old model computed a question's notes on read as `(window ∪ includes) − excludes`, with
+    /// the window `[created_at, max(resolved_at ?? now, created_at)]`, both ends inclusive, over
+    /// live questions and live notes; an `exclude` beat the window, any other live `kind` (including
+    /// one a newer client invented) counted as an include, and a soft-deleted override returned the
+    /// pair to the window. This runs that rule ONE last time, in SQL, and stages a `question_notes`
+    /// row for every pair it yields — so every question keeps exactly the notes the user saw.
+    /// It is the same rule surfc migration 0058 applies to the cloud copy, and both write the
+    /// deterministic [`question_note_id`], so this device's rows and the server's converge as one
+    /// row per pair under LWW rather than doubling.
+    ///
+    /// Why it cannot be skipped in favour of re-pulling: the server copy knows nothing this device
+    /// never flushed. Un-flushed curation is exactly the data a pull would lose, so the old table
+    /// is read here and its queued outbox rows are discarded only after being folded in. (Those
+    /// rows could never flush anyway: the push loop iterates [`synced_table_names`] only, so they
+    /// would sit in the outbox forever, invisible to every gate.)
+    ///
+    /// The table's existence is the run-once flag: it is dropped in the same transaction that
+    /// stages its replacement, so a crash leaves either the old world intact (retried on the next
+    /// open) or the new one complete. Its per-table pull bookkeeping in `meta` goes with it.
+    ///
+    /// ponytail: O(questions × notes) join once per device, ever. Fine at personal-archive scale.
+    pub fn convert_question_note_overrides(&self, now_ms: i64) -> rusqlite::Result<()> {
+        const OLD: &str = "question_note_overrides";
+        if !self.table_exists(OLD)? {
+            return Ok(());
+        }
+        let pairs: Vec<(String, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT q.id, n.id FROM questions q JOIN notes n \
+                   ON n.deleted = 0 \
+                  AND coalesce(n.created_at, 0) >= coalesce(q.created_at, 0) \
+                  AND coalesce(n.created_at, 0) <= \
+                      max(coalesce(q.resolved_at, ?1), coalesce(q.created_at, 0)) \
+                 WHERE q.deleted = 0 \
+                   AND NOT EXISTS (SELECT 1 FROM question_note_overrides o \
+                                    WHERE o.question_id = q.id AND o.note_id = n.id \
+                                      AND o.deleted = 0 AND o.kind = 'exclude') \
+                 UNION \
+                 SELECT o.question_id, o.note_id FROM question_note_overrides o \
+                   JOIN questions q ON q.id = o.question_id AND q.deleted = 0 \
+                   JOIN notes n     ON n.id = o.note_id     AND n.deleted = 0 \
+                  WHERE o.deleted = 0 AND coalesce(o.kind, '') <> 'exclude'",
+            )?;
+            let rows = stmt
+                .query_map([now_ms], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+
+        let tx = self.conn.unchecked_transaction()?;
+        for (question_id, note_id) in pairs {
+            let id = question_note_id(&question_id, &note_id);
+            let mut row = Map::new();
+            row.insert("id".into(), Value::from(id.clone()));
+            row.insert("question_id".into(), Value::from(question_id));
+            row.insert("note_id".into(), Value::from(note_id));
+            row.insert("created_at".into(), Value::from(now_ms));
+            row.insert("updated_at".into(), Value::from(now_ms));
+            row.insert("deleted".into(), Value::from(false));
+            self.stage_write_inner("question_notes", &id, row, now_ms)?;
+        }
+        self.conn
+            .execute("DELETE FROM outbox WHERE table_name = ?1", [OLD])?;
+        self.conn.execute_batch(&format!("DROP TABLE {OLD};"))?;
+        for key in [
+            sync_seq_key(OLD),
+            sync_cursor_key(OLD),
+            sync_pulled_key(OLD),
+        ] {
+            self.meta_delete(&key)?;
+        }
+        tx.commit()
     }
 
     /// Every table the live store actually holds, read from `sqlite_master`. The registry guard
@@ -1542,9 +1626,174 @@ fn pending_embeddings_sql(select: &str) -> String {
     )
 }
 
+/// Recreate what core <= v0.16.0 left on disk for SUR-1101's conversion tests: the retired
+/// `question_note_overrides` table (its 0.16.0 DDL, verbatim from the old descriptor), the given
+/// `(question_id, note_id, kind, deleted)` rows, and one un-flushed outbox row per override.
+#[cfg(test)]
+pub(crate) fn plant_legacy_overrides(db_path: &str, rows: &[(&str, &str, &str, bool)]) {
+    let conn = Connection::open(db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE question_note_overrides (id TEXT PRIMARY KEY, question_id TEXT, \
+         note_id TEXT, kind TEXT, created_at INTEGER, updated_at INTEGER, deleted INTEGER);",
+    )
+    .unwrap();
+    for (question_id, note_id, kind, deleted) in rows {
+        let id = question_note_id(question_id, note_id);
+        conn.execute(
+            "INSERT INTO question_note_overrides VALUES (?1, ?2, ?3, ?4, 1, 1, ?5)",
+            rusqlite::params![id, question_id, note_id, kind, *deleted as i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO outbox (table_name, record_id, payload, created_at) \
+             VALUES ('question_note_overrides', ?1, '{}', 1)",
+            [&id],
+        )
+        .unwrap();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── SUR-1101: converting a <= v0.16.0 store ──────────────────────────────
+    // One case per branch of the retired rule, `(window ∪ includes) − excludes`, mirroring surfc's
+    // `questionNotes.migration.test.js` for migration 0058 — the two conversions must agree, because
+    // their rows meet as one row per pair under LWW.
+
+    fn legacy_store(
+        questions: &[(&str, i64, Option<i64>, bool)],
+        notes: &[(&str, i64, bool)],
+        overrides: &[(&str, &str, &str, bool)],
+    ) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sqlite").to_str().unwrap().to_string();
+        let store = Store::open(&path).unwrap();
+        for (id, created_at, resolved_at, deleted) in questions {
+            let row = serde_json::json!({
+                "id": id, "text": "enc:v2:x", "status": "active", "created_at": created_at,
+                "resolved_at": resolved_at, "updated_at": 1, "deleted": deleted,
+            });
+            store
+                .apply_row("questions", row.as_object().unwrap())
+                .unwrap();
+        }
+        for (id, created_at, deleted) in notes {
+            let row = serde_json::json!({
+                "id": id, "text": "", "created_at": created_at, "updated_at": 1, "deleted": deleted,
+            });
+            store.apply_row("notes", row.as_object().unwrap()).unwrap();
+        }
+        drop(store);
+        plant_legacy_overrides(&path, overrides);
+        (dir, path)
+    }
+
+    fn attached_pairs(store: &Store) -> Vec<String> {
+        let mut ids: Vec<String> = store
+            .list_live("question_notes", None, -1, 0)
+            .unwrap()
+            .iter()
+            .filter_map(|r| r.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    const NOW: i64 = 9_000;
+
+    #[test]
+    fn conversion_keeps_exactly_the_old_effective_set() {
+        let (_d, path) = legacy_store(
+            &[
+                ("active", 1_000, None, false),
+                ("resolved", 1_000, Some(2_500), false),
+                ("deleted", 1_000, None, true),
+                // resolved before it opened (clock skew): core clamps the end to the start.
+                ("inverted", 5_000, Some(4_000), false),
+            ],
+            &[
+                ("in", 2_000, false),
+                ("before", 500, false),
+                ("include-out", 500, false),
+                ("exclude-in", 3_000, false),
+                ("tomb-in", 4_000, false),
+                ("tomb-out", 600, false),
+                ("unknown", 700, false),
+                ("gone", 2_000, true),
+                ("at-end", 2_500, false),
+                ("late", 5_000, false),
+                ("after-now", NOW + 1, false),
+            ],
+            &[
+                ("active", "include-out", "include", false),
+                ("active", "exclude-in", "exclude", false),
+                ("active", "tomb-in", "exclude", true),
+                ("active", "tomb-out", "include", true),
+                ("active", "unknown", "pinned-by-a-newer-client", false),
+                ("deleted", "include-out", "include", false),
+            ],
+        );
+        let store = Store::open(&path).unwrap();
+        store.convert_question_note_overrides(NOW).unwrap();
+
+        assert_eq!(
+            attached_pairs(&store),
+            vec![
+                "active:at-end",
+                "active:in",
+                "active:include-out",
+                "active:late",
+                "active:tomb-in",
+                "active:unknown",
+                "inverted:late",
+                "resolved:at-end",
+                "resolved:in",
+            ]
+        );
+    }
+
+    #[test]
+    fn conversion_queues_its_rows_and_retires_everything_of_the_old_table() {
+        let (_d, path) = legacy_store(
+            &[("q", 1_000, None, false)],
+            &[("n", 2_000, false)],
+            &[("q", "n", "include", false)],
+        );
+        let store = Store::open(&path).unwrap();
+        store.set_seq_cursor("question_note_overrides", 7).unwrap();
+        store.mark_pull_complete("question_note_overrides").unwrap();
+
+        store.convert_question_note_overrides(NOW).unwrap();
+
+        assert!(!store.table_exists("question_note_overrides").unwrap());
+        let outbox = store.outbox_items().unwrap();
+        assert_eq!(
+            outbox
+                .iter()
+                .map(|r| (r.1.as_str(), r.2.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![("question_notes", Some("q:n"))],
+            "the attachment is queued to sync; the old table's queued rows are gone"
+        );
+        assert_eq!(
+            store.get_seq_cursor("question_note_overrides").unwrap(),
+            None
+        );
+        assert!(!store.has_completed_pull("question_note_overrides").unwrap());
+
+        // Run-once: the table's absence IS the flag.
+        store.convert_question_note_overrides(NOW).unwrap();
+        assert_eq!(store.outbox_items().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_store_that_never_had_the_old_table_is_untouched() {
+        let store = Store::open_in_memory().unwrap();
+        store.convert_question_note_overrides(NOW).unwrap();
+        assert!(store.outbox_items().unwrap().is_empty());
+    }
 
     #[test]
     fn opens_and_creates_every_table() {

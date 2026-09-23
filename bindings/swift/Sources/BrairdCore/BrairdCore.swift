@@ -882,10 +882,31 @@ public protocol SyncEngineProtocol : AnyObject {
     func collectionNoteCounts() throws  -> [CollectionNoteCount]
     
     /**
+     * Record that a check-in pass happened (SUR-1101) — whether the user answered every question,
+     * some, or skipped the lot. The next check-in is due one cadence from `now_ms`.
+     *
+     * One call per PASS, not per question: a check-in covers every active question at once, so the
+     * timer is the pass's, stored as the synced [`prompt::CHECKIN_LAST_AT_KEY`]. Per-question
+     * answers still go through [`SyncEngine::enqueue_question`] (`checkin_response`, `status`, and
+     * the question's own `checkin_at`); this replaces `skip_checkin`, which could only stamp one
+     * question. Skipping is still never punished and never visibly counted — nothing records that a
+     * pass answered nothing (founder, 2026-08-19).
+     *
+     * `now_ms` is host-supplied, for the [`SyncEngine::skip_prompt`] reason.
+     */
+    func completeCheckin(nowMs: Int64) throws 
+    
+    /**
      * Live (non-deleted) row totals for books / notes / custom ideas, plus `active_ideas` — the
      * count of distinct idea tags on live notes (the Home stat row, SUR-806).
      */
     func counts() throws  -> StoreCounts
+    
+    /**
+     * Record that the user dismissed the too-many-questions nudge (SUR-1101). Synced, so the
+     * dismissal silences every device for the quiet period.
+     */
+    func dismissQuestionNudge(nowMs: Int64) throws 
     
     /**
      * Drain up to `max_items` of the derived embed queue (SUR-997 item 5): per note —
@@ -1063,21 +1084,24 @@ public protocol SyncEngineProtocol : AnyObject {
      * last-write-wins, so a dismiss on one device and a check-in on another inside the same window
      * resolve to whichever `updated_at` is larger — the loser's field is discarded, not merged. The
      * alternative (a check-in satellite row, the `note_signals`/migration-0047 precedent) was
-     * considered and rejected: v1 has ONE live question and both flows are user-initiated seconds
-     * apart at worst. Documented rather than engineered around, and pinned by a test so it stays a
-     * decision instead of becoming a discovery.
+     * considered and rejected: both flows are user-initiated seconds apart at worst, and the stake
+     * is PER QUESTION — SUR-1101 allowing several active questions multiplies the rows, not the
+     * chance that two devices edit the same one at the same moment. Documented rather than
+     * engineered around, and pinned by a test so it stays a decision instead of becoming a
+     * discovery.
      */
     func enqueueQuestion(draft: QuestionUpsert) throws 
     
     /**
-     * Enqueue a question↔note curation override (SUR-1042), keyed by the DETERMINISTIC
-     * `question_id:note_id` ([`crate::store::override_id`]).
+     * Attach a note to a question, or detach it (SUR-1101), keyed by the DETERMINISTIC
+     * `question_id:note_id` ([`crate::store::question_note_id`]). Attaching an already-attached
+     * pair is harmless: it is the same row.
      *
      * THE RE-ADD FORK, and why it is not optional. A deterministic pk makes
-     * `include → remove → include` inside ONE un-flushed batch collapse onto a single outbox key,
+     * `attach → detach → attach` inside ONE un-flushed batch collapse onto a single outbox key,
      * and the collapse makes `deleted` **sticky** across the group (SUR-724, "within a batch,
      * delete wins"). So the re-add would flush as a tombstone: the local mirror reads correctly —
-     * the note still shows pinned — while push sends a delete, every other device drops it, and the
+     * the note still shows attached — while push sends a delete, every other device drops it, and the
      * next pull LWW-overwrites the local copy. A silent lost write whose local read masks it. This
      * is the [`SyncEngine::enqueue_collection_membership`] class (SUR-940), and `store.rs`'s
      * descriptor doc names this table as the case to extend the split for.
@@ -1093,7 +1117,7 @@ public protocol SyncEngineProtocol : AnyObject {
      * re-add stage `deleted: false` between the lookup and the stage, with this tombstone landing
      * after it and collapsing sticky-deleted — the same loss re-opened as a race.
      */
-    func enqueueQuestionNoteOverride(draft: QuestionNoteOverride) throws 
+    func enqueueQuestionNote(draft: QuestionNote) throws 
     
     /**
      * Export a plaintext, PWA-compatible snapshot of every live synced row. Note ciphertext is
@@ -1174,19 +1198,18 @@ public protocol SyncEngineProtocol : AnyObject {
     
     /**
      * The SUR-996 question log — every live question, **active first** then newest-first, each
-     * with the size of its effective note set (SUR-1071). Decrypted in core. This is the Lexicon
-     * Questions section; there is no separate log view.
+     * with the number of notes attached to it (SUR-1071, SUR-1101). Decrypted in core. This is the
+     * Lexicon Questions section; there is no separate log view. It is also the list of questions a
+     * check-in covers: every entry whose status is active.
      *
-     * `note_count` equals `question_notes(id, now_ms).len()` by construction — the same predicate
-     * produces both — so a row's subtitle can never disagree with the detail page it opens.
-     * `now_ms` closes the window of a question that has no `resolved_at`; the host supplies it so
-     * this stays a pure function of its inputs, exactly as [`Self::question_notes`] does. Pass the
-     * same `now_ms` to both if you render them together.
+     * `note_count` equals `question_notes(id).len()` by construction — one definition of
+     * "attached" produces both — so a row's subtitle can never disagree with the detail page it
+     * opens.
      *
      * Unpaginated on purpose: active-first ordering has to be applied before any page is cut, and
      * the log grows by about one row per cadence period.
      */
-    func listQuestions(nowMs: Int64) throws  -> [QuestionLogEntry]
+    func listQuestions() throws  -> [QuestionLogEntry]
     
     /**
      * Merge duplicate source books into `survivor_id` (SUR-915): rehome the losers' notes, keep the
@@ -1293,12 +1316,21 @@ public protocol SyncEngineProtocol : AnyObject {
     func pull() throws  -> PullSummary
     
     /**
-     * The effective note set of one question — `(auto ∪ includes) − excludes`, newest-first
-     * (SUR-1042). `now_ms` closes the active window of a question that has no `resolved_at`; the
-     * host supplies it so this stays a pure function of its inputs (see [`read::question_notes`]).
+     * The notes attached to one question, newest-first (SUR-1101 — explicit attachments only).
      * An absent or soft-deleted question yields an empty set, never an error.
      */
-    func questionNotes(questionId: String, nowMs: Int64) throws  -> [NoteRecord]
+    func questionNotes(questionId: String) throws  -> [NoteRecord]
+    
+    /**
+     * Whether to show the too-many-questions nudge now (SUR-1101): more than eight active
+     * questions and no dismissal in the last four weeks. Independent of the check-in cadence, so it
+     * is a separate call rather than a [`PromptEvent`]; re-run it whenever the question log changes.
+     *
+     * `false` before the prompt tables have been pulled (the [`SyncEngine::next_prompt_events`]
+     * gate): an unpulled count reads low, and an unpulled dismissal would re-show a nudge the user
+     * dismissed on another device — not showing a dismissable nudge is the safe side of that.
+     */
+    func questionNudgeDue(nowMs: Int64) throws  -> Bool
     
     /**
      * Hybrid ranked search (SUR-1019, ADR 0007 — the SUR-157 query path): ONE ranked
@@ -1555,21 +1587,6 @@ public protocol SyncEngineProtocol : AnyObject {
     func similarNotes(noteId: String, limit: UInt32) throws  -> [SemanticHit]
     
     /**
-     * Record a skipped check-in (SUR-996 R3) — the timer resets, nothing else changes.
-     *
-     * A metadata-only patch of `checkin_at` alone: `plaintext: None` makes no Vault call and
-     * [`insert_opt`] omits every other `None`, so the ciphertext, the status, and the previous
-     * `checkin_response` all survive byte-for-byte. Skipping is never punished and never visibly
-     * counted, so nothing records that this WAS a skip — "still open" and "skip" reset the timer
-     * identically, and the stored vocabulary was deliberately not extended to tell them apart
-     * (founder, 2026-08-19).
-     *
-     * Inherits [`SyncError::PatchTargetMissing`] for an id that has no live row, from the same
-     * precondition [`SyncEngine::enqueue_question`] enforces.
-     */
-    func skipCheckin(questionId: String, nowMs: Int64) throws 
-    
-    /**
      * Record that the user dismissed a prompt without answering it (SUR-996 R2).
      *
      * Hosts MUST call this when the sheet is dismissed unanswered, not only when Skip is tapped:
@@ -1626,6 +1643,21 @@ public protocol SyncEngineProtocol : AnyObject {
      * SERVER row before this pull could see it is the server's job, PR-3.)
      */
     func sync() throws  -> SyncSummary
+    
+    /**
+     * The check-in's backstop section (SUR-1101): live notes captured since the current check-in
+     * period began that are attached to no live question — including every note whose "attach to
+     * an open question?" sheet was dismissed. Newest-first, decrypted in core.
+     *
+     * The period starts at [`prompt::checkin_anchor`], the same instant the pending CheckIn event is
+     * scheduled from, so the section covers exactly the period that check-in closes. No active
+     * question → `Some(empty)`: there is no check-in for the section to belong to.
+     *
+     * `None` means core cannot tell yet, exactly as for [`SyncEngine::next_prompt_events`] — the
+     * same pull receipts gate both, because before `question_notes` has been pulled every note
+     * would read as unattached.
+     */
+    func unattachedSinceLastCheckin(nowMs: Int64) throws  -> [NoteRecord]?
     
     /**
      * Reverse a `merge_books` within the host's undo window (SUR-915). Idempotent.
@@ -1745,6 +1777,26 @@ open func collectionNoteCounts()throws  -> [CollectionNoteCount] {
 }
     
     /**
+     * Record that a check-in pass happened (SUR-1101) — whether the user answered every question,
+     * some, or skipped the lot. The next check-in is due one cadence from `now_ms`.
+     *
+     * One call per PASS, not per question: a check-in covers every active question at once, so the
+     * timer is the pass's, stored as the synced [`prompt::CHECKIN_LAST_AT_KEY`]. Per-question
+     * answers still go through [`SyncEngine::enqueue_question`] (`checkin_response`, `status`, and
+     * the question's own `checkin_at`); this replaces `skip_checkin`, which could only stamp one
+     * question. Skipping is still never punished and never visibly counted — nothing records that a
+     * pass answered nothing (founder, 2026-08-19).
+     *
+     * `now_ms` is host-supplied, for the [`SyncEngine::skip_prompt`] reason.
+     */
+open func completeCheckin(nowMs: Int64)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_complete_checkin(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+}
+}
+    
+    /**
      * Live (non-deleted) row totals for books / notes / custom ideas, plus `active_ideas` — the
      * count of distinct idea tags on live notes (the Home stat row, SUR-806).
      */
@@ -1753,6 +1805,17 @@ open func counts()throws  -> StoreCounts {
     uniffi_braird_core_fn_method_syncengine_counts(self.uniffiClonePointer(),$0
     )
 })
+}
+    
+    /**
+     * Record that the user dismissed the too-many-questions nudge (SUR-1101). Synced, so the
+     * dismissal silences every device for the quiet period.
+     */
+open func dismissQuestionNudge(nowMs: Int64)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_dismiss_question_nudge(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+}
 }
     
     /**
@@ -2007,9 +2070,11 @@ open func enqueueNoteSignals(noteId: String, sourcePrior: Double, returnVisits: 
      * last-write-wins, so a dismiss on one device and a check-in on another inside the same window
      * resolve to whichever `updated_at` is larger — the loser's field is discarded, not merged. The
      * alternative (a check-in satellite row, the `note_signals`/migration-0047 precedent) was
-     * considered and rejected: v1 has ONE live question and both flows are user-initiated seconds
-     * apart at worst. Documented rather than engineered around, and pinned by a test so it stays a
-     * decision instead of becoming a discovery.
+     * considered and rejected: both flows are user-initiated seconds apart at worst, and the stake
+     * is PER QUESTION — SUR-1101 allowing several active questions multiplies the rows, not the
+     * chance that two devices edit the same one at the same moment. Documented rather than
+     * engineered around, and pinned by a test so it stays a decision instead of becoming a
+     * discovery.
      */
 open func enqueueQuestion(draft: QuestionUpsert)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_enqueue_question(self.uniffiClonePointer(),
@@ -2019,14 +2084,15 @@ open func enqueueQuestion(draft: QuestionUpsert)throws  {try rustCallWithError(F
 }
     
     /**
-     * Enqueue a question↔note curation override (SUR-1042), keyed by the DETERMINISTIC
-     * `question_id:note_id` ([`crate::store::override_id`]).
+     * Attach a note to a question, or detach it (SUR-1101), keyed by the DETERMINISTIC
+     * `question_id:note_id` ([`crate::store::question_note_id`]). Attaching an already-attached
+     * pair is harmless: it is the same row.
      *
      * THE RE-ADD FORK, and why it is not optional. A deterministic pk makes
-     * `include → remove → include` inside ONE un-flushed batch collapse onto a single outbox key,
+     * `attach → detach → attach` inside ONE un-flushed batch collapse onto a single outbox key,
      * and the collapse makes `deleted` **sticky** across the group (SUR-724, "within a batch,
      * delete wins"). So the re-add would flush as a tombstone: the local mirror reads correctly —
-     * the note still shows pinned — while push sends a delete, every other device drops it, and the
+     * the note still shows attached — while push sends a delete, every other device drops it, and the
      * next pull LWW-overwrites the local copy. A silent lost write whose local read masks it. This
      * is the [`SyncEngine::enqueue_collection_membership`] class (SUR-940), and `store.rs`'s
      * descriptor doc names this table as the case to extend the split for.
@@ -2042,9 +2108,9 @@ open func enqueueQuestion(draft: QuestionUpsert)throws  {try rustCallWithError(F
      * re-add stage `deleted: false` between the lookup and the stage, with this tombstone landing
      * after it and collapsing sticky-deleted — the same loss re-opened as a race.
      */
-open func enqueueQuestionNoteOverride(draft: QuestionNoteOverride)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
-    uniffi_braird_core_fn_method_syncengine_enqueue_question_note_override(self.uniffiClonePointer(),
-        FfiConverterTypeQuestionNoteOverride.lower(draft),$0
+open func enqueueQuestionNote(draft: QuestionNote)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_enqueue_question_note(self.uniffiClonePointer(),
+        FfiConverterTypeQuestionNote.lower(draft),$0
     )
 }
 }
@@ -2203,22 +2269,20 @@ open func listNotes(bookId: String?, limit: UInt32, offset: UInt32)throws  -> [N
     
     /**
      * The SUR-996 question log — every live question, **active first** then newest-first, each
-     * with the size of its effective note set (SUR-1071). Decrypted in core. This is the Lexicon
-     * Questions section; there is no separate log view.
+     * with the number of notes attached to it (SUR-1071, SUR-1101). Decrypted in core. This is the
+     * Lexicon Questions section; there is no separate log view. It is also the list of questions a
+     * check-in covers: every entry whose status is active.
      *
-     * `note_count` equals `question_notes(id, now_ms).len()` by construction — the same predicate
-     * produces both — so a row's subtitle can never disagree with the detail page it opens.
-     * `now_ms` closes the window of a question that has no `resolved_at`; the host supplies it so
-     * this stays a pure function of its inputs, exactly as [`Self::question_notes`] does. Pass the
-     * same `now_ms` to both if you render them together.
+     * `note_count` equals `question_notes(id).len()` by construction — one definition of
+     * "attached" produces both — so a row's subtitle can never disagree with the detail page it
+     * opens.
      *
      * Unpaginated on purpose: active-first ordering has to be applied before any page is cut, and
      * the log grows by about one row per cadence period.
      */
-open func listQuestions(nowMs: Int64)throws  -> [QuestionLogEntry] {
+open func listQuestions()throws  -> [QuestionLogEntry] {
     return try  FfiConverterSequenceTypeQuestionLogEntry.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
-    uniffi_braird_core_fn_method_syncengine_list_questions(self.uniffiClonePointer(),
-        FfiConverterInt64.lower(nowMs),$0
+    uniffi_braird_core_fn_method_syncengine_list_questions(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -2391,15 +2455,29 @@ open func pull()throws  -> PullSummary {
 }
     
     /**
-     * The effective note set of one question — `(auto ∪ includes) − excludes`, newest-first
-     * (SUR-1042). `now_ms` closes the active window of a question that has no `resolved_at`; the
-     * host supplies it so this stays a pure function of its inputs (see [`read::question_notes`]).
+     * The notes attached to one question, newest-first (SUR-1101 — explicit attachments only).
      * An absent or soft-deleted question yields an empty set, never an error.
      */
-open func questionNotes(questionId: String, nowMs: Int64)throws  -> [NoteRecord] {
+open func questionNotes(questionId: String)throws  -> [NoteRecord] {
     return try  FfiConverterSequenceTypeNoteRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_question_notes(self.uniffiClonePointer(),
-        FfiConverterString.lower(questionId),
+        FfiConverterString.lower(questionId),$0
+    )
+})
+}
+    
+    /**
+     * Whether to show the too-many-questions nudge now (SUR-1101): more than eight active
+     * questions and no dismissal in the last four weeks. Independent of the check-in cadence, so it
+     * is a separate call rather than a [`PromptEvent`]; re-run it whenever the question log changes.
+     *
+     * `false` before the prompt tables have been pulled (the [`SyncEngine::next_prompt_events`]
+     * gate): an unpulled count reads low, and an unpulled dismissal would re-show a nudge the user
+     * dismissed on another device — not showing a dismissable nudge is the safe side of that.
+     */
+open func questionNudgeDue(nowMs: Int64)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_question_nudge_due(self.uniffiClonePointer(),
         FfiConverterInt64.lower(nowMs),$0
     )
 })
@@ -2736,27 +2814,6 @@ open func similarNotes(noteId: String, limit: UInt32)throws  -> [SemanticHit] {
 }
     
     /**
-     * Record a skipped check-in (SUR-996 R3) — the timer resets, nothing else changes.
-     *
-     * A metadata-only patch of `checkin_at` alone: `plaintext: None` makes no Vault call and
-     * [`insert_opt`] omits every other `None`, so the ciphertext, the status, and the previous
-     * `checkin_response` all survive byte-for-byte. Skipping is never punished and never visibly
-     * counted, so nothing records that this WAS a skip — "still open" and "skip" reset the timer
-     * identically, and the stored vocabulary was deliberately not extended to tell them apart
-     * (founder, 2026-08-19).
-     *
-     * Inherits [`SyncError::PatchTargetMissing`] for an id that has no live row, from the same
-     * precondition [`SyncEngine::enqueue_question`] enforces.
-     */
-open func skipCheckin(questionId: String, nowMs: Int64)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
-    uniffi_braird_core_fn_method_syncengine_skip_checkin(self.uniffiClonePointer(),
-        FfiConverterString.lower(questionId),
-        FfiConverterInt64.lower(nowMs),$0
-    )
-}
-}
-    
-    /**
      * Record that the user dismissed a prompt without answering it (SUR-996 R2).
      *
      * Hosts MUST call this when the sheet is dismissed unanswered, not only when Skip is tapped:
@@ -2825,6 +2882,27 @@ open func softDeleteSignalsForNote(noteId: String)throws  {try rustCallWithError
 open func sync()throws  -> SyncSummary {
     return try  FfiConverterTypeSyncSummary.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_sync(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * The check-in's backstop section (SUR-1101): live notes captured since the current check-in
+     * period began that are attached to no live question — including every note whose "attach to
+     * an open question?" sheet was dismissed. Newest-first, decrypted in core.
+     *
+     * The period starts at [`prompt::checkin_anchor`], the same instant the pending CheckIn event is
+     * scheduled from, so the section covers exactly the period that check-in closes. No active
+     * question → `Some(empty)`: there is no check-in for the section to belong to.
+     *
+     * `None` means core cannot tell yet, exactly as for [`SyncEngine::next_prompt_events`] — the
+     * same pull receipts gate both, because before `question_notes` has been pulled every note
+     * would read as unattached.
+     */
+open func unattachedSinceLastCheckin(nowMs: Int64)throws  -> [NoteRecord]? {
+    return try  FfiConverterOptionSequenceTypeNoteRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_unattached_since_last_checkin(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),$0
     )
 })
 }
@@ -5172,25 +5250,21 @@ public func FfiConverterTypeNoteUpsert_lower(_ value: NoteUpsert) -> RustBuffer 
  * reaches a lock screen — SUR-996 R5). It rides on every event anyway because a non-optional
  * field is simpler across three binding languages than an `Option` two of three kinds ignore.
  *
- * `question_id` names the question a `CheckIn` is ABOUT, and is `None` for the other two kinds
- * (neither has a question yet). Carried rather than left for the client to work out: the machine
- * already picked which question wins when several are momentarily active, and a client re-deriving
- * that pick is exactly the cross-platform drift this module exists to prevent. It is the id the
- * host passes back to [`crate::sync::SyncEngine::skip_checkin`] or `enqueue_question`.
+ * No question id. Until SUR-1101 a `CheckIn` named the one question it was about; a check-in now
+ * covers every active question, so the host lists them from `list_questions` (active first) and
+ * records the pass with [`crate::sync::SyncEngine::complete_checkin`].
  */
 public struct PromptEvent {
     public var kind: PromptEventKind
     public var dueAt: Int64
     public var tone: PromptTone
-    public var questionId: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(kind: PromptEventKind, dueAt: Int64, tone: PromptTone, questionId: String?) {
+    public init(kind: PromptEventKind, dueAt: Int64, tone: PromptTone) {
         self.kind = kind
         self.dueAt = dueAt
         self.tone = tone
-        self.questionId = questionId
     }
 }
 
@@ -5207,9 +5281,6 @@ extension PromptEvent: Equatable, Hashable {
         if lhs.tone != rhs.tone {
             return false
         }
-        if lhs.questionId != rhs.questionId {
-            return false
-        }
         return true
     }
 
@@ -5217,7 +5288,6 @@ extension PromptEvent: Equatable, Hashable {
         hasher.combine(kind)
         hasher.combine(dueAt)
         hasher.combine(tone)
-        hasher.combine(questionId)
     }
 }
 
@@ -5231,8 +5301,7 @@ public struct FfiConverterTypePromptEvent: FfiConverterRustBuffer {
             try PromptEvent(
                 kind: FfiConverterTypePromptEventKind.read(from: &buf), 
                 dueAt: FfiConverterInt64.read(from: &buf), 
-                tone: FfiConverterTypePromptTone.read(from: &buf), 
-                questionId: FfiConverterOptionString.read(from: &buf)
+                tone: FfiConverterTypePromptTone.read(from: &buf)
         )
     }
 
@@ -5240,7 +5309,6 @@ public struct FfiConverterTypePromptEvent: FfiConverterRustBuffer {
         FfiConverterTypePromptEventKind.write(value.kind, into: &buf)
         FfiConverterInt64.write(value.dueAt, into: &buf)
         FfiConverterTypePromptTone.write(value.tone, into: &buf)
-        FfiConverterOptionString.write(value.questionId, into: &buf)
     }
 }
 
@@ -5428,15 +5496,14 @@ public func FfiConverterTypePullSummary_lower(_ value: PullSummary) -> RustBuffe
 
 
 /**
- * One row of the Lexicon Questions section (SUR-1071) — a question plus the size of its effective
- * note set, shaped like [`CollectionNoteCount`] but carrying its subject rather than pointing at it
- * (the section renders both together, and a host that had to zip two lists would also have to
- * re-derive the ordering).
+ * One row of the Lexicon Questions section (SUR-1071) — a question plus the number of notes
+ * attached to it, shaped like [`CollectionNoteCount`] but carrying its subject rather than pointing
+ * at it (the section renders both together, and a host that had to zip two lists would also have
+ * to re-derive the ordering).
  *
- * `note_count` is `question_notes(id, now_ms).len()` **by construction** — both are
- * [`in_effective_set`] over the same rows — so the subtitle can never disagree with the detail page
- * it opens. It is a function of `now_ms`: an active question's window runs to the caller's clock,
- * so its count grows; a resolved one is frozen at `resolved_at`.
+ * `note_count` is `question_notes(id).len()` **by construction** — both read [`attachments`] — so
+ * the subtitle can never disagree with the detail page it opens. Since SUR-1101 it changes only
+ * when a note is attached, detached or deleted; there is no window running to the caller's clock.
  *
  * No date-range field. `question.created_at`, `question.resolved_at` and `question.status` already
  * carry it, and only the host knows how to render "12 Jul – now" in the user's locale.
@@ -5508,31 +5575,24 @@ public func FfiConverterTypeQuestionLogEntry_lower(_ value: QuestionLogEntry) ->
 
 
 /**
- * One question↔note curation override (SUR-996 R1) — the user pinning a note onto a question, or
- * excluding one the active-window join offered.
+ * One question↔note attachment (SUR-1101) — the user attaching a note to a question, explicitly.
+ * A note may belong to any number of questions; there is no automatic attachment by date.
  *
  * Plaintext id pair, the same trade-off as `collection_memberships`: the question's *text* is
  * sealed, the fact that it relates to a note is not. Its row id is **derived**, not carried —
- * [`crate::store::override_id`] makes it `question_id:note_id` so two devices curating the same
- * pair converge on one row.
+ * [`crate::store::question_note_id`] makes it `question_id:note_id` so two devices attaching the
+ * same pair converge on one row.
  *
- * A record by API shape rather than arm64 necessity (four fields is nowhere near the 8-slot limit
- * the SUR-843 guard enforces): the pair + kind is one concept, and passing it as one argument
- * keeps the call site readable and the field names on the wire. Deliberately NOT named
- * `QuestionNoteOverrideUpsert` — there is no `…Record` read model to pair against, because the
- * effective note set is exposed as notes ([`SyncEngine::question_notes`]), never as raw override
- * rows. The ticket specifies this name.
+ * A record by API shape rather than arm64 necessity (three fields is nowhere near the 8-slot limit
+ * the SUR-843 guard enforces): the pair is one concept, and passing it as one argument keeps the
+ * call site readable and the field names on the wire. Named for the table, like the attachments it
+ * writes; the read side is notes ([`SyncEngine::question_notes`]), never raw attachment rows.
  */
-public struct QuestionNoteOverride {
+public struct QuestionNote {
     public var questionId: String
     public var noteId: String
     /**
-     * `include` (pin a note the window missed) or `exclude` (drop one it offered). Not validated
-     * here — same forward-extensible-vocabulary reasoning as [`QuestionUpsert::status`].
-     */
-    public var kind: String
-    /**
-     * Soft-delete the override, returning the pair to whatever the active-window join says.
+     * Detach the note (soft-delete the attachment). `false` attaches, or re-attaches.
      */
     public var deleted: Bool
 
@@ -5540,30 +5600,22 @@ public struct QuestionNoteOverride {
     // declare one manually.
     public init(questionId: String, noteId: String, 
         /**
-         * `include` (pin a note the window missed) or `exclude` (drop one it offered). Not validated
-         * here — same forward-extensible-vocabulary reasoning as [`QuestionUpsert::status`].
-         */kind: String, 
-        /**
-         * Soft-delete the override, returning the pair to whatever the active-window join says.
+         * Detach the note (soft-delete the attachment). `false` attaches, or re-attaches.
          */deleted: Bool) {
         self.questionId = questionId
         self.noteId = noteId
-        self.kind = kind
         self.deleted = deleted
     }
 }
 
 
 
-extension QuestionNoteOverride: Equatable, Hashable {
-    public static func ==(lhs: QuestionNoteOverride, rhs: QuestionNoteOverride) -> Bool {
+extension QuestionNote: Equatable, Hashable {
+    public static func ==(lhs: QuestionNote, rhs: QuestionNote) -> Bool {
         if lhs.questionId != rhs.questionId {
             return false
         }
         if lhs.noteId != rhs.noteId {
-            return false
-        }
-        if lhs.kind != rhs.kind {
             return false
         }
         if lhs.deleted != rhs.deleted {
@@ -5575,7 +5627,6 @@ extension QuestionNoteOverride: Equatable, Hashable {
     public func hash(into hasher: inout Hasher) {
         hasher.combine(questionId)
         hasher.combine(noteId)
-        hasher.combine(kind)
         hasher.combine(deleted)
     }
 }
@@ -5584,21 +5635,19 @@ extension QuestionNoteOverride: Equatable, Hashable {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeQuestionNoteOverride: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> QuestionNoteOverride {
+public struct FfiConverterTypeQuestionNote: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> QuestionNote {
         return
-            try QuestionNoteOverride(
+            try QuestionNote(
                 questionId: FfiConverterString.read(from: &buf), 
                 noteId: FfiConverterString.read(from: &buf), 
-                kind: FfiConverterString.read(from: &buf), 
                 deleted: FfiConverterBool.read(from: &buf)
         )
     }
 
-    public static func write(_ value: QuestionNoteOverride, into buf: inout [UInt8]) {
+    public static func write(_ value: QuestionNote, into buf: inout [UInt8]) {
         FfiConverterString.write(value.questionId, into: &buf)
         FfiConverterString.write(value.noteId, into: &buf)
-        FfiConverterString.write(value.kind, into: &buf)
         FfiConverterBool.write(value.deleted, into: &buf)
     }
 }
@@ -5607,15 +5656,15 @@ public struct FfiConverterTypeQuestionNoteOverride: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeQuestionNoteOverride_lift(_ buf: RustBuffer) throws -> QuestionNoteOverride {
-    return try FfiConverterTypeQuestionNoteOverride.lift(buf)
+public func FfiConverterTypeQuestionNote_lift(_ buf: RustBuffer) throws -> QuestionNote {
+    return try FfiConverterTypeQuestionNote.lift(buf)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeQuestionNoteOverride_lower(_ value: QuestionNoteOverride) -> RustBuffer {
-    return FfiConverterTypeQuestionNoteOverride.lower(value)
+public func FfiConverterTypeQuestionNote_lower(_ value: QuestionNote) -> RustBuffer {
+    return FfiConverterTypeQuestionNote.lower(value)
 }
 
 
@@ -5631,8 +5680,8 @@ public func FfiConverterTypeQuestionNoteOverride_lower(_ value: QuestionNoteOver
  * CHECK, so a row written by a newer client must not panic an older read.
  *
  * Deliberately NO note count or active-date-range field — those are Lexicon presentation shapes.
- * The count rides on [`QuestionLogEntry`] (SUR-1071), because it is a function of `now`; the range
- * needs no field at all, since `created_at` + `resolved_at` + `status` already say it.
+ * The count rides on [`QuestionLogEntry`] (SUR-1071); the range needs no field at all, since
+ * `created_at` + `resolved_at` + `status` already say it.
  */
 public struct QuestionRecord {
     public var id: String
@@ -7080,7 +7129,7 @@ extension NoteSignalKind: Equatable, Hashable {}
 /**
  * What a due prompt is. `Initial` asks for a question (and doubles as the tone picker on first
  * use), `Nudge` is the one-and-only reminder for an unanswered initial prompt, `CheckIn` revisits
- * the live question at cadence.
+ * EVERY active question in one pass at cadence (SUR-1101).
  */
 
 public enum PromptEventKind {
@@ -7632,6 +7681,30 @@ fileprivate struct FfiConverterOptionTypeQuestionRecord: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionSequenceTypeNoteRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [NoteRecord]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceTypeNoteRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceTypeNoteRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionSequenceTypePromptEvent: FfiConverterRustBuffer {
     typealias SwiftType = [PromptEvent]?
 
@@ -8175,7 +8248,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_collection_note_counts() != 26206) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_braird_core_checksum_method_syncengine_complete_checkin() != 4115) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_braird_core_checksum_method_syncengine_counts() != 34830) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_dismiss_question_nudge() != 42537) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_embed_pending() != 57921) {
@@ -8205,10 +8284,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_enqueue_note_signals() != 65282) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_enqueue_question() != 36841) {
+    if (uniffi_braird_core_checksum_method_syncengine_enqueue_question() != 31774) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_enqueue_question_note_override() != 50313) {
+    if (uniffi_braird_core_checksum_method_syncengine_enqueue_question_note() != 27049) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_export_snapshot() != 42276) {
@@ -8247,7 +8326,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_list_notes() != 26133) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_list_questions() != 33394) {
+    if (uniffi_braird_core_checksum_method_syncengine_list_questions() != 21954) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_merge_books() != 55148) {
@@ -8280,7 +8359,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_pull() != 8960) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_question_notes() != 6988) {
+    if (uniffi_braird_core_checksum_method_syncengine_question_notes() != 50321) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_question_nudge_due() != 22080) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_ranked_search() != 46931) {
@@ -8319,9 +8401,6 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_similar_notes() != 52094) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_skip_checkin() != 64973) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_braird_core_checksum_method_syncengine_skip_prompt() != 15062) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8329,6 +8408,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_sync() != 38790) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_unattached_since_last_checkin() != 51270) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_unmerge_books() != 15809) {
