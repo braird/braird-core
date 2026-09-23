@@ -19,7 +19,7 @@
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Map, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 /// One `outbox` row read back by [`Store::outbox_items`]: `(id, table_name, record_id,
 /// payload_json, created_at)`. Aliased so the 5-tuple stays readable at the call site (and
@@ -654,27 +654,40 @@ impl Store {
     }
 
     /// One-time conversion of a store written by core <= v0.16.0 (SUR-1101): the retired
-    /// `question_note_overrides` table becomes `question_notes` rows, then goes.
+    /// `question_note_overrides` table is folded into `question_notes`, then goes.
     ///
-    /// The old model computed a question's notes on read as `(window ∪ includes) − excludes`, with
-    /// the window `[created_at, max(resolved_at ?? now, created_at)]`, both ends inclusive, over
-    /// live questions and live notes; an `exclude` beat the window, any other live `kind` (including
-    /// one a newer client invented) counted as an include, and a soft-deleted override returned the
-    /// pair to the window. This runs that rule ONE last time, in SQL, and stages a `question_notes`
-    /// row for every pair it yields — so every question keeps exactly the notes the user saw.
-    /// It is the same rule surfc migration 0058 applies to the cloud copy, and both write the
-    /// deterministic [`question_note_id`], so this device's rows and the server's converge as one
-    /// row per pair under LWW rather than doubling.
+    /// **It stages ONLY what the server cannot know**, and that restraint is the correctness
+    /// property, not an optimisation. surfc migration 0058 already materialised every question's
+    /// note set on the server from everything devices had flushed; the first pull of
+    /// `question_notes` (cursor 0) brings those rows here. A first version re-staged this device's
+    /// whole effective set stamped `now`, and review showed that loses writes both ways: a device
+    /// upgrading late would out-stamp a detach the user made on an already-upgraded device, and an
+    /// exclude another device had flushed (then hard-deleted by 0058) would come back attached.
+    /// So only two things are written:
     ///
-    /// Why it cannot be skipped in favour of re-pulling: the server copy knows nothing this device
-    /// never flushed. Un-flushed curation is exactly the data a pull would lose, so the old table
-    /// is read here and its queued outbox rows are discarded only after being folded in. (Those
-    /// rows could never flush anyway: the push loop iterates [`synced_table_names`] only, so they
-    /// would sit in the outbox forever, invisible to every gate.)
+    /// 1. **Curation this device never flushed** — an old row still in the outbox. The server never
+    ///    saw it, so the pull cannot restore it. Each such pair gets the old rule's answer AS A
+    ///    ROW: attached if the pair was in the effective set, a TOMBSTONE otherwise (an exclude, or
+    ///    an un-pin). Stamped `now_ms`, because it is the user's latest intent on this device and
+    ///    must outrank the server's materialised row for the same pair.
+    /// 2. **Window pairs of a note or question this device never flushed.** The server could not
+    ///    materialise a pair whose endpoint it did not have. Stamped `1` — the lowest possible —
+    ///    so any row the server does hold for the pair (from 0058, or a later attach or detach on
+    ///    another device) wins the LWW compare on pull and on push alike.
     ///
-    /// The table's existence is the run-once flag: it is dropped in the same transaction that
-    /// stages its replacement, so a crash leaves either the old world intact (retried on the next
-    /// open) or the new one complete. Its per-table pull bookkeeping in `meta` goes with it.
+    /// Everything else stays exactly as the server has it. The effective set itself is the old
+    /// read rule, run one last time in SQL: `(window ∪ includes) − excludes`, the window
+    /// `[created_at, max(resolved_at ?? now, created_at)]` inclusive at both ends, over live
+    /// questions and live notes (`deleted = 0`, as `list_live` reads them); an `exclude` beat the
+    /// window, any other live `kind` (including one a newer client invented) counted as an include,
+    /// and a soft-deleted override returned the pair to the window. `now` is this device's open
+    /// time — used only for pairs the server has never seen, which is when it is the right clock.
+    ///
+    /// The old table's queued outbox rows are deleted with it: the push loop iterates
+    /// [`synced_table_names`] only, so they would otherwise sit in the outbox forever. The table's
+    /// existence is the run-once flag: it is dropped in the same transaction that stages its
+    /// replacement, so a crash leaves either the old world intact (retried on the next open) or the
+    /// new one complete. Its per-table pull bookkeeping in `meta` goes with it.
     ///
     /// ponytail: O(questions × notes) join once per device, ever. Fine at personal-archive scale.
     pub fn convert_question_note_overrides(&self, now_ms: i64) -> rusqlite::Result<()> {
@@ -682,40 +695,74 @@ impl Store {
         if !self.table_exists(OLD)? {
             return Ok(());
         }
-        let pairs: Vec<(String, String)> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT q.id, n.id FROM questions q JOIN notes n \
-                   ON n.deleted = 0 \
-                  AND coalesce(n.created_at, 0) >= coalesce(q.created_at, 0) \
-                  AND coalesce(n.created_at, 0) <= \
-                      max(coalesce(q.resolved_at, ?1), coalesce(q.created_at, 0)) \
-                 WHERE q.deleted = 0 \
-                   AND NOT EXISTS (SELECT 1 FROM question_note_overrides o \
-                                    WHERE o.question_id = q.id AND o.note_id = n.id \
-                                      AND o.deleted = 0 AND o.kind = 'exclude') \
-                 UNION \
-                 SELECT o.question_id, o.note_id FROM question_note_overrides o \
-                   JOIN questions q ON q.id = o.question_id AND q.deleted = 0 \
-                   JOIN notes n     ON n.id = o.note_id     AND n.deleted = 0 \
-                  WHERE o.deleted = 0 AND coalesce(o.kind, '') <> 'exclude'",
-            )?;
+        let pairs = |sql: &str,
+                     params: &[&dyn rusqlite::ToSql]|
+         -> rusqlite::Result<Vec<(String, String)>> {
+            let mut stmt = self.conn.prepare(sql)?;
             let rows = stmt
-                .query_map([now_ms], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .query_map(params, |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            rows
+            Ok(rows)
         };
+        let effective: BTreeSet<(String, String)> = pairs(
+            "SELECT q.id, n.id FROM questions q JOIN notes n \
+               ON n.deleted = 0 \
+              AND coalesce(n.created_at, 0) >= coalesce(q.created_at, 0) \
+              AND coalesce(n.created_at, 0) <= \
+                  max(coalesce(q.resolved_at, ?1), coalesce(q.created_at, 0)) \
+             WHERE q.deleted = 0 \
+               AND NOT EXISTS (SELECT 1 FROM question_note_overrides o \
+                                WHERE o.question_id = q.id AND o.note_id = n.id \
+                                  AND o.deleted = 0 AND o.kind = 'exclude') \
+             UNION \
+             SELECT o.question_id, o.note_id FROM question_note_overrides o \
+               JOIN questions q ON q.id = o.question_id AND q.deleted = 0 \
+               JOIN notes n     ON n.id = o.note_id     AND n.deleted = 0 \
+              WHERE o.deleted = 0 AND coalesce(o.kind, '') <> 'exclude'",
+            &[&now_ms],
+        )?
+        .into_iter()
+        .collect();
+        let unflushed_curation = pairs(
+            "SELECT o.question_id, o.note_id FROM question_note_overrides o \
+              WHERE EXISTS (SELECT 1 FROM outbox x \
+                             WHERE x.table_name = 'question_note_overrides' AND x.record_id = o.id)",
+            &[],
+        )?;
+        let unflushed = |table: &str| -> rusqlite::Result<HashSet<String>> {
+            let mut stmt = self.conn.prepare(
+                "SELECT record_id FROM outbox WHERE table_name = ?1 AND record_id IS NOT NULL",
+            )?;
+            let ids = stmt
+                .query_map([table], |r| r.get(0))?
+                .collect::<rusqlite::Result<HashSet<String>>>()?;
+            Ok(ids)
+        };
+        let (unflushed_notes, unflushed_questions) = (unflushed("notes")?, unflushed("questions")?);
 
         let tx = self.conn.unchecked_transaction()?;
-        for (question_id, note_id) in pairs {
-            let id = question_note_id(&question_id, &note_id);
+        let stage = |question_id: &str, note_id: &str, deleted: bool, stamp: i64| {
+            let id = question_note_id(question_id, note_id);
             let mut row = Map::new();
             row.insert("id".into(), Value::from(id.clone()));
             row.insert("question_id".into(), Value::from(question_id));
             row.insert("note_id".into(), Value::from(note_id));
             row.insert("created_at".into(), Value::from(now_ms));
-            row.insert("updated_at".into(), Value::from(now_ms));
-            row.insert("deleted".into(), Value::from(false));
-            self.stage_write_inner("question_notes", &id, row, now_ms)?;
+            row.insert("updated_at".into(), Value::from(stamp));
+            row.insert("deleted".into(), Value::from(deleted));
+            self.stage_write_inner("question_notes", &id, row, now_ms)
+        };
+        for (question_id, note_id) in &unflushed_curation {
+            let attached = effective.contains(&(question_id.clone(), note_id.clone()));
+            stage(question_id, note_id, !attached, now_ms)?;
+        }
+        let curated: HashSet<&(String, String)> = unflushed_curation.iter().collect();
+        for pair @ (question_id, note_id) in &effective {
+            if !curated.contains(pair)
+                && (unflushed_notes.contains(note_id) || unflushed_questions.contains(question_id))
+            {
+                stage(question_id, note_id, false, 1)?;
+            }
         }
         self.conn
             .execute("DELETE FROM outbox WHERE table_name = ?1", [OLD])?;
@@ -1003,7 +1050,8 @@ impl Store {
     /// embedding vector, here rather than at any call site: `apply_row` is the single choke point
     /// every note write funnels through (`stage_write_inner`, `apply_row_rebasing_outbox`,
     /// `stage_import_batch`, and the pull loop), so one guard covers local deletes, pulled foreign
-    /// deletes, and imports alike — a plaintext-derived artifact must not outlive its note. Rides
+    /// deletes, and imports alike — a plaintext-derived artifact must not outlive its note (and,
+    /// since SUR-1101, a question tombstone drops its `question_embeddings` row the same way). Rides
     /// the caller's transaction when one is open; standalone, a crash between the two statements
     /// leaves at worst an orphan vector, which `sweep_orphan_embeddings` heals on the next embed
     /// pass. The branch is a table-name compare + one indexed DELETE, only on the tombstone path —
@@ -1059,6 +1107,13 @@ impl Store {
             if let Some(id) = row.get("id").and_then(Value::as_str) {
                 self.conn
                     .execute("DELETE FROM embeddings WHERE note_id = ?1", [id])?;
+            }
+        }
+        // The same rule for a question's vector (SUR-1101): it is derived from the question's
+        // plaintext, so it goes when the question does — not whenever the next embed pass sweeps.
+        if table == "questions" && truthy(row.get("deleted")) {
+            if let Some(id) = row.get("id").and_then(Value::as_str) {
+                self.delete_question_embedding(id)?;
             }
         }
         Ok(())
@@ -1685,6 +1740,38 @@ impl Store {
         Ok(())
     }
 
+    /// A note's sealed vector only if it was embedded from the note's CURRENT text — the
+    /// [`Store::sealed_embedding`] read plus the staleness token the derived queue uses. For the
+    /// attach-sheet probe (SUR-1101): an edited note, not yet re-embedded, must be ranked by what it
+    /// says now, so a stale vector reads as "no vector" and the caller embeds on demand.
+    pub(crate) fn current_sealed_embedding(
+        &self,
+        note_id: &str,
+        corpus_key: &str,
+    ) -> rusqlite::Result<Option<Vec<u8>>> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT e.encrypted_vector FROM embeddings e \
+                     JOIN notes n ON n.id = e.note_id AND n.deleted = 0 \
+                     WHERE e.note_id = ?1 AND e.model_version = ?2 \
+                       AND e.encrypted_vector IS NOT NULL AND e.content_token IS {}",
+                    content_token_sql("n")
+                ),
+                rusqlite::params![note_id, corpus_key],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// Row count of a local-only table, for tests that assert a hook removed something.
+    #[cfg(test)]
+    pub(crate) fn count_embedding_rows_for_test(&self, table: &str) -> i64 {
+        self.conn
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+
     /// One `embeddings` row read back for tests: `(corpus key, source token,
     /// sealed vector — `None` = skip marker)`, or `None` when the note has no row at all.
     /// Test-only (both this module's and `sync`'s test modules) — no production reader
@@ -1761,29 +1848,32 @@ fn pending_question_embeddings_sql(select: &str) -> String {
 }
 
 /// Recreate what core <= v0.16.0 left on disk for SUR-1101's conversion tests: the retired
-/// `question_note_overrides` table (its 0.16.0 DDL, verbatim from the old descriptor), the given
-/// `(question_id, note_id, kind, deleted)` rows, and one un-flushed outbox row per override.
+/// `question_note_overrides` table (its 0.16.0 DDL, verbatim from the old descriptor) and the given
+/// `(question_id, note_id, kind, deleted, queued)` rows — `queued` ones also get an un-flushed
+/// outbox row, the rest read as already synced.
 #[cfg(test)]
-pub(crate) fn plant_legacy_overrides(db_path: &str, rows: &[(&str, &str, &str, bool)]) {
+pub(crate) fn plant_legacy_overrides(db_path: &str, rows: &[(&str, &str, &str, bool, bool)]) {
     let conn = Connection::open(db_path).unwrap();
     conn.execute_batch(
         "CREATE TABLE question_note_overrides (id TEXT PRIMARY KEY, question_id TEXT, \
          note_id TEXT, kind TEXT, created_at INTEGER, updated_at INTEGER, deleted INTEGER);",
     )
     .unwrap();
-    for (question_id, note_id, kind, deleted) in rows {
+    for (question_id, note_id, kind, deleted, queued) in rows {
         let id = question_note_id(question_id, note_id);
         conn.execute(
             "INSERT INTO question_note_overrides VALUES (?1, ?2, ?3, ?4, 1, 1, ?5)",
             rusqlite::params![id, question_id, note_id, kind, *deleted as i64],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO outbox (table_name, record_id, payload, created_at) \
-             VALUES ('question_note_overrides', ?1, '{}', 1)",
-            [&id],
-        )
-        .unwrap();
+        if *queued {
+            conn.execute(
+                "INSERT INTO outbox (table_name, record_id, payload, created_at) \
+                 VALUES ('question_note_overrides', ?1, '{}', 1)",
+                [&id],
+            )
+            .unwrap();
+        }
     }
 }
 
@@ -1792,108 +1882,172 @@ mod tests {
     use super::*;
 
     // ── SUR-1101: converting a <= v0.16.0 store ──────────────────────────────
-    // One case per branch of the retired rule, `(window ∪ includes) − excludes`, mirroring surfc's
-    // `questionNotes.migration.test.js` for migration 0058 — the two conversions must agree, because
-    // their rows meet as one row per pair under LWW.
+    // The conversion writes ONLY what the server cannot know (see its doc). Every case asserts the
+    // full set of staged rows — including tombstones and their stamps — because a row staged that
+    // should not be, or stamped too high, is exactly the lost write the rule exists to prevent.
 
+    /// Rows applied with `apply_row` are FLUSHED state (in the mirror, not in the outbox), the
+    /// state a pull leaves behind. `unflushed_*` go through `stage_local_write`, which queues them.
     fn legacy_store(
         questions: &[(&str, i64, Option<i64>, bool)],
         notes: &[(&str, i64, bool)],
-        overrides: &[(&str, &str, &str, bool)],
+        overrides: &[(&str, &str, &str, bool, bool)],
     ) -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.sqlite").to_str().unwrap().to_string();
         let store = Store::open(&path).unwrap();
         for (id, created_at, resolved_at, deleted) in questions {
-            let row = serde_json::json!({
-                "id": id, "text": "enc:v2:x", "status": "active", "created_at": created_at,
-                "resolved_at": resolved_at, "updated_at": 1, "deleted": deleted,
-            });
             store
-                .apply_row("questions", row.as_object().unwrap())
+                .apply_row(
+                    "questions",
+                    question_json(id, *created_at, *resolved_at, *deleted)
+                        .as_object()
+                        .unwrap(),
+                )
                 .unwrap();
         }
         for (id, created_at, deleted) in notes {
-            let row = serde_json::json!({
-                "id": id, "text": "", "created_at": created_at, "updated_at": 1, "deleted": deleted,
-            });
-            store.apply_row("notes", row.as_object().unwrap()).unwrap();
+            store
+                .apply_row(
+                    "notes",
+                    note_json(id, *created_at, *deleted).as_object().unwrap(),
+                )
+                .unwrap();
         }
         drop(store);
         plant_legacy_overrides(&path, overrides);
         (dir, path)
     }
 
-    fn attached_pairs(store: &Store) -> Vec<String> {
-        let mut ids: Vec<String> = store
-            .list_live("question_notes", None, -1, 0)
+    fn question_json(id: &str, created_at: i64, resolved_at: Option<i64>, deleted: bool) -> Value {
+        serde_json::json!({
+            "id": id, "text": "enc:v2:x", "status": "active", "created_at": created_at,
+            "resolved_at": resolved_at, "updated_at": 1, "deleted": deleted,
+        })
+    }
+
+    fn note_json(id: &str, created_at: i64, deleted: bool) -> Value {
+        serde_json::json!({
+            "id": id, "text": "", "created_at": created_at, "updated_at": 1, "deleted": deleted,
+        })
+    }
+
+    fn unflushed(store: &Store, table: &str, row: Value) {
+        let id = row["id"].as_str().unwrap().to_string();
+        store
+            .stage_local_write(table, &id, row.as_object().unwrap().clone(), 1)
+            .unwrap();
+    }
+
+    /// Every `question_notes` row, tombstones included: `(id, deleted, updated_at)`.
+    fn staged(store: &Store) -> Vec<(String, bool, i64)> {
+        let mut stmt = store
+            .conn
+            .prepare("SELECT id, deleted, updated_at FROM question_notes ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0, r.get(2)?)))
             .unwrap()
-            .iter()
-            .filter_map(|r| r.get("id").and_then(Value::as_str).map(str::to_string))
-            .collect();
-        ids.sort();
-        ids
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    fn row(id: &str, deleted: bool, updated_at: i64) -> (String, bool, i64) {
+        (id.to_string(), deleted, updated_at)
     }
 
     const NOW: i64 = 9_000;
 
     #[test]
-    fn conversion_keeps_exactly_the_old_effective_set() {
+    fn unflushed_curation_converts_to_the_old_rules_answer_stamped_now() {
+        // Questions and notes are flushed; only the overrides marked `queued` never left the
+        // device. Each queued pair becomes a row carrying what the user saw — attached, or a
+        // tombstone — stamped `now` so it outranks 0058's materialised row for the same pair.
         let (_d, path) = legacy_store(
             &[
                 ("active", 1_000, None, false),
-                ("resolved", 1_000, Some(2_500), false),
                 ("deleted", 1_000, None, true),
-                // resolved before it opened (clock skew): core clamps the end to the start.
-                ("inverted", 5_000, Some(4_000), false),
             ],
             &[
                 ("in", 2_000, false),
-                ("before", 500, false),
                 ("include-out", 500, false),
                 ("exclude-in", 3_000, false),
                 ("tomb-in", 4_000, false),
                 ("tomb-out", 600, false),
                 ("unknown", 700, false),
-                ("gone", 2_000, true),
-                ("at-end", 2_500, false),
-                ("late", 5_000, false),
-                ("after-now", NOW + 1, false),
+                ("flushed-exclude", 2_100, false),
             ],
             &[
-                ("active", "include-out", "include", false),
-                ("active", "exclude-in", "exclude", false),
-                ("active", "tomb-in", "exclude", true),
-                ("active", "tomb-out", "include", true),
-                ("active", "unknown", "pinned-by-a-newer-client", false),
-                ("deleted", "include-out", "include", false),
+                ("active", "include-out", "include", false, true),
+                ("active", "exclude-in", "exclude", false, true),
+                // An un-pin of a pinned window note: the window still offers it.
+                ("active", "tomb-in", "exclude", true, true),
+                // An un-pin of an out-of-window note: nothing offers it any more.
+                ("active", "tomb-out", "include", true, true),
+                ("active", "unknown", "pinned-by-a-newer-client", false, true),
+                ("deleted", "include-out", "include", false, true),
+                // Already flushed: 0058 resolved it on the server; the pull brings the result.
+                ("active", "flushed-exclude", "exclude", false, false),
             ],
         );
         let store = Store::open(&path).unwrap();
         store.convert_question_note_overrides(NOW).unwrap();
 
         assert_eq!(
-            attached_pairs(&store),
+            staged(&store),
             vec![
-                "active:at-end",
-                "active:in",
-                "active:include-out",
-                "active:late",
-                "active:tomb-in",
-                "active:unknown",
-                "inverted:late",
-                "resolved:at-end",
-                "resolved:in",
-            ]
+                row("active:exclude-in", true, NOW),
+                row("active:include-out", false, NOW),
+                row("active:tomb-in", false, NOW),
+                row("active:tomb-out", true, NOW),
+                row("active:unknown", false, NOW),
+                row("deleted:include-out", true, NOW),
+            ],
+            "flushed window pairs (active:in) and flushed curation are left to the pull"
         );
     }
 
     #[test]
-    fn conversion_queues_its_rows_and_retires_everything_of_the_old_table() {
+    fn window_pairs_of_an_unflushed_endpoint_are_staged_at_the_lowest_stamp() {
+        // The server could not materialise a pair whose note or question it never received, so
+        // those pairs are written — at stamp 1, so any row the server DOES hold wins.
+        let (_d, path) = legacy_store(
+            &[
+                ("active", 1_000, None, false),
+                ("resolved", 1_000, Some(2_500), false),
+            ],
+            &[("flushed-in", 2_000, false), ("at-end", 2_500, false)],
+            &[("resolved", "flushed-in", "exclude", false, false)],
+        );
+        let store = Store::open(&path).unwrap();
+        unflushed(&store, "notes", note_json("offline-note", 2_200, false));
+        unflushed(
+            &store,
+            "questions",
+            question_json("q-offline", 1_500, None, false),
+        );
+
+        store.convert_question_note_overrides(NOW).unwrap();
+
+        assert_eq!(
+            staged(&store),
+            vec![
+                row("active:offline-note", false, 1),
+                row("q-offline:at-end", false, 1),
+                row("q-offline:flushed-in", false, 1),
+                row("q-offline:offline-note", false, 1),
+                row("resolved:offline-note", false, 1),
+            ],
+            "pairs whose endpoints are both flushed (active:flushed-in, resolved:at-end) are \
+             the server's; the flushed exclude still removes resolved:flushed-in"
+        );
+    }
+
+    #[test]
+    fn conversion_retires_everything_of_the_old_table() {
         let (_d, path) = legacy_store(
             &[("q", 1_000, None, false)],
             &[("n", 2_000, false)],
-            &[("q", "n", "include", false)],
+            &[("q", "n", "include", false, true)],
         );
         let store = Store::open(&path).unwrap();
         store.set_seq_cursor("question_note_overrides", 7).unwrap();

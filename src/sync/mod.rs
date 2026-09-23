@@ -1700,7 +1700,7 @@ impl SyncEngine {
     /// nudge; see [`prompt::next_events`] for the full rule table).
     ///
     /// Both timestamps are host-supplied. `now_ms` follows the read-surface convention
-    /// ([`SyncEngine::question_notes`]) — core reads no clock, so the result is a pure function of
+    /// ([`SyncEngine::notes_this_week`]) — core reads no clock, so the result is a pure function of
     /// its inputs and testable at any point on the timeline. `account_created_at_ms` has no choice
     /// about it: core holds no account-creation stamp anywhere, because `user_profiles` is
     /// server-authoritative and stays outside the client sync surface. Both platforms read it from
@@ -1764,7 +1764,7 @@ impl SyncEngine {
     /// some, or skipped the lot. The next check-in is due one cadence from `now_ms`.
     ///
     /// One call per PASS, not per question: a check-in covers every active question at once, so the
-    /// timer is the pass's, stored as the synced [`prompt::CHECKIN_LAST_AT_KEY`]. Per-question
+    /// timer is the pass's, stored as the synced [`prompt::CHECKIN_COMPLETED_AT_KEY`]. Per-question
     /// answers still go through [`SyncEngine::enqueue_question`] (`checkin_response`, `status`, and
     /// the question's own `checkin_at`); this replaces `skip_checkin`, which could only stamp one
     /// question. Skipping is still never punished and never visibly counted — nothing records that a
@@ -1772,7 +1772,18 @@ impl SyncEngine {
     ///
     /// `now_ms` is host-supplied, for the [`SyncEngine::skip_prompt`] reason.
     pub fn complete_checkin(&self, now_ms: i64) -> Result<(), SyncError> {
-        self.set_user_setting(prompt::CHECKIN_LAST_AT_KEY.into(), now_ms.to_string())
+        // MONOTONE ON THE VALUE, not only on `updated_at`. The stamp is when the pass happened, and
+        // a later pass never un-happens an earlier one: a device whose clock trails the one that
+        // wrote the stored value would otherwise move the anchor BACK (its row wins LWW on the
+        // bookkeeping stamp) and make the next check-in come due early on every device.
+        let stored = {
+            let store = lock!(self.store);
+            read::user_setting(&store, prompt::CHECKIN_COMPLETED_AT_KEY)
+                .map_err(store_err)?
+                .and_then(|v| v.parse::<i64>().ok())
+        };
+        let at = stored.map_or(now_ms, |s| s.max(now_ms));
+        self.set_user_setting(prompt::CHECKIN_COMPLETED_AT_KEY.into(), at.to_string())
     }
 
     /// The check-in's backstop section (SUR-1101): live notes captured since the current check-in
@@ -2079,7 +2090,7 @@ impl SyncEngine {
     /// opens.
     ///
     /// Unpaginated on purpose: active-first ordering has to be applied before any page is cut, and
-    /// the log grows by about one row per cadence period.
+    /// the log grows by one row per question the user opens.
     pub fn list_questions(&self) -> Result<Vec<QuestionLogEntry>, SyncError> {
         let store = lock!(self.store);
         read::list_questions(&store, &self.vault).map_err(store_err)
@@ -2349,7 +2360,7 @@ impl SyncEngine {
             questions: read::question_metas(store)?,
             has_ever_answered: read::user_setting(store, PROMPT_ANSWERED_AT_KEY)?.is_some(),
             prompt_skipped_at_ms: stamp(PROMPT_SKIPPED_AT_KEY)?,
-            checkin_last_at_ms: stamp(prompt::CHECKIN_LAST_AT_KEY)?,
+            checkin_completed_at_ms: stamp(prompt::CHECKIN_COMPLETED_AT_KEY)?,
         })
     }
 
@@ -3106,7 +3117,7 @@ impl SyncEngine {
             let store = lock!(self.store);
             (
                 store
-                    .sealed_embedding(note_id, &reg.corpus_key)
+                    .current_sealed_embedding(note_id, &reg.corpus_key)
                     .map_err(store_err)?,
                 store.get_row("notes", note_id).map_err(store_err)?,
             )
@@ -3341,17 +3352,20 @@ impl SyncEngine {
                     (if decrypt_failed { None } else { text }, token)
                 }
                 PendingEmbed::Question => {
-                    // `get_question` decrypts through the question-only enc:v2 gate; one short
-                    // hold of the store lock for a single row, released before the host call.
-                    let store = lock!(self.store);
-                    let token = store.question_text_token(&id).map_err(store_err)?;
-                    let question =
-                        read::get_question(&store, &self.vault, &id).map_err(store_err)?;
-                    let (Some(question), Some(token)) = (question, token) else {
+                    let (row, token) = {
+                        let store = lock!(self.store);
+                        (
+                            store.get_row("questions", &id).map_err(store_err)?,
+                            store.question_text_token(&id).map_err(store_err)?,
+                        )
+                    };
+                    let (Some(row), Some(token)) = (row, token) else {
                         skipped += 1;
                         continue;
                     };
-                    (question.text, token)
+                    // Decrypt through the question-only enc:v2 gate (store lock already released,
+                    // like the note arm): an unbound `text` reads as None and gets a skip marker.
+                    (read::question_record(&row, &self.vault).text, token)
                 }
             };
             let content = content
@@ -3423,14 +3437,10 @@ impl SyncEngine {
         &self,
         note_id: String,
     ) -> Result<Vec<QuestionRecord>, SyncError> {
-        let mut active: Vec<QuestionRecord> = {
+        let mut active = {
             let store = lock!(self.store);
-            read::list_questions(&store, &self.vault).map_err(store_err)?
-        }
-        .into_iter()
-        .map(|entry| entry.question)
-        .filter(|q| prompt::is_active(q.status.as_deref()))
-        .collect();
+            read::active_questions(&store, &self.vault).map_err(store_err)?
+        };
         if active.len() < 2 {
             return Ok(active);
         }
@@ -5171,7 +5181,10 @@ mod tests {
                 })
                 .unwrap();
         }
-        crate::store::plant_legacy_overrides(db_path, &[("q1", "in-window", "exclude", false)]);
+        crate::store::plant_legacy_overrides(
+            db_path,
+            &[("q1", "in-window", "exclude", false, true)],
+        );
         {
             let store = Store::open(db_path).unwrap();
             store.mark_pull_complete("question_note_overrides").unwrap();
@@ -5581,6 +5594,24 @@ mod tests {
     }
 
     #[test]
+    fn a_pass_from_a_trailing_clock_never_moves_the_anchor_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.complete_checkin(10_000).unwrap();
+        engine.complete_checkin(9_000).unwrap(); // a device whose clock runs behind
+        assert_eq!(
+            read::user_setting(
+                &Store::open(db_path).unwrap(),
+                prompt::CHECKIN_COMPLETED_AT_KEY
+            )
+            .unwrap(),
+            Some("10000".into())
+        );
+    }
+
+    #[test]
     fn complete_checkin_stamps_the_pass_and_touches_no_question() {
         // A pass is a timer reset. Per-question answers are separate `enqueue_question` patches, so
         // a pass that answered nothing must leave every question row byte-for-byte as it was.
@@ -5599,7 +5630,7 @@ mod tests {
         let store = Store::open(db_path).unwrap();
         assert_eq!(store.get_row("questions", "q1").unwrap(), before);
         assert_eq!(
-            read::user_setting(&store, prompt::CHECKIN_LAST_AT_KEY).unwrap(),
+            read::user_setting(&store, prompt::CHECKIN_COMPLETED_AT_KEY).unwrap(),
             Some("5000".into())
         );
     }
@@ -9470,6 +9501,7 @@ mod tests {
     struct HistogramEmbedder {
         model_id: String,
         embed_calls: AtomicU32,
+        query_calls: AtomicU32,
     }
 
     const DIMS: u32 = 8;
@@ -9487,6 +9519,7 @@ mod tests {
             Arc::new(Self {
                 model_id: model_id.into(),
                 embed_calls: AtomicU32::new(0),
+                query_calls: AtomicU32::new(0),
             })
         }
     }
@@ -9504,6 +9537,7 @@ mod tests {
             Ok(histogram(&text))
         }
         fn embed_query(&self, text: String) -> Result<Vec<f32>, EmbedderError> {
+            self.query_calls.fetch_add(1, Ordering::SeqCst);
             Ok(histogram(&text))
         }
     }
@@ -9709,6 +9743,112 @@ mod tests {
                 "vectors must never enqueue for sync"
             );
         }
+    }
+
+    #[test]
+    fn a_question_tombstone_drops_its_vector_without_waiting_for_a_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, db_path) = embed_engine(&dir, "qtomb");
+        ask(&engine, "q1", "aaaa", 100);
+        engine
+            .register_embedder(HistogramEmbedder::new("fake-model"))
+            .unwrap();
+        engine.embed_pending(10).unwrap();
+        engine
+            .enqueue_question(QuestionUpsert {
+                deleted: true,
+                ..question_upsert("q1", "aaaa")
+            })
+            .unwrap();
+        let store = Store::open(&db_path).unwrap();
+        let rows: i64 = store.count_embedding_rows_for_test("question_embeddings");
+        assert_eq!(
+            rows, 0,
+            "a plaintext-derived vector must not outlive its question"
+        );
+    }
+
+    #[test]
+    fn an_unbound_question_text_is_skip_marked_and_never_reaches_the_embedder() {
+        // The question gate accepts enc:v2 bound to the question's own id and nothing else. A
+        // pulled row carrying plaintext (or anything else) must drain as a skip marker, not be
+        // handed to the host embedder as though the account key had sealed it.
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, db_path) = embed_engine(&dir, "qunbound");
+        let store = Store::open(&db_path).unwrap();
+        store
+            .apply_row(
+                "questions",
+                json!({
+                    "id": "q-plain", "text": "not sealed at all", "status": "active",
+                    "created_at": 1, "updated_at": 1, "deleted": false
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .unwrap();
+        let embedder = HistogramEmbedder::new("fake-model");
+        engine.register_embedder(embedder.clone()).unwrap();
+
+        let pass = engine.embed_pending(10).unwrap();
+        assert_eq!(
+            (pass.skipped, pass.pending),
+            (1, 0),
+            "skip-marked, and the queue drains"
+        );
+        assert_eq!(embedder.query_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_corrupt_question_vector_is_dropped_and_requeued() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, db_path) = embed_engine(&dir, "qcorrupt");
+        ask(&engine, "q-a", "aaaa", 100);
+        ask(&engine, "q-b", "bbbb", 200);
+        engine.enqueue_note(note_upsert("n", "aaaa")).unwrap();
+        engine
+            .register_embedder(HistogramEmbedder::new("fake-model"))
+            .unwrap();
+        engine.embed_pending(10).unwrap();
+        {
+            let store = Store::open(&db_path).unwrap();
+            let token = store.question_text_token("q-a").unwrap().unwrap();
+            store
+                .upsert_question_embedding_if_current(
+                    "q-a",
+                    "fake-model|8|test|f32le-v1",
+                    &token,
+                    Some(b"garbage"),
+                    1,
+                )
+                .unwrap();
+        }
+
+        // The unreadable vector counts as "no vector": q-a drops behind the scored q-b.
+        assert_eq!(ranked(&engine, "n"), vec!["q-b", "q-a"]);
+        assert_eq!(
+            engine.pending_embed_count().unwrap(),
+            1,
+            "re-queued for the next pass"
+        );
+    }
+
+    #[test]
+    fn an_edited_note_is_ranked_by_what_it_says_now() {
+        // Its stored vector was made from the old text; until the queue re-embeds it, the probe
+        // must come from the current text, not the stale vector.
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "stale");
+        ask(&engine, "q-about-a", "aaaa", 100);
+        ask(&engine, "q-about-b", "bbbb", 200);
+        engine.enqueue_note(note_upsert("n", "aaaa")).unwrap();
+        let embedder = HistogramEmbedder::new("fake-model");
+        engine.register_embedder(embedder.clone()).unwrap();
+        engine.embed_pending(10).unwrap();
+        assert_eq!(ranked(&engine, "n"), vec!["q-about-a", "q-about-b"]);
+
+        engine.enqueue_note(note_upsert("n", "bbbb")).unwrap();
+        assert_eq!(ranked(&engine, "n"), vec!["q-about-b", "q-about-a"]);
     }
 
     #[test]

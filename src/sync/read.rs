@@ -460,6 +460,24 @@ pub fn get_question(
     }
 }
 
+/// The ACTIVE live questions, newest-first with `id` breaking a tie — the log's order within its
+/// active block, which is also "most recently opened". Status is read off the row BEFORE any
+/// decrypt, so resolved and dismissed questions never produce plaintext (SUR-1101: the attach
+/// sheet only ever shows active ones).
+pub fn active_questions(store: &Store, vault: &Vault) -> rusqlite::Result<Vec<QuestionRecord>> {
+    let mut rows: Vec<Map<String, Value>> = store
+        .list_live("questions", None, -1, 0)?
+        .into_iter()
+        .filter(|row| is_active(string_field(row, "status").as_deref()))
+        .collect();
+    rows.sort_by(|a, b| {
+        int_field(b, "created_at")
+            .cmp(&int_field(a, "created_at"))
+            .then(string_field(a, "id").cmp(&string_field(b, "id")))
+    });
+    Ok(rows.iter().map(|row| question_record(row, vault)).collect())
+}
+
 /// The LIVE notes attached to each question: live `question_notes` rows whose note is also live,
 /// bucketed by question id. `only` narrows the attachment scan to one question.
 ///
@@ -774,7 +792,7 @@ fn note_record(row: &Map<String, Value>, vault: &Vault) -> NoteRecord {
     }
 }
 
-fn question_record(row: &Map<String, Value>, vault: &Vault) -> QuestionRecord {
+pub(crate) fn question_record(row: &Map<String, Value>, vault: &Vault) -> QuestionRecord {
     let id = string_field(row, "id").unwrap_or_default();
     let (text, decrypt_failed) = decrypt_v2_bound(row, &id, vault);
     QuestionRecord {

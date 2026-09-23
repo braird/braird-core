@@ -886,7 +886,7 @@ public protocol SyncEngineProtocol : AnyObject {
      * some, or skipped the lot. The next check-in is due one cadence from `now_ms`.
      *
      * One call per PASS, not per question: a check-in covers every active question at once, so the
-     * timer is the pass's, stored as the synced [`prompt::CHECKIN_LAST_AT_KEY`]. Per-question
+     * timer is the pass's, stored as the synced [`prompt::CHECKIN_COMPLETED_AT_KEY`]. Per-question
      * answers still go through [`SyncEngine::enqueue_question`] (`checkin_response`, `status`, and
      * the question's own `checkin_at`); this replaces `skip_checkin`, which could only stamp one
      * question. Skipping is still never punished and never visibly counted — nothing records that a
@@ -1207,7 +1207,7 @@ public protocol SyncEngineProtocol : AnyObject {
      * opens.
      *
      * Unpaginated on purpose: active-first ordering has to be applied before any page is cut, and
-     * the log grows by about one row per cadence period.
+     * the log grows by one row per question the user opens.
      */
     func listQuestions() throws  -> [QuestionLogEntry]
     
@@ -1241,7 +1241,7 @@ public protocol SyncEngineProtocol : AnyObject {
      * nudge; see [`prompt::next_events`] for the full rule table).
      *
      * Both timestamps are host-supplied. `now_ms` follows the read-surface convention
-     * ([`SyncEngine::question_notes`]) — core reads no clock, so the result is a pure function of
+     * ([`SyncEngine::notes_this_week`]) — core reads no clock, so the result is a pure function of
      * its inputs and testable at any point on the timeline. `account_created_at_ms` has no choice
      * about it: core holds no account-creation stamp anywhere, because `user_profiles` is
      * server-authoritative and stays outside the client sync surface. Both platforms read it from
@@ -1800,7 +1800,7 @@ open func collectionNoteCounts()throws  -> [CollectionNoteCount] {
      * some, or skipped the lot. The next check-in is due one cadence from `now_ms`.
      *
      * One call per PASS, not per question: a check-in covers every active question at once, so the
-     * timer is the pass's, stored as the synced [`prompt::CHECKIN_LAST_AT_KEY`]. Per-question
+     * timer is the pass's, stored as the synced [`prompt::CHECKIN_COMPLETED_AT_KEY`]. Per-question
      * answers still go through [`SyncEngine::enqueue_question`] (`checkin_response`, `status`, and
      * the question's own `checkin_at`); this replaces `skip_checkin`, which could only stamp one
      * question. Skipping is still never punished and never visibly counted — nothing records that a
@@ -2297,7 +2297,7 @@ open func listNotes(bookId: String?, limit: UInt32, offset: UInt32)throws  -> [N
      * opens.
      *
      * Unpaginated on purpose: active-first ordering has to be applied before any page is cut, and
-     * the log grows by about one row per cadence period.
+     * the log grows by one row per question the user opens.
      */
 open func listQuestions()throws  -> [QuestionLogEntry] {
     return try  FfiConverterSequenceTypeQuestionLogEntry.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
@@ -2351,7 +2351,7 @@ open func mergeContentDuplicates(survivorId: String, loserIds: [String], allowCr
      * nudge; see [`prompt::next_events`] for the full rule table).
      *
      * Both timestamps are host-supplied. `now_ms` follows the read-surface convention
-     * ([`SyncEngine::question_notes`]) — core reads no clock, so the result is a pure function of
+     * ([`SyncEngine::notes_this_week`]) — core reads no clock, so the result is a pure function of
      * its inputs and testable at any point on the timeline. `account_created_at_ms` has no choice
      * about it: core holds no account-creation stamp anywhere, because `user_profiles` is
      * server-authoritative and stays outside the client sync surface. Both platforms read it from
@@ -8317,7 +8317,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_collection_note_counts() != 26206) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_complete_checkin() != 4115) {
+    if (uniffi_braird_core_checksum_method_syncengine_complete_checkin() != 49086) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_counts() != 34830) {
@@ -8395,7 +8395,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_list_notes() != 26133) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_list_questions() != 21954) {
+    if (uniffi_braird_core_checksum_method_syncengine_list_questions() != 61785) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_merge_books() != 55148) {
@@ -8404,7 +8404,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_merge_content_duplicates() != 26022) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_next_prompt_events() != 63384) {
+    if (uniffi_braird_core_checksum_method_syncengine_next_prompt_events() != 5202) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_note_ids_for_collection() != 25011) {

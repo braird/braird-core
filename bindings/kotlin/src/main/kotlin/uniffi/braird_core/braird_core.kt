@@ -1413,7 +1413,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_collection_note_counts() != 26206.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_complete_checkin() != 4115.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_complete_checkin() != 49086.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_counts() != 34830.toShort()) {
@@ -1491,7 +1491,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_list_notes() != 26133.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_list_questions() != 21954.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_list_questions() != 61785.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_merge_books() != 55148.toShort()) {
@@ -1500,7 +1500,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_merge_content_duplicates() != 26022.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_next_prompt_events() != 63384.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_next_prompt_events() != 5202.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_note_ids_for_collection() != 25011.toShort()) {
@@ -2499,7 +2499,7 @@ public interface SyncEngineInterface {
      * some, or skipped the lot. The next check-in is due one cadence from `now_ms`.
      *
      * One call per PASS, not per question: a check-in covers every active question at once, so the
-     * timer is the pass's, stored as the synced [`prompt::CHECKIN_LAST_AT_KEY`]. Per-question
+     * timer is the pass's, stored as the synced [`prompt::CHECKIN_COMPLETED_AT_KEY`]. Per-question
      * answers still go through [`SyncEngine::enqueue_question`] (`checkin_response`, `status`, and
      * the question's own `checkin_at`); this replaces `skip_checkin`, which could only stamp one
      * question. Skipping is still never punished and never visibly counted — nothing records that a
@@ -2820,7 +2820,7 @@ public interface SyncEngineInterface {
      * opens.
      *
      * Unpaginated on purpose: active-first ordering has to be applied before any page is cut, and
-     * the log grows by about one row per cadence period.
+     * the log grows by one row per question the user opens.
      */
     fun `listQuestions`(): List<QuestionLogEntry>
     
@@ -2854,7 +2854,7 @@ public interface SyncEngineInterface {
      * nudge; see [`prompt::next_events`] for the full rule table).
      *
      * Both timestamps are host-supplied. `now_ms` follows the read-surface convention
-     * ([`SyncEngine::question_notes`]) — core reads no clock, so the result is a pure function of
+     * ([`SyncEngine::notes_this_week`]) — core reads no clock, so the result is a pure function of
      * its inputs and testable at any point on the timeline. `account_created_at_ms` has no choice
      * about it: core holds no account-creation stamp anywhere, because `user_profiles` is
      * server-authoritative and stays outside the client sync surface. Both platforms read it from
@@ -3440,7 +3440,7 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * some, or skipped the lot. The next check-in is due one cadence from `now_ms`.
      *
      * One call per PASS, not per question: a check-in covers every active question at once, so the
-     * timer is the pass's, stored as the synced [`prompt::CHECKIN_LAST_AT_KEY`]. Per-question
+     * timer is the pass's, stored as the synced [`prompt::CHECKIN_COMPLETED_AT_KEY`]. Per-question
      * answers still go through [`SyncEngine::enqueue_question`] (`checkin_response`, `status`, and
      * the question's own `checkin_at`); this replaces `skip_checkin`, which could only stamp one
      * question. Skipping is still never punished and never visibly counted — nothing records that a
@@ -4035,7 +4035,7 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * opens.
      *
      * Unpaginated on purpose: active-first ordering has to be applied before any page is cut, and
-     * the log grows by about one row per cadence period.
+     * the log grows by one row per question the user opens.
      */
     @Throws(SyncException::class)override fun `listQuestions`(): List<QuestionLogEntry> {
             return FfiConverterSequenceTypeQuestionLogEntry.lift(
@@ -4102,7 +4102,7 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * nudge; see [`prompt::next_events`] for the full rule table).
      *
      * Both timestamps are host-supplied. `now_ms` follows the read-surface convention
-     * ([`SyncEngine::question_notes`]) — core reads no clock, so the result is a pure function of
+     * ([`SyncEngine::notes_this_week`]) — core reads no clock, so the result is a pure function of
      * its inputs and testable at any point on the timeline. `account_created_at_ms` has no choice
      * about it: core holds no account-creation stamp anywhere, because `user_profiles` is
      * server-authoritative and stays outside the client sync surface. Both platforms read it from

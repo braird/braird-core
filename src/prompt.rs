@@ -49,7 +49,7 @@ pub const PROMPT_ANSWERED_AT_KEY: &str = "prompt_answered_at";
 /// question's row can say when the PASS happened — a pass that answered nothing (all skipped) writes
 /// no question at all. Synced for the [`PROMPT_SKIPPED_AT_KEY`] reason: the newest pass wins across
 /// devices, so checking in on the phone silences the tablet.
-pub const CHECKIN_LAST_AT_KEY: &str = "checkin_last_at";
+pub const CHECKIN_COMPLETED_AT_KEY: &str = "checkin_completed_at";
 /// When the user last dismissed the too-many-questions nudge (epoch ms, decimal string) — SUR-1101.
 pub const QUESTION_NUDGE_DISMISSED_AT_KEY: &str = "question_nudge_dismissed_at";
 
@@ -146,8 +146,8 @@ pub struct PromptState {
     /// discards a tombstone for a row it never had, so the second reads zero on a fresh install.
     pub has_ever_answered: bool,
     pub prompt_skipped_at_ms: Option<i64>,
-    /// The [`CHECKIN_LAST_AT_KEY`] stamp, raw — [`checkin_anchor`] bounds it.
-    pub checkin_last_at_ms: Option<i64>,
+    /// The [`CHECKIN_COMPLETED_AT_KEY`] stamp, raw — [`checkin_anchor`] bounds it.
+    pub checkin_completed_at_ms: Option<i64>,
 }
 
 /// Force a cadence into 72..=672 hours. Total: there is no invalid input, only clamping.
@@ -219,7 +219,7 @@ fn bound_interaction(stamp: i64, birth: i64, now_ms: i64) -> i64 {
 /// "notes captured since the last check-in with no attachment" section reads from it — ONE
 /// definition, so the section always covers exactly the period the check-in closes (SUR-1101).
 ///
-/// The anchor is the latest recorded check-in: the pass stamp [`CHECKIN_LAST_AT_KEY`], or any
+/// The anchor is the latest recorded check-in: the pass stamp [`CHECKIN_COMPLETED_AT_KEY`], or any
 /// active question's own `checkin_at` (the pre-SUR-1101 per-question stamp, still written when a
 /// question's check-in is answered, and the only record an upgrading account has). With no record
 /// at all it is the OLDEST active question's birth — the first check-in comes one cadence after the
@@ -240,7 +240,7 @@ pub fn checkin_anchor(state: &PromptState, now_ms: i64) -> Option<i64> {
     let birth = active().map(|q| q.created_at).min()?;
     Some(
         state
-            .checkin_last_at_ms
+            .checkin_completed_at_ms
             .into_iter()
             .chain(active().filter_map(|q| q.checkin_at))
             .map(|stamp| bound_interaction(stamp, birth, now_ms))
@@ -396,7 +396,7 @@ mod tests {
             has_ever_answered: !questions.is_empty(),
             questions,
             prompt_skipped_at_ms: skipped_at,
-            checkin_last_at_ms: None,
+            checkin_completed_at_ms: None,
         }
     }
 
@@ -408,7 +408,7 @@ mod tests {
             questions: vec![],
             has_ever_answered: true,
             prompt_skipped_at_ms: None,
-            checkin_last_at_ms: None,
+            checkin_completed_at_ms: None,
         }
     }
 
@@ -833,7 +833,7 @@ mod tests {
             None,
         );
         let pass = CREATED + CADENCE_MS + 60_000;
-        s.checkin_last_at_ms = Some(pass);
+        s.checkin_completed_at_ms = Some(pass);
         let events = next_events(&s, &settings(PromptTone::Introspective), pass + 1);
         assert_eq!(events[0].due_at, pass + CADENCE_MS);
     }
@@ -859,7 +859,7 @@ mod tests {
         // than anything active, so it is bounded up to the new question's birth.
         let born = CREATED + 10 * CADENCE_MS;
         let mut s = state(vec![question("active", born)], None);
-        s.checkin_last_at_ms = Some(CREATED + CADENCE_MS);
+        s.checkin_completed_at_ms = Some(CREATED + CADENCE_MS);
         let events = next_events(&s, &settings(PromptTone::Introspective), born + 1);
         assert_eq!(events[0].due_at, born + CADENCE_MS);
     }
@@ -867,7 +867,7 @@ mod tests {
     #[test]
     fn a_future_pass_stamp_falls_back_to_the_oldest_birth_and_stays_there() {
         let mut s = state(vec![question("active", CREATED)], None);
-        s.checkin_last_at_ms = Some(CREATED + 50 * CADENCE_MS);
+        s.checkin_completed_at_ms = Some(CREATED + 50 * CADENCE_MS);
         let first = next_events(&s, &settings(PromptTone::Introspective), CREATED + 1_000);
         let again = next_events(&s, &settings(PromptTone::Introspective), CREATED + 9_000);
         assert_eq!(first[0].due_at, CREATED + CADENCE_MS);
@@ -882,7 +882,7 @@ mod tests {
         let mut resolved = question("resolved", CREATED);
         resolved.resolved_at = Some(CREATED + 1);
         let mut s = state(vec![resolved], None);
-        s.checkin_last_at_ms = Some(CREATED + 2);
+        s.checkin_completed_at_ms = Some(CREATED + 2);
         assert_eq!(checkin_anchor(&s, CREATED + 3), None);
     }
 
