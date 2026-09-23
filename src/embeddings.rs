@@ -210,9 +210,13 @@ pub(crate) fn from_le_bytes(bytes: &[u8], dims: u32) -> Result<Vec<f32>, CryptoE
             "sealed vector has wrong length".into(),
         ));
     }
+    // `as_chunks` (clippy::chunks_exact_to_as_chunks, Rust 1.98): the length check above makes the
+    // remainder empty, so this is the same decode with the chunk width in the type.
     Ok(bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect())
 }
 
