@@ -511,12 +511,19 @@ pub fn question_note_id(question_id: &str, note_id: &str) -> String {
 /// The local-only / derived stores (parent SUR-659 §1) — present in the mirror but
 /// **never synced** and **exempt from the drift guard**: `meta` is the config + the
 /// per-table sync cursors (a KV store), `outbox` the pending-write queue keyed
-/// `(table, record_id)`, `embeddings` the device-local sealed search vectors, and
+/// `(table, record_id)`, `embeddings` the device-local sealed search vectors,
+/// `question_embeddings` the sealed vectors the attach sheet ranks questions by (SUR-1101), and
 /// `discovery_jobs` the local job queue. Raw DDL — they have no cloud counterpart.
 /// The names created by [`LOCAL_ONLY_DDL`]. Hand-kept in step with it — the registry test
 /// (`tests/schema_parity.rs`) reconciles this list against `sqlite_master`, so a table added to the
 /// DDL without a name here fails the build rather than becoming an unregistered third category.
-pub const LOCAL_ONLY_TABLES: &[&str] = &["meta", "outbox", "embeddings", "discovery_jobs"];
+pub const LOCAL_ONLY_TABLES: &[&str] = &[
+    "meta",
+    "outbox",
+    "embeddings",
+    "question_embeddings",
+    "discovery_jobs",
+];
 
 const LOCAL_ONLY_DDL: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);",
@@ -533,6 +540,12 @@ const LOCAL_ONLY_DDL: &[&str] = &[
         encrypted_vector BLOB, \
         updated_at INTEGER, \
         deleted INTEGER);",
+    "CREATE TABLE IF NOT EXISTS question_embeddings (\
+        question_id TEXT PRIMARY KEY, \
+        model_version TEXT, \
+        content_token TEXT, \
+        encrypted_vector BLOB, \
+        updated_at INTEGER);",
     "CREATE TABLE IF NOT EXISTS discovery_jobs (\
         id TEXT PRIMARY KEY, \
         status TEXT, \
@@ -1475,21 +1488,35 @@ impl Store {
         &self,
         corpus_key: &str,
     ) -> rusqlite::Result<usize> {
-        self.conn.execute(
+        let notes = self.conn.execute(
             "DELETE FROM embeddings WHERE model_version IS NOT ?1",
             [corpus_key],
-        )
+        )?;
+        // The question vectors share the corpus: a question sealed under one model and a note
+        // under another would be compared across two embedding spaces (SUR-1101).
+        let questions = self.conn.execute(
+            "DELETE FROM question_embeddings WHERE model_version IS NOT ?1",
+            [corpus_key],
+        )?;
+        Ok(notes + questions)
     }
 
     /// Sweep vectors whose note no longer exists live (a hard-deleted or vacuumed row the
     /// [`Store::apply_row`] tombstone hook didn't see — e.g. a crash between its two
     /// statements). Best-effort hygiene, run once per embed pass.
     pub(crate) fn sweep_orphan_embeddings(&self) -> rusqlite::Result<usize> {
-        self.conn.execute(
+        let notes = self.conn.execute(
             "DELETE FROM embeddings WHERE NOT EXISTS \
              (SELECT 1 FROM notes n WHERE n.id = embeddings.note_id AND n.deleted = 0)",
             [],
-        )
+        )?;
+        let questions = self.conn.execute(
+            "DELETE FROM question_embeddings WHERE NOT EXISTS \
+             (SELECT 1 FROM questions q WHERE q.id = question_embeddings.question_id \
+              AND q.deleted = 0)",
+            [],
+        )?;
+        Ok(notes + questions)
     }
 
     /// The derived embed queue as `(note id, current content token)` pairs: live notes
@@ -1514,14 +1541,18 @@ impl Store {
         rows.collect()
     }
 
-    /// How many notes the derived queue currently holds — the host's durable
-    /// rebuild/progress signal (survives a process restart, unlike a registration-time
-    /// flag). Same derivation as [`Store::pending_embeddings`], by construction.
+    /// How many items the derived queues currently hold — notes plus active questions
+    /// (SUR-1101) — the host's durable rebuild/progress signal (survives a process restart,
+    /// unlike a registration-time flag). Questions count because `embed_pending` drains them from
+    /// the same budget: a host that stopped draining at "zero notes pending" would leave the
+    /// attach sheet ranking by recency forever. Same derivations as [`Store::pending_embeddings`]
+    /// and [`Store::pending_question_embeddings`], by construction.
     pub(crate) fn pending_embedding_count(&self, corpus_key: &str) -> rusqlite::Result<i64> {
-        self.conn
-            .query_row(&pending_embeddings_sql("count(*)"), [corpus_key], |row| {
-                row.get(0)
-            })
+        let count = |sql: String| -> rusqlite::Result<i64> {
+            self.conn.query_row(&sql, [corpus_key], |row| row.get(0))
+        };
+        Ok(count(pending_embeddings_sql("count(*)"))?
+            + count(pending_question_embeddings_sql("count(*)"))?)
     }
 
     /// The scannable corpus: `(note_id, sealed vector)` for every current-key, non-marker
@@ -1562,6 +1593,96 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()
+    }
+
+    // ── sealed question vectors (SUR-1101) ───────────────────────────────────
+    // The attach sheet orders a note's candidate questions by cosine similarity, so each ACTIVE
+    // question needs a vector. Its own local-only table rather than rows in `embeddings`: that
+    // table is keyed by note id and swept of anything without a live note on every pass. The same
+    // posture otherwise — device-local, sealed, never on the outbox, queue derived rather than
+    // staged. The staleness token is the question's `text` CIPHERTEXT: it changes exactly when the
+    // text is re-sealed (an edit), not on the status/check-in metadata patches that are the common
+    // write, and it is already on disk, so storing it beside the vector reveals nothing new.
+
+    /// The live question's `text` ciphertext — its embedding staleness token — or `None` when the
+    /// question is absent, tombstoned or carries no text.
+    pub(crate) fn question_text_token(
+        &self,
+        question_id: &str,
+    ) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT text FROM questions WHERE id = ?1 AND deleted = 0",
+                [question_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+    }
+
+    /// The derived question-embed queue as `(question id, token)`, newest-first: ACTIVE live
+    /// questions whose vector is missing, keyed to another corpus, or sealed from different text.
+    /// Active here is `prompt::is_active` — not resolved, not dismissed, unknown counts as active —
+    /// because only active questions are ever ranked.
+    pub(crate) fn pending_question_embeddings(
+        &self,
+        corpus_key: &str,
+    ) -> rusqlite::Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{} ORDER BY q.created_at DESC, q.id DESC",
+            pending_question_embeddings_sql("q.id, q.text")
+        ))?;
+        let rows = stmt.query_map([corpus_key], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Upsert a question's sealed vector (or a NULL skip marker) only if its text is unchanged
+    /// since `token` was read — the [`Store::upsert_embedding_if_current`] guard for the same
+    /// lock-released host-callback window.
+    pub(crate) fn upsert_question_embedding_if_current(
+        &self,
+        question_id: &str,
+        corpus_key: &str,
+        token: &str,
+        sealed: Option<&[u8]>,
+        updated_at: i64,
+    ) -> rusqlite::Result<bool> {
+        if self.question_text_token(question_id)?.as_deref() != Some(token) {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "INSERT OR REPLACE INTO question_embeddings \
+             (question_id, model_version, content_token, encrypted_vector, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![question_id, corpus_key, token, sealed, updated_at],
+        )?;
+        Ok(true)
+    }
+
+    /// `(question id, sealed vector)` for every live question with a current-key, non-marker
+    /// vector. Callers filter to the active set they are ranking.
+    pub(crate) fn question_embeddings(
+        &self,
+        corpus_key: &str,
+    ) -> rusqlite::Result<Vec<(String, Vec<u8>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT e.question_id, e.encrypted_vector FROM question_embeddings e \
+             JOIN questions q ON q.id = e.question_id AND q.deleted = 0 \
+             WHERE e.model_version = ?1 AND e.encrypted_vector IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([corpus_key], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        rows.collect()
+    }
+
+    /// Hard-delete one question's vector — the self-heal for a blob that fails to open.
+    pub(crate) fn delete_question_embedding(&self, question_id: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "DELETE FROM question_embeddings WHERE question_id = ?1",
+            [question_id],
+        )?;
+        Ok(())
     }
 
     /// One `embeddings` row read back for tests: `(corpus key, source token,
@@ -1623,6 +1744,19 @@ fn pending_embeddings_sql(select: &str) -> String {
            OR e.model_version IS NOT ?1 \
            OR e.content_token IS NOT {token})",
         token = content_token_sql("n"),
+    )
+}
+
+/// The derived question-embed queue's one query body (SUR-1101) — list and count share it, as
+/// [`pending_embeddings_sql`] does for notes. `?1` = the corpus key.
+fn pending_question_embeddings_sql(select: &str) -> String {
+    format!(
+        "SELECT {select} FROM questions q LEFT JOIN question_embeddings e ON e.question_id = q.id \
+         WHERE q.deleted = 0 AND q.text IS NOT NULL \
+           AND COALESCE(q.status, '') NOT IN ('resolved', 'dismissed') \
+           AND (e.question_id IS NULL \
+             OR e.model_version IS NOT ?1 \
+             OR e.content_token IS NOT q.text)"
     )
 }
 

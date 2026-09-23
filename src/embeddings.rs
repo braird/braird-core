@@ -172,6 +172,14 @@ pub(crate) fn embed_aad(note_id: &str) -> String {
     format!("emb:{note_id}")
 }
 
+/// The AAD a question's vector is sealed under: `qemb:{question_id}` (SUR-1101). Its own prefix,
+/// not `emb:`, for the reason `emb:` exists: question and note ids share one namespace of opaque
+/// strings under the same Master Key, so a note's vector copied into a question's row (or back)
+/// must fail to open rather than silently rank one entity by another's meaning.
+pub(crate) fn question_embed_aad(question_id: &str) -> String {
+    format!("qemb:{question_id}")
+}
+
 /// Normalize to unit length, or `None` for a zero/non-finite vector (a NaN/Inf anywhere
 /// poisons the norm, so one check covers every component). The spike's exports are
 /// pre-normalized; normalizing anyway makes the scan a plain dot product and stops a host

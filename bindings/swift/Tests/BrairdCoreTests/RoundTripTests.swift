@@ -1120,6 +1120,10 @@ final class RoundTripTests: XCTestCase {
         XCTAssertEqual(
             try engine.unattachedSinceLastCheckin(nowMs: passAt + 20)?.map { $0.id }, ["loose"])
 
+        // The attach sheet's order crosses as an array of records. No embedder is registered here,
+        // so it is the recency fallback: the most recently opened question first.
+        XCTAssertEqual(try engine.rankQuestionsForNote(noteId: "loose").map { $0.id }, ["q2", "q1"])
+
         // The too-many-questions nudge: two active is nowhere near nine; a Bool crosses intact.
         XCTAssertFalse(try engine.questionNudgeDue(nowMs: passAt))
         try engine.dismissQuestionNudge(nowMs: passAt)

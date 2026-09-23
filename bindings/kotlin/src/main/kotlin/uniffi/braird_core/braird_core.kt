@@ -918,6 +918,8 @@ internal open class UniffiVTableCallbackInterfaceEmbedder(
 
 
 
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -1038,6 +1040,8 @@ internal interface UniffiLib : Library {
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_question_nudge_due(`ptr`: Pointer,`nowMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
+    fun uniffi_braird_core_fn_method_syncengine_rank_questions_for_note(`ptr`: Pointer,`noteId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_ranked_search(`ptr`: Pointer,`query`: RustBuffer.ByValue,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_recent_note(`ptr`: Pointer,`nowMs`: Long,`seed`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -1308,6 +1312,8 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_question_nudge_due(
     ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_rank_questions_for_note(
+    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_ranked_search(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_recent_note(
@@ -1522,6 +1528,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_question_nudge_due() != 22080.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_rank_questions_for_note() != 26525.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_ranked_search() != 46931.toShort()) {
@@ -2937,6 +2946,25 @@ public interface SyncEngineInterface {
     fun `questionNudgeDue`(`nowMs`: kotlin.Long): kotlin.Boolean
     
     /**
+     * Order the ACTIVE questions for the "does this note attach to an open question?" sheet
+     * (SUR-1101): most similar to the note first, by cosine over the on-device embeddings.
+     *
+     * Never fails on the embedding side, only on the store. Every step that may legitimately be
+     * absent degrades to the log's own order — newest-first, which is "most recently opened" (a
+     * question is opened when it is created):
+     * - no embedder registered, or it is `Unavailable` / errors → recency;
+     * - the note has no stored vector yet (the usual case: `embed_pending` runs AFTER a save) →
+     * core embeds its text NOW, through the host embedder, and does not store the result
+     * (founder, 2026-09-23 — the sheet is shown once, `embed_pending` stores it moments later);
+     * - a question with no vector yet (just created, or pulled and not yet drained) → after every
+     * scored question, in recency order.
+     *
+     * An empty list means no question is active, so the host shows no sheet. With exactly one,
+     * there is nothing to order and no embed is paid for.
+     */
+    fun `rankQuestionsForNote`(`noteId`: kotlin.String): List<QuestionRecord>
+    
+    /**
      * Hybrid ranked search (SUR-1019, ADR 0007 — the SUR-157 query path): ONE ranked
      * answer over the lexical engine (ADR 0005; notes + ideas) and the sealed-vector
      * cosine scan (ADR 0006; notes), fused by reciprocal rank IN CORE so the two native
@@ -4268,6 +4296,36 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_question_nudge_due(
         it, FfiConverterLong.lower(`nowMs`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Order the ACTIVE questions for the "does this note attach to an open question?" sheet
+     * (SUR-1101): most similar to the note first, by cosine over the on-device embeddings.
+     *
+     * Never fails on the embedding side, only on the store. Every step that may legitimately be
+     * absent degrades to the log's own order — newest-first, which is "most recently opened" (a
+     * question is opened when it is created):
+     * - no embedder registered, or it is `Unavailable` / errors → recency;
+     * - the note has no stored vector yet (the usual case: `embed_pending` runs AFTER a save) →
+     * core embeds its text NOW, through the host embedder, and does not store the result
+     * (founder, 2026-09-23 — the sheet is shown once, `embed_pending` stores it moments later);
+     * - a question with no vector yet (just created, or pulled and not yet drained) → after every
+     * scored question, in recency order.
+     *
+     * An empty list means no question is active, so the host shows no sheet. With exactly one,
+     * there is nothing to order and no embed is paid for.
+     */
+    @Throws(SyncException::class)override fun `rankQuestionsForNote`(`noteId`: kotlin.String): List<QuestionRecord> {
+            return FfiConverterSequenceTypeQuestionRecord.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_rank_questions_for_note(
+        it, FfiConverterString.lower(`noteId`),_status)
 }
     }
     )
@@ -8400,6 +8458,34 @@ public object FfiConverterSequenceTypeQuestionLogEntry: FfiConverterRustBuffer<L
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeQuestionLogEntry.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeQuestionRecord: FfiConverterRustBuffer<List<QuestionRecord>> {
+    override fun read(buf: ByteBuffer): List<QuestionRecord> {
+        val len = buf.getInt()
+        return List<QuestionRecord>(len) {
+            FfiConverterTypeQuestionRecord.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<QuestionRecord>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeQuestionRecord.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<QuestionRecord>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeQuestionRecord.write(it, buf)
         }
     }
 }

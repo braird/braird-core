@@ -36,6 +36,18 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     `question_notes`. `question_nudge_due(now_ms)` / `dismiss_question_nudge(now_ms)` — the
     too-many-questions nudge at the 9th active question, silent for 28 days after a dismissal
     (`question_nudge_dismissed_at`).
+  - New: `rank_questions_for_note(note_id) -> Vec<QuestionRecord>` — the ACTIVE questions in the
+    order the "attach to an open question?" sheet lists them: cosine similarity between the note's
+    vector and each question's, most similar first. The note's stored vector is used when current;
+    otherwise core embeds its text on the spot (a note is usually not embedded yet when the sheet
+    shows) and does not store it. No embedder, an unavailable one, or an unembedded question falls
+    back to most-recently-opened (`created_at` DESC). Empty = no active question = no sheet; one
+    active question is returned without an embed.
+  - Question text is embedded into a new LOCAL-ONLY `question_embeddings` table, sealed with AAD
+    `qemb:{id}` (domain-separated from `emb:` note vectors), never on the outbox. `embed_pending`
+    drains active questions first, embedding them as queries; the staleness token is the text
+    ciphertext, so check-in and status patches do not re-embed. `pending_embed_count` includes
+    them, a corpus-key change purges them, and the orphan sweep drops them with their question.
   - **Rollout (founder, 2026-09-23):** 0058 drops the old table name, and one 404 aborts a flush, so
     an install on ≤ v0.16.0 stops syncing once 0058 reaches its environment. Production is applied
     together with the app pin of the release carrying this (SUR-1104).

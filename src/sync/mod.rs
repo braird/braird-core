@@ -462,6 +462,24 @@ struct RegisteredEmbedder {
     generation: u64,
 }
 
+/// Which derived embed queue an item came from (SUR-1101: active questions, then notes).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingEmbed {
+    Note,
+    Question,
+}
+
+impl PendingEmbed {
+    /// The [`EmbedFailureMemory`] key. Notes keep their bare id (the SUR-1010 shape); questions are
+    /// prefixed because question and note ids share one namespace of opaque strings.
+    fn failure_key(self, id: &str) -> String {
+        match self {
+            PendingEmbed::Note => id.to_string(),
+            PendingEmbed::Question => format!("question:{id}"),
+        }
+    }
+}
+
 macro_rules! lock {
     ($self:ident . $field:ident) => {
         $self.$field.lock().expect("sync engine mutex poisoned")
@@ -3026,6 +3044,126 @@ impl SyncEngine {
         // re-queued are counted, not silently missing from the honesty signal.
         Ok((hits, status, self.pending_for(&reg)?))
     }
+
+    /// One host embed, validated to a unit vector — the shared body of the note and question arms
+    /// of [`SyncEngine::embed_pending`] and of the on-demand probe in
+    /// [`SyncEngine::rank_questions_for_note`]. MUST be called with no lock held. A wrong-length
+    /// or zero/non-finite vector is reported as `Runtime`: the embedder failed this input, which
+    /// is exactly how the failure memory already treats it.
+    fn embed_unit(
+        &self,
+        reg: &RegisteredEmbedder,
+        content: String,
+        as_query: bool,
+    ) -> Result<Vec<f32>, EmbedderError> {
+        let vector = if as_query {
+            reg.embedder.embed_query(content)?
+        } else {
+            reg.embedder.embed_document(content)?
+        };
+        if vector.len() != reg.dims as usize {
+            return Err(EmbedderError::Runtime); // never keep a mis-sized vector
+        }
+        embeddings::normalize(vector).ok_or(EmbedderError::Runtime)
+    }
+
+    /// Write one sealed vector (or a NULL skip marker) to the table its kind lives in, only if the
+    /// source is unchanged since `token` was read. Returns whether it was written.
+    fn store_vector(
+        &self,
+        kind: PendingEmbed,
+        id: &str,
+        reg: &RegisteredEmbedder,
+        token: &str,
+        sealed: Option<&[u8]>,
+    ) -> Result<bool, SyncError> {
+        let store = lock!(self.store);
+        match kind {
+            PendingEmbed::Note => {
+                store.upsert_embedding_if_current(id, &reg.corpus_key, token, sealed, epoch_ms())
+            }
+            PendingEmbed::Question => store.upsert_question_embedding_if_current(
+                id,
+                &reg.corpus_key,
+                token,
+                sealed,
+                epoch_ms(),
+            ),
+        }
+        .map_err(store_err)
+    }
+
+    /// The note's unit vector for ranking: its stored one when current, otherwise embedded now
+    /// from its text (founder, 2026-09-23). `None` when neither is possible — no text, the note is
+    /// gone, or the embedder is unavailable or fails — which the caller reads as "rank by
+    /// recency". A stored blob that fails to open is dropped (re-queued), the scan's self-heal.
+    fn note_probe(
+        &self,
+        reg: &RegisteredEmbedder,
+        note_id: &str,
+    ) -> Result<Option<Vec<f32>>, SyncError> {
+        let (sealed, row) = {
+            let store = lock!(self.store);
+            (
+                store
+                    .sealed_embedding(note_id, &reg.corpus_key)
+                    .map_err(store_err)?,
+                store.get_row("notes", note_id).map_err(store_err)?,
+            )
+        };
+        if let Some(sealed) = sealed {
+            match self
+                .vault
+                .open_bytes(sealed, embeddings::embed_aad(note_id))
+                .and_then(|bytes| embeddings::from_le_bytes(&bytes, reg.dims))
+            {
+                Ok(vector) => return Ok(Some(vector)),
+                Err(_) => lock!(self.store)
+                    .delete_embedding(note_id)
+                    .map_err(store_err)?,
+            }
+        }
+        let Some(row) = row.filter(|r| r.get("deleted") != Some(&Value::Bool(true))) else {
+            return Ok(None);
+        };
+        let (text, decrypt_failed) = read::decrypt_note_text(&row, note_id, &self.vault);
+        let Some(text) = text
+            .filter(|_| !decrypt_failed)
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+        else {
+            return Ok(None);
+        };
+        // The host callback — no lock held.
+        Ok(self.embed_unit(reg, text, false).ok())
+    }
+
+    /// Every live question's current-key unit vector, keyed by question id. A blob that fails to
+    /// open is dropped so `embed_pending` re-embeds that question.
+    fn question_vectors(
+        &self,
+        reg: &RegisteredEmbedder,
+    ) -> Result<HashMap<String, Vec<f32>>, SyncError> {
+        let rows = lock!(self.store)
+            .question_embeddings(&reg.corpus_key)
+            .map_err(store_err)?;
+        let mut out = HashMap::with_capacity(rows.len());
+        for (id, sealed) in rows {
+            match self
+                .vault
+                .open_bytes(sealed, embeddings::question_embed_aad(&id))
+                .and_then(|bytes| embeddings::from_le_bytes(&bytes, reg.dims))
+            {
+                Ok(vector) => {
+                    out.insert(id, vector);
+                }
+                Err(_) => lock!(self.store)
+                    .delete_question_embedding(&id)
+                    .map_err(store_err)?,
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[uniffi::export]
@@ -3133,23 +3271,40 @@ impl SyncEngine {
     /// describe the departed embedder, and must not deprioritize notes for its successor).
     pub fn embed_pending(&self, max_items: u32) -> Result<EmbedSummary, SyncError> {
         let reg = self.registered_embedder()?;
-        let all_pending = {
+        // ACTIVE QUESTIONS FIRST (SUR-1101). There are a handful, the attach sheet ranks by them the
+        // moment a note is saved, and a question pulled from another device has no vector here
+        // until this pass makes one — so they must not wait behind a thousand-note backfill.
+        let all_pending: Vec<(PendingEmbed, String, String)> = {
             let store = lock!(self.store);
             store.sweep_orphan_embeddings().map_err(store_err)?;
             // The FULL queue, not LIMIT max_items: the failure filter below must be able
             // to select past a failing head. Ids + tokens only — trivial at archive scale.
-            store
+            let questions = store
+                .pending_question_embeddings(&reg.corpus_key)
+                .map_err(store_err)?;
+            let notes = store
                 .pending_embeddings(&reg.corpus_key, -1)
-                .map_err(store_err)?
+                .map_err(store_err)?;
+            questions
+                .into_iter()
+                .map(|(id, token)| (PendingEmbed::Question, id, token))
+                .chain(
+                    notes
+                        .into_iter()
+                        .map(|(id, token)| (PendingEmbed::Note, id, token)),
+                )
+                .collect()
         };
-        let ids: Vec<String> = {
+        let picked: Vec<(PendingEmbed, String)> = {
             let mut failures = lock!(self.embed_failures);
-            let fresh: Vec<&(String, String)> = all_pending
+            let fresh: Vec<&(PendingEmbed, String, String)> = all_pending
                 .iter()
-                .filter(|(id, token)| failures.by_note.get(id) != Some(token))
+                .filter(|(kind, id, token)| {
+                    failures.by_note.get(&kind.failure_key(id)) != Some(token)
+                })
                 .collect();
             let sweep = if fresh.is_empty() && !all_pending.is_empty() {
-                // Every pending note has failed — clear and retry from the top rather
+                // Every pending item has failed — clear and retry from the top rather
                 // than idling forever on attempted: 0. Deliberately does NOT bump the
                 // registration generation: a same-registration failure recorded by a
                 // concurrent pass is still current information.
@@ -3161,78 +3316,77 @@ impl SyncEngine {
             sweep
                 .into_iter()
                 .take(max_items as usize)
-                .map(|(id, _)| id.clone())
+                .map(|(kind, id, _)| (*kind, id.clone()))
                 .collect()
         };
         let (mut attempted, mut embedded, mut skipped, mut failed) = (0u32, 0u32, 0u32, 0u32);
-        'pass: for id in ids {
+        for (kind, id) in picked {
             attempted += 1;
-            // One lock acquisition for the read leg: the row (ciphertext) + its token.
-            let (row, token) = {
-                let store = lock!(self.store);
-                (
-                    store.get_row("notes", &id).map_err(store_err)?,
-                    store.note_content_token(&id).map_err(store_err)?,
-                )
+            let (content, token) = match kind {
+                PendingEmbed::Note => {
+                    // One lock acquisition for the read leg: the row (ciphertext) + its token.
+                    let (row, token) = {
+                        let store = lock!(self.store);
+                        (
+                            store.get_row("notes", &id).map_err(store_err)?,
+                            store.note_content_token(&id).map_err(store_err)?,
+                        )
+                    };
+                    let (Some(row), Some(token)) = (row, token) else {
+                        skipped += 1; // vanished/tombstoned since the queue was derived
+                        continue;
+                    };
+                    // Decrypt in core (vault only — store lock already released).
+                    let (text, decrypt_failed) = read::decrypt_note_text(&row, &id, &self.vault);
+                    (if decrypt_failed { None } else { text }, token)
+                }
+                PendingEmbed::Question => {
+                    // `get_question` decrypts through the question-only enc:v2 gate; one short
+                    // hold of the store lock for a single row, released before the host call.
+                    let store = lock!(self.store);
+                    let token = store.question_text_token(&id).map_err(store_err)?;
+                    let question =
+                        read::get_question(&store, &self.vault, &id).map_err(store_err)?;
+                    let (Some(question), Some(token)) = (question, token) else {
+                        skipped += 1;
+                        continue;
+                    };
+                    (question.text, token)
+                }
             };
-            let (Some(row), Some(token)) = (row, token) else {
-                skipped += 1; // vanished/tombstoned since the queue was derived
-                continue;
-            };
-            // Decrypt in core (vault only — store lock already released).
-            let (text, decrypt_failed) = read::decrypt_note_text(&row, &id, &self.vault);
-            let content = if decrypt_failed {
-                None
-            } else {
-                text.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
-            };
+            let content = content
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty());
             let Some(content) = content else {
                 // Skip marker: NULL vector at the current key + token, so the queue drains
-                // instead of re-attempting this note every pass forever.
-                lock!(self.store)
-                    .upsert_embedding_if_current(&id, &reg.corpus_key, &token, None, epoch_ms())
-                    .map_err(store_err)?;
+                // instead of re-attempting this item every pass forever.
+                self.store_vector(kind, &id, &reg, &token, None)?;
                 skipped += 1;
                 continue;
             };
-            // The host callback — NO locks held (see the section header).
-            let vector = match reg.embedder.embed_document(content) {
-                Ok(v) => v,
-                Err(EmbedderError::Runtime) => {
-                    failed += 1;
-                    // Remember (id → token) so selection deprioritizes it (SUR-1010).
-                    self.record_embed_failure(&reg, &id, &token);
-                    continue;
-                }
+            // The host callback — NO locks held (see the section header). A question is embedded
+            // as a QUERY and a note as a DOCUMENT: the attach sheet asks "which open question is
+            // this note about", the same asymmetric retrieval `semantic_search` does.
+            let unit = match self.embed_unit(&reg, content, kind == PendingEmbed::Question) {
+                Ok(unit) => unit,
                 Err(EmbedderError::Unavailable) => {
                     failed += 1;
-                    // Deliberately NOT remembered: the runtime was gone, not the note.
-                    break 'pass; // the host re-drains later
+                    // Deliberately NOT remembered: the runtime was gone, not the item.
+                    break; // the host re-drains later
+                }
+                Err(EmbedderError::Runtime) => {
+                    failed += 1;
+                    // Remember (key → token) so selection deprioritizes it (SUR-1010).
+                    self.record_embed_failure(&reg, &kind.failure_key(&id), &token);
+                    continue;
                 }
             };
-            if vector.len() != reg.dims as usize {
-                failed += 1; // dims contract violated — never store a mis-sized vector
-                self.record_embed_failure(&reg, &id, &token);
-                continue;
-            }
-            let Some(unit) = embeddings::normalize(vector) else {
-                failed += 1; // zero/NaN/Inf output — unusable
-                self.record_embed_failure(&reg, &id, &token);
-                continue;
+            let aad = match kind {
+                PendingEmbed::Note => embeddings::embed_aad(&id),
+                PendingEmbed::Question => embeddings::question_embed_aad(&id),
             };
-            let sealed = self
-                .vault
-                .seal_bytes(embeddings::to_le_bytes(&unit), embeddings::embed_aad(&id));
-            let wrote = lock!(self.store)
-                .upsert_embedding_if_current(
-                    &id,
-                    &reg.corpus_key,
-                    &token,
-                    Some(&sealed),
-                    epoch_ms(),
-                )
-                .map_err(store_err)?;
-            if wrote {
+            let sealed = self.vault.seal_bytes(embeddings::to_le_bytes(&unit), aad);
+            if self.store_vector(kind, &id, &reg, &token, Some(&sealed))? {
                 embedded += 1;
             } else {
                 skipped += 1; // edited/deleted mid-embed — re-queues with its new token
@@ -3248,6 +3402,54 @@ impl SyncEngine {
             failed,
             pending: pending.max(0) as u32,
         })
+    }
+
+    /// Order the ACTIVE questions for the "does this note attach to an open question?" sheet
+    /// (SUR-1101): most similar to the note first, by cosine over the on-device embeddings.
+    ///
+    /// Never fails on the embedding side, only on the store. Every step that may legitimately be
+    /// absent degrades to the log's own order — newest-first, which is "most recently opened" (a
+    /// question is opened when it is created):
+    /// - no embedder registered, or it is `Unavailable` / errors → recency;
+    /// - the note has no stored vector yet (the usual case: `embed_pending` runs AFTER a save) →
+    ///   core embeds its text NOW, through the host embedder, and does not store the result
+    ///   (founder, 2026-09-23 — the sheet is shown once, `embed_pending` stores it moments later);
+    /// - a question with no vector yet (just created, or pulled and not yet drained) → after every
+    ///   scored question, in recency order.
+    ///
+    /// An empty list means no question is active, so the host shows no sheet. With exactly one,
+    /// there is nothing to order and no embed is paid for.
+    pub fn rank_questions_for_note(
+        &self,
+        note_id: String,
+    ) -> Result<Vec<QuestionRecord>, SyncError> {
+        let mut active: Vec<QuestionRecord> = {
+            let store = lock!(self.store);
+            read::list_questions(&store, &self.vault).map_err(store_err)?
+        }
+        .into_iter()
+        .map(|entry| entry.question)
+        .filter(|q| prompt::is_active(q.status.as_deref()))
+        .collect();
+        if active.len() < 2 {
+            return Ok(active);
+        }
+        let Ok(reg) = self.registered_embedder() else {
+            return Ok(active);
+        };
+        let Some(probe) = self.note_probe(&reg, &note_id)? else {
+            return Ok(active);
+        };
+        let vectors = self.question_vectors(&reg)?;
+        let score = |q: &QuestionRecord| vectors.get(&q.id).map(|v| embeddings::dot(&probe, v));
+        // Stable, so equal scores and every unscored question keep the recency order above.
+        active.sort_by(|a, b| match (score(a), score(b)) {
+            (Some(x), Some(y)) => y.partial_cmp(&x).unwrap_or(std::cmp::Ordering::Equal),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+        Ok(active)
     }
 
     /// Semantic search (SUR-997 item 4 → SUR-157): embed the query via the host embedder
@@ -9339,6 +9541,206 @@ mod tests {
             engine.similar_notes("n1".into(), 5).unwrap_err(),
             SyncError::EmbedderNotRegistered
         ));
+    }
+
+    // ── SUR-1101: ranking the attach sheet ───────────────────────────────────
+
+    fn ask(engine: &SyncEngine, id: &str, text: &str, created_at: i64) {
+        engine
+            .enqueue_question(QuestionUpsert {
+                created_at,
+                ..question_upsert(id, text)
+            })
+            .unwrap();
+    }
+
+    fn ranked(engine: &SyncEngine, note_id: &str) -> Vec<String> {
+        engine
+            .rank_questions_for_note(note_id.into())
+            .unwrap()
+            .into_iter()
+            .map(|q| q.id)
+            .collect()
+    }
+
+    #[test]
+    fn the_attach_sheet_lists_the_semantically_closest_question_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "rank");
+        // The closer question is the OLDER one, so a recency fallback would put it second.
+        ask(&engine, "q-about-a", "aaaa", 100);
+        ask(&engine, "q-about-b", "bbbb", 200);
+        engine.enqueue_note(note_upsert("n", "aaab")).unwrap();
+        let embedder = HistogramEmbedder::new("fake-model");
+        let reg = engine.register_embedder(embedder.clone()).unwrap();
+        assert_eq!(
+            reg.pending, 3,
+            "both active questions are queued beside the note"
+        );
+
+        let pass = engine.embed_pending(10).unwrap();
+        assert_eq!((pass.embedded, pass.pending), (3, 0));
+        assert_eq!(ranked(&engine, "n"), vec!["q-about-a", "q-about-b"]);
+    }
+
+    #[test]
+    fn a_fresh_note_is_embedded_on_demand_and_not_stored() {
+        // The usual case: the sheet shows right after a save, before `embed_pending` reaches the
+        // note. Ranking must still be by meaning (founder, 2026-09-23), and the vector is left for
+        // the queue to store rather than written from here.
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, db_path) = embed_engine(&dir, "on-demand");
+        ask(&engine, "q-about-a", "aaaa", 200);
+        ask(&engine, "q-about-b", "bbbb", 100);
+        let embedder = HistogramEmbedder::new("fake-model");
+        engine.register_embedder(embedder.clone()).unwrap();
+        engine.embed_pending(10).unwrap(); // the two questions
+        engine.enqueue_note(note_upsert("fresh", "bbbb")).unwrap();
+        let before = embedder.embed_calls.load(Ordering::SeqCst);
+
+        assert_eq!(ranked(&engine, "fresh"), vec!["q-about-b", "q-about-a"]);
+        assert_eq!(embedder.embed_calls.load(Ordering::SeqCst), before + 1);
+        assert!(
+            Store::open(&db_path)
+                .unwrap()
+                .embedding_row("fresh")
+                .unwrap()
+                .is_none(),
+            "the on-demand vector is not written"
+        );
+    }
+
+    #[test]
+    fn without_an_embedder_the_sheet_falls_back_to_most_recently_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "fallback");
+        ask(&engine, "q-old", "aaaa", 100);
+        ask(&engine, "q-new", "bbbb", 200);
+        engine.enqueue_note(note_upsert("n", "aaaa")).unwrap();
+        assert_eq!(ranked(&engine, "n"), vec!["q-new", "q-old"]);
+    }
+
+    #[test]
+    fn a_question_without_a_vector_yet_sorts_after_every_scored_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "partial");
+        ask(&engine, "q-a", "aaaa", 100);
+        ask(&engine, "q-b", "bbbb", 200);
+        engine
+            .register_embedder(HistogramEmbedder::new("fake-model"))
+            .unwrap();
+        engine.embed_pending(10).unwrap();
+        // Opened after the drain — newest, but unscored.
+        ask(&engine, "q-unembedded", "aaaa", 300);
+        engine.enqueue_note(note_upsert("n", "bbbb")).unwrap();
+        assert_eq!(ranked(&engine, "n"), vec!["q-b", "q-a", "q-unembedded"]);
+    }
+
+    #[test]
+    fn only_active_questions_are_ranked_and_one_costs_no_embed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "active-only");
+        ask(&engine, "q-open", "aaaa", 100);
+        engine
+            .enqueue_question(QuestionUpsert {
+                status: Some("resolved".into()),
+                ..question_upsert("q-closed", "aaaa")
+            })
+            .unwrap();
+        engine
+            .enqueue_question(QuestionUpsert {
+                status: Some("dismissed".into()),
+                ..question_upsert("q-dropped", "aaaa")
+            })
+            .unwrap();
+        engine.enqueue_note(note_upsert("n", "aaaa")).unwrap();
+        let embedder = HistogramEmbedder::new("fake-model");
+        let reg = engine.register_embedder(embedder.clone()).unwrap();
+        assert_eq!(
+            reg.pending, 2,
+            "the note and the one active question — closed ones never queue"
+        );
+
+        assert_eq!(ranked(&engine, "n"), vec!["q-open"]);
+        assert_eq!(
+            embedder.embed_calls.load(Ordering::SeqCst),
+            0,
+            "one candidate has nothing to order"
+        );
+
+        engine
+            .enqueue_question(QuestionUpsert {
+                status: Some("resolved".into()),
+                plaintext: None,
+                ..question_upsert("q-open", "")
+            })
+            .unwrap();
+        assert!(ranked(&engine, "n").is_empty(), "zero active → no sheet");
+    }
+
+    #[test]
+    fn a_question_vector_is_sealed_to_its_question_and_never_syncs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, db_path) = embed_engine(&dir, "qseal");
+        ask(&engine, "q1", "aaaa", 100);
+        engine
+            .register_embedder(HistogramEmbedder::new("fake-model"))
+            .unwrap();
+        engine.embed_pending(10).unwrap();
+
+        let store = Store::open(&db_path).unwrap();
+        let rows = store
+            .question_embeddings("fake-model|8|test|f32le-v1")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let (id, blob) = &rows[0];
+        assert!(engine
+            .vault
+            .open_bytes(blob.clone(), crate::embeddings::question_embed_aad(id))
+            .is_ok());
+        // Domain separation: the same blob presented as a NOTE vector for the same id must not open.
+        assert!(engine
+            .vault
+            .open_bytes(blob.clone(), crate::embeddings::embed_aad(id))
+            .is_err());
+        for (_, table, _, _, _) in store.outbox_items().unwrap() {
+            assert_ne!(
+                table, "question_embeddings",
+                "vectors must never enqueue for sync"
+            );
+        }
+    }
+
+    #[test]
+    fn a_model_change_purges_question_vectors_and_an_edit_requeues_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "qcorpus");
+        ask(&engine, "q1", "aaaa", 100);
+        engine
+            .register_embedder(HistogramEmbedder::new("model-a"))
+            .unwrap();
+        engine.embed_pending(10).unwrap();
+
+        // A metadata patch (a check-in answer) does NOT re-queue: the token is the ciphertext.
+        engine
+            .enqueue_question(QuestionUpsert {
+                plaintext: None,
+                checkin_response: Some("active".into()),
+                ..question_upsert("q1", "")
+            })
+            .unwrap();
+        assert_eq!(engine.pending_embed_count().unwrap(), 0);
+        // A text edit does.
+        engine
+            .enqueue_question(question_upsert("q1", "bbbb"))
+            .unwrap();
+        assert_eq!(engine.pending_embed_count().unwrap(), 1);
+        engine.embed_pending(10).unwrap();
+
+        let reg = engine
+            .register_embedder(HistogramEmbedder::new("model-b"))
+            .unwrap();
+        assert_eq!((reg.invalidated, reg.pending), (1, 1));
     }
 
     #[test]

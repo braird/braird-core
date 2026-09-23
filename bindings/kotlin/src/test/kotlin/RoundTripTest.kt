@@ -1176,6 +1176,10 @@ class RoundTripTest {
         )
         assertEquals(listOf("loose"), engine.unattachedSinceLastCheckin(passAt + 20)!!.map { it.id })
 
+        // The attach sheet's order crosses as a list of records. No embedder is registered here, so
+        // it is the recency fallback: the most recently opened question first.
+        assertEquals(listOf("q2", "q1"), engine.rankQuestionsForNote("loose").map { it.id })
+
         // The too-many-questions nudge: two active is nowhere near nine; a Boolean crosses intact.
         assertEquals(false, engine.questionNudgeDue(passAt))
         engine.dismissQuestionNudge(passAt)

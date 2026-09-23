@@ -1333,6 +1333,25 @@ public protocol SyncEngineProtocol : AnyObject {
     func questionNudgeDue(nowMs: Int64) throws  -> Bool
     
     /**
+     * Order the ACTIVE questions for the "does this note attach to an open question?" sheet
+     * (SUR-1101): most similar to the note first, by cosine over the on-device embeddings.
+     *
+     * Never fails on the embedding side, only on the store. Every step that may legitimately be
+     * absent degrades to the log's own order — newest-first, which is "most recently opened" (a
+     * question is opened when it is created):
+     * - no embedder registered, or it is `Unavailable` / errors → recency;
+     * - the note has no stored vector yet (the usual case: `embed_pending` runs AFTER a save) →
+     * core embeds its text NOW, through the host embedder, and does not store the result
+     * (founder, 2026-09-23 — the sheet is shown once, `embed_pending` stores it moments later);
+     * - a question with no vector yet (just created, or pulled and not yet drained) → after every
+     * scored question, in recency order.
+     *
+     * An empty list means no question is active, so the host shows no sheet. With exactly one,
+     * there is nothing to order and no embed is paid for.
+     */
+    func rankQuestionsForNote(noteId: String) throws  -> [QuestionRecord]
+    
+    /**
      * Hybrid ranked search (SUR-1019, ADR 0007 — the SUR-157 query path): ONE ranked
      * answer over the lexical engine (ADR 0005; notes + ideas) and the sealed-vector
      * cosine scan (ADR 0006; notes), fused by reciprocal rank IN CORE so the two native
@@ -2479,6 +2498,31 @@ open func questionNudgeDue(nowMs: Int64)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_question_nudge_due(self.uniffiClonePointer(),
         FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * Order the ACTIVE questions for the "does this note attach to an open question?" sheet
+     * (SUR-1101): most similar to the note first, by cosine over the on-device embeddings.
+     *
+     * Never fails on the embedding side, only on the store. Every step that may legitimately be
+     * absent degrades to the log's own order — newest-first, which is "most recently opened" (a
+     * question is opened when it is created):
+     * - no embedder registered, or it is `Unavailable` / errors → recency;
+     * - the note has no stored vector yet (the usual case: `embed_pending` runs AFTER a save) →
+     * core embeds its text NOW, through the host embedder, and does not store the result
+     * (founder, 2026-09-23 — the sheet is shown once, `embed_pending` stores it moments later);
+     * - a question with no vector yet (just created, or pulled and not yet drained) → after every
+     * scored question, in recency order.
+     *
+     * An empty list means no question is active, so the host shows no sheet. With exactly one,
+     * there is nothing to order and no embed is paid for.
+     */
+open func rankQuestionsForNote(noteId: String)throws  -> [QuestionRecord] {
+    return try  FfiConverterSequenceTypeQuestionRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_rank_questions_for_note(self.uniffiClonePointer(),
+        FfiConverterString.lower(noteId),$0
     )
 })
 }
@@ -8079,6 +8123,31 @@ fileprivate struct FfiConverterSequenceTypeQuestionLogEntry: FfiConverterRustBuf
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeQuestionRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [QuestionRecord]
+
+    public static func write(_ value: [QuestionRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeQuestionRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [QuestionRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [QuestionRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeQuestionRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeRankedHit: FfiConverterRustBuffer {
     typealias SwiftType = [RankedHit]
 
@@ -8363,6 +8432,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_question_nudge_due() != 22080) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_rank_questions_for_note() != 26525) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_ranked_search() != 46931) {
