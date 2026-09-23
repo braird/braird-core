@@ -4,7 +4,7 @@
 //
 // `vendored/schema/sync-schema.json` is DERIVED from surfc, so `schema-drift.yml` can re-derive it
 // and catch drift by construction. The native-first tables (SUR-996: questions,
-// question_note_overrides, user_settings) have no PWA counterpart — `src/store.rs`'s
+// question_notes, user_settings) have no PWA counterpart — `src/store.rs`'s
 // `native_schema()` IS the source of truth and `vendored/schema/native-schema.json` is a
 // hand-authored LOCK of it. `tests/schema_parity.rs` reconciles those two.
 //
@@ -483,7 +483,7 @@ function checkPhysicalType(table, column, want, found, errors) {
   }
   // `uuid` normalises to logical `text`, which is right for the SQLite mirror (no uuid type) and
   // wrong as a cloud acceptance rule: it is a CONSTRAINT the client cannot honour. Native ids are
-  // not all uuids — `question_note_overrides.id` is the colon-joined `question_id:note_id`, and
+  // not all uuids — `question_notes.id` is the colon-joined `question_id:note_id`, and
   // `user_settings.key` is a setting name. PostgREST rejects a non-uuid value on every upsert while
   // the schema gate stays green (raised on review).
   if (want === 'text' && t === 'uuid') {

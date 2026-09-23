@@ -6,6 +6,61 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING (FFI + schema): several questions can be active at once, and a question's notes are
+  explicit attachments (SUR-1101).** The founder retired the single-active model and the automatic
+  date window (2026-09-18). A note now belongs to a question only because someone attached it, and
+  a note can belong to several.
+  - **`question_note_overrides` is replaced by `question_notes`** — the same deterministic
+    `question_id:note_id` row with `kind` gone, because a row IS an attachment. surfc migration
+    0058 renames the cloud table in place and materialises every question's then-current note set
+    (`(window ∪ includes) − excludes`) as rows, so no count changes, and keeps each exclude as a
+    tombstone so a device's lowest-stamped attachment for that pair loses to it. The native-schema
+    registry, manifest (`live`, SUR-1101), push arms and parity test move with it.
+  - **Existing stores are converted on open, writing only what the server cannot know.**
+    `Store::convert_question_note_overrides` runs the retired rule once, in SQL. Curation this
+    device never flushed becomes a row carrying the user's answer — attached, or a TOMBSTONE for an
+    exclude or un-pin — stamped at upgrade time so it wins over 0058's row; window pairs of a note or
+    question never flushed are staged at stamp 1 so any server row wins. Everything else arrives by
+    pulling `question_notes`. (A first version re-staged the whole effective set at upgrade time;
+    review showed that lets a late-upgrading device re-attach notes detached elsewhere and resurrect
+    unflushed excludes.) Then the old table, its queued outbox rows (which the flush could never
+    dispatch again) and its pull bookkeeping go, in one transaction; the table's absence is the
+    run-once flag.
+  - `enqueue_question_note_override(QuestionNoteOverride)` → `enqueue_question_note(QuestionNote {
+    question_id, note_id, deleted })`, keeping the re-attach resurrect fork. `question_notes(id)`
+    and `list_questions()` lose `now_ms`: both read one `attachments` definition, so the Lexicon
+    count and the detail list still agree by construction.
+  - **The check-in covers every active question in one pass, on the one global cadence.**
+    `PromptEvent` loses `question_id`; the CheckIn is due one cadence after `prompt::checkin_anchor`
+    — the latest pass (`checkin_completed_at`, a new synced setting) or legacy per-question
+    `checkin_at`, bounded to [oldest active birth, now]. `skip_checkin(question_id, now_ms)` →
+    `complete_checkin(now_ms)`, one call per pass, which records this device's `now_ms` as given.
+    (Keeping the larger stored value was tried in review and reverted: it re-wrote a future stamp on
+    every pass, which the anchor reads as the oldest birth, keeping the check-in overdue.)
+  - New: `unattached_since_last_checkin(now_ms)` — the check-in's backstop section, notes since the
+    anchor that no live question holds; gated on the prompt pull receipts, which now include
+    `question_notes`. `question_nudge_due(now_ms)` / `dismiss_question_nudge(now_ms)` — the
+    too-many-questions nudge at the 9th active question, silent for 28 days after a dismissal
+    (`question_nudge_dismissed_at`).
+  - New: `rank_questions_for_note(note_id) -> Vec<QuestionRecord>` — the ACTIVE questions in the
+    order the "attach to an open question?" sheet lists them: cosine similarity between the note's
+    vector and each question's, most similar first. The note's stored vector is used when current;
+    otherwise core embeds its text on the spot (a note is usually not embedded yet when the sheet
+    shows) and does not store it. No embedder, an unavailable one, or an unembedded question falls
+    back to most-recently-opened (`created_at` DESC). Empty = no active question = no sheet; one
+    active question is returned without an embed.
+  - Question text is embedded into a new LOCAL-ONLY `question_embeddings` table, sealed with AAD
+    `qemb:{id}` (domain-separated from `emb:` note vectors), never on the outbox. `embed_pending`
+    drains active questions first, embedding them as queries; the staleness token is the text
+    ciphertext, so check-in and status patches do not re-embed. `pending_embed_count` includes
+    them, a corpus-key change purges them, and a question tombstone drops its vector at once (the
+    note rule in `apply_row`). The ranking probe ignores a note vector made from older text.
+  - **Rollout (founder, 2026-09-23):** 0058 drops the old table name, and one 404 aborts a flush, so
+    an install on ≤ v0.16.0 stops syncing once 0058 reaches its environment — and a build carrying
+    this release stops syncing against an environment WITHOUT 0058. Apply 0058 to production
+    immediately before the app release carrying this is published (SUR-1104).
+
 ## [0.16.0] - 2026-08-20
 
 ### Added

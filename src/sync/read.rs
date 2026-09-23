@@ -165,8 +165,8 @@ pub struct CollectionNoteCount {
 /// CHECK, so a row written by a newer client must not panic an older read.
 ///
 /// Deliberately NO note count or active-date-range field — those are Lexicon presentation shapes.
-/// The count rides on [`QuestionLogEntry`] (SUR-1071), because it is a function of `now`; the range
-/// needs no field at all, since `created_at` + `resolved_at` + `status` already say it.
+/// The count rides on [`QuestionLogEntry`] (SUR-1071); the range needs no field at all, since
+/// `created_at` + `resolved_at` + `status` already say it.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct QuestionRecord {
     pub id: String,
@@ -181,15 +181,14 @@ pub struct QuestionRecord {
     pub updated_at: i64,
 }
 
-/// One row of the Lexicon Questions section (SUR-1071) — a question plus the size of its effective
-/// note set, shaped like [`CollectionNoteCount`] but carrying its subject rather than pointing at it
-/// (the section renders both together, and a host that had to zip two lists would also have to
-/// re-derive the ordering).
+/// One row of the Lexicon Questions section (SUR-1071) — a question plus the number of notes
+/// attached to it, shaped like [`CollectionNoteCount`] but carrying its subject rather than pointing
+/// at it (the section renders both together, and a host that had to zip two lists would also have
+/// to re-derive the ordering).
 ///
-/// `note_count` is `question_notes(id, now_ms).len()` **by construction** — both are
-/// [`in_effective_set`] over the same rows — so the subtitle can never disagree with the detail page
-/// it opens. It is a function of `now_ms`: an active question's window runs to the caller's clock,
-/// so its count grows; a resolved one is frozen at `resolved_at`.
+/// `note_count` is `question_notes(id).len()` **by construction** — both read [`attachments`] — so
+/// the subtitle can never disagree with the detail page it opens. Since SUR-1101 it changes only
+/// when a note is attached, detached or deleted; there is no window running to the caller's clock.
 ///
 /// No date-range field. `question.created_at`, `question.resolved_at` and `question.status` already
 /// carry it, and only the host knows how to render "12 Jul – now" in the user's locale.
@@ -404,65 +403,35 @@ pub fn collection_ids_for_note(store: &Store, note_id: &str) -> rusqlite::Result
         .collect())
 }
 
-/// The question log — every live question, **active first**, then newest-first, each with the size
-/// of its effective note set (SUR-1071). Decrypted in core. This IS the log: SUR-1044 renders no
-/// separate view.
+/// The question log — every live question, **active first**, then newest-first, each with the number
+/// of notes attached to it (SUR-1071; explicit attachments since SUR-1101). Decrypted in core. This
+/// IS the log: SUR-1044 renders no separate view.
 ///
 /// Ordering is core's, not the host's, because two clients sorting independently is how the same
 /// store starts rendering two different sections. "Active" is [`crate::prompt::is_active`] — the one
 /// the check-in loop schedules on — so a status neither recognises sorts as open in both.
 ///
-/// **Three store reads, not one per question.** Live questions, live notes and live overrides are
-/// each scanned once and tallied in memory, the [`collection_note_counts`] shape. The count also
-/// does no vault work — only `(id, created_at)` is read off each note — so a log of any length never
-/// pays to decrypt the archive. Calling [`question_notes`] per question would do both: N full scans,
-/// each decrypting every note, to produce N integers.
+/// **Three store reads, not one per question.** Live questions, live notes and live attachments are
+/// each scanned once and tallied in memory ([`attachments`]). The count does no vault work — only
+/// note ids are read — so a log of any length never pays to decrypt the archive.
 ///
 /// A question that fails to decrypt still appears, with `text: None, decrypt_failed: true` and a
-/// correct count (the effective set is defined on rows, not on plaintext). Founder-decided
-/// 2026-08-20: a hidden row is a lost question.
+/// correct count (the set is defined on rows, not on plaintext). Founder-decided 2026-08-20: a
+/// hidden row is a lost question.
 ///
 /// No `limit`/`offset`, and no scan bound either. Sorting active-first AFTER a SQL `LIMIT` would
 /// page over the wrong order, so any cut has to happen after the sort — and since this API is
 /// unpaginated, a cut is not a page the caller can step past but history it can never ask for
 /// again. `list_live` orders by `created_at` DESC, so a bound would also drop an OLD ACTIVE
-/// question behind newer resolved ones, contradicting the active-first contract outright. Scans
-/// with `-1` like the notes and overrides reads above, and like [`question_metas`], which lost the
-/// same bound for the same reason: a cut that cannot see `status` is unsafe for any reader that
-/// cares about it.
-///
-/// ponytail: the tally is O(questions × notes) after those three scans. Fine while v1 keeps one
-/// active question at a time; if a log ever gets long, sort the notes by `created_at` once and
-/// `partition_point` the window instead of re-walking them per question.
-pub fn list_questions(
-    store: &Store,
-    vault: &Vault,
-    now_ms: i64,
-) -> rusqlite::Result<Vec<QuestionLogEntry>> {
-    let notes: Vec<(String, i64)> = store
-        .list_live("notes", None, -1, 0)?
-        .iter()
-        .map(|row| {
-            (
-                string_field(row, "id").unwrap_or_default(),
-                int_field(row, "created_at"),
-            )
-        })
-        .collect();
-    let overrides = store.list_live("question_note_overrides", None, -1, 0)?;
-    let by_question = curation_by_question(&overrides);
-
+/// question behind newer resolved ones, contradicting the active-first contract outright.
+pub fn list_questions(store: &Store, vault: &Vault) -> rusqlite::Result<Vec<QuestionLogEntry>> {
+    let attached = attachments(store, None)?;
     let mut out: Vec<QuestionLogEntry> = store
         .list_live("questions", None, -1, 0)?
         .iter()
         .map(|row| {
             let question = question_record(row, vault);
-            let window = active_window(row, now_ms);
-            let curation = by_question.get(&question.id);
-            let note_count = notes
-                .iter()
-                .filter(|(id, created_at)| in_effective_set(id, *created_at, window, curation))
-                .count() as u32;
+            let note_count = attached.get(&question.id).map_or(0, HashSet::len) as u32;
             QuestionLogEntry {
                 question,
                 note_count,
@@ -491,123 +460,112 @@ pub fn get_question(
     }
 }
 
-/// The live curation overrides of one question — the authored half of its effective note set.
-#[derive(Default)]
-struct Curation {
-    includes: HashSet<String>,
-    excludes: HashSet<String>,
+/// The ACTIVE live questions, newest-first with `id` breaking a tie — the log's order within its
+/// active block, which is also "most recently opened". Status is read off the row BEFORE any
+/// decrypt, so resolved and dismissed questions never produce plaintext (SUR-1101: the attach
+/// sheet only ever shows active ones).
+pub fn active_questions(store: &Store, vault: &Vault) -> rusqlite::Result<Vec<QuestionRecord>> {
+    let mut rows: Vec<Map<String, Value>> = store
+        .list_live("questions", None, -1, 0)?
+        .into_iter()
+        .filter(|row| is_active(string_field(row, "status").as_deref()))
+        .collect();
+    rows.sort_by(|a, b| {
+        int_field(b, "created_at")
+            .cmp(&int_field(a, "created_at"))
+            .then(string_field(a, "id").cmp(&string_field(b, "id")))
+    });
+    Ok(rows.iter().map(|row| question_record(row, vault)).collect())
 }
 
-/// Bucket live `question_note_overrides` rows by question id.
+/// The LIVE notes attached to each question: live `question_notes` rows whose note is also live,
+/// bucketed by question id. `only` narrows the attachment scan to one question.
 ///
-/// `excludes` beats `includes` only by being the later write: the two are not ranks but the same
-/// deterministic `question_id:note_id` row under whole-row LWW, so the surviving `kind` IS the
-/// answer. Soft-deleted override rows are simply absent, which returns the pair to whatever the
-/// window says — the reason [`super::SyncEngine::enqueue_question_note_override`] must resurrect
-/// rather than let a re-add collapse into a tombstone.
+/// **This is the only place "attached" is defined.** [`question_notes`] lists a bucket,
+/// [`list_questions`] counts it and [`unattached_notes_since`] subtracts all of them, so the Lexicon
+/// subtitle, the detail page and the check-in's backstop section cannot disagree about which notes
+/// belong to which question — the SUR-1071 acceptance criterion, kept in the explicit model.
 ///
-/// Takes rows rather than reading them, so one filtered scan ([`question_notes`]) and one
-/// whole-table scan ([`list_questions`]) share this bucketing instead of each rolling their own.
-fn curation_by_question(rows: &[Map<String, Value>]) -> HashMap<String, Curation> {
-    let mut out: HashMap<String, Curation> = HashMap::new();
-    for row in rows {
+/// A soft-deleted NOTE drops out even though its attachment row is still live: the app soft-deletes
+/// notes without touching their attachments (the FK cascade is only the hard-delete backstop), and a
+/// count that included deleted notes would disagree with the list it summarises.
+fn attachments(
+    store: &Store,
+    only: Option<&str>,
+) -> rusqlite::Result<HashMap<String, HashSet<String>>> {
+    let live_notes: HashSet<String> = store
+        .list_live("notes", None, -1, 0)?
+        .iter()
+        .filter_map(|row| string_field(row, "id"))
+        .collect();
+    let mut out: HashMap<String, HashSet<String>> = HashMap::new();
+    for row in store.list_live("question_notes", only.map(|id| ("question_id", id)), -1, 0)? {
         let (Some(question_id), Some(note_id)) = (
-            string_field(row, "question_id"),
-            string_field(row, "note_id"),
+            string_field(&row, "question_id"),
+            string_field(&row, "note_id"),
         ) else {
             continue;
         };
-        let curation = out.entry(question_id).or_default();
-        match string_field(row, "kind").as_deref() {
-            Some("exclude") => curation.excludes.insert(note_id),
-            // Anything else that survived LWW is treated as an include. An unknown `kind` from a
-            // newer client should widen the set, never silently drop a note the user pinned.
-            _ => curation.includes.insert(note_id),
-        };
-    }
-    out
-}
-
-/// A question's active window, `[created_at, resolved_at ?? now]`.
-///
-/// A resolved or dismissed question closes its window at `resolved_at`, so its set stops growing; a
-/// still-active one runs to `now`, which the HOST supplies rather than core reading a clock,
-/// matching [`notes_this_week`]. That keeps every reader built on this a pure function of
-/// (store, question, now) — the property the acceptance criterion "converges across devices" is
-/// actually testable against.
-///
-/// A `resolved_at` BEFORE `created_at` (clock skew across devices) would invert the window and
-/// silently empty the set, so the end is clamped to at least the start.
-fn active_window(question: &Map<String, Value>, now_ms: i64) -> (i64, i64) {
-    let opened_at = int_field(question, "created_at");
-    let closed_at = opt_int_field(question, "resolved_at")
-        .unwrap_or(now_ms)
-        .max(opened_at);
-    (opened_at, closed_at)
-}
-
-/// Does one note belong to one question's effective set (SUR-996 R1)? `(auto ∪ includes) − excludes`
-/// for a single note: an `exclude` drops a note the window would have offered, an `include` adds one
-/// the window missed, and everything else is decided by the window alone.
-///
-/// **This is the only place that rule exists.** [`question_notes`] returns the set and
-/// [`list_questions`] counts it; two implementations of one definition would let the Lexicon
-/// subtitle and the detail page disagree, which is exactly what SUR-1071's acceptance criterion
-/// ("counts match the effective-set definition exactly") forbids.
-fn in_effective_set(
-    note_id: &str,
-    created_at: i64,
-    (opened_at, closed_at): (i64, i64),
-    curation: Option<&Curation>,
-) -> bool {
-    if let Some(curation) = curation {
-        if curation.excludes.contains(note_id) {
-            return false;
-        }
-        if curation.includes.contains(note_id) {
-            return true;
+        if live_notes.contains(&note_id) {
+            out.entry(question_id).or_default().insert(note_id);
         }
     }
-    created_at >= opened_at && created_at <= closed_at
+    Ok(out)
 }
 
-/// The EFFECTIVE note set of one question (SUR-996 R1) — [`in_effective_set`] over every live note,
-/// newest-first, decrypted in core. An absent or soft-deleted question yields an empty set.
+/// The notes attached to one question, newest-first, decrypted in core (SUR-1101: explicit
+/// attachments only — the automatic date window is gone). An absent or soft-deleted question yields
+/// an empty set.
 ///
-/// ponytail: scan-then-filter over live notes and this question's overrides, no index. Same posture
-/// as [`notes_by_idea`] and correct at personal-archive scale; revisit only if a profile says so.
+/// ponytail: scans live notes and filters by the attachment set, no index. Same posture as
+/// [`notes_by_idea`] and correct at personal-archive scale; only attached notes are decrypted.
 pub fn question_notes(
     store: &Store,
     vault: &Vault,
     question_id: &str,
-    now_ms: i64,
 ) -> rusqlite::Result<Vec<NoteRecord>> {
-    let Some(question) = store.get_row("questions", question_id)? else {
-        return Ok(Vec::new());
-    };
-    if is_deleted(&question) {
-        return Ok(Vec::new());
+    match store.get_row("questions", question_id)? {
+        Some(row) if !is_deleted(&row) => {}
+        _ => return Ok(Vec::new()),
     }
-    let window = active_window(&question, now_ms);
-    let overrides = store.list_live(
-        "question_note_overrides",
-        Some(("question_id", question_id)),
-        -1,
-        0,
-    )?;
-    let by_question = curation_by_question(&overrides);
-    let curation = by_question.get(question_id);
+    let attached = attachments(store, Some(question_id))?
+        .remove(question_id)
+        .unwrap_or_default();
+    Ok(store
+        .list_live("notes", None, -1, 0)?
+        .into_iter()
+        .filter(|row| string_field(row, "id").is_some_and(|id| attached.contains(&id)))
+        .map(|row| note_record(&row, vault))
+        .collect())
+}
 
+/// Live notes created at or after `since_ms` that are attached to no live question, newest-first
+/// (SUR-1101) — the check-in's backstop for a dismissed "attach to an open question?" sheet.
+///
+/// "Attached" is [`attachments`], so this is exactly the complement of what the question log counts.
+/// An attachment to a soft-deleted question does not count: that question is gone from every view,
+/// and a note whose only home was it would otherwise be unreachable from the check-in.
+pub fn unattached_notes_since(
+    store: &Store,
+    vault: &Vault,
+    since_ms: i64,
+) -> rusqlite::Result<Vec<NoteRecord>> {
+    let live_questions: HashSet<String> = store
+        .list_live("questions", None, -1, 0)?
+        .iter()
+        .filter_map(|row| string_field(row, "id"))
+        .collect();
+    let attached: HashSet<String> = attachments(store, None)?
+        .into_iter()
+        .filter(|(question_id, _)| live_questions.contains(question_id))
+        .flat_map(|(_, notes)| notes)
+        .collect();
     Ok(store
         .list_live("notes", None, -1, 0)?
         .into_iter()
         .filter(|row| {
-            in_effective_set(
-                &string_field(row, "id").unwrap_or_default(),
-                int_field(row, "created_at"),
-                window,
-                curation,
-            )
+            int_field(row, "created_at") >= since_ms
+                && string_field(row, "id").is_some_and(|id| !attached.contains(&id))
         })
         .map(|row| note_record(&row, vault))
         .collect())
@@ -834,7 +792,7 @@ fn note_record(row: &Map<String, Value>, vault: &Vault) -> NoteRecord {
     }
 }
 
-fn question_record(row: &Map<String, Value>, vault: &Vault) -> QuestionRecord {
+pub(crate) fn question_record(row: &Map<String, Value>, vault: &Vault) -> QuestionRecord {
     let id = string_field(row, "id").unwrap_or_default();
     let (text, decrypt_failed) = decrypt_v2_bound(row, &id, vault);
     QuestionRecord {
@@ -1852,11 +1810,11 @@ mod tests {
         );
     }
 
-    // ── SUR-1071: the question log ───────────────────────────────────────────
+    // ── SUR-1071 / SUR-1101: the question log and its attachments ────────────
     // Every count case asserts the log's `note_count` AND `question_notes(...).len()` on the same
     // fixture. That pairing is the point: the acceptance criterion is that the Lexicon subtitle and
-    // the detail page it opens agree, and only a shared predicate can make that true by
-    // construction. A test that checked one of them would pass while they diverged.
+    // the detail page it opens agree, and only a shared definition ([`attachments`]) can make that
+    // true by construction. A test that checked one of them would pass while they diverged.
 
     fn question_row(
         id: &str,
@@ -1878,43 +1836,41 @@ mod tests {
         r
     }
 
-    fn override_row(
-        question_id: &str,
-        note_id: &str,
-        kind: &str,
-        deleted: bool,
-    ) -> Map<String, Value> {
+    fn attachment_row(question_id: &str, note_id: &str, deleted: bool) -> Map<String, Value> {
         let mut r = Map::new();
         r.insert(
             "id".into(),
-            json!(crate::store::override_id(question_id, note_id)),
+            json!(crate::store::question_note_id(question_id, note_id)),
         );
         r.insert("question_id".into(), json!(question_id));
         r.insert("note_id".into(), json!(note_id));
-        r.insert("kind".into(), json!(kind));
         r.insert("created_at".into(), json!(1));
         r.insert("updated_at".into(), json!(1));
         r.insert("deleted".into(), json!(deleted));
         r
     }
 
+    fn attach(question_id: &str, note_id: &str) -> (&'static str, Map<String, Value>) {
+        (
+            "question_notes",
+            attachment_row(question_id, note_id, false),
+        )
+    }
+
     /// The log's count for one question, and the length of the set the detail page would show.
-    /// Every effective-set case goes through here so the two can never be asserted apart.
-    fn counted_both_ways(
-        store: &Store,
-        vault: &Vault,
-        question_id: &str,
-        now_ms: i64,
-    ) -> (u32, u32) {
-        let entry = list_questions(store, vault, now_ms)
+    /// Every count case goes through here so the two can never be asserted apart.
+    fn counted_both_ways(store: &Store, vault: &Vault, question_id: &str) -> (u32, u32) {
+        let entry = list_questions(store, vault)
             .unwrap()
             .into_iter()
             .find(|e| e.question.id == question_id)
             .unwrap_or_else(|| panic!("{question_id} missing from the log"));
-        let set = question_notes(store, vault, question_id, now_ms)
-            .unwrap()
-            .len() as u32;
+        let set = question_notes(store, vault, question_id).unwrap().len() as u32;
         (entry.note_count, set)
+    }
+
+    fn ids(notes: &[NoteRecord]) -> Vec<&str> {
+        notes.iter().map(|n| n.id.as_str()).collect()
     }
 
     fn store_with(rows: &[(&str, Map<String, Value>)]) -> (tempfile::TempDir, Store) {
@@ -1927,235 +1883,90 @@ mod tests {
     }
 
     const Q_BIRTH: i64 = 1_000;
-    const Q_NOW: i64 = 9_000;
+
+    fn note(vault: &Vault, id: &str, created_at: i64) -> (&'static str, Map<String, Value>) {
+        (
+            "notes",
+            note_row(id, None, &seal(vault, id, id), created_at),
+        )
+    }
 
     #[test]
-    fn effective_count_is_the_active_window_and_matches_the_note_set() {
+    fn a_question_holds_exactly_its_attached_notes_and_nothing_by_date() {
+        // SUR-1101 retired the automatic window: a note written while the question was open is NOT
+        // in the set unless someone attached it, and an old note is in it if they did.
         let vault = Vault::generate();
         let (_d, store) = store_with(&[
             (
                 "questions",
                 question_row("q", &vault, "what am I avoiding?", "active", Q_BIRTH, None),
             ),
-            (
-                "notes",
-                note_row("before", None, &seal(&vault, "before", "a"), Q_BIRTH - 1),
-            ),
-            (
-                "notes",
-                note_row("opening", None, &seal(&vault, "opening", "b"), Q_BIRTH),
-            ),
-            (
-                "notes",
-                note_row("inside", None, &seal(&vault, "inside", "c"), Q_BIRTH + 500),
-            ),
-            (
-                "notes",
-                note_row("now", None, &seal(&vault, "now", "d"), Q_NOW),
-            ),
-            (
-                "notes",
-                note_row("after", None, &seal(&vault, "after", "e"), Q_NOW + 1),
-            ),
+            note(&vault, "attached-old", Q_BIRTH - 5_000),
+            note(&vault, "attached-new", Q_BIRTH + 10),
+            note(&vault, "unattached-in-window", Q_BIRTH + 20),
+            attach("q", "attached-old"),
+            attach("q", "attached-new"),
         ]);
 
-        // The window is INCLUSIVE at both ends: a note written in the same millisecond the question
-        // was asked belongs to it, and so does one written at `now`.
-        assert_eq!(counted_both_ways(&store, &vault, "q", Q_NOW), (3, 3));
+        assert_eq!(counted_both_ways(&store, &vault, "q"), (2, 2));
         assert_eq!(
-            question_notes(&store, &vault, "q", Q_NOW)
-                .unwrap()
-                .iter()
-                .map(|n| n.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["now", "inside", "opening"],
-            "newest-first, window-bounded"
+            ids(&question_notes(&store, &vault, "q").unwrap()),
+            vec!["attached-new", "attached-old"],
+            "newest-first, and only what was attached"
         );
     }
 
     #[test]
-    fn an_include_adds_a_note_the_window_never_offered() {
+    fn one_note_attached_to_two_questions_counts_in_both() {
         let vault = Vault::generate();
+        let (_d, store) = store_with(&[
+            (
+                "questions",
+                question_row("q1", &vault, "a", "active", Q_BIRTH, None),
+            ),
+            (
+                "questions",
+                question_row("q2", &vault, "b", "active", Q_BIRTH, None),
+            ),
+            note(&vault, "shared", Q_BIRTH + 1),
+            note(&vault, "only-q2", Q_BIRTH + 2),
+            attach("q1", "shared"),
+            attach("q2", "shared"),
+            attach("q2", "only-q2"),
+        ]);
+
+        // The log buckets EVERY attachment in one scan, unlike `question_notes`, which asks the
+        // store for one question's rows. Bucketing by the wrong key would be invisible with a
+        // single question in the fixture and wrong for every real user.
+        assert_eq!(counted_both_ways(&store, &vault, "q1"), (1, 1));
+        assert_eq!(counted_both_ways(&store, &vault, "q2"), (2, 2));
+    }
+
+    #[test]
+    fn a_detached_note_or_a_deleted_note_leaves_the_set() {
+        let vault = Vault::generate();
+        let mut deleted = note_row("deleted", None, &seal(&vault, "deleted", "x"), Q_BIRTH + 2);
+        deleted.insert("deleted".into(), json!(true));
         let (_d, store) = store_with(&[
             (
                 "questions",
                 question_row("q", &vault, "q?", "active", Q_BIRTH, None),
             ),
-            (
-                "notes",
-                note_row(
-                    "ancient",
-                    None,
-                    &seal(&vault, "ancient", "a"),
-                    Q_BIRTH - 5_000,
-                ),
-            ),
-            (
-                "question_note_overrides",
-                override_row("q", "ancient", "include", false),
-            ),
+            note(&vault, "kept", Q_BIRTH + 1),
+            note(&vault, "detached", Q_BIRTH + 3),
+            ("notes", deleted),
+            attach("q", "kept"),
+            ("question_notes", attachment_row("q", "detached", true)),
+            // The attachment row is still live: soft-deleting a note does not touch its attachments.
+            attach("q", "deleted"),
         ]);
 
-        assert_eq!(counted_both_ways(&store, &vault, "q", Q_NOW), (1, 1));
-    }
-
-    #[test]
-    fn an_exclude_drops_a_note_the_window_would_have_offered() {
-        let vault = Vault::generate();
-        let (_d, store) = store_with(&[
-            (
-                "questions",
-                question_row("q", &vault, "q?", "active", Q_BIRTH, None),
-            ),
-            (
-                "notes",
-                note_row("kept", None, &seal(&vault, "kept", "a"), Q_BIRTH + 1),
-            ),
-            (
-                "notes",
-                note_row("dropped", None, &seal(&vault, "dropped", "b"), Q_BIRTH + 2),
-            ),
-            (
-                "question_note_overrides",
-                override_row("q", "dropped", "exclude", false),
-            ),
-        ]);
-
-        assert_eq!(counted_both_ways(&store, &vault, "q", Q_NOW), (1, 1));
-        assert_eq!(
-            question_notes(&store, &vault, "q", Q_NOW).unwrap()[0].id,
-            "kept"
-        );
-    }
-
-    #[test]
-    fn a_resolved_questions_window_is_closed_and_its_count_stops_growing() {
-        // The superseded case: the user answered, started a new question, and kept writing. The old
-        // row must freeze at `resolved_at` — an archived question whose count still climbed would
-        // mean the log rewrites its own history every time it is opened.
-        let vault = Vault::generate();
-        let resolved_at = Q_BIRTH + 1_000;
-        let (_d, store) = store_with(&[
-            (
-                "questions",
-                question_row("q", &vault, "q?", "resolved", Q_BIRTH, Some(resolved_at)),
-            ),
-            (
-                "notes",
-                note_row("during", None, &seal(&vault, "during", "a"), Q_BIRTH + 500),
-            ),
-            (
-                "notes",
-                note_row(
-                    "at-close",
-                    None,
-                    &seal(&vault, "at-close", "b"),
-                    resolved_at,
-                ),
-            ),
-            (
-                "notes",
-                note_row("after", None, &seal(&vault, "after", "c"), resolved_at + 1),
-            ),
-        ]);
-
-        assert_eq!(counted_both_ways(&store, &vault, "q", Q_NOW), (2, 2));
-        assert_eq!(
-            counted_both_ways(&store, &vault, "q", Q_NOW * 1_000),
-            (2, 2),
-            "a closed window ignores `now` entirely"
-        );
-    }
-
-    #[test]
-    fn an_inverted_window_clamps_instead_of_silently_emptying_the_set() {
-        // `resolved_at` BEFORE `created_at` — a row pulled from a device with a trailing clock.
-        // Clamping keeps the question's own birth millisecond; NOT clamping would make every count
-        // zero, which reads as "you wrote nothing about this" rather than as a clock fault.
-        let vault = Vault::generate();
-        let (_d, store) = store_with(&[
-            (
-                "questions",
-                question_row("q", &vault, "q?", "resolved", Q_BIRTH, Some(Q_BIRTH - 500)),
-            ),
-            (
-                "notes",
-                note_row("at-birth", None, &seal(&vault, "at-birth", "a"), Q_BIRTH),
-            ),
-            (
-                "notes",
-                note_row("later", None, &seal(&vault, "later", "b"), Q_BIRTH + 1),
-            ),
-        ]);
-
-        assert_eq!(counted_both_ways(&store, &vault, "q", Q_NOW), (1, 1));
-    }
-
-    #[test]
-    fn a_tombstoned_override_returns_the_pair_to_the_window() {
-        let vault = Vault::generate();
-        let (_d, store) = store_with(&[
-            (
-                "questions",
-                question_row("q", &vault, "q?", "active", Q_BIRTH, None),
-            ),
-            (
-                "notes",
-                note_row("inside", None, &seal(&vault, "inside", "a"), Q_BIRTH + 1),
-            ),
-            (
-                "notes",
-                note_row("outside", None, &seal(&vault, "outside", "b"), Q_BIRTH - 1),
-            ),
-            // Both overrides are dead, so neither speaks: the window decides both pairs.
-            (
-                "question_note_overrides",
-                override_row("q", "inside", "exclude", true),
-            ),
-            (
-                "question_note_overrides",
-                override_row("q", "outside", "include", true),
-            ),
-        ]);
-
-        assert_eq!(counted_both_ways(&store, &vault, "q", Q_NOW), (1, 1));
-        assert_eq!(
-            question_notes(&store, &vault, "q", Q_NOW).unwrap()[0].id,
-            "inside"
-        );
-    }
-
-    #[test]
-    fn an_unknown_override_kind_widens_the_set_rather_than_dropping_a_pinned_note() {
-        let vault = Vault::generate();
-        let (_d, store) = store_with(&[
-            (
-                "questions",
-                question_row("q", &vault, "q?", "active", Q_BIRTH, None),
-            ),
-            (
-                "notes",
-                note_row(
-                    "ancient",
-                    None,
-                    &seal(&vault, "ancient", "a"),
-                    Q_BIRTH - 5_000,
-                ),
-            ),
-            (
-                "question_note_overrides",
-                override_row("q", "ancient", "pinned-by-a-newer-client", false),
-            ),
-        ]);
-
-        assert_eq!(counted_both_ways(&store, &vault, "q", Q_NOW), (1, 1));
+        assert_eq!(counted_both_ways(&store, &vault, "q"), (1, 1));
     }
 
     #[test]
     fn the_log_and_its_counts_see_only_live_rows() {
         let vault = Vault::generate();
-        let mut dead_note = note_row("dead", None, &seal(&vault, "dead", "a"), Q_BIRTH + 1);
-        dead_note.insert("deleted".into(), json!(true));
         let mut dead_question = question_row("gone", &vault, "gone?", "active", Q_BIRTH, None);
         dead_question.insert("deleted".into(), json!(true));
         let (_d, store) = store_with(&[
@@ -2164,14 +1975,12 @@ mod tests {
                 question_row("q", &vault, "q?", "active", Q_BIRTH, None),
             ),
             ("questions", dead_question),
-            (
-                "notes",
-                note_row("live", None, &seal(&vault, "live", "b"), Q_BIRTH + 1),
-            ),
-            ("notes", dead_note),
+            note(&vault, "live", Q_BIRTH + 1),
+            attach("q", "live"),
+            attach("gone", "live"),
         ]);
 
-        let log = list_questions(&store, &vault, Q_NOW).unwrap();
+        let log = list_questions(&store, &vault).unwrap();
         assert_eq!(
             log.iter()
                 .map(|e| e.question.id.as_str())
@@ -2179,12 +1988,10 @@ mod tests {
             vec!["q"],
             "a soft-deleted question is not in the log"
         );
-        assert_eq!(counted_both_ways(&store, &vault, "q", Q_NOW), (1, 1));
+        assert_eq!(counted_both_ways(&store, &vault, "q"), (1, 1));
         assert!(
-            question_notes(&store, &vault, "gone", Q_NOW)
-                .unwrap()
-                .is_empty(),
-            "and its effective set is empty, not an error"
+            question_notes(&store, &vault, "gone").unwrap().is_empty(),
+            "and its set is empty, not an error"
         );
     }
 
@@ -2223,7 +2030,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            list_questions(&store, &vault, Q_NOW)
+            list_questions(&store, &vault)
                 .unwrap()
                 .iter()
                 .map(|e| e.question.id.as_str())
@@ -2243,8 +2050,8 @@ mod tests {
 
     #[test]
     fn a_question_that_fails_to_decrypt_still_appears_and_still_counts() {
-        // Founder-decided 2026-08-20: a hidden row is a lost question. The effective set is defined
-        // on rows, so the count does not depend on any text opening — the question's or the notes'.
+        // Founder-decided 2026-08-20: a hidden row is a lost question. The set is defined on rows,
+        // so the count does not depend on any text opening — the question's or the notes'.
         let foreign = Vault::generate();
         let vault = Vault::generate();
         let (_d, store) = store_with(&[
@@ -2259,26 +2066,22 @@ mod tests {
                     None,
                 ),
             ),
-            (
-                "notes",
-                note_row("mine", None, &seal(&vault, "mine", "a"), Q_BIRTH + 1),
-            ),
-            (
-                "notes",
-                note_row("theirs", None, &seal(&foreign, "theirs", "b"), Q_BIRTH + 2),
-            ),
+            note(&vault, "mine", Q_BIRTH + 1),
+            note(&foreign, "theirs", Q_BIRTH + 2),
+            attach("q", "mine"),
+            attach("q", "theirs"),
         ]);
 
-        let entry = &list_questions(&store, &vault, Q_NOW).unwrap()[0];
+        let entry = &list_questions(&store, &vault).unwrap()[0];
         assert_eq!(entry.question.id, "q");
         assert!(entry.question.decrypt_failed);
         assert_eq!(
             entry.question.text, None,
             "ciphertext never crosses in enc: form"
         );
-        assert_eq!(counted_both_ways(&store, &vault, "q", Q_NOW), (2, 2));
+        assert_eq!(counted_both_ways(&store, &vault, "q"), (2, 2));
         assert!(
-            question_notes(&store, &vault, "q", Q_NOW)
+            question_notes(&store, &vault, "q")
                 .unwrap()
                 .iter()
                 .any(|n| n.decrypt_failed),
@@ -2295,8 +2098,7 @@ mod tests {
         //     it is history it can never ask for again; and an old ACTIVE question would sort
         //     behind newer resolved ones, contradicting the active-first contract outright.
         //   - `question_metas` feeds the scheduler, which filters `is_active` AFTER this read.
-        //     Truncate the only active question and `next_events` sees none, so the user gets an
-        //     initial-style prompt instead of the check-in they are owed.
+        //     Truncate the oldest active question and the check-in anchors on a younger birth.
         let vault = Vault::generate();
         let (_d, store) = store_with(&[]);
         // One old active question, buried under more resolved rows than any fixed bound.
@@ -2322,7 +2124,7 @@ mod tests {
                 .unwrap();
         }
 
-        let log = list_questions(&store, &vault, Q_NOW).unwrap();
+        let log = list_questions(&store, &vault).unwrap();
         assert_eq!(log.len(), 6_001, "every live question is in the log");
         assert_eq!(
             log[0].question.id, "the-oldest-active",
@@ -2345,49 +2147,49 @@ mod tests {
     fn an_empty_store_yields_an_empty_log() {
         let vault = Vault::generate();
         let (_d, store) = store_with(&[]);
-        assert!(list_questions(&store, &vault, Q_NOW).unwrap().is_empty());
+        assert!(list_questions(&store, &vault).unwrap().is_empty());
     }
 
     #[test]
-    fn one_questions_curation_never_leaks_into_another() {
-        // The log buckets EVERY override row in one scan, unlike `question_notes`, which asks the
-        // store for one question's rows. Bucketing by the wrong key would be invisible with a
-        // single question in the fixture and wrong for every real user.
+    fn unattached_notes_are_the_complement_of_every_live_questions_set() {
+        // SUR-1101's backstop for a dismissed attach sheet: a note captured since the anchor that no
+        // live question holds.
         let vault = Vault::generate();
+        let mut gone = question_row("gone", &vault, "gone?", "active", Q_BIRTH, None);
+        gone.insert("deleted".into(), json!(true));
         let (_d, store) = store_with(&[
             (
                 "questions",
-                question_row("q1", &vault, "a", "active", Q_BIRTH, None),
+                question_row("q", &vault, "q?", "active", Q_BIRTH, None),
             ),
             (
                 "questions",
-                question_row("q2", &vault, "b", "active", Q_BIRTH, None),
-            ),
-            (
-                "notes",
-                note_row("shared", None, &seal(&vault, "shared", "a"), Q_BIRTH + 1),
-            ),
-            (
-                "notes",
-                note_row(
-                    "ancient",
-                    None,
-                    &seal(&vault, "ancient", "b"),
-                    Q_BIRTH - 5_000,
+                question_row(
+                    "closed",
+                    &vault,
+                    "c?",
+                    "resolved",
+                    Q_BIRTH,
+                    Some(Q_BIRTH + 1),
                 ),
             ),
-            // q1 drops the shared note; q2 pins the ancient one. Neither may affect the other.
-            (
-                "question_note_overrides",
-                override_row("q1", "shared", "exclude", false),
-            ),
-            (
-                "question_note_overrides",
-                override_row("q2", "ancient", "include", false),
-            ),
+            ("questions", gone),
+            note(&vault, "before-anchor", Q_BIRTH + 5),
+            note(&vault, "dismissed-sheet", Q_BIRTH + 20),
+            note(&vault, "attached", Q_BIRTH + 21),
+            note(&vault, "attached-to-closed", Q_BIRTH + 22),
+            note(&vault, "only-home-deleted", Q_BIRTH + 23),
+            note(&vault, "detached", Q_BIRTH + 24),
+            attach("q", "attached"),
+            // Still attached: resolving a question does not un-attach its notes.
+            attach("closed", "attached-to-closed"),
+            attach("gone", "only-home-deleted"),
+            ("question_notes", attachment_row("q", "detached", true)),
         ]);
 
-        assert_eq!(counted_both_ways(&store, &vault, "q1", Q_NOW), (0, 0));
-        assert_eq!(counted_both_ways(&store, &vault, "q2", Q_NOW), (2, 2));
+        assert_eq!(
+            ids(&unattached_notes_since(&store, &vault, Q_BIRTH + 10).unwrap()),
+            vec!["detached", "only-home-deleted", "dismissed-sheet"],
+        );
     }
 }

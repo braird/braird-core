@@ -31,7 +31,7 @@ import uniffi.braird_core.NoteUpsert
 import uniffi.braird_core.PromptEventKind
 import uniffi.braird_core.PromptSettings
 import uniffi.braird_core.PromptTone
-import uniffi.braird_core.QuestionNoteOverride
+import uniffi.braird_core.QuestionNote
 import uniffi.braird_core.QuestionUpsert
 import uniffi.braird_core.SearchDocKind
 import uniffi.braird_core.SemanticStatus
@@ -1040,7 +1040,7 @@ class RoundTripTest {
         // SUR-1071: `listQuestions` returns a NESTED record — a QuestionRecord inside a
         // QuestionLogEntry inside a sequence. That lowering is new to this surface, so reading the
         // inner fields back is the assertion, not a formality.
-        val listed = engine.listQuestions(10_000L).single().question
+        val listed = engine.listQuestions().single().question
         assertEquals("q1", listed.id)
         assertEquals("what am I avoiding?", listed.text)
         assertEquals(false, listed.decryptFailed)
@@ -1055,38 +1055,39 @@ class RoundTripTest {
         assertEquals("resolved", patched.status)
         assertEquals(900L, patched.resolvedAt)
 
-        // The effective note set: auto-window ∪ includes − excludes, over the FFI.
+        // SUR-1101: a question holds exactly the notes attached to it — none by date — and one note
+        // can be attached to several questions. Over the FFI.
         fun note(id: String, createdAt: Long) = NoteUpsert(
             id = id, bookId = null, plaintext = "text-$id", page = null, tags = emptyList(),
             source = null, sourceId = null, sourceMetaJson = null, chapter = null, imagePath = null,
             inkCropPath = null, createdAt = createdAt, deleted = false, clearNullableFields = emptyList(),
         )
         engine.enqueueQuestion(question("q2", "the open one", "active"))
-        engine.enqueueNote(note("in-window", 150L))
-        engine.enqueueNote(note("too-early", 10L))
-        engine.enqueueNote(note("dropped", 160L))
-        engine.enqueueQuestionNoteOverride(
-            QuestionNoteOverride(questionId = "q2", noteId = "too-early", kind = "include", deleted = false)
-        )
-        engine.enqueueQuestionNoteOverride(
-            QuestionNoteOverride(questionId = "q2", noteId = "dropped", kind = "exclude", deleted = false)
-        )
+        engine.enqueueNote(note("attached", 150L))
+        engine.enqueueNote(note("shared", 10L))
+        engine.enqueueNote(note("unattached", 160L))
+        engine.enqueueNote(note("detached", 170L))
+        for ((q, n) in listOf("q2" to "attached", "q2" to "shared", "q1" to "shared", "q2" to "detached")) {
+            engine.enqueueQuestionNote(QuestionNote(questionId = q, noteId = n, deleted = false))
+        }
+        engine.enqueueQuestionNote(QuestionNote(questionId = "q2", noteId = "detached", deleted = true))
         assertEquals(
-            listOf("in-window", "too-early"),
-            engine.questionNotes("q2", 10_000L).map { it.id }.sorted(),
+            listOf("attached", "shared"),
+            engine.questionNotes("q2").map { it.id }.sorted(),
         )
 
-        // SUR-1071: the log over the ABI — active first, and each count equal to the effective set
-        // the detail page would show. `q1` was resolved above; `q2` is still open, so the older
-        // active question outranks the newer closed one.
-        val log = engine.listQuestions(10_000L)
+        // SUR-1071: the log over the ABI — active first, and each count equal to the notes the
+        // detail page would show. `q1` was resolved above; `q2` is still open, so the older active
+        // question outranks the newer closed one.
+        val log = engine.listQuestions()
         assertEquals(listOf("q2", "q1"), log.map { it.question.id }, "active first, then newest")
         assertEquals(2u, log.first { it.question.id == "q2" }.noteCount)
+        assertEquals(1u, log.first { it.question.id == "q1" }.noteCount)
         for (entry in log) {
             assertEquals(
-                engine.questionNotes(entry.question.id, 10_000L).size.toUInt(),
+                engine.questionNotes(entry.question.id).size.toUInt(),
                 entry.noteCount,
-                "count and effective set must agree for ${entry.question.id}",
+                "count and notes must agree for ${entry.question.id}",
             )
         }
 
@@ -1149,15 +1150,39 @@ class RoundTripTest {
         val live = events(engine, created + 60_000L, created)
         assertEquals(listOf(PromptEventKind.CHECK_IN), live.map { it.kind })
         assertEquals(created + 72 * hourMs, live[0].dueAt)
-        // The event names its question, so the client never re-derives the pick.
-        assertEquals("q1", live[0].questionId)
-        assertEquals(null, opening[0].questionId, "an initial prompt has no question yet")
 
-        // Skipping the check-in resets the timer and leaves the sealed text alone.
-        val skippedAt = created + 80 * hourMs
-        engine.skipCheckin("q1", skippedAt)
-        assertEquals(skippedAt + 72 * hourMs, events(engine, skippedAt + 1, created)[0].dueAt)
+        // SUR-1101: a second question needs no resolve, and joins the same single check-in.
+        engine.enqueueQuestion(
+            QuestionUpsert(
+                id = "q2", plaintext = "and this?", status = "active", tone = null, resolvedAt = null,
+                checkinAt = null, checkinResponse = null, createdAt = created + hourMs, deleted = false,
+            )
+        )
+        assertEquals(listOf(PromptEventKind.CHECK_IN), events(engine, created + 2 * hourMs, created).map { it.kind })
+
+        // One pass for both resets the timer and leaves the sealed text alone.
+        val passAt = created + 80 * hourMs
+        engine.completeCheckin(passAt)
+        assertEquals(passAt + 72 * hourMs, events(engine, passAt + 1, created)[0].dueAt)
         assertEquals("what am I sitting with?", engine.getQuestion("q1")!!.text)
+
+        // The check-in's backstop section: a note captured since the pass that nothing holds.
+        engine.enqueueNote(
+            NoteUpsert(
+                id = "loose", bookId = null, plaintext = "unfiled", page = null, tags = emptyList(),
+                source = null, sourceId = null, sourceMetaJson = null, chapter = null, imagePath = null,
+                inkCropPath = null, createdAt = passAt + 10, deleted = false, clearNullableFields = emptyList(),
+            )
+        )
+        assertEquals(listOf("loose"), engine.unattachedSinceLastCheckin(passAt + 20)!!.map { it.id })
+
+        // The attach sheet's order crosses as a list of records. No embedder is registered here, so
+        // it is the recency fallback: the most recently opened question first.
+        assertEquals(listOf("q2", "q1"), engine.rankQuestionsForNote("loose").map { it.id })
+
+        // The too-many-questions nudge: two active is nowhere near nine; a Boolean crosses intact.
+        assertEquals(false, engine.questionNudgeDue(passAt))
+        engine.dismissQuestionNudge(passAt)
 
         // A recorded skip earns the quiet period on a fresh account, and cancels the nudge with it:
         // a user who declined is not pinged 24h later.

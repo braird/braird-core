@@ -296,28 +296,23 @@ pub struct QuestionUpsert {
     pub deleted: bool,
 }
 
-/// One question↔note curation override (SUR-996 R1) — the user pinning a note onto a question, or
-/// excluding one the active-window join offered.
+/// One question↔note attachment (SUR-1101) — the user attaching a note to a question, explicitly.
+/// A note may belong to any number of questions; there is no automatic attachment by date.
 ///
 /// Plaintext id pair, the same trade-off as `collection_memberships`: the question's *text* is
 /// sealed, the fact that it relates to a note is not. Its row id is **derived**, not carried —
-/// [`crate::store::override_id`] makes it `question_id:note_id` so two devices curating the same
-/// pair converge on one row.
+/// [`crate::store::question_note_id`] makes it `question_id:note_id` so two devices attaching the
+/// same pair converge on one row.
 ///
-/// A record by API shape rather than arm64 necessity (four fields is nowhere near the 8-slot limit
-/// the SUR-843 guard enforces): the pair + kind is one concept, and passing it as one argument
-/// keeps the call site readable and the field names on the wire. Deliberately NOT named
-/// `QuestionNoteOverrideUpsert` — there is no `…Record` read model to pair against, because the
-/// effective note set is exposed as notes ([`SyncEngine::question_notes`]), never as raw override
-/// rows. The ticket specifies this name.
+/// A record by API shape rather than arm64 necessity (three fields is nowhere near the 8-slot limit
+/// the SUR-843 guard enforces): the pair is one concept, and passing it as one argument keeps the
+/// call site readable and the field names on the wire. Named for the table, like the attachments it
+/// writes; the read side is notes ([`SyncEngine::question_notes`]), never raw attachment rows.
 #[derive(Debug, uniffi::Record)]
-pub struct QuestionNoteOverride {
+pub struct QuestionNote {
     pub question_id: String,
     pub note_id: String,
-    /// `include` (pin a note the window missed) or `exclude` (drop one it offered). Not validated
-    /// here — same forward-extensible-vocabulary reasoning as [`QuestionUpsert::status`].
-    pub kind: String,
-    /// Soft-delete the override, returning the pair to whatever the active-window join says.
+    /// Detach the note (soft-delete the attachment). `false` attaches, or re-attaches.
     pub deleted: bool,
 }
 
@@ -389,7 +384,11 @@ const IMPORTANCE_EPSILON: f64 = 1e-9;
 /// completed a pull before it can answer at all (SUR-1075). Keep this list in step with the reads
 /// in that method: a table whose absence the prompt rules interpret, but which is missing here,
 /// re-opens exactly the hole this gate closes.
-const PROMPT_SOURCE_TABLES: [&str; 2] = ["questions", "user_settings"];
+///
+/// `question_notes` is here because a check-in renders its "captured since the last check-in with
+/// no attachment" section from it (SUR-1101): before that table's first pull, every note would read
+/// as unattached.
+const PROMPT_SOURCE_TABLES: [&str; 3] = ["questions", "question_notes", "user_settings"];
 
 /// The change-detection compare (SUR-977): exact on every counter/stamp/prior, epsilon-tolerant
 /// on the derived `importance` only. NaN-safe by construction — a NaN `importance` (a live row's
@@ -463,6 +462,24 @@ struct RegisteredEmbedder {
     generation: u64,
 }
 
+/// Which derived embed queue an item came from (SUR-1101: active questions, then notes).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingEmbed {
+    Note,
+    Question,
+}
+
+impl PendingEmbed {
+    /// The [`EmbedFailureMemory`] key. Notes keep their bare id (the SUR-1010 shape); questions are
+    /// prefixed because question and note ids share one namespace of opaque strings.
+    fn failure_key(self, id: &str) -> String {
+        match self {
+            PendingEmbed::Note => id.to_string(),
+            PendingEmbed::Question => format!("question:{id}"),
+        }
+    }
+}
+
 macro_rules! lock {
     ($self:ident . $field:ident) => {
         $self.$field.lock().expect("sync engine mutex poisoned")
@@ -483,6 +500,11 @@ impl SyncEngine {
         vault: Arc<Vault>,
     ) -> Result<Arc<SyncEngine>, SyncError> {
         let store = Store::open(&db_path).map_err(|e| SyncError::Store(e.to_string()))?;
+        // Before anything can flush or pull: a store written by core <= v0.16.0 still holds the
+        // retired curation table and possibly un-flushed rows for it (SUR-1101). No-op afterwards.
+        store
+            .convert_question_note_overrides(epoch_ms())
+            .map_err(|e| SyncError::Store(e.to_string()))?;
         // Current-thread runtime: one flush at a time, no worker-thread pool to schedule across
         // the FFI. `rt` + `net` + `time` are all reqwest needs; no `macros`/`rt-multi-thread`.
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1410,9 +1432,11 @@ impl SyncEngine {
     /// last-write-wins, so a dismiss on one device and a check-in on another inside the same window
     /// resolve to whichever `updated_at` is larger — the loser's field is discarded, not merged. The
     /// alternative (a check-in satellite row, the `note_signals`/migration-0047 precedent) was
-    /// considered and rejected: v1 has ONE live question and both flows are user-initiated seconds
-    /// apart at worst. Documented rather than engineered around, and pinned by a test so it stays a
-    /// decision instead of becoming a discovery.
+    /// considered and rejected: both flows are user-initiated seconds apart at worst, and the stake
+    /// is PER QUESTION — SUR-1101 allowing several active questions multiplies the rows, not the
+    /// chance that two devices edit the same one at the same moment. Documented rather than
+    /// engineered around, and pinned by a test so it stays a decision instead of becoming a
+    /// discovery.
     pub fn enqueue_question(&self, draft: QuestionUpsert) -> Result<(), SyncError> {
         let QuestionUpsert {
             id,
@@ -1496,14 +1520,15 @@ impl SyncEngine {
         }
     }
 
-    /// Enqueue a question↔note curation override (SUR-1042), keyed by the DETERMINISTIC
-    /// `question_id:note_id` ([`crate::store::override_id`]).
+    /// Attach a note to a question, or detach it (SUR-1101), keyed by the DETERMINISTIC
+    /// `question_id:note_id` ([`crate::store::question_note_id`]). Attaching an already-attached
+    /// pair is harmless: it is the same row.
     ///
     /// THE RE-ADD FORK, and why it is not optional. A deterministic pk makes
-    /// `include → remove → include` inside ONE un-flushed batch collapse onto a single outbox key,
+    /// `attach → detach → attach` inside ONE un-flushed batch collapse onto a single outbox key,
     /// and the collapse makes `deleted` **sticky** across the group (SUR-724, "within a batch,
     /// delete wins"). So the re-add would flush as a tombstone: the local mirror reads correctly —
-    /// the note still shows pinned — while push sends a delete, every other device drops it, and the
+    /// the note still shows attached — while push sends a delete, every other device drops it, and the
     /// next pull LWW-overwrites the local copy. A silent lost write whose local read masks it. This
     /// is the [`SyncEngine::enqueue_collection_membership`] class (SUR-940), and `store.rs`'s
     /// descriptor doc names this table as the case to extend the split for.
@@ -1518,23 +1543,18 @@ impl SyncEngine {
     /// Both arms take ONE held store guard. A released-and-reacquired lock would let a concurrent
     /// re-add stage `deleted: false` between the lookup and the stage, with this tombstone landing
     /// after it and collapsing sticky-deleted — the same loss re-opened as a race.
-    pub fn enqueue_question_note_override(
-        &self,
-        draft: QuestionNoteOverride,
-    ) -> Result<(), SyncError> {
-        let QuestionNoteOverride {
+    pub fn enqueue_question_note(&self, draft: QuestionNote) -> Result<(), SyncError> {
+        let QuestionNote {
             question_id,
             note_id,
-            kind,
             deleted,
         } = draft;
         let now = epoch_ms();
-        let id = crate::store::override_id(&question_id, &note_id);
+        let id = crate::store::question_note_id(&question_id, &note_id);
         let mut row = Map::new();
         row.insert("id".into(), json!(id));
         row.insert("question_id".into(), json!(question_id));
         row.insert("note_id".into(), json!(note_id));
-        row.insert("kind".into(), json!(kind));
         row.insert("created_at".into(), json!(now));
         row.insert("updated_at".into(), json!(now));
         row.insert("deleted".into(), json!(deleted));
@@ -1542,18 +1562,18 @@ impl SyncEngine {
         let store = lock!(self.store);
         if deleted {
             if let Some(existing) = store
-                .get_row("question_note_overrides", &id)
+                .get_row("question_notes", &id)
                 .map_err(store_err)?
                 .and_then(|r| r.get("created_at").and_then(Value::as_i64))
             {
                 row.insert("created_at".into(), json!(existing));
             }
             store
-                .stage_local_write("question_note_overrides", &id, row, now)
+                .stage_local_write("question_notes", &id, row, now)
                 .map_err(store_err)
         } else {
             store
-                .stage_local_write_resurrecting("question_note_overrides", &id, row, now)
+                .stage_local_write_resurrecting("question_notes", &id, row, now)
                 .map_err(store_err)
         }
     }
@@ -1680,7 +1700,7 @@ impl SyncEngine {
     /// nudge; see [`prompt::next_events`] for the full rule table).
     ///
     /// Both timestamps are host-supplied. `now_ms` follows the read-surface convention
-    /// ([`SyncEngine::question_notes`]) — core reads no clock, so the result is a pure function of
+    /// ([`SyncEngine::notes_this_week`]) — core reads no clock, so the result is a pure function of
     /// its inputs and testable at any point on the timeline. `account_created_at_ms` has no choice
     /// about it: core holds no account-creation stamp anywhere, because `user_profiles` is
     /// server-authoritative and stays outside the client sync surface. Both platforms read it from
@@ -1722,16 +1742,7 @@ impl SyncEngine {
 
         let store = lock!(self.store);
         let settings = Self::read_prompt_settings(&store).map_err(store_err)?;
-        let state = PromptState {
-            account_created_at_ms,
-            questions: read::question_metas(&store).map_err(store_err)?,
-            has_ever_answered: read::user_setting(&store, PROMPT_ANSWERED_AT_KEY)
-                .map_err(store_err)?
-                .is_some(),
-            prompt_skipped_at_ms: read::user_setting(&store, PROMPT_SKIPPED_AT_KEY)
-                .map_err(store_err)?
-                .and_then(|v| v.parse().ok()),
-        };
+        let state = Self::read_prompt_state(&store, account_created_at_ms).map_err(store_err)?;
         Ok(Some(prompt::next_events(&state, &settings, now_ms)))
     }
 
@@ -1749,29 +1760,86 @@ impl SyncEngine {
         self.set_user_setting(PROMPT_SKIPPED_AT_KEY.into(), now_ms.to_string())
     }
 
-    /// Record a skipped check-in (SUR-996 R3) — the timer resets, nothing else changes.
+    /// Record that a check-in pass happened (SUR-1101) — whether the user answered every question,
+    /// some, or skipped the lot. The next check-in is due one cadence from `now_ms`.
     ///
-    /// A metadata-only patch of `checkin_at` alone: `plaintext: None` makes no Vault call and
-    /// [`insert_opt`] omits every other `None`, so the ciphertext, the status, and the previous
-    /// `checkin_response` all survive byte-for-byte. Skipping is never punished and never visibly
-    /// counted, so nothing records that this WAS a skip — "still open" and "skip" reset the timer
-    /// identically, and the stored vocabulary was deliberately not extended to tell them apart
-    /// (founder, 2026-08-19).
+    /// One call per PASS, not per question: a check-in covers every active question at once, so the
+    /// timer is the pass's, stored as the synced [`prompt::CHECKIN_COMPLETED_AT_KEY`]. Per-question
+    /// answers still go through [`SyncEngine::enqueue_question`] (`checkin_response`, `status`, and
+    /// the question's own `checkin_at`); this replaces `skip_checkin`, which could only stamp one
+    /// question. Skipping is still never punished and never visibly counted — nothing records that a
+    /// pass answered nothing (founder, 2026-08-19).
     ///
-    /// Inherits [`SyncError::PatchTargetMissing`] for an id that has no live row, from the same
-    /// precondition [`SyncEngine::enqueue_question`] enforces.
-    pub fn skip_checkin(&self, question_id: String, now_ms: i64) -> Result<(), SyncError> {
-        self.enqueue_question(QuestionUpsert {
-            id: question_id,
-            plaintext: None,
-            status: None,
-            tone: None,
-            resolved_at: None,
-            checkin_at: Some(now_ms),
-            checkin_response: None,
-            created_at: 0,
-            deleted: false,
-        })
+    /// `now_ms` is host-supplied, for the [`SyncEngine::skip_prompt`] reason.
+    pub fn complete_checkin(&self, now_ms: i64) -> Result<(), SyncError> {
+        // Plain `now_ms`, deliberately NOT `max(stored, now_ms)`. A device whose clock trails the
+        // one that wrote the stored value moves the anchor back by the skew, so the next check-in
+        // comes that much early — bounded and self-healing. Keeping the larger value was tried and
+        // is worse: it re-writes a FUTURE stamp on every pass, `checkin_anchor` reads a future
+        // stamp as the oldest question's birth, and the check-in stays overdue for as long as the
+        // skew lasts (sync-reviewer, SUR-1101 review round 2).
+        self.set_user_setting(prompt::CHECKIN_COMPLETED_AT_KEY.into(), now_ms.to_string())
+    }
+
+    /// The check-in's backstop section (SUR-1101): live notes captured since the current check-in
+    /// period began that are attached to no live question — including every note whose "attach to
+    /// an open question?" sheet was dismissed. Newest-first, decrypted in core.
+    ///
+    /// The period starts at [`prompt::checkin_anchor`], the same instant the pending CheckIn event is
+    /// scheduled from, so the section covers exactly the period that check-in closes. No active
+    /// question → `Some(empty)`: there is no check-in for the section to belong to.
+    ///
+    /// `None` means core cannot tell yet, exactly as for [`SyncEngine::next_prompt_events`] — the
+    /// same pull receipts gate both, because before `question_notes` has been pulled every note
+    /// would read as unattached.
+    pub fn unattached_since_last_checkin(
+        &self,
+        now_ms: i64,
+    ) -> Result<Option<Vec<NoteRecord>>, SyncError> {
+        let store = lock!(self.store);
+        if !Self::prompt_state_ready(&store).map_err(store_err)? {
+            return Ok(None);
+        }
+        // `account_created_at_ms` feeds only the Initial/Nudge rules, never the check-in anchor.
+        let state = Self::read_prompt_state(&store, 0).map_err(store_err)?;
+        let Some(since) = prompt::checkin_anchor(&state, now_ms) else {
+            return Ok(Some(Vec::new()));
+        };
+        read::unattached_notes_since(&store, &self.vault, since)
+            .map(Some)
+            .map_err(store_err)
+    }
+
+    /// Whether to show the too-many-questions nudge now (SUR-1101): more than eight active
+    /// questions and no dismissal in the last four weeks. Independent of the check-in cadence, so it
+    /// is a separate call rather than a [`PromptEvent`]; re-run it whenever the question log changes.
+    ///
+    /// `false` before the prompt tables have been pulled (the [`SyncEngine::next_prompt_events`]
+    /// gate): an unpulled count reads low, and an unpulled dismissal would re-show a nudge the user
+    /// dismissed on another device — not showing a dismissable nudge is the safe side of that.
+    pub fn question_nudge_due(&self, now_ms: i64) -> Result<bool, SyncError> {
+        let store = lock!(self.store);
+        if !Self::prompt_state_ready(&store).map_err(store_err)? {
+            return Ok(false);
+        }
+        let active = read::question_metas(&store)
+            .map_err(store_err)?
+            .iter()
+            .filter(|q| prompt::is_active(q.status.as_deref()))
+            .count();
+        let dismissed_at = read::user_setting(&store, prompt::QUESTION_NUDGE_DISMISSED_AT_KEY)
+            .map_err(store_err)?
+            .and_then(|v| v.parse().ok());
+        Ok(prompt::question_nudge_due(active, dismissed_at, now_ms))
+    }
+
+    /// Record that the user dismissed the too-many-questions nudge (SUR-1101). Synced, so the
+    /// dismissal silences every device for the quiet period.
+    pub fn dismiss_question_nudge(&self, now_ms: i64) -> Result<(), SyncError> {
+        self.set_user_setting(
+            prompt::QUESTION_NUDGE_DISMISSED_AT_KEY.into(),
+            now_ms.to_string(),
+        )
     }
 
     /// Enqueue a note-signals upsert (SUR-726) — per-note behavioural counters, keyed by `note_id`
@@ -2008,20 +2076,19 @@ impl SyncEngine {
     }
 
     /// The SUR-996 question log — every live question, **active first** then newest-first, each
-    /// with the size of its effective note set (SUR-1071). Decrypted in core. This is the Lexicon
-    /// Questions section; there is no separate log view.
+    /// with the number of notes attached to it (SUR-1071, SUR-1101). Decrypted in core. This is the
+    /// Lexicon Questions section; there is no separate log view. It is also the list of questions a
+    /// check-in covers: every entry whose status is active.
     ///
-    /// `note_count` equals `question_notes(id, now_ms).len()` by construction — the same predicate
-    /// produces both — so a row's subtitle can never disagree with the detail page it opens.
-    /// `now_ms` closes the window of a question that has no `resolved_at`; the host supplies it so
-    /// this stays a pure function of its inputs, exactly as [`Self::question_notes`] does. Pass the
-    /// same `now_ms` to both if you render them together.
+    /// `note_count` equals `question_notes(id).len()` by construction — one definition of
+    /// "attached" produces both — so a row's subtitle can never disagree with the detail page it
+    /// opens.
     ///
     /// Unpaginated on purpose: active-first ordering has to be applied before any page is cut, and
-    /// the log grows by about one row per cadence period.
-    pub fn list_questions(&self, now_ms: i64) -> Result<Vec<QuestionLogEntry>, SyncError> {
+    /// the log grows by one row per question the user opens.
+    pub fn list_questions(&self) -> Result<Vec<QuestionLogEntry>, SyncError> {
         let store = lock!(self.store);
-        read::list_questions(&store, &self.vault, now_ms).map_err(store_err)
+        read::list_questions(&store, &self.vault).map_err(store_err)
     }
 
     /// One question by id, or `None` if absent or soft-deleted.
@@ -2030,17 +2097,11 @@ impl SyncEngine {
         read::get_question(&store, &self.vault, &id).map_err(store_err)
     }
 
-    /// The effective note set of one question — `(auto ∪ includes) − excludes`, newest-first
-    /// (SUR-1042). `now_ms` closes the active window of a question that has no `resolved_at`; the
-    /// host supplies it so this stays a pure function of its inputs (see [`read::question_notes`]).
+    /// The notes attached to one question, newest-first (SUR-1101 — explicit attachments only).
     /// An absent or soft-deleted question yields an empty set, never an error.
-    pub fn question_notes(
-        &self,
-        question_id: String,
-        now_ms: i64,
-    ) -> Result<Vec<NoteRecord>, SyncError> {
+    pub fn question_notes(&self, question_id: String) -> Result<Vec<NoteRecord>, SyncError> {
         let store = lock!(self.store);
-        read::question_notes(&store, &self.vault, &question_id, now_ms).map_err(store_err)
+        read::question_notes(&store, &self.vault, &question_id).map_err(store_err)
     }
 
     /// Notes newest-first. `book_id = None` → the Commonplace flat list (all notes); `Some` →
@@ -2276,6 +2337,25 @@ impl SyncEngine {
         Ok(PromptSettings {
             cadence_hours: prompt::clamp_cadence(cadence),
             tone: prompt::parse_tone(tone.as_deref()),
+        })
+    }
+
+    /// Assemble the prompt machine's [`PromptState`] from an ALREADY-HELD store guard — shared by
+    /// [`SyncEngine::next_prompt_events`] and [`SyncEngine::unattached_since_last_checkin`], so the
+    /// CheckIn event and the section it renders compute their anchor from one read (SUR-1101).
+    fn read_prompt_state(
+        store: &Store,
+        account_created_at_ms: i64,
+    ) -> rusqlite::Result<PromptState> {
+        let stamp = |key| -> rusqlite::Result<Option<i64>> {
+            Ok(read::user_setting(store, key)?.and_then(|v| v.parse().ok()))
+        };
+        Ok(PromptState {
+            account_created_at_ms,
+            questions: read::question_metas(store)?,
+            has_ever_answered: read::user_setting(store, PROMPT_ANSWERED_AT_KEY)?.is_some(),
+            prompt_skipped_at_ms: stamp(PROMPT_SKIPPED_AT_KEY)?,
+            checkin_completed_at_ms: stamp(prompt::CHECKIN_COMPLETED_AT_KEY)?,
         })
     }
 
@@ -2970,6 +3050,126 @@ impl SyncEngine {
         // re-queued are counted, not silently missing from the honesty signal.
         Ok((hits, status, self.pending_for(&reg)?))
     }
+
+    /// One host embed, validated to a unit vector — the shared body of the note and question arms
+    /// of [`SyncEngine::embed_pending`] and of the on-demand probe in
+    /// [`SyncEngine::rank_questions_for_note`]. MUST be called with no lock held. A wrong-length
+    /// or zero/non-finite vector is reported as `Runtime`: the embedder failed this input, which
+    /// is exactly how the failure memory already treats it.
+    fn embed_unit(
+        &self,
+        reg: &RegisteredEmbedder,
+        content: String,
+        as_query: bool,
+    ) -> Result<Vec<f32>, EmbedderError> {
+        let vector = if as_query {
+            reg.embedder.embed_query(content)?
+        } else {
+            reg.embedder.embed_document(content)?
+        };
+        if vector.len() != reg.dims as usize {
+            return Err(EmbedderError::Runtime); // never keep a mis-sized vector
+        }
+        embeddings::normalize(vector).ok_or(EmbedderError::Runtime)
+    }
+
+    /// Write one sealed vector (or a NULL skip marker) to the table its kind lives in, only if the
+    /// source is unchanged since `token` was read. Returns whether it was written.
+    fn store_vector(
+        &self,
+        kind: PendingEmbed,
+        id: &str,
+        reg: &RegisteredEmbedder,
+        token: &str,
+        sealed: Option<&[u8]>,
+    ) -> Result<bool, SyncError> {
+        let store = lock!(self.store);
+        match kind {
+            PendingEmbed::Note => {
+                store.upsert_embedding_if_current(id, &reg.corpus_key, token, sealed, epoch_ms())
+            }
+            PendingEmbed::Question => store.upsert_question_embedding_if_current(
+                id,
+                &reg.corpus_key,
+                token,
+                sealed,
+                epoch_ms(),
+            ),
+        }
+        .map_err(store_err)
+    }
+
+    /// The note's unit vector for ranking: its stored one when current, otherwise embedded now
+    /// from its text (founder, 2026-09-23). `None` when neither is possible — no text, the note is
+    /// gone, or the embedder is unavailable or fails — which the caller reads as "rank by
+    /// recency". A stored blob that fails to open is dropped (re-queued), the scan's self-heal.
+    fn note_probe(
+        &self,
+        reg: &RegisteredEmbedder,
+        note_id: &str,
+    ) -> Result<Option<Vec<f32>>, SyncError> {
+        let (sealed, row) = {
+            let store = lock!(self.store);
+            (
+                store
+                    .current_sealed_embedding(note_id, &reg.corpus_key)
+                    .map_err(store_err)?,
+                store.get_row("notes", note_id).map_err(store_err)?,
+            )
+        };
+        if let Some(sealed) = sealed {
+            match self
+                .vault
+                .open_bytes(sealed, embeddings::embed_aad(note_id))
+                .and_then(|bytes| embeddings::from_le_bytes(&bytes, reg.dims))
+            {
+                Ok(vector) => return Ok(Some(vector)),
+                Err(_) => lock!(self.store)
+                    .delete_embedding(note_id)
+                    .map_err(store_err)?,
+            }
+        }
+        let Some(row) = row.filter(|r| r.get("deleted") != Some(&Value::Bool(true))) else {
+            return Ok(None);
+        };
+        let (text, decrypt_failed) = read::decrypt_note_text(&row, note_id, &self.vault);
+        let Some(text) = text
+            .filter(|_| !decrypt_failed)
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+        else {
+            return Ok(None);
+        };
+        // The host callback — no lock held.
+        Ok(self.embed_unit(reg, text, false).ok())
+    }
+
+    /// Every live question's current-key unit vector, keyed by question id. A blob that fails to
+    /// open is dropped so `embed_pending` re-embeds that question.
+    fn question_vectors(
+        &self,
+        reg: &RegisteredEmbedder,
+    ) -> Result<HashMap<String, Vec<f32>>, SyncError> {
+        let rows = lock!(self.store)
+            .question_embeddings(&reg.corpus_key)
+            .map_err(store_err)?;
+        let mut out = HashMap::with_capacity(rows.len());
+        for (id, sealed) in rows {
+            match self
+                .vault
+                .open_bytes(sealed, embeddings::question_embed_aad(&id))
+                .and_then(|bytes| embeddings::from_le_bytes(&bytes, reg.dims))
+            {
+                Ok(vector) => {
+                    out.insert(id, vector);
+                }
+                Err(_) => lock!(self.store)
+                    .delete_question_embedding(&id)
+                    .map_err(store_err)?,
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[uniffi::export]
@@ -3077,23 +3277,40 @@ impl SyncEngine {
     /// describe the departed embedder, and must not deprioritize notes for its successor).
     pub fn embed_pending(&self, max_items: u32) -> Result<EmbedSummary, SyncError> {
         let reg = self.registered_embedder()?;
-        let all_pending = {
+        // ACTIVE QUESTIONS FIRST (SUR-1101). There are a handful, the attach sheet ranks by them the
+        // moment a note is saved, and a question pulled from another device has no vector here
+        // until this pass makes one — so they must not wait behind a thousand-note backfill.
+        let all_pending: Vec<(PendingEmbed, String, String)> = {
             let store = lock!(self.store);
             store.sweep_orphan_embeddings().map_err(store_err)?;
             // The FULL queue, not LIMIT max_items: the failure filter below must be able
             // to select past a failing head. Ids + tokens only — trivial at archive scale.
-            store
+            let questions = store
+                .pending_question_embeddings(&reg.corpus_key)
+                .map_err(store_err)?;
+            let notes = store
                 .pending_embeddings(&reg.corpus_key, -1)
-                .map_err(store_err)?
+                .map_err(store_err)?;
+            questions
+                .into_iter()
+                .map(|(id, token)| (PendingEmbed::Question, id, token))
+                .chain(
+                    notes
+                        .into_iter()
+                        .map(|(id, token)| (PendingEmbed::Note, id, token)),
+                )
+                .collect()
         };
-        let ids: Vec<String> = {
+        let picked: Vec<(PendingEmbed, String)> = {
             let mut failures = lock!(self.embed_failures);
-            let fresh: Vec<&(String, String)> = all_pending
+            let fresh: Vec<&(PendingEmbed, String, String)> = all_pending
                 .iter()
-                .filter(|(id, token)| failures.by_note.get(id) != Some(token))
+                .filter(|(kind, id, token)| {
+                    failures.by_note.get(&kind.failure_key(id)) != Some(token)
+                })
                 .collect();
             let sweep = if fresh.is_empty() && !all_pending.is_empty() {
-                // Every pending note has failed — clear and retry from the top rather
+                // Every pending item has failed — clear and retry from the top rather
                 // than idling forever on attempted: 0. Deliberately does NOT bump the
                 // registration generation: a same-registration failure recorded by a
                 // concurrent pass is still current information.
@@ -3105,78 +3322,80 @@ impl SyncEngine {
             sweep
                 .into_iter()
                 .take(max_items as usize)
-                .map(|(id, _)| id.clone())
+                .map(|(kind, id, _)| (*kind, id.clone()))
                 .collect()
         };
         let (mut attempted, mut embedded, mut skipped, mut failed) = (0u32, 0u32, 0u32, 0u32);
-        'pass: for id in ids {
+        for (kind, id) in picked {
             attempted += 1;
-            // One lock acquisition for the read leg: the row (ciphertext) + its token.
-            let (row, token) = {
-                let store = lock!(self.store);
-                (
-                    store.get_row("notes", &id).map_err(store_err)?,
-                    store.note_content_token(&id).map_err(store_err)?,
-                )
+            let (content, token) = match kind {
+                PendingEmbed::Note => {
+                    // One lock acquisition for the read leg: the row (ciphertext) + its token.
+                    let (row, token) = {
+                        let store = lock!(self.store);
+                        (
+                            store.get_row("notes", &id).map_err(store_err)?,
+                            store.note_content_token(&id).map_err(store_err)?,
+                        )
+                    };
+                    let (Some(row), Some(token)) = (row, token) else {
+                        skipped += 1; // vanished/tombstoned since the queue was derived
+                        continue;
+                    };
+                    // Decrypt in core (vault only — store lock already released).
+                    let (text, decrypt_failed) = read::decrypt_note_text(&row, &id, &self.vault);
+                    (if decrypt_failed { None } else { text }, token)
+                }
+                PendingEmbed::Question => {
+                    let (row, token) = {
+                        let store = lock!(self.store);
+                        (
+                            store.get_row("questions", &id).map_err(store_err)?,
+                            store.question_text_token(&id).map_err(store_err)?,
+                        )
+                    };
+                    let (Some(row), Some(token)) = (row, token) else {
+                        skipped += 1;
+                        continue;
+                    };
+                    // Decrypt through the question-only enc:v2 gate (store lock already released,
+                    // like the note arm): an unbound `text` reads as None and gets a skip marker.
+                    (read::question_record(&row, &self.vault).text, token)
+                }
             };
-            let (Some(row), Some(token)) = (row, token) else {
-                skipped += 1; // vanished/tombstoned since the queue was derived
-                continue;
-            };
-            // Decrypt in core (vault only — store lock already released).
-            let (text, decrypt_failed) = read::decrypt_note_text(&row, &id, &self.vault);
-            let content = if decrypt_failed {
-                None
-            } else {
-                text.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
-            };
+            let content = content
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty());
             let Some(content) = content else {
                 // Skip marker: NULL vector at the current key + token, so the queue drains
-                // instead of re-attempting this note every pass forever.
-                lock!(self.store)
-                    .upsert_embedding_if_current(&id, &reg.corpus_key, &token, None, epoch_ms())
-                    .map_err(store_err)?;
+                // instead of re-attempting this item every pass forever.
+                self.store_vector(kind, &id, &reg, &token, None)?;
                 skipped += 1;
                 continue;
             };
-            // The host callback — NO locks held (see the section header).
-            let vector = match reg.embedder.embed_document(content) {
-                Ok(v) => v,
-                Err(EmbedderError::Runtime) => {
-                    failed += 1;
-                    // Remember (id → token) so selection deprioritizes it (SUR-1010).
-                    self.record_embed_failure(&reg, &id, &token);
-                    continue;
-                }
+            // The host callback — NO locks held (see the section header). A question is embedded
+            // as a QUERY and a note as a DOCUMENT: the attach sheet asks "which open question is
+            // this note about", the same asymmetric retrieval `semantic_search` does.
+            let unit = match self.embed_unit(&reg, content, kind == PendingEmbed::Question) {
+                Ok(unit) => unit,
                 Err(EmbedderError::Unavailable) => {
                     failed += 1;
-                    // Deliberately NOT remembered: the runtime was gone, not the note.
-                    break 'pass; // the host re-drains later
+                    // Deliberately NOT remembered: the runtime was gone, not the item.
+                    break; // the host re-drains later
+                }
+                Err(EmbedderError::Runtime) => {
+                    failed += 1;
+                    // Remember (key → token) so selection deprioritizes it (SUR-1010).
+                    self.record_embed_failure(&reg, &kind.failure_key(&id), &token);
+                    continue;
                 }
             };
-            if vector.len() != reg.dims as usize {
-                failed += 1; // dims contract violated — never store a mis-sized vector
-                self.record_embed_failure(&reg, &id, &token);
-                continue;
-            }
-            let Some(unit) = embeddings::normalize(vector) else {
-                failed += 1; // zero/NaN/Inf output — unusable
-                self.record_embed_failure(&reg, &id, &token);
-                continue;
+            let aad = match kind {
+                PendingEmbed::Note => embeddings::embed_aad(&id),
+                PendingEmbed::Question => embeddings::question_embed_aad(&id),
             };
-            let sealed = self
-                .vault
-                .seal_bytes(embeddings::to_le_bytes(&unit), embeddings::embed_aad(&id));
-            let wrote = lock!(self.store)
-                .upsert_embedding_if_current(
-                    &id,
-                    &reg.corpus_key,
-                    &token,
-                    Some(&sealed),
-                    epoch_ms(),
-                )
-                .map_err(store_err)?;
-            if wrote {
+            let sealed = self.vault.seal_bytes(embeddings::to_le_bytes(&unit), aad);
+            if self.store_vector(kind, &id, &reg, &token, Some(&sealed))? {
                 embedded += 1;
             } else {
                 skipped += 1; // edited/deleted mid-embed — re-queues with its new token
@@ -3192,6 +3411,50 @@ impl SyncEngine {
             failed,
             pending: pending.max(0) as u32,
         })
+    }
+
+    /// Order the ACTIVE questions for the "does this note attach to an open question?" sheet
+    /// (SUR-1101): most similar to the note first, by cosine over the on-device embeddings.
+    ///
+    /// Never fails on the embedding side, only on the store. Every step that may legitimately be
+    /// absent degrades to the log's own order — newest-first, which is "most recently opened" (a
+    /// question is opened when it is created):
+    /// - no embedder registered, or it is `Unavailable` / errors → recency;
+    /// - the note has no stored vector yet (the usual case: `embed_pending` runs AFTER a save) →
+    ///   core embeds its text NOW, through the host embedder, and does not store the result
+    ///   (founder, 2026-09-23 — the sheet is shown once, `embed_pending` stores it moments later);
+    /// - a question with no vector yet (just created, or pulled and not yet drained) → after every
+    ///   scored question, in recency order.
+    ///
+    /// An empty list means no question is active, so the host shows no sheet. With exactly one,
+    /// there is nothing to order and no embed is paid for.
+    pub fn rank_questions_for_note(
+        &self,
+        note_id: String,
+    ) -> Result<Vec<QuestionRecord>, SyncError> {
+        let mut active = {
+            let store = lock!(self.store);
+            read::active_questions(&store, &self.vault).map_err(store_err)?
+        };
+        if active.len() < 2 {
+            return Ok(active);
+        }
+        let Ok(reg) = self.registered_embedder() else {
+            return Ok(active);
+        };
+        let Some(probe) = self.note_probe(&reg, &note_id)? else {
+            return Ok(active);
+        };
+        let vectors = self.question_vectors(&reg)?;
+        let score = |q: &QuestionRecord| vectors.get(&q.id).map(|v| embeddings::dot(&probe, v));
+        // Stable, so equal scores and every unscored question keep the recency order above.
+        active.sort_by(|a, b| match (score(a), score(b)) {
+            (Some(x), Some(y)) => y.partial_cmp(&x).unwrap_or(std::cmp::Ordering::Equal),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+        Ok(active)
     }
 
     /// Semantic search (SUR-997 item 4 → SUR-157): embed the query via the host embedder
@@ -4501,10 +4764,6 @@ mod tests {
     // ── SUR-1042: the question entity ────────────────────────────────────────
 
     /// A minimal live question. Override with struct-update, as [`note_upsert`] is used.
-    /// A fixed read-side clock for the question log. `question_upsert` births rows at
-    /// `created_at: 0`, so any positive `now_ms` leaves an active question's window open.
-    const QUESTION_NOW: i64 = 1_000;
-
     fn question_upsert(id: &str, plaintext: &str) -> QuestionUpsert {
         QuestionUpsert {
             id: id.into(),
@@ -4559,7 +4818,7 @@ mod tests {
             .enqueue_question(question_upsert("q1", "what am I avoiding?"))
             .unwrap();
 
-        let got = engine.list_questions(QUESTION_NOW).unwrap();
+        let got = engine.list_questions().unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].question.text.as_deref(), Some("what am I avoiding?"));
         assert!(!got[0].question.decrypt_failed);
@@ -4747,7 +5006,7 @@ mod tests {
         assert!(matches!(err, SyncError::PatchTargetMissing), "got {err:?}");
 
         assert!(
-            engine.list_questions(QUESTION_NOW).unwrap().is_empty(),
+            engine.list_questions().unwrap().is_empty(),
             "no ghost question may appear in the log"
         );
         assert!(
@@ -4761,61 +5020,67 @@ mod tests {
     }
 
     #[test]
-    fn override_id_is_question_then_note() {
-        assert_eq!(crate::store::override_id("q1", "n1"), "q1:n1");
+    fn question_note_id_is_question_then_note() {
+        assert_eq!(crate::store::question_note_id("q1", "n1"), "q1:n1");
+    }
+
+    fn attachment(question_id: &str, note_id: &str, deleted: bool) -> QuestionNote {
+        QuestionNote {
+            question_id: question_id.into(),
+            note_id: note_id.into(),
+            deleted,
+        }
     }
 
     #[test]
-    fn override_re_add_after_delete_resurrects_past_the_sticky_collapse() {
-        // THE deterministic-pk regression (the SUR-940 class). include → remove → include inside
-        // ONE un-flushed batch. Assert the COLLAPSED OUTBOX, never a live read: the mirror is
-        // correct either way, which is exactly what makes this bug silent.
+    fn re_attach_after_detach_resurrects_past_the_sticky_collapse() {
+        // THE deterministic-pk regression (the SUR-940 class). attach → detach → attach inside ONE
+        // un-flushed batch. Assert the COLLAPSED OUTBOX, never a live read: the mirror is correct
+        // either way, which is exactly what makes this bug silent.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
         let engine = engine_at(db_path);
-        let ov = |deleted| QuestionNoteOverride {
-            question_id: "q1".into(),
-            note_id: "n1".into(),
-            kind: "include".into(),
-            deleted,
-        };
-        engine.enqueue_question_note_override(ov(false)).unwrap();
-        engine.enqueue_question_note_override(ov(true)).unwrap();
-        engine.enqueue_question_note_override(ov(false)).unwrap();
+        engine
+            .enqueue_question_note(attachment("q1", "n1", false))
+            .unwrap();
+        engine
+            .enqueue_question_note(attachment("q1", "n1", true))
+            .unwrap();
+        engine
+            .enqueue_question_note(attachment("q1", "n1", false))
+            .unwrap();
 
-        let payload = collapsed_payload_for(db_path, "question_note_overrides", "q1:n1")
-            .expect("an override upsert is queued");
+        let payload = collapsed_payload_for(db_path, "question_notes", "q1:n1")
+            .expect("an attachment upsert is queued");
         assert_eq!(
             payload["deleted"],
             json!(false),
-            "the re-add must survive the collapse — a sticky tombstone here is a silent lost write"
+            "the re-attach must survive the collapse — a sticky tombstone here is a silent lost write"
         );
         assert_eq!(payload["id"], json!("q1:n1"));
     }
 
     #[test]
-    fn override_delete_without_re_add_still_wins_the_collapse() {
-        // The other half: a genuine delete must NOT be softened by the resurrect path.
+    fn detach_without_re_attach_still_wins_the_collapse() {
+        // The other half: a genuine detach must NOT be softened by the resurrect path.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
         let engine = engine_at(db_path);
-        let ov = |deleted| QuestionNoteOverride {
-            question_id: "q1".into(),
-            note_id: "n1".into(),
-            kind: "include".into(),
-            deleted,
-        };
-        engine.enqueue_question_note_override(ov(false)).unwrap();
-        engine.enqueue_question_note_override(ov(true)).unwrap();
+        engine
+            .enqueue_question_note(attachment("q1", "n1", false))
+            .unwrap();
+        engine
+            .enqueue_question_note(attachment("q1", "n1", true))
+            .unwrap();
 
-        let payload = collapsed_payload_for(db_path, "question_note_overrides", "q1:n1").unwrap();
+        let payload = collapsed_payload_for(db_path, "question_notes", "q1:n1").unwrap();
         assert_eq!(payload["deleted"], json!(true));
     }
 
     #[test]
-    fn override_tombstone_preserves_the_stored_created_at() {
+    fn a_detach_preserves_the_stored_created_at() {
         // The server column is NOT NULL with no default and the pushed payload IS the outbox
         // partial, so a reconstructed tombstone would push a fresh timestamp over the real one.
         let dir = tempfile::tempdir().unwrap();
@@ -4823,131 +5088,128 @@ mod tests {
         let db_path = db.to_str().unwrap();
         let engine = engine_at(db_path);
         engine
-            .enqueue_question_note_override(QuestionNoteOverride {
-                question_id: "q1".into(),
-                note_id: "n1".into(),
-                kind: "include".into(),
-                deleted: false,
-            })
+            .enqueue_question_note(attachment("q1", "n1", false))
             .unwrap();
         let filed_at = Store::open(db_path)
             .unwrap()
-            .get_row("question_note_overrides", "q1:n1")
+            .get_row("question_notes", "q1:n1")
             .unwrap()
             .unwrap()["created_at"]
             .as_i64()
             .unwrap();
 
         engine
-            .enqueue_question_note_override(QuestionNoteOverride {
-                question_id: "q1".into(),
-                note_id: "n1".into(),
-                kind: "include".into(),
-                deleted: true,
-            })
+            .enqueue_question_note(attachment("q1", "n1", true))
             .unwrap();
 
         let row = Store::open(db_path)
             .unwrap()
-            .get_row("question_note_overrides", "q1:n1")
+            .get_row("question_notes", "q1:n1")
             .unwrap()
             .unwrap();
         assert_eq!(row["created_at"].as_i64(), Some(filed_at));
         assert_eq!(row["deleted"], json!(true));
         // And in the PUSHED payload, which is the half that actually reaches the server.
-        let pushed = collapsed_payload_for(db_path, "question_note_overrides", "q1:n1").unwrap();
+        let pushed = collapsed_payload_for(db_path, "question_notes", "q1:n1").unwrap();
         assert_eq!(pushed["created_at"].as_i64(), Some(filed_at));
     }
 
     #[test]
-    fn question_notes_is_auto_window_union_includes_minus_excludes() {
+    fn a_note_attached_to_two_questions_is_in_both_and_counted_in_both() {
+        // SUR-1101 acceptance: two questions active, a note saved, "selecting both attaches to
+        // both". Through the FFI surface, so the log count and both detail lists are the ones a
+        // host renders.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.sqlite");
-        let db_path = db.to_str().unwrap();
-        let engine = engine_at(db_path);
-
-        // The question opens at t=100 and is still active.
-        engine
-            .enqueue_question(QuestionUpsert {
-                created_at: 100,
-                ..question_upsert("q1", "the question")
-            })
-            .unwrap();
-        // in-window, before-window, after-`now`, and one to pin / one to drop
-        for (id, created) in [
-            ("in", 150),
-            ("before", 50),
-            ("future", 5_000),
-            ("pinned", 10),
-            ("dropped", 160),
-        ] {
-            engine
-                .enqueue_note(NoteUpsert {
-                    created_at: created,
-                    ..note_upsert(id, id)
-                })
-                .unwrap();
+        let engine = engine_at(db.to_str().unwrap());
+        for q in ["q1", "q2"] {
+            engine.enqueue_question(question_upsert(q, q)).unwrap();
         }
-        let ov = |note_id: &str, kind: &str| QuestionNoteOverride {
-            question_id: "q1".into(),
-            note_id: note_id.into(),
-            kind: kind.into(),
-            deleted: false,
-        };
+        engine.enqueue_note(note_upsert("n1", "a note")).unwrap();
         engine
-            .enqueue_question_note_override(ov("pinned", "include"))
+            .enqueue_note(note_upsert("n-other", "unattached"))
             .unwrap();
         engine
-            .enqueue_question_note_override(ov("dropped", "exclude"))
+            .enqueue_question_note(attachment("q1", "n1", false))
+            .unwrap();
+        engine
+            .enqueue_question_note(attachment("q2", "n1", false))
             .unwrap();
 
-        let mut got: Vec<String> = engine
-            .question_notes("q1".into(), 1_000)
+        for q in ["q1", "q2"] {
+            let notes = engine.question_notes(q.into()).unwrap();
+            assert_eq!(
+                notes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+                vec!["n1"],
+                "{q} holds the attached note and nothing by date"
+            );
+        }
+        let counts: Vec<u32> = engine
+            .list_questions()
             .unwrap()
-            .into_iter()
-            .map(|n| n.id)
+            .iter()
+            .map(|e| e.note_count)
             .collect();
-        got.sort();
-        assert_eq!(
-            got,
-            vec!["in".to_string(), "pinned".to_string()],
-            "auto-window ∪ includes − excludes"
-        );
+        assert_eq!(counts, vec![1, 1]);
     }
 
     #[test]
-    fn question_notes_window_closes_at_resolved_at() {
-        // A resolved question's set stops growing — notes captured after it closed are not its.
+    fn opening_a_legacy_store_converts_its_overrides_once() {
+        // A store written by core <= v0.16.0 holds `question_note_overrides`. Opening the engine
+        // must fold it into `question_notes` (queued, so it syncs) and leave nothing behind that
+        // could never flush.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
-        let engine = engine_at(db_path);
-        engine
-            .enqueue_question(QuestionUpsert {
-                created_at: 100,
-                status: Some("resolved".into()),
-                resolved_at: Some(200),
-                ..question_upsert("q1", "resolved question")
-            })
-            .unwrap();
-        for (id, created) in [("inside", 150), ("after", 300)] {
+        {
+            let engine = engine_at(db_path);
+            engine
+                .enqueue_question(QuestionUpsert {
+                    created_at: 100,
+                    ..question_upsert("q1", "q")
+                })
+                .unwrap();
             engine
                 .enqueue_note(NoteUpsert {
-                    created_at: created,
-                    ..note_upsert(id, id)
+                    created_at: 150,
+                    ..note_upsert("in-window", "a")
                 })
                 .unwrap();
         }
+        crate::store::plant_legacy_overrides(
+            db_path,
+            &[("q1", "in-window", "exclude", false, true)],
+        );
+        {
+            let store = Store::open(db_path).unwrap();
+            store.mark_pull_complete("question_note_overrides").unwrap();
+        }
 
-        let got: Vec<String> = engine
-            .question_notes("q1".into(), 10_000)
-            .unwrap()
-            .into_iter()
-            .map(|n| n.id)
-            .collect();
-        assert_eq!(got, vec!["inside".to_string()]);
+        let engine = engine_at(db_path);
+        let store = Store::open(db_path).unwrap();
+        assert!(!store.table_exists("question_note_overrides").unwrap());
+        assert!(
+            store
+                .outbox_items()
+                .unwrap()
+                .iter()
+                .all(|r| r.1 != "question_note_overrides"),
+            "no row may stay queued for a table the flush no longer visits"
+        );
+        assert!(!store.has_completed_pull("question_note_overrides").unwrap());
+        assert!(
+            engine.question_notes("q1".into()).unwrap().is_empty(),
+            "the exclude beat the window, so nothing converts"
+        );
+        drop(engine);
+        // Idempotent: a second open finds no table and changes nothing.
+        let before = store.outbox_items().unwrap().len();
+        let _again = engine_at(db_path);
+        assert_eq!(
+            Store::open(db_path).unwrap().outbox_items().unwrap().len(),
+            before
+        );
     }
-
     #[test]
     fn set_user_setting_stages_a_row_keyed_by_the_setting_name() {
         // `user_settings` has no `id` — `key` IS the local pk, so the outbox record id and the
@@ -5153,40 +5415,118 @@ mod tests {
     }
 
     #[test]
-    fn a_check_in_names_the_question_it_is_about() {
-        // The client must not have to re-derive "which question" — that re-implements the pick and
-        // is exactly the drift this state machine removes.
+    fn two_active_questions_share_one_check_in_and_one_pass_resets_it() {
+        // SUR-1101: opening a second question needs no resolve, and the check-in covers both.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.sqlite");
         let engine = prompt_ready_engine_at(db.to_str().unwrap());
-        let draft = |id: &str, created_at: i64, status: &str| QuestionUpsert {
-            id: id.into(),
-            plaintext: Some("q".into()),
-            status: Some(status.into()),
-            tone: None,
-            resolved_at: None,
-            checkin_at: None,
-            checkin_response: None,
-            created_at,
-            deleted: false,
-        };
-        engine
-            .enqueue_question(draft("old", 1_000, "active"))
-            .unwrap();
-        engine
-            .enqueue_question(draft("newer", 2_000, "active"))
-            .unwrap();
+        let cadence = prompt::CADENCE_DEFAULT_HOURS as i64 * 60 * 60 * 1000;
+        for (id, created_at) in [("old", 1_000), ("newer", 2_000)] {
+            engine
+                .enqueue_question(QuestionUpsert {
+                    created_at,
+                    ..question_upsert(id, id)
+                })
+                .unwrap();
+        }
 
         let events = events_of(&engine, 2_001, 500);
-
-        assert_eq!(events[0].kind, PromptEventKind::CheckIn);
         assert_eq!(
-            events[0].question_id.as_deref(),
-            Some("newer"),
-            "the event must name the SAME question the machine picked"
+            events.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            vec![PromptEventKind::CheckIn]
+        );
+        assert_eq!(
+            events[0].due_at,
+            1_000 + cadence,
+            "anchored on the oldest birth"
+        );
+
+        let pass = 1_000 + cadence + 5;
+        engine.complete_checkin(pass).unwrap();
+        assert_eq!(events_of(&engine, pass + 1, 500)[0].due_at, pass + cadence);
+    }
+
+    #[test]
+    fn the_unattached_section_holds_what_the_last_period_left_unattached() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = prompt_ready_engine_at(db.to_str().unwrap());
+        engine
+            .enqueue_question(QuestionUpsert {
+                created_at: 1_000,
+                ..question_upsert("q1", "q")
+            })
+            .unwrap();
+        for (id, created_at) in [
+            ("before-pass", 1_500),
+            ("dismissed", 3_000),
+            ("attached", 3_100),
+        ] {
+            engine
+                .enqueue_note(NoteUpsert {
+                    created_at,
+                    ..note_upsert(id, id)
+                })
+                .unwrap();
+        }
+        engine
+            .enqueue_question_note(attachment("q1", "attached", false))
+            .unwrap();
+        engine.complete_checkin(2_000).unwrap();
+
+        let section = engine
+            .unattached_since_last_checkin(4_000)
+            .unwrap()
+            .expect("prompt tables are marked pulled");
+        assert_eq!(
+            section.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            vec!["dismissed"]
         );
     }
 
+    #[test]
+    fn the_unattached_section_waits_for_the_pull_like_the_prompt_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+        assert!(engine.unattached_since_last_checkin(1).unwrap().is_none());
+        assert!(!engine.question_nudge_due(1).unwrap());
+    }
+
+    #[test]
+    fn the_question_nudge_counts_active_questions_and_honours_a_dismissal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = prompt_ready_engine_at(db.to_str().unwrap());
+        let now = 10_000_000;
+        for i in 0..8 {
+            engine
+                .enqueue_question(question_upsert(&format!("q{i}"), "q"))
+                .unwrap();
+        }
+        engine
+            .enqueue_question(QuestionUpsert {
+                status: Some("resolved".into()),
+                ..question_upsert("closed", "q")
+            })
+            .unwrap();
+        assert!(
+            !engine.question_nudge_due(now).unwrap(),
+            "8 active, 1 resolved"
+        );
+
+        engine.enqueue_question(question_upsert("q8", "q")).unwrap();
+        assert!(
+            engine.question_nudge_due(now).unwrap(),
+            "the 9th active fires it"
+        );
+
+        engine.dismiss_question_nudge(now).unwrap();
+        assert!(!engine.question_nudge_due(now + 1).unwrap());
+        assert!(engine
+            .question_nudge_due(now + prompt::QUESTION_NUDGE_QUIET_MS)
+            .unwrap());
+    }
     #[test]
     fn an_out_of_range_cadence_is_clamped_on_the_way_in() {
         let dir = tempfile::tempdir().unwrap();
@@ -5249,69 +5589,48 @@ mod tests {
     }
 
     #[test]
-    fn skip_checkin_moves_only_the_timer() {
+    fn a_pass_always_records_this_devices_now_even_behind_a_future_stamp() {
+        // A stored FUTURE stamp must not survive a pass: the anchor would read it as the oldest
+        // birth and keep the check-in overdue until the clock catches up.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
         let engine = engine_at(db_path);
-
-        engine
-            .enqueue_question(QuestionUpsert {
-                id: "q1".into(),
-                plaintext: Some("what am I optimising for?".into()),
-                status: Some("active".into()),
-                tone: Some("productive".into()),
-                resolved_at: None,
-                checkin_at: None,
-                checkin_response: Some("active".into()),
-                created_at: 10,
-                deleted: false,
-            })
-            .unwrap();
-        let before = Store::open(db_path)
-            .unwrap()
-            .get_row("questions", "q1")
-            .unwrap()
-            .unwrap();
-
-        engine.skip_checkin("q1".into(), 5_000).unwrap();
-
-        let after = Store::open(db_path)
-            .unwrap()
-            .get_row("questions", "q1")
-            .unwrap()
-            .unwrap();
-        assert_eq!(after["checkin_at"], json!(5_000));
-        // The ciphertext, the birth stamp, the status and the PREVIOUS response all survive: a
-        // skip is a timer reset, not an answer.
-        assert_eq!(after["text"], before["text"]);
-        assert_eq!(after["created_at"], before["created_at"]);
-        assert_eq!(after["status"].as_str(), Some("active"));
-        assert_eq!(after["checkin_response"].as_str(), Some("active"));
+        engine.complete_checkin(10_000).unwrap();
+        engine.complete_checkin(9_000).unwrap(); // this device's clock trails the stored value
         assert_eq!(
-            engine
-                .get_question("q1".into())
-                .unwrap()
-                .unwrap()
-                .text
-                .as_deref(),
-            Some("what am I optimising for?"),
-            "the question still decrypts after a skip"
+            read::user_setting(
+                &Store::open(db_path).unwrap(),
+                prompt::CHECKIN_COMPLETED_AT_KEY
+            )
+            .unwrap(),
+            Some("9000".into())
         );
     }
 
     #[test]
-    fn skip_checkin_refuses_a_question_that_does_not_exist() {
+    fn complete_checkin_stamps_the_pass_and_touches_no_question() {
+        // A pass is a timer reset. Per-question answers are separate `enqueue_question` patches, so
+        // a pass that answered nothing must leave every question row byte-for-byte as it was.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.sqlite");
-        let engine = engine_at(db.to_str().unwrap());
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_question(question_upsert("q1", "q")).unwrap();
+        let before = Store::open(db_path)
+            .unwrap()
+            .get_row("questions", "q1")
+            .unwrap();
 
-        assert!(matches!(
-            engine.skip_checkin("ghost".into(), 1_000),
-            Err(SyncError::PatchTargetMissing)
-        ));
+        engine.complete_checkin(5_000).unwrap();
+
+        let store = Store::open(db_path).unwrap();
+        assert_eq!(store.get_row("questions", "q1").unwrap(), before);
+        assert_eq!(
+            read::user_setting(&store, prompt::CHECKIN_COMPLETED_AT_KEY).unwrap(),
+            Some("5000".into())
+        );
     }
-
     #[test]
     fn the_prompt_timeline_walks_from_a_fresh_account_to_a_re_offer() {
         // The whole loop over a real store, one host clock reading at a time.
@@ -5363,11 +5682,9 @@ mod tests {
         );
         assert_eq!(live[0].due_at, answered_at + cadence);
 
-        // 4. Skipped check-in: the timer resets, nothing is punished.
+        // 4. Skipped check-in pass: the timer resets, nothing is punished.
         let skipped_checkin_at = answered_at + cadence + hour;
-        engine
-            .skip_checkin("q1".into(), skipped_checkin_at)
-            .unwrap();
+        engine.complete_checkin(skipped_checkin_at).unwrap();
         assert_eq!(
             events(skipped_checkin_at + 1)[0].due_at,
             skipped_checkin_at + cadence
@@ -5455,7 +5772,7 @@ mod tests {
         engine.enqueue_question(draft(true)).unwrap();
 
         // The live surface is empty again...
-        assert!(engine.list_questions(created + 60_000).unwrap().is_empty());
+        assert!(engine.list_questions().unwrap().is_empty());
 
         // ...but onboarding still happened, so only the prompt returns — never the nudge.
         let events = events_of(&engine, created + 60_000, created);
@@ -5502,7 +5819,7 @@ mod tests {
             .apply_row("user_settings", &marker)
             .unwrap();
 
-        assert!(fresh.list_questions(created + 60_000).unwrap().is_empty());
+        assert!(fresh.list_questions().unwrap().is_empty());
         assert_eq!(
             events_of(&fresh, created + 60_000, created)
                 .iter()
@@ -5668,7 +5985,14 @@ mod tests {
         store.apply_row("questions", &pulled).unwrap();
         drop(store);
 
-        engine.skip_checkin("q1".into(), 9_000).unwrap();
+        // A per-question check-in answer: the metadata patch hosts still send for each question.
+        engine
+            .enqueue_question(QuestionUpsert {
+                plaintext: None,
+                checkin_at: Some(9_000),
+                ..question_upsert("q1", "")
+            })
+            .unwrap();
 
         let after = Store::open(db_path)
             .unwrap()
@@ -5814,49 +6138,6 @@ mod tests {
             PromptTone::Introspective
         );
         assert_eq!(engine.prompt_settings().unwrap().cadence_hours, 336);
-    }
-
-    #[test]
-    fn a_resolved_at_before_created_at_does_not_invert_the_window() {
-        // Clock skew across devices can stamp `resolved_at` earlier than `created_at`. Unclamped,
-        // the window would run backwards and silently return NOTHING — a question whose notes all
-        // vanished, with no error to explain it. The clamp makes the window empty-but-valid.
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.sqlite");
-        let db_path = db.to_str().unwrap();
-        let engine = engine_at(db_path);
-        engine
-            .enqueue_question(QuestionUpsert {
-                created_at: 200,
-                status: Some("resolved".into()),
-                resolved_at: Some(100), // BEFORE it opened
-                ..question_upsert("q1", "skewed")
-            })
-            .unwrap();
-        engine
-            .enqueue_note(NoteUpsert {
-                created_at: 200,
-                ..note_upsert("n-at-open", "n")
-            })
-            .unwrap();
-        engine
-            .enqueue_note(NoteUpsert {
-                created_at: 150,
-                ..note_upsert("n-between", "n")
-            })
-            .unwrap();
-
-        let ids: Vec<String> = engine
-            .question_notes("q1".into(), 10_000)
-            .unwrap()
-            .into_iter()
-            .map(|n| n.id)
-            .collect();
-        assert_eq!(
-            ids,
-            vec!["n-at-open".to_string()],
-            "the window collapses to the single instant it opened, not to nothing and not backwards"
-        );
     }
 
     #[test]
@@ -9217,6 +9498,7 @@ mod tests {
     struct HistogramEmbedder {
         model_id: String,
         embed_calls: AtomicU32,
+        query_calls: AtomicU32,
     }
 
     const DIMS: u32 = 8;
@@ -9234,6 +9516,7 @@ mod tests {
             Arc::new(Self {
                 model_id: model_id.into(),
                 embed_calls: AtomicU32::new(0),
+                query_calls: AtomicU32::new(0),
             })
         }
     }
@@ -9251,6 +9534,7 @@ mod tests {
             Ok(histogram(&text))
         }
         fn embed_query(&self, text: String) -> Result<Vec<f32>, EmbedderError> {
+            self.query_calls.fetch_add(1, Ordering::SeqCst);
             Ok(histogram(&text))
         }
     }
@@ -9288,6 +9572,312 @@ mod tests {
             engine.similar_notes("n1".into(), 5).unwrap_err(),
             SyncError::EmbedderNotRegistered
         ));
+    }
+
+    // ── SUR-1101: ranking the attach sheet ───────────────────────────────────
+
+    fn ask(engine: &SyncEngine, id: &str, text: &str, created_at: i64) {
+        engine
+            .enqueue_question(QuestionUpsert {
+                created_at,
+                ..question_upsert(id, text)
+            })
+            .unwrap();
+    }
+
+    fn ranked(engine: &SyncEngine, note_id: &str) -> Vec<String> {
+        engine
+            .rank_questions_for_note(note_id.into())
+            .unwrap()
+            .into_iter()
+            .map(|q| q.id)
+            .collect()
+    }
+
+    #[test]
+    fn the_attach_sheet_lists_the_semantically_closest_question_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "rank");
+        // The closer question is the OLDER one, so a recency fallback would put it second.
+        ask(&engine, "q-about-a", "aaaa", 100);
+        ask(&engine, "q-about-b", "bbbb", 200);
+        engine.enqueue_note(note_upsert("n", "aaab")).unwrap();
+        let embedder = HistogramEmbedder::new("fake-model");
+        let reg = engine.register_embedder(embedder.clone()).unwrap();
+        assert_eq!(
+            reg.pending, 3,
+            "both active questions are queued beside the note"
+        );
+
+        let pass = engine.embed_pending(10).unwrap();
+        assert_eq!((pass.embedded, pass.pending), (3, 0));
+        assert_eq!(ranked(&engine, "n"), vec!["q-about-a", "q-about-b"]);
+    }
+
+    #[test]
+    fn a_fresh_note_is_embedded_on_demand_and_not_stored() {
+        // The usual case: the sheet shows right after a save, before `embed_pending` reaches the
+        // note. Ranking must still be by meaning (founder, 2026-09-23), and the vector is left for
+        // the queue to store rather than written from here.
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, db_path) = embed_engine(&dir, "on-demand");
+        ask(&engine, "q-about-a", "aaaa", 200);
+        ask(&engine, "q-about-b", "bbbb", 100);
+        let embedder = HistogramEmbedder::new("fake-model");
+        engine.register_embedder(embedder.clone()).unwrap();
+        engine.embed_pending(10).unwrap(); // the two questions
+        engine.enqueue_note(note_upsert("fresh", "bbbb")).unwrap();
+        let before = embedder.embed_calls.load(Ordering::SeqCst);
+
+        assert_eq!(ranked(&engine, "fresh"), vec!["q-about-b", "q-about-a"]);
+        assert_eq!(embedder.embed_calls.load(Ordering::SeqCst), before + 1);
+        assert!(
+            Store::open(&db_path)
+                .unwrap()
+                .embedding_row("fresh")
+                .unwrap()
+                .is_none(),
+            "the on-demand vector is not written"
+        );
+    }
+
+    #[test]
+    fn without_an_embedder_the_sheet_falls_back_to_most_recently_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "fallback");
+        ask(&engine, "q-old", "aaaa", 100);
+        ask(&engine, "q-new", "bbbb", 200);
+        engine.enqueue_note(note_upsert("n", "aaaa")).unwrap();
+        assert_eq!(ranked(&engine, "n"), vec!["q-new", "q-old"]);
+    }
+
+    #[test]
+    fn a_question_without_a_vector_yet_sorts_after_every_scored_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "partial");
+        ask(&engine, "q-a", "aaaa", 100);
+        ask(&engine, "q-b", "bbbb", 200);
+        engine
+            .register_embedder(HistogramEmbedder::new("fake-model"))
+            .unwrap();
+        engine.embed_pending(10).unwrap();
+        // Opened after the drain — newest, but unscored.
+        ask(&engine, "q-unembedded", "aaaa", 300);
+        engine.enqueue_note(note_upsert("n", "bbbb")).unwrap();
+        assert_eq!(ranked(&engine, "n"), vec!["q-b", "q-a", "q-unembedded"]);
+    }
+
+    #[test]
+    fn only_active_questions_are_ranked_and_one_costs_no_embed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "active-only");
+        ask(&engine, "q-open", "aaaa", 100);
+        engine
+            .enqueue_question(QuestionUpsert {
+                status: Some("resolved".into()),
+                ..question_upsert("q-closed", "aaaa")
+            })
+            .unwrap();
+        engine
+            .enqueue_question(QuestionUpsert {
+                status: Some("dismissed".into()),
+                ..question_upsert("q-dropped", "aaaa")
+            })
+            .unwrap();
+        engine.enqueue_note(note_upsert("n", "aaaa")).unwrap();
+        let embedder = HistogramEmbedder::new("fake-model");
+        let reg = engine.register_embedder(embedder.clone()).unwrap();
+        assert_eq!(
+            reg.pending, 2,
+            "the note and the one active question — closed ones never queue"
+        );
+
+        assert_eq!(ranked(&engine, "n"), vec!["q-open"]);
+        assert_eq!(
+            embedder.embed_calls.load(Ordering::SeqCst),
+            0,
+            "one candidate has nothing to order"
+        );
+
+        engine
+            .enqueue_question(QuestionUpsert {
+                status: Some("resolved".into()),
+                plaintext: None,
+                ..question_upsert("q-open", "")
+            })
+            .unwrap();
+        assert!(ranked(&engine, "n").is_empty(), "zero active → no sheet");
+    }
+
+    #[test]
+    fn a_question_vector_is_sealed_to_its_question_and_never_syncs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, db_path) = embed_engine(&dir, "qseal");
+        ask(&engine, "q1", "aaaa", 100);
+        engine
+            .register_embedder(HistogramEmbedder::new("fake-model"))
+            .unwrap();
+        engine.embed_pending(10).unwrap();
+
+        let store = Store::open(&db_path).unwrap();
+        let rows = store
+            .question_embeddings("fake-model|8|test|f32le-v1")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let (id, blob) = &rows[0];
+        assert!(engine
+            .vault
+            .open_bytes(blob.clone(), crate::embeddings::question_embed_aad(id))
+            .is_ok());
+        // Domain separation: the same blob presented as a NOTE vector for the same id must not open.
+        assert!(engine
+            .vault
+            .open_bytes(blob.clone(), crate::embeddings::embed_aad(id))
+            .is_err());
+        for (_, table, _, _, _) in store.outbox_items().unwrap() {
+            assert_ne!(
+                table, "question_embeddings",
+                "vectors must never enqueue for sync"
+            );
+        }
+    }
+
+    #[test]
+    fn a_question_tombstone_drops_its_vector_without_waiting_for_a_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, db_path) = embed_engine(&dir, "qtomb");
+        ask(&engine, "q1", "aaaa", 100);
+        engine
+            .register_embedder(HistogramEmbedder::new("fake-model"))
+            .unwrap();
+        engine.embed_pending(10).unwrap();
+        engine
+            .enqueue_question(QuestionUpsert {
+                deleted: true,
+                ..question_upsert("q1", "aaaa")
+            })
+            .unwrap();
+        let store = Store::open(&db_path).unwrap();
+        let rows: i64 = store.count_embedding_rows_for_test("question_embeddings");
+        assert_eq!(
+            rows, 0,
+            "a plaintext-derived vector must not outlive its question"
+        );
+    }
+
+    #[test]
+    fn an_unbound_question_text_is_skip_marked_and_never_reaches_the_embedder() {
+        // The question gate accepts enc:v2 bound to the question's own id and nothing else. A
+        // pulled row carrying plaintext (or anything else) must drain as a skip marker, not be
+        // handed to the host embedder as though the account key had sealed it.
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, db_path) = embed_engine(&dir, "qunbound");
+        let store = Store::open(&db_path).unwrap();
+        store
+            .apply_row(
+                "questions",
+                json!({
+                    "id": "q-plain", "text": "not sealed at all", "status": "active",
+                    "created_at": 1, "updated_at": 1, "deleted": false
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .unwrap();
+        let embedder = HistogramEmbedder::new("fake-model");
+        engine.register_embedder(embedder.clone()).unwrap();
+
+        let pass = engine.embed_pending(10).unwrap();
+        assert_eq!(
+            (pass.skipped, pass.pending),
+            (1, 0),
+            "skip-marked, and the queue drains"
+        );
+        assert_eq!(embedder.query_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_corrupt_question_vector_is_dropped_and_requeued() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, db_path) = embed_engine(&dir, "qcorrupt");
+        ask(&engine, "q-a", "aaaa", 100);
+        ask(&engine, "q-b", "bbbb", 200);
+        engine.enqueue_note(note_upsert("n", "aaaa")).unwrap();
+        engine
+            .register_embedder(HistogramEmbedder::new("fake-model"))
+            .unwrap();
+        engine.embed_pending(10).unwrap();
+        {
+            let store = Store::open(&db_path).unwrap();
+            let token = store.question_text_token("q-a").unwrap().unwrap();
+            store
+                .upsert_question_embedding_if_current(
+                    "q-a",
+                    "fake-model|8|test|f32le-v1",
+                    &token,
+                    Some(b"garbage"),
+                    1,
+                )
+                .unwrap();
+        }
+
+        // The unreadable vector counts as "no vector": q-a drops behind the scored q-b.
+        assert_eq!(ranked(&engine, "n"), vec!["q-b", "q-a"]);
+        assert_eq!(
+            engine.pending_embed_count().unwrap(),
+            1,
+            "re-queued for the next pass"
+        );
+    }
+
+    #[test]
+    fn an_edited_note_is_ranked_by_what_it_says_now() {
+        // Its stored vector was made from the old text; until the queue re-embeds it, the probe
+        // must come from the current text, not the stale vector.
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "stale");
+        ask(&engine, "q-about-a", "aaaa", 100);
+        ask(&engine, "q-about-b", "bbbb", 200);
+        engine.enqueue_note(note_upsert("n", "aaaa")).unwrap();
+        let embedder = HistogramEmbedder::new("fake-model");
+        engine.register_embedder(embedder.clone()).unwrap();
+        engine.embed_pending(10).unwrap();
+        assert_eq!(ranked(&engine, "n"), vec!["q-about-a", "q-about-b"]);
+
+        engine.enqueue_note(note_upsert("n", "bbbb")).unwrap();
+        assert_eq!(ranked(&engine, "n"), vec!["q-about-b", "q-about-a"]);
+    }
+
+    #[test]
+    fn a_model_change_purges_question_vectors_and_an_edit_requeues_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "qcorpus");
+        ask(&engine, "q1", "aaaa", 100);
+        engine
+            .register_embedder(HistogramEmbedder::new("model-a"))
+            .unwrap();
+        engine.embed_pending(10).unwrap();
+
+        // A metadata patch (a check-in answer) does NOT re-queue: the token is the ciphertext.
+        engine
+            .enqueue_question(QuestionUpsert {
+                plaintext: None,
+                checkin_response: Some("active".into()),
+                ..question_upsert("q1", "")
+            })
+            .unwrap();
+        assert_eq!(engine.pending_embed_count().unwrap(), 0);
+        // A text edit does.
+        engine
+            .enqueue_question(question_upsert("q1", "bbbb"))
+            .unwrap();
+        assert_eq!(engine.pending_embed_count().unwrap(), 1);
+        engine.embed_pending(10).unwrap();
+
+        let reg = engine
+            .register_embedder(HistogramEmbedder::new("model-b"))
+            .unwrap();
+        assert_eq!((reg.invalidated, reg.pending), (1, 1));
     }
 
     #[test]

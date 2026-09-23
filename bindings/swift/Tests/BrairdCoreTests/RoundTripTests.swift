@@ -976,7 +976,7 @@ final class RoundTripTests: XCTestCase {
         // SUR-1071: `listQuestions` hands back a NESTED record — a QuestionRecord inside a
         // QuestionLogEntry inside an array. That lowering is new to this surface, so reading the
         // inner fields back is the assertion, not a formality.
-        let listed = try engine.listQuestions(nowMs: 10_000).map { $0.question }
+        let listed = try engine.listQuestions().map { $0.question }
         XCTAssertEqual(listed.count, 1)
         XCTAssertEqual(listed[0].id, "q1")
         XCTAssertEqual(listed[0].text, "what am I avoiding?")
@@ -992,7 +992,8 @@ final class RoundTripTests: XCTestCase {
         XCTAssertEqual(patched?.status, "resolved")
         XCTAssertEqual(patched?.resolvedAt, 900)
 
-        // The effective note set: auto-window ∪ includes − excludes.
+        // SUR-1101: a question holds exactly the notes attached to it — none by date — and one note
+        // can be attached to several questions.
         func note(_ id: String, _ createdAt: Int64) -> NoteUpsert {
             NoteUpsert(
                 id: id, bookId: nil, plaintext: "text-\(id)", page: nil, tags: [],
@@ -1000,30 +1001,32 @@ final class RoundTripTests: XCTestCase {
                 inkCropPath: nil, createdAt: createdAt, deleted: false, clearNullableFields: [])
         }
         try engine.enqueueQuestion(draft: question("q2", "the open one", "active"))
-        try engine.enqueueNote(draft: note("in-window", 150))
-        try engine.enqueueNote(draft: note("too-early", 10))
-        try engine.enqueueNote(draft: note("dropped", 160))
-        try engine.enqueueQuestionNoteOverride(
-            draft: QuestionNoteOverride(
-                questionId: "q2", noteId: "too-early", kind: "include", deleted: false))
-        try engine.enqueueQuestionNoteOverride(
-            draft: QuestionNoteOverride(
-                questionId: "q2", noteId: "dropped", kind: "exclude", deleted: false))
+        try engine.enqueueNote(draft: note("attached", 150))
+        try engine.enqueueNote(draft: note("shared", 10))
+        try engine.enqueueNote(draft: note("unattached", 160))
+        try engine.enqueueNote(draft: note("detached", 170))
+        for (q, n) in [("q2", "attached"), ("q2", "shared"), ("q1", "shared"), ("q2", "detached")] {
+            try engine.enqueueQuestionNote(
+                draft: QuestionNote(questionId: q, noteId: n, deleted: false))
+        }
+        try engine.enqueueQuestionNote(
+            draft: QuestionNote(questionId: "q2", noteId: "detached", deleted: true))
         XCTAssertEqual(
-            try engine.questionNotes(questionId: "q2", nowMs: 10_000).map { $0.id }.sorted(),
-            ["in-window", "too-early"])
+            try engine.questionNotes(questionId: "q2").map { $0.id }.sorted(),
+            ["attached", "shared"])
 
-        // SUR-1071: the log over the ABI — active first, and every count equal to the effective set
-        // the detail page would show. `q1` was resolved above; `q2` is still open, so the older
-        // active question outranks the newer closed one.
-        let log = try engine.listQuestions(nowMs: 10_000)
+        // SUR-1071: the log over the ABI — active first, and every count equal to the notes the
+        // detail page would show. `q1` was resolved above; `q2` is still open, so the older active
+        // question outranks the newer closed one.
+        let log = try engine.listQuestions()
         XCTAssertEqual(log.map { $0.question.id }, ["q2", "q1"], "active first, then newest")
         XCTAssertEqual(log.first { $0.question.id == "q2" }?.noteCount, 2)
+        XCTAssertEqual(log.first { $0.question.id == "q1" }?.noteCount, 1)
         for entry in log {
             XCTAssertEqual(
-                UInt32(try engine.questionNotes(questionId: entry.question.id, nowMs: 10_000).count),
+                UInt32(try engine.questionNotes(questionId: entry.question.id).count),
                 entry.noteCount,
-                "count and effective set must agree for \(entry.question.id)")
+                "count and notes must agree for \(entry.question.id)")
         }
 
         // The first synced setting, keyed by name (no id column).
@@ -1092,17 +1095,38 @@ final class RoundTripTests: XCTestCase {
         let live = try events(engine, created + 60_000, created)
         XCTAssertEqual(live.map { $0.kind }, [.checkIn])
         XCTAssertEqual(live[0].dueAt, created + 72 * hourMs)
-        // The event names its question, so the client never re-derives the pick.
-        XCTAssertEqual(live[0].questionId, "q1")
-        XCTAssertNil(opening[0].questionId, "an initial prompt has no question yet")
 
-        // Skipping the check-in resets the timer and leaves the sealed text alone.
-        let skippedAt = created + 80 * hourMs
-        try engine.skipCheckin(questionId: "q1", nowMs: skippedAt)
+        // SUR-1101: a second question needs no resolve, and joins the same single check-in.
+        try engine.enqueueQuestion(
+            draft: QuestionUpsert(
+                id: "q2", plaintext: "and this?", status: "active", tone: nil, resolvedAt: nil,
+                checkinAt: nil, checkinResponse: nil, createdAt: created + hourMs, deleted: false))
+        XCTAssertEqual(try events(engine, created + 2 * hourMs, created).map { $0.kind }, [.checkIn])
+
+        // One pass for both resets the timer and leaves the sealed text alone.
+        let passAt = created + 80 * hourMs
+        try engine.completeCheckin(nowMs: passAt)
         XCTAssertEqual(
-            try events(engine, skippedAt + 1, created)[0].dueAt,
-            skippedAt + 72 * hourMs)
+            try events(engine, passAt + 1, created)[0].dueAt,
+            passAt + 72 * hourMs)
         XCTAssertEqual(try engine.getQuestion(id: "q1")?.text, "what am I sitting with?")
+
+        // The check-in's backstop section: a note captured since the pass that nothing holds.
+        try engine.enqueueNote(
+            draft: NoteUpsert(
+                id: "loose", bookId: nil, plaintext: "unfiled", page: nil, tags: [],
+                source: nil, sourceId: nil, sourceMetaJson: nil, chapter: nil, imagePath: nil,
+                inkCropPath: nil, createdAt: passAt + 10, deleted: false, clearNullableFields: []))
+        XCTAssertEqual(
+            try engine.unattachedSinceLastCheckin(nowMs: passAt + 20)?.map { $0.id }, ["loose"])
+
+        // The attach sheet's order crosses as an array of records. No embedder is registered here,
+        // so it is the recency fallback: the most recently opened question first.
+        XCTAssertEqual(try engine.rankQuestionsForNote(noteId: "loose").map { $0.id }, ["q2", "q1"])
+
+        // The too-many-questions nudge: two active is nowhere near nine; a Bool crosses intact.
+        XCTAssertFalse(try engine.questionNudgeDue(nowMs: passAt))
+        try engine.dismissQuestionNudge(nowMs: passAt)
 
         // A recorded skip earns the quiet period on a fresh account, and cancels the nudge with it:
         // a user who declined is not pinged 24h later.
