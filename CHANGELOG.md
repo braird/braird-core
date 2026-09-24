@@ -6,6 +6,8 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-09-24
+
 ### Changed
 - **BREAKING (FFI + schema): several questions can be active at once, and a question's notes are
   explicit attachments (SUR-1101).** The founder retired the single-active model and the automatic
@@ -57,9 +59,9 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     them, a corpus-key change purges them, and a question tombstone drops its vector at once (the
     note rule in `apply_row`). The ranking probe ignores a note vector made from older text.
   - **Rollout (founder, 2026-09-23):** 0058 drops the old table name, and one 404 aborts a flush, so
-    an install on ≤ v0.16.0 stops syncing once 0058 reaches its environment — and a build carrying
-    this release stops syncing against an environment WITHOUT 0058. Apply 0058 to production
-    immediately before the app release carrying this is published (SUR-1104).
+    an install on ≤ v0.16.0 stops syncing once 0058 reaches its environment — and a build on
+    v0.17.0 stops syncing against an environment WITHOUT 0058. Apply 0058 to production
+    immediately before the app release pinning v0.17.0 is published (SUR-1104).
 
 ## [0.16.0] - 2026-08-20
 
