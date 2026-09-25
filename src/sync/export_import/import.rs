@@ -275,10 +275,15 @@ fn normalize_book(input: &Map<String, Value>, now: i64) -> Result<Map<String, Va
         true,
     )?;
     copy_integer(input, &mut output, "createdAt", "created_at", false)?;
-    // SUR-1106 — an archive from before the lifecycle has no status: those sources existed before
-    // 0059, so they land `shelved`, as the server backfilled them. Unknown/null → the same.
-    let status = parse_status(input.get("status").and_then(Value::as_str));
-    output.insert("status".into(), Value::from(status_value(status)));
+    // SUR-1106 — copied only when it is a real lifecycle value. An archive with none (a PWA export,
+    // or one from before 0059) leaves it absent, and the merge keeps the existing row's status.
+    if let Some(status) = input
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|raw| status_value(parse_status(Some(raw))) == *raw)
+    {
+        output.insert("status".into(), Value::from(status));
+    }
     output.insert(
         "updated_at".into(),
         Value::from(defaulted_timestamp(input, "updatedAt", now)?),
@@ -1059,7 +1064,7 @@ mod import_tests {
             json!({
                 "id":"b1", "title":"Book", "author":"Author", "isbn":null,
                 "cover_url":"https://cover", "cover_source":"openlibrary",
-                "cover_resolved_at":null, "status":"shelved", "created_at":101, "updated_at":102,
+                "cover_resolved_at":null, "created_at":101, "updated_at":102,
                 "deleted":false
             })
             .as_object()

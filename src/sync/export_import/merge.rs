@@ -220,6 +220,25 @@ fn select_prepare_and_stage(
             }
 
             increment(&mut imported, table)?;
+            let mut candidate = candidate;
+            if table == "books" && !candidate.row.contains_key("status") {
+                // SUR-1106 — the archive does not know this book's status. The accepted row is
+                // stamped newer than everything, so inventing one would overwrite a real status:
+                // take the newer existing row's instead, and `shelved` only for a book new here.
+                let server_row = server
+                    .get(table)
+                    .and_then(|rows| rows.get(&candidate.primary_key));
+                let existing = match (local.as_ref(), server_row) {
+                    (Some(l), Some(s)) if local_updated >= server_updated => [Some(l), Some(s)],
+                    (l, s) => [s, l],
+                };
+                let status = existing
+                    .into_iter()
+                    .flatten()
+                    .find_map(|row| row.get("status").and_then(Value::as_str))
+                    .unwrap_or("shelved");
+                candidate.row.insert("status".into(), Value::from(status));
+            }
             for timestamp in [Some(candidate.updated_at), local_updated, server_updated]
                 .into_iter()
                 .flatten()
@@ -932,6 +951,63 @@ mod tests {
             assert!(store.get_row("books", "b1").unwrap().is_none());
             assert!(store.outbox_items().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn an_archive_without_status_keeps_the_existing_status() {
+        // SUR-1106 — the accepted row is stamped newer than everything, so a status invented for
+        // an archive that never had one would overwrite a real one on the server.
+        let archive = parsed(
+            "books",
+            vec![
+                json!({"id":"local","title":"a","updatedAt":50}),
+                json!({"id":"server","title":"a","updatedAt":50}),
+                json!({"id":"both","title":"a","updatedAt":50}),
+                json!({"id":"fresh","title":"a","updatedAt":50}),
+                json!({"id":"explicit","title":"a","updatedAt":50,"status":"to_read"}),
+            ],
+            10,
+        );
+        let store = Store::open_in_memory().unwrap();
+        let local = |id: &str, updated_at: i64, status: &str| {
+            let row = json!({"id":id,"title":"l","created_at":1,"updated_at":updated_at,
+                             "deleted":false,"status":status});
+            store.apply_row("books", row.as_object().unwrap()).unwrap();
+        };
+        local("local", 5, "reading");
+        local("both", 7, "to_read"); // the NEWER existing row wins
+        let sink = RecordingSink::default();
+        sink.fetch_result(
+            "books",
+            Ok(vec![
+                json!({"id":"server","updated_at":5,"deleted":false,"status":"reading"}),
+                json!({"id":"both","updated_at":6,"deleted":false,"status":"shelved"}),
+            ]),
+        );
+
+        run(merge_parsed_with_sink(
+            &store,
+            &sink,
+            &Vault::generate(),
+            archive,
+            10,
+        ))
+        .unwrap();
+
+        let status = |id: &str| store.get_row("books", id).unwrap().unwrap()["status"].clone();
+        assert_eq!(status("local"), json!("reading"));
+        assert_eq!(status("server"), json!("reading"));
+        assert_eq!(status("both"), json!("to_read"));
+        assert_eq!(
+            status("fresh"),
+            json!("shelved"),
+            "new to the account → shelved"
+        );
+        assert_eq!(
+            status("explicit"),
+            json!("to_read"),
+            "the archive's own value wins"
+        );
     }
 
     #[test]

@@ -5525,7 +5525,7 @@ data class BookRecord (
      * SUR-1106 — the newest live note's `created_at` under this book, for the picker's
      * reading-first order. `None` when the book has no live notes.
      */
-    var `lastCapturedAt`: kotlin.Long?
+    var `latestNoteCreatedAt`: kotlin.Long?
 ) {
     
     companion object
@@ -5564,7 +5564,7 @@ public object FfiConverterTypeBookRecord: FfiConverterRustBuffer<BookRecord> {
             FfiConverterLong.allocationSize(value.`createdAt`) +
             FfiConverterLong.allocationSize(value.`updatedAt`) +
             FfiConverterUInt.allocationSize(value.`noteCount`) +
-            FfiConverterOptionalLong.allocationSize(value.`lastCapturedAt`)
+            FfiConverterOptionalLong.allocationSize(value.`latestNoteCreatedAt`)
     )
 
     override fun write(value: BookRecord, buf: ByteBuffer) {
@@ -5579,7 +5579,7 @@ public object FfiConverterTypeBookRecord: FfiConverterRustBuffer<BookRecord> {
             FfiConverterLong.write(value.`createdAt`, buf)
             FfiConverterLong.write(value.`updatedAt`, buf)
             FfiConverterUInt.write(value.`noteCount`, buf)
-            FfiConverterOptionalLong.write(value.`lastCapturedAt`, buf)
+            FfiConverterOptionalLong.write(value.`latestNoteCreatedAt`, buf)
     }
 }
 
@@ -7798,6 +7798,13 @@ public object FfiConverterTypeSemanticStatus: FfiConverterRustBuffer<SemanticSta
 
 /**
  * Where a source sits in the reader's lifecycle. Stored as `to_read | reading | shelved`.
+ *
+ * "Source" is the product word for a book: this is `books.status`, carried on [`BookRecord`] and
+ * [`BookUpsert`] (named for the user-facing Sources surface, founder 2026-09-25). Unrelated to
+ * `BookRecord::cover_source`, which says where a cover image came from.
+ *
+ * [`BookRecord`]: crate::sync::read::BookRecord
+ * [`BookUpsert`]: crate::sync::BookUpsert
  */
 
 enum class SourceStatus {

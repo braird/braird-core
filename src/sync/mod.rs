@@ -571,25 +571,28 @@ impl SyncEngine {
         insert_opt(&mut row, "cover_url", cover_url);
         insert_opt(&mut row, "cover_source", cover_source);
         insert_opt(&mut row, "cover_resolved_at", cover_resolved_at);
-        // SUR-1106 — a new book with no status starts `to_read`, written locally too (the server
-        // default alone would leave this device reading NULL → Shelved until the row re-pulls).
-        let status = match status {
-            Some(s) => Some(s),
-            None => {
-                let exists = lock!(self.store)
-                    .get_row("books", &id)
-                    .map_err(store_err)?
-                    .is_some();
-                (!exists).then_some(SourceStatus::ToRead)
-            }
-        };
-        insert_opt(&mut row, "status", status.map(library::status_value));
         row.insert("created_at".into(), json!(created_at));
         row.insert("updated_at".into(), json!(now));
         row.insert("deleted".into(), json!(deleted));
         // Tri-state clears — validated against the clearable allowlist; nothing staged on reject.
         apply_clears("books", &mut row, &clear_nullable_fields)?;
-        self.stage_write("books", &id, row)
+        // One guard for the existence check AND the write, so a pull cannot land between them.
+        let store = lock!(self.store);
+        // SUR-1106 — a new book with no status starts `to_read`, written locally too (the server
+        // default alone would leave this device reading NULL → Shelved until the row re-pulls).
+        // Accepted residual (founder 2026-09-25): "new" means new HERE, so an id the server has
+        // but this device has not pulled yet would send an explicit `to_read` over it. Hosts
+        // mint a fresh id for a new book, so that needs a host bug.
+        let status = match status {
+            None if store.get_row("books", &id).map_err(store_err)?.is_none() => {
+                Some(SourceStatus::ToRead)
+            }
+            s => s,
+        };
+        insert_opt(&mut row, "status", status.map(library::status_value));
+        store
+            .stage_local_write("books", &id, row, epoch_ms())
+            .map_err(|e| SyncError::Store(e.to_string()))
     }
 
     /// Enqueue a full note write or a plaintext-free patch. `plaintext: Some` is the existing
@@ -3982,14 +3985,14 @@ mod tests {
         let book = engine.get_book("b1".into()).unwrap().unwrap();
         assert_eq!(book.status, SourceStatus::Shelved);
         assert_eq!(
-            book.last_captured_at,
+            book.latest_note_created_at,
             Some(30),
             "the deleted n3 does not count"
         );
 
         engine.enqueue_book(book_upsert("b2", "Empty")).unwrap();
         let empty = engine.get_book("b2".into()).unwrap().unwrap();
-        assert_eq!(empty.last_captured_at, None);
+        assert_eq!(empty.latest_note_created_at, None);
     }
 
     #[test]

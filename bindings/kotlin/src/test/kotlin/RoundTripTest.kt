@@ -353,7 +353,7 @@ class RoundTripTest {
         assertEquals(1u, books[0].noteCount)
         // SUR-1106 — the lifecycle status and newest capture cross the FFI boundary.
         assertEquals(SourceStatus.READING, books[0].status)
-        assertEquals(10L, books[0].lastCapturedAt)
+        assertEquals(10L, books[0].latestNoteCreatedAt)
         assertEquals(LibrarySort.DATE_ADDED, engine.librarySort())
         engine.setLibrarySort(LibrarySort.ALPHABETICAL)
         assertEquals(LibrarySort.ALPHABETICAL, engine.librarySort())

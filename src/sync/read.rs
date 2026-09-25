@@ -47,7 +47,7 @@ pub struct BookRecord {
     pub note_count: u32,
     /// SUR-1106 — the newest live note's `created_at` under this book, for the picker's
     /// reading-first order. `None` when the book has no live notes.
-    pub last_captured_at: Option<i64>,
+    pub latest_note_created_at: Option<i64>,
 }
 
 /// A note for the Commonplace list / NoteForm. `text` is **plaintext** (decrypted in core), or
@@ -762,7 +762,7 @@ pub fn build_search_docs(store: &Store, vault: &Vault) -> rusqlite::Result<Vec<S
 fn book_record(store: &Store, row: &Map<String, Value>) -> rusqlite::Result<BookRecord> {
     let id = string_field(row, "id").unwrap_or_default();
     let note_count = store.count_live("notes", Some(("book_id", &id)))? as u32;
-    let last_captured_at = store.max_live_int("notes", "created_at", ("book_id", &id))?;
+    let latest_note_created_at = store.max_live_int("notes", "created_at", ("book_id", &id))?;
     Ok(BookRecord {
         title: string_field(row, "title"),
         author: string_field(row, "author"),
@@ -774,7 +774,7 @@ fn book_record(store: &Store, row: &Map<String, Value>) -> rusqlite::Result<Book
         created_at: int_field(row, "created_at"),
         updated_at: int_field(row, "updated_at"),
         note_count,
-        last_captured_at,
+        latest_note_created_at,
         id,
     })
 }

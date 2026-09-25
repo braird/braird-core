@@ -378,7 +378,7 @@ final class RoundTripTests: XCTestCase {
         XCTAssertEqual(books[0].noteCount, 1)
         // SUR-1106 — the lifecycle status and newest capture cross the FFI boundary.
         XCTAssertEqual(books[0].status, .reading)
-        XCTAssertEqual(books[0].lastCapturedAt, 10)
+        XCTAssertEqual(books[0].latestNoteCreatedAt, 10)
         XCTAssertEqual(try engine.librarySort(), .dateAdded)
         try engine.setLibrarySort(sort: .alphabetical)
         XCTAssertEqual(try engine.librarySort(), .alphabetical)

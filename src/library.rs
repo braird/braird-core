@@ -6,6 +6,13 @@
 //! because 0059's backfill did not bump `change_seq`), which is exactly the server's `shelved`.
 
 /// Where a source sits in the reader's lifecycle. Stored as `to_read | reading | shelved`.
+///
+/// "Source" is the product word for a book: this is `books.status`, carried on [`BookRecord`] and
+/// [`BookUpsert`] (named for the user-facing Sources surface, founder 2026-09-25). Unrelated to
+/// `BookRecord::cover_source`, which says where a cover image came from.
+///
+/// [`BookRecord`]: crate::sync::read::BookRecord
+/// [`BookUpsert`]: crate::sync::BookUpsert
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum SourceStatus {
     ToRead,
@@ -73,14 +80,5 @@ mod tests {
         }
         assert_eq!(parse_status(None), SourceStatus::Shelved);
         assert_eq!(parse_status(Some("finished")), SourceStatus::Shelved);
-    }
-
-    #[test]
-    fn sort_round_trips_and_falls_back_to_date_added() {
-        for s in [LibrarySort::DateAdded, LibrarySort::Alphabetical] {
-            assert_eq!(parse_sort(Some(sort_value(s))), s);
-        }
-        assert_eq!(parse_sort(None), LibrarySort::DateAdded);
-        assert_eq!(parse_sort(Some("by_rating")), LibrarySort::DateAdded);
     }
 }

@@ -607,6 +607,12 @@ impl Store {
     /// re-opening an existing store is a no-op — plus the additive column migration
     /// below for stores created before a descriptor column existed.
     fn init_schema(&self) -> rusqlite::Result<()> {
+        // SUR-1106 — an EXISTING books table about to gain `status` (a store opened by core
+        // <= v0.17.0). Read before the migration below adds it.
+        let books_gains_status = {
+            let cols = self.table_columns("books")?;
+            !cols.is_empty() && !cols.iter().any(|(name, _)| name == "status")
+        };
         for t in descriptor_tables() {
             self.conn.execute_batch(&create_table_sql(t))?;
             // SUR-1005 — additive local-DB migration (see `ensure_columns`): a store
@@ -629,6 +635,13 @@ impl Store {
         // `content_token` postdates the original DDL, and every store created before it
         // (the table has existed, writer-less, since SUR-723) needs the ALTER on open.
         self.ensure_columns("embeddings", &[("content_token", "TEXT")])?;
+        // SUR-1106 — that store dropped `status` from every book it pulled while surfc 0059 was
+        // live, so those rows now read NULL (→ Shelved) whatever the server holds. Forget the books
+        // cursor for ONE full re-pull; `sync::pull` fills a NULL status from an equal-stamp row
+        // (see `Store::fill_null_book_status`), which the strict-`>` LWW alone would never apply.
+        if books_gains_status {
+            self.meta_delete(&sync_seq_key("books"))?;
+        }
         Ok(())
     }
 
@@ -1046,6 +1059,17 @@ impl Store {
             schema.name
         );
         self.conn.query_row(&sql, [val], |row| row.get(0))
+    }
+
+    /// SUR-1106 — set a book's `status` ONLY where the local row has none. Status only: no other
+    /// column, no stamp, no outbox. Sound for this one column because the server's is NOT NULL, so
+    /// a local NULL is never a value anyone chose (unlike a cleared cover, where NULL is the edit).
+    pub fn fill_null_book_status(&self, id: &str, status: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE books SET status = ?2 WHERE id = ?1 AND status IS NULL",
+            [id, status],
+        )?;
+        Ok(())
     }
 
     /// Count rows INCLUDING tombstones — the counterpart to [`Store::count_live`], for the one
@@ -2190,6 +2214,48 @@ mod tests {
     }
 
     // ── SUR-1005 additive column migration ───────────────────────────────────
+
+    #[test]
+    fn a_store_gaining_book_status_forgets_only_the_books_cursor() {
+        // SUR-1106 — a pre-v0.18 store dropped `status` from rows it pulled while 0059 was live;
+        // one full books re-pull (plus the pull's NULL fill) repairs them. Other tables keep theirs,
+        // and a store that already has the column is untouched on every later open.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE books (id TEXT, title TEXT, author TEXT, isbn TEXT,                  cover_url TEXT, cover_source TEXT, cover_resolved_at INTEGER, merged_into TEXT,                  created_at INTEGER, updated_at INTEGER, deleted INTEGER, PRIMARY KEY (id));",
+            )
+            .unwrap();
+        }
+        let path = path.to_str().unwrap();
+        {
+            let store = Store::open(path).unwrap(); // gains the column; cursor was never set
+            store.set_seq_cursor("books", 40).unwrap();
+            store.set_seq_cursor("notes", 41).unwrap();
+            store
+                .conn
+                .execute_batch("ALTER TABLE books DROP COLUMN status;")
+                .unwrap();
+        }
+        let store = Store::open(path).unwrap();
+        assert_eq!(
+            store.get_seq_cursor("books").unwrap(),
+            None,
+            "books re-pulls"
+        );
+        assert_eq!(store.get_seq_cursor("notes").unwrap(), Some(41));
+
+        store.set_seq_cursor("books", 42).unwrap();
+        drop(store);
+        let store = Store::open(path).unwrap();
+        assert_eq!(
+            store.get_seq_cursor("books").unwrap(),
+            Some(42),
+            "once only"
+        );
+    }
 
     #[test]
     fn init_schema_alters_an_existing_store_missing_a_descriptor_column() {

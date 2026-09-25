@@ -3496,7 +3496,7 @@ public struct BookRecord {
      * SUR-1106 — the newest live note's `created_at` under this book, for the picker's
      * reading-first order. `None` when the book has no live notes.
      */
-    public var lastCapturedAt: Int64?
+    public var latestNoteCreatedAt: Int64?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -3507,7 +3507,7 @@ public struct BookRecord {
         /**
          * SUR-1106 — the newest live note's `created_at` under this book, for the picker's
          * reading-first order. `None` when the book has no live notes.
-         */lastCapturedAt: Int64?) {
+         */latestNoteCreatedAt: Int64?) {
         self.id = id
         self.title = title
         self.author = author
@@ -3519,7 +3519,7 @@ public struct BookRecord {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.noteCount = noteCount
-        self.lastCapturedAt = lastCapturedAt
+        self.latestNoteCreatedAt = latestNoteCreatedAt
     }
 }
 
@@ -3560,7 +3560,7 @@ extension BookRecord: Equatable, Hashable {
         if lhs.noteCount != rhs.noteCount {
             return false
         }
-        if lhs.lastCapturedAt != rhs.lastCapturedAt {
+        if lhs.latestNoteCreatedAt != rhs.latestNoteCreatedAt {
             return false
         }
         return true
@@ -3578,7 +3578,7 @@ extension BookRecord: Equatable, Hashable {
         hasher.combine(createdAt)
         hasher.combine(updatedAt)
         hasher.combine(noteCount)
-        hasher.combine(lastCapturedAt)
+        hasher.combine(latestNoteCreatedAt)
     }
 }
 
@@ -3601,7 +3601,7 @@ public struct FfiConverterTypeBookRecord: FfiConverterRustBuffer {
                 createdAt: FfiConverterInt64.read(from: &buf), 
                 updatedAt: FfiConverterInt64.read(from: &buf), 
                 noteCount: FfiConverterUInt32.read(from: &buf), 
-                lastCapturedAt: FfiConverterOptionInt64.read(from: &buf)
+                latestNoteCreatedAt: FfiConverterOptionInt64.read(from: &buf)
         )
     }
 
@@ -3617,7 +3617,7 @@ public struct FfiConverterTypeBookRecord: FfiConverterRustBuffer {
         FfiConverterInt64.write(value.createdAt, into: &buf)
         FfiConverterInt64.write(value.updatedAt, into: &buf)
         FfiConverterUInt32.write(value.noteCount, into: &buf)
-        FfiConverterOptionInt64.write(value.lastCapturedAt, into: &buf)
+        FfiConverterOptionInt64.write(value.latestNoteCreatedAt, into: &buf)
     }
 }
 
@@ -7636,6 +7636,13 @@ extension SemanticStatus: Equatable, Hashable {}
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
  * Where a source sits in the reader's lifecycle. Stored as `to_read | reading | shelved`.
+ *
+ * "Source" is the product word for a book: this is `books.status`, carried on [`BookRecord`] and
+ * [`BookUpsert`] (named for the user-facing Sources surface, founder 2026-09-25). Unrelated to
+ * `BookRecord::cover_source`, which says where a cover image came from.
+ *
+ * [`BookRecord`]: crate::sync::read::BookRecord
+ * [`BookUpsert`]: crate::sync::BookUpsert
  */
 
 public enum SourceStatus {
