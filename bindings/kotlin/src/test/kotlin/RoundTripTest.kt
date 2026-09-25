@@ -26,8 +26,10 @@ import uniffi.braird_core.UniffiRustCallStatus
 import uniffi.braird_core.uniffiCallbackInterfaceEmbedder
 import uniffi.braird_core.ImportCounts
 import uniffi.braird_core.ImportSummary
+import uniffi.braird_core.LibrarySort
 import uniffi.braird_core.NoteSignalKind
 import uniffi.braird_core.NoteUpsert
+import uniffi.braird_core.SourceStatus
 import uniffi.braird_core.PromptEventKind
 import uniffi.braird_core.PromptSettings
 import uniffi.braird_core.PromptTone
