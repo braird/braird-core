@@ -37,6 +37,7 @@ use crate::embeddings::{
     self, EmbedSummary, Embedder, EmbedderError, RegisterEmbedderSummary, SemanticHit,
 };
 use crate::fusion::{self, RankedHit, RankedSearchPage, SemanticStatus};
+use crate::library::{self, LibrarySort, SourceStatus, LIBRARY_SORT_KEY};
 use crate::prompt::{
     self, PromptEvent, PromptSettings, PromptState, PromptTone, PROMPT_ANSWERED_AT_KEY,
     PROMPT_CADENCE_KEY, PROMPT_SKIPPED_AT_KEY, PROMPT_TONE_KEY,
@@ -247,6 +248,8 @@ pub struct BookUpsert {
     pub cover_url: Option<String>,
     pub cover_source: Option<String>,
     pub cover_resolved_at: Option<i64>,
+    /// SUR-1106. `None` keeps the stored status, or starts a NEW book as `ToRead`.
+    pub status: Option<SourceStatus>,
     pub created_at: i64,
     pub deleted: bool,
     pub clear_nullable_fields: Vec<String>,
@@ -554,6 +557,7 @@ impl SyncEngine {
             cover_url,
             cover_source,
             cover_resolved_at,
+            status,
             created_at,
             deleted,
             clear_nullable_fields,
@@ -567,6 +571,19 @@ impl SyncEngine {
         insert_opt(&mut row, "cover_url", cover_url);
         insert_opt(&mut row, "cover_source", cover_source);
         insert_opt(&mut row, "cover_resolved_at", cover_resolved_at);
+        // SUR-1106 — a new book with no status starts `to_read`, written locally too (the server
+        // default alone would leave this device reading NULL → Shelved until the row re-pulls).
+        let status = match status {
+            Some(s) => Some(s),
+            None => {
+                let exists = lock!(self.store)
+                    .get_row("books", &id)
+                    .map_err(store_err)?
+                    .is_some();
+                (!exists).then_some(SourceStatus::ToRead)
+            }
+        };
+        insert_opt(&mut row, "status", status.map(library::status_value));
         row.insert("created_at".into(), json!(created_at));
         row.insert("updated_at".into(), json!(now));
         row.insert("deleted".into(), json!(deleted));
@@ -1683,6 +1700,27 @@ impl SyncEngine {
             return Ok(());
         }
         self.set_user_setting(PROMPT_TONE_KEY.into(), value.into())
+    }
+
+    /// The Library's within-rail sort (SUR-1106). Unset or unrecognised → `DateAdded`.
+    pub fn library_sort(&self) -> Result<LibrarySort, SyncError> {
+        let store = lock!(self.store);
+        let raw = read::user_setting(&store, LIBRARY_SORT_KEY).map_err(store_err)?;
+        Ok(library::parse_sort(raw.as_deref()))
+    }
+
+    /// Set the Library sort. An unchanged value is not a write, compared against the RAW stored
+    /// string for the reason [`SyncEngine::set_prompt_cadence`] gives (an absent row must write).
+    pub fn set_library_sort(&self, sort: LibrarySort) -> Result<(), SyncError> {
+        let value = library::sort_value(sort);
+        let stored = {
+            let store = lock!(self.store);
+            read::user_setting(&store, LIBRARY_SORT_KEY).map_err(store_err)?
+        };
+        if stored.as_deref() == Some(value) {
+            return Ok(());
+        }
+        self.set_user_setting(LIBRARY_SORT_KEY.into(), value.into())
     }
 
     /// The prompt(s) the client should act on now, sorted by `due_at` (SUR-1043).
@@ -3897,6 +3935,103 @@ mod tests {
         );
     }
 
+    // ── SUR-1106: source lifecycle + Library sort ────────────────────────────────
+
+    #[test]
+    fn a_new_book_starts_to_read_and_an_edit_without_status_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+        engine.enqueue_book(book_upsert("b1", "T")).unwrap();
+        let get = || engine.get_book("b1".into()).unwrap().unwrap().status;
+        assert_eq!(get(), SourceStatus::ToRead, "new book, no status → to_read");
+
+        engine
+            .enqueue_book(BookUpsert {
+                status: Some(SourceStatus::Reading),
+                ..book_upsert("b1", "T")
+            })
+            .unwrap();
+        engine.enqueue_book(book_upsert("b1", "Renamed")).unwrap();
+        assert_eq!(get(), SourceStatus::Reading, "a status-less edit keeps it");
+        // The edit's outbox payload omits the key, so the server keeps its value too.
+        let p = outbox_payload(db.to_str().unwrap(), 2);
+        assert_eq!(p["title"], json!("Renamed"));
+        assert!(p.get("status").is_none());
+    }
+
+    #[test]
+    fn a_pre_0059_row_reads_shelved_and_last_capture_ignores_deleted_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        {
+            // Pulled before the column existed: no `status` key → SQL NULL.
+            let store = Store::open(db_path).unwrap();
+            let row = |v: Value| v.as_object().unwrap().clone();
+            store
+                .apply_row("books", &row(json!({"id":"b1","title":"T","created_at":1,"updated_at":1,"deleted":false})))
+                .unwrap();
+            for (id, at, deleted) in [("n1", 10, false), ("n2", 30, false), ("n3", 50, true)] {
+                store
+                    .apply_row("notes", &row(json!({"id":id,"book_id":"b1","created_at":at,"updated_at":at,"deleted":deleted})))
+                    .unwrap();
+            }
+        }
+        let book = engine.get_book("b1".into()).unwrap().unwrap();
+        assert_eq!(book.status, SourceStatus::Shelved);
+        assert_eq!(
+            book.last_captured_at,
+            Some(30),
+            "the deleted n3 does not count"
+        );
+
+        engine.enqueue_book(book_upsert("b2", "Empty")).unwrap();
+        let empty = engine.get_book("b2".into()).unwrap().unwrap();
+        assert_eq!(empty.last_captured_at, None);
+    }
+
+    #[test]
+    fn library_sort_round_trips_and_skips_an_unchanged_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        assert_eq!(engine.library_sort().unwrap(), LibrarySort::DateAdded);
+
+        // The default still writes once when chosen: an absent row is not "unchanged".
+        engine.set_library_sort(LibrarySort::DateAdded).unwrap();
+        engine.set_library_sort(LibrarySort::Alphabetical).unwrap();
+        engine.set_library_sort(LibrarySort::Alphabetical).unwrap();
+        assert_eq!(engine.library_sort().unwrap(), LibrarySort::Alphabetical);
+        assert_eq!(
+            Store::open(db_path).unwrap().outbox_items().unwrap().len(),
+            2
+        );
+
+        engine
+            .set_user_setting(LIBRARY_SORT_KEY.into(), "by_rating".into())
+            .unwrap();
+        assert_eq!(engine.library_sort().unwrap(), LibrarySort::DateAdded);
+    }
+
+    #[test]
+    fn status_survives_export_then_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+        engine
+            .enqueue_book(BookUpsert {
+                status: Some(SourceStatus::Reading),
+                ..book_upsert("b1", "T")
+            })
+            .unwrap();
+        let archive = engine.export_snapshot().unwrap();
+        let parsed = export_import::import::parse_import_at(&archive, 1).unwrap();
+        assert_eq!(parsed.books[0].row["status"], json!("reading"));
+    }
+
     // ── SUR-741: widened enqueue_book / enqueue_note authoring surface ──────────
 
     fn outbox_payload(db_path: &str, idx: usize) -> Value {
@@ -4660,6 +4795,7 @@ mod tests {
             cover_url: None,
             cover_source: None,
             cover_resolved_at: None,
+            status: None,
             created_at: 0,
             deleted: false,
             clear_nullable_fields: vec![],

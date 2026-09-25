@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
+use crate::library::{parse_status, status_value};
 use crate::sync::SyncError;
 
 const MAX_SCHEMA_VERSION: u32 = 19;
@@ -274,6 +275,10 @@ fn normalize_book(input: &Map<String, Value>, now: i64) -> Result<Map<String, Va
         true,
     )?;
     copy_integer(input, &mut output, "createdAt", "created_at", false)?;
+    // SUR-1106 — an archive from before the lifecycle has no status: those sources existed before
+    // 0059, so they land `shelved`, as the server backfilled them. Unknown/null → the same.
+    let status = parse_status(input.get("status").and_then(Value::as_str));
+    output.insert("status".into(), Value::from(status_value(status)));
     output.insert(
         "updated_at".into(),
         Value::from(defaulted_timestamp(input, "updatedAt", now)?),
@@ -1054,7 +1059,7 @@ mod import_tests {
             json!({
                 "id":"b1", "title":"Book", "author":"Author", "isbn":null,
                 "cover_url":"https://cover", "cover_source":"openlibrary",
-                "cover_resolved_at":null, "created_at":101, "updated_at":102,
+                "cover_resolved_at":null, "status":"shelved", "created_at":101, "updated_at":102,
                 "deleted":false
             })
             .as_object()

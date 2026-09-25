@@ -99,11 +99,11 @@ class SelfContainedRoundTripTest {
         val engine = SyncEngine.open(db.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
         engine.enqueueBook(BookUpsert(
             id = "s", title = "S", author = null, isbn = null, coverUrl = null, coverSource = null,
-            coverResolvedAt = null, createdAt = 100L, deleted = false, clearNullableFields = emptyList(),
+            coverResolvedAt = null, status = null, createdAt = 100L, deleted = false, clearNullableFields = emptyList(),
         ))
         engine.enqueueBook(BookUpsert(
             id = "l1", title = "L", author = null, isbn = null, coverUrl = null, coverSource = null,
-            coverResolvedAt = null, createdAt = 50L, deleted = false, clearNullableFields = emptyList(),
+            coverResolvedAt = null, status = null, createdAt = 50L, deleted = false, clearNullableFields = emptyList(),
         ))
         engine.enqueueNote(NoteUpsert(
             id = "n1", bookId = "l1", plaintext = "note", page = null, tags = emptyList(),

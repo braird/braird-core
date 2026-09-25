@@ -4,6 +4,7 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use time::{macros::format_description, OffsetDateTime};
 
+use crate::library::{parse_status, status_value};
 use crate::store::Store;
 use crate::sync::read::decrypt_note_text_for_archive;
 use crate::sync::SyncError;
@@ -20,6 +21,7 @@ const BOOK_FIELDS: &[(&str, &str)] = &[
     ("cover_url", "coverUrl"),
     ("cover_source", "coverSource"),
     ("cover_resolved_at", "coverResolvedAt"),
+    ("status", "status"), // SUR-1106 — the PWA keeps it on the Dexie row under the same name
     ("created_at", "createdAt"),
     ("updated_at", "updatedAt"),
     ("deleted", "deleted"),
@@ -119,7 +121,12 @@ pub(in crate::sync) fn build_snapshot_at(
     vault: &Vault,
     now_ms: i64,
 ) -> Result<String, SyncError> {
-    let books = mapped_live_rows(store, "books", BOOK_FIELDS)?;
+    let mut books = mapped_live_rows(store, "books", BOOK_FIELDS)?;
+    // SUR-1106 — never export a null status (a pre-0059 local row): the PWA would push it back.
+    for book in &mut books {
+        let status = parse_status(book.get("status").and_then(Value::as_str));
+        book["status"] = json!(status_value(status));
+    }
     let note_rows = live_rows(store, "notes")?;
     let mut notes = note_rows
         .iter()
@@ -832,7 +839,7 @@ mod tests {
             json!({
                 "id": "b1", "title": "The Republic", "author": "Plato", "isbn": "9781",
                 "coverUrl": "https://covers/b1", "coverSource": "openlibrary",
-                "coverResolvedAt": 101, "createdAt": 100, "updatedAt": 102,
+                "coverResolvedAt": 101, "status": "shelved", "createdAt": 100, "updatedAt": 102,
                 "deleted": 0
             })
         );

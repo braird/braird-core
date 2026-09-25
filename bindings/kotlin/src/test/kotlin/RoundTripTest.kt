@@ -319,8 +319,8 @@ class RoundTripTest {
 
         engine.enqueueBook(BookUpsert(
             id = "b1", title = "Meditations", author = "Aurelius", isbn = null, coverUrl = null,
-            coverSource = null, coverResolvedAt = null, createdAt = 1L, deleted = false,
-            clearNullableFields = emptyList(),
+            coverSource = null, coverResolvedAt = null, status = SourceStatus.READING, createdAt = 1L,
+            deleted = false, clearNullableFields = emptyList(),
         ))
         engine.enqueueNote(NoteUpsert(
             id = "n1", bookId = "b1", plaintext = "the unexamined life is not worth living",
@@ -351,6 +351,12 @@ class RoundTripTest {
         assertEquals(1, books.size)
         assertEquals("Meditations", books[0].title)
         assertEquals(1u, books[0].noteCount)
+        // SUR-1106 — the lifecycle status and newest capture cross the FFI boundary.
+        assertEquals(SourceStatus.READING, books[0].status)
+        assertEquals(10L, books[0].lastCapturedAt)
+        assertEquals(LibrarySort.DATE_ADDED, engine.librarySort())
+        engine.setLibrarySort(LibrarySort.ALPHABETICAL)
+        assertEquals(LibrarySort.ALPHABETICAL, engine.librarySort())
 
         // Commonplace flat list: newest-first, decrypted plaintext, never a ciphertext sentinel.
         val all = engine.listNotes(null, 50u, 0u)
@@ -528,8 +534,8 @@ class RoundTripTest {
 
         fun book(id: String, createdAt: Long) = BookUpsert(
             id = id, title = "T-$id", author = null, isbn = null, coverUrl = null,
-            coverSource = null, coverResolvedAt = null, createdAt = createdAt, deleted = false,
-            clearNullableFields = emptyList(),
+            coverSource = null, coverResolvedAt = null, status = null, createdAt = createdAt,
+            deleted = false, clearNullableFields = emptyList(),
         )
         fun note(id: String, bookId: String?) = NoteUpsert(
             id = id, bookId = bookId, plaintext = "text-$id", page = null, tags = emptyList(),

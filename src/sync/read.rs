@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
+use crate::library::{self, SourceStatus};
 use crate::note_encryption::is_encrypted_v2;
 use crate::prompt::{is_active, QuestionMeta};
 use crate::search::{SearchDoc, SearchDocKind};
@@ -39,9 +40,14 @@ pub struct BookRecord {
     pub cover_url: Option<String>,
     pub cover_source: Option<String>,
     pub cover_resolved_at: Option<i64>,
+    /// SUR-1106. A pre-0059 local row (NULL) reads as `Shelved`, matching the server backfill.
+    pub status: SourceStatus,
     pub created_at: i64,
     pub updated_at: i64,
     pub note_count: u32,
+    /// SUR-1106 — the newest live note's `created_at` under this book, for the picker's
+    /// reading-first order. `None` when the book has no live notes.
+    pub last_captured_at: Option<i64>,
 }
 
 /// A note for the Commonplace list / NoteForm. `text` is **plaintext** (decrypted in core), or
@@ -756,17 +762,20 @@ pub fn build_search_docs(store: &Store, vault: &Vault) -> rusqlite::Result<Vec<S
 fn book_record(store: &Store, row: &Map<String, Value>) -> rusqlite::Result<BookRecord> {
     let id = string_field(row, "id").unwrap_or_default();
     let note_count = store.count_live("notes", Some(("book_id", &id)))? as u32;
+    let last_captured_at = store.max_live_int("notes", "created_at", ("book_id", &id))?;
     Ok(BookRecord {
-        id,
         title: string_field(row, "title"),
         author: string_field(row, "author"),
         isbn: string_field(row, "isbn"),
         cover_url: string_field(row, "cover_url"),
         cover_source: string_field(row, "cover_source"),
         cover_resolved_at: opt_int_field(row, "cover_resolved_at"),
+        status: library::parse_status(string_field(row, "status").as_deref()),
         created_at: int_field(row, "created_at"),
         updated_at: int_field(row, "updated_at"),
         note_count,
+        last_captured_at,
+        id,
     })
 }
 

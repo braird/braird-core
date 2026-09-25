@@ -9,6 +9,7 @@
     "id": "text",
     "isbn": "text",
     "merged_into": "text",
+    "status": "text",
     "title": "text",
     "updated_at": "int"
   },

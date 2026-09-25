@@ -241,6 +241,7 @@ pub fn synced_schema() -> &'static [TableSchema] {
                 ("cover_source", Text),
                 ("cover_resolved_at", Int),
                 ("merged_into", Text), // SUR-1005 synced loser→survivor pointer (SUR-916 Option 1)
+                ("status", Text), // SUR-1106 to_read|reading|shelved; NULL on pre-0059 local rows
                 ("created_at", Int),
                 ("updated_at", Int),
                 ("deleted", Bool),
@@ -1028,6 +1029,23 @@ impl Store {
             }
             None => self.conn.query_row(&sql, [], |row| row.get(0)),
         }
+    }
+
+    /// The largest `col` among live rows matching `filter` (SUR-1106: a book's newest capture), or
+    /// `None` when no live row matches. Identifier safety as [`Store::count_live`].
+    pub fn max_live_int(
+        &self,
+        table: &str,
+        col: &str,
+        filter: (&str, &str),
+    ) -> rusqlite::Result<Option<i64>> {
+        let schema = schema_or_err(table)?;
+        let (fcol, val) = filter;
+        let sql = format!(
+            "SELECT max({col}) FROM {} WHERE deleted = 0 AND {fcol} = ?1",
+            schema.name
+        );
+        self.conn.query_row(&sql, [val], |row| row.get(0))
     }
 
     /// Count rows INCLUDING tombstones — the counterpart to [`Store::count_live`], for the one
@@ -2951,7 +2969,7 @@ mod tests {
         let book = json!({
             "id":"b1", "title":"Imported", "author":null, "isbn":null,
             "cover_url":null, "cover_source":null, "cover_resolved_at":null,
-            "merged_into":null, "created_at":1, "updated_at":99, "deleted":false
+            "merged_into":null, "status":"reading", "created_at":1, "updated_at":99, "deleted":false
         });
         let note = json!({
             "id":"n1", "book_id":"b1", "text":"enc:v2:cipher", "page":null,

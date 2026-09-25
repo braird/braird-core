@@ -1171,6 +1171,11 @@ public protocol SyncEngineProtocol : AnyObject {
     func importMerge(json: String) throws  -> ImportSummary
     
     /**
+     * The Library's within-rail sort (SUR-1106). Unset or unrecognised → `DateAdded`.
+     */
+    func librarySort() throws  -> LibrarySort
+    
+    /**
      * Books for the Library / Sources grid, newest-first, each with its live `note_count`.
      */
     func listBooks(limit: UInt32, offset: UInt32) throws  -> [BookRecord]
@@ -1529,6 +1534,12 @@ public protocol SyncEngineProtocol : AnyObject {
      * PostgREST calls with it; the `user_id` stamped on each row is the token's `sub` claim.
      */
     func setAccessToken(jwt: String) 
+    
+    /**
+     * Set the Library sort. An unchanged value is not a write, compared against the RAW stored
+     * string for the reason [`SyncEngine::set_prompt_cadence`] gives (an absent row must write).
+     */
+    func setLibrarySort(sort: LibrarySort) throws 
     
     /**
      * Set the check-in cadence, clamped to 72..=672 hours (SUR-996 R4).
@@ -2225,6 +2236,16 @@ open func importMerge(json: String)throws  -> ImportSummary {
 }
     
     /**
+     * The Library's within-rail sort (SUR-1106). Unset or unrecognised → `DateAdded`.
+     */
+open func librarySort()throws  -> LibrarySort {
+    return try  FfiConverterTypeLibrarySort.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_library_sort(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * Books for the Library / Sources grid, newest-first, each with its live `note_count`.
      */
 open func listBooks(limit: UInt32, offset: UInt32)throws  -> [BookRecord] {
@@ -2755,6 +2776,17 @@ open func semanticSearch(query: String, limit: UInt32)throws  -> [SemanticHit] {
 open func setAccessToken(jwt: String) {try! rustCall() {
     uniffi_braird_core_fn_method_syncengine_set_access_token(self.uniffiClonePointer(),
         FfiConverterString.lower(jwt),$0
+    )
+}
+}
+    
+    /**
+     * Set the Library sort. An unchanged value is not a write, compared against the RAW stored
+     * string for the reason [`SyncEngine::set_prompt_cadence`] gives (an absent row must write).
+     */
+open func setLibrarySort(sort: LibrarySort)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_set_library_sort(self.uniffiClonePointer(),
+        FfiConverterTypeLibrarySort.lower(sort),$0
     )
 }
 }
@@ -3453,13 +3485,29 @@ public struct BookRecord {
     public var coverUrl: String?
     public var coverSource: String?
     public var coverResolvedAt: Int64?
+    /**
+     * SUR-1106. A pre-0059 local row (NULL) reads as `Shelved`, matching the server backfill.
+     */
+    public var status: SourceStatus
     public var createdAt: Int64
     public var updatedAt: Int64
     public var noteCount: UInt32
+    /**
+     * SUR-1106 — the newest live note's `created_at` under this book, for the picker's
+     * reading-first order. `None` when the book has no live notes.
+     */
+    public var lastCapturedAt: Int64?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: String, title: String?, author: String?, isbn: String?, coverUrl: String?, coverSource: String?, coverResolvedAt: Int64?, createdAt: Int64, updatedAt: Int64, noteCount: UInt32) {
+    public init(id: String, title: String?, author: String?, isbn: String?, coverUrl: String?, coverSource: String?, coverResolvedAt: Int64?, 
+        /**
+         * SUR-1106. A pre-0059 local row (NULL) reads as `Shelved`, matching the server backfill.
+         */status: SourceStatus, createdAt: Int64, updatedAt: Int64, noteCount: UInt32, 
+        /**
+         * SUR-1106 — the newest live note's `created_at` under this book, for the picker's
+         * reading-first order. `None` when the book has no live notes.
+         */lastCapturedAt: Int64?) {
         self.id = id
         self.title = title
         self.author = author
@@ -3467,9 +3515,11 @@ public struct BookRecord {
         self.coverUrl = coverUrl
         self.coverSource = coverSource
         self.coverResolvedAt = coverResolvedAt
+        self.status = status
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.noteCount = noteCount
+        self.lastCapturedAt = lastCapturedAt
     }
 }
 
@@ -3498,6 +3548,9 @@ extension BookRecord: Equatable, Hashable {
         if lhs.coverResolvedAt != rhs.coverResolvedAt {
             return false
         }
+        if lhs.status != rhs.status {
+            return false
+        }
         if lhs.createdAt != rhs.createdAt {
             return false
         }
@@ -3505,6 +3558,9 @@ extension BookRecord: Equatable, Hashable {
             return false
         }
         if lhs.noteCount != rhs.noteCount {
+            return false
+        }
+        if lhs.lastCapturedAt != rhs.lastCapturedAt {
             return false
         }
         return true
@@ -3518,9 +3574,11 @@ extension BookRecord: Equatable, Hashable {
         hasher.combine(coverUrl)
         hasher.combine(coverSource)
         hasher.combine(coverResolvedAt)
+        hasher.combine(status)
         hasher.combine(createdAt)
         hasher.combine(updatedAt)
         hasher.combine(noteCount)
+        hasher.combine(lastCapturedAt)
     }
 }
 
@@ -3539,9 +3597,11 @@ public struct FfiConverterTypeBookRecord: FfiConverterRustBuffer {
                 coverUrl: FfiConverterOptionString.read(from: &buf), 
                 coverSource: FfiConverterOptionString.read(from: &buf), 
                 coverResolvedAt: FfiConverterOptionInt64.read(from: &buf), 
+                status: FfiConverterTypeSourceStatus.read(from: &buf), 
                 createdAt: FfiConverterInt64.read(from: &buf), 
                 updatedAt: FfiConverterInt64.read(from: &buf), 
-                noteCount: FfiConverterUInt32.read(from: &buf)
+                noteCount: FfiConverterUInt32.read(from: &buf), 
+                lastCapturedAt: FfiConverterOptionInt64.read(from: &buf)
         )
     }
 
@@ -3553,9 +3613,11 @@ public struct FfiConverterTypeBookRecord: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.coverUrl, into: &buf)
         FfiConverterOptionString.write(value.coverSource, into: &buf)
         FfiConverterOptionInt64.write(value.coverResolvedAt, into: &buf)
+        FfiConverterTypeSourceStatus.write(value.status, into: &buf)
         FfiConverterInt64.write(value.createdAt, into: &buf)
         FfiConverterInt64.write(value.updatedAt, into: &buf)
         FfiConverterUInt32.write(value.noteCount, into: &buf)
+        FfiConverterOptionInt64.write(value.lastCapturedAt, into: &buf)
     }
 }
 
@@ -3598,13 +3660,20 @@ public struct BookUpsert {
     public var coverUrl: String?
     public var coverSource: String?
     public var coverResolvedAt: Int64?
+    /**
+     * SUR-1106. `None` keeps the stored status, or starts a NEW book as `ToRead`.
+     */
+    public var status: SourceStatus?
     public var createdAt: Int64
     public var deleted: Bool
     public var clearNullableFields: [String]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: String, title: String, author: String?, isbn: String?, coverUrl: String?, coverSource: String?, coverResolvedAt: Int64?, createdAt: Int64, deleted: Bool, clearNullableFields: [String]) {
+    public init(id: String, title: String, author: String?, isbn: String?, coverUrl: String?, coverSource: String?, coverResolvedAt: Int64?, 
+        /**
+         * SUR-1106. `None` keeps the stored status, or starts a NEW book as `ToRead`.
+         */status: SourceStatus?, createdAt: Int64, deleted: Bool, clearNullableFields: [String]) {
         self.id = id
         self.title = title
         self.author = author
@@ -3612,6 +3681,7 @@ public struct BookUpsert {
         self.coverUrl = coverUrl
         self.coverSource = coverSource
         self.coverResolvedAt = coverResolvedAt
+        self.status = status
         self.createdAt = createdAt
         self.deleted = deleted
         self.clearNullableFields = clearNullableFields
@@ -3643,6 +3713,9 @@ extension BookUpsert: Equatable, Hashable {
         if lhs.coverResolvedAt != rhs.coverResolvedAt {
             return false
         }
+        if lhs.status != rhs.status {
+            return false
+        }
         if lhs.createdAt != rhs.createdAt {
             return false
         }
@@ -3663,6 +3736,7 @@ extension BookUpsert: Equatable, Hashable {
         hasher.combine(coverUrl)
         hasher.combine(coverSource)
         hasher.combine(coverResolvedAt)
+        hasher.combine(status)
         hasher.combine(createdAt)
         hasher.combine(deleted)
         hasher.combine(clearNullableFields)
@@ -3684,6 +3758,7 @@ public struct FfiConverterTypeBookUpsert: FfiConverterRustBuffer {
                 coverUrl: FfiConverterOptionString.read(from: &buf), 
                 coverSource: FfiConverterOptionString.read(from: &buf), 
                 coverResolvedAt: FfiConverterOptionInt64.read(from: &buf), 
+                status: FfiConverterOptionTypeSourceStatus.read(from: &buf), 
                 createdAt: FfiConverterInt64.read(from: &buf), 
                 deleted: FfiConverterBool.read(from: &buf), 
                 clearNullableFields: FfiConverterSequenceString.read(from: &buf)
@@ -3698,6 +3773,7 @@ public struct FfiConverterTypeBookUpsert: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.coverUrl, into: &buf)
         FfiConverterOptionString.write(value.coverSource, into: &buf)
         FfiConverterOptionInt64.write(value.coverResolvedAt, into: &buf)
+        FfiConverterOptionTypeSourceStatus.write(value.status, into: &buf)
         FfiConverterInt64.write(value.createdAt, into: &buf)
         FfiConverterBool.write(value.deleted, into: &buf)
         FfiConverterSequenceString.write(value.clearNullableFields, into: &buf)
@@ -7078,6 +7154,74 @@ extension EmbedderError: Foundation.LocalizedError {
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * How the Library orders sources inside each status rail. The sort itself is the host's — core
+ * owns only the synced choice, so both platforms agree on which order is in force.
+ */
+
+public enum LibrarySort {
+    
+    case dateAdded
+    case alphabetical
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLibrarySort: FfiConverterRustBuffer {
+    typealias SwiftType = LibrarySort
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LibrarySort {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .dateAdded
+        
+        case 2: return .alphabetical
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: LibrarySort, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .dateAdded:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .alphabetical:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLibrarySort_lift(_ buf: RustBuffer) throws -> LibrarySort {
+    return try FfiConverterTypeLibrarySort.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLibrarySort_lower(_ value: LibrarySort) -> RustBuffer {
+    return FfiConverterTypeLibrarySort.lower(value)
+}
+
+
+
+extension LibrarySort: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * The kind of behavioural signal a host records for a note (SUR-966), mirroring surfc
  * `applyNoteSignal`. Collection lives HERE (not host-side) because `note_signals` is a
  * whole-row LWW table with no FFI read-back — a host can't increment a counter it can't read
@@ -7488,6 +7632,80 @@ extension SemanticStatus: Equatable, Hashable {}
 
 
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Where a source sits in the reader's lifecycle. Stored as `to_read | reading | shelved`.
+ */
+
+public enum SourceStatus {
+    
+    case toRead
+    case reading
+    case shelved
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSourceStatus: FfiConverterRustBuffer {
+    typealias SwiftType = SourceStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SourceStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .toRead
+        
+        case 2: return .reading
+        
+        case 3: return .shelved
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SourceStatus, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .toRead:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .reading:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .shelved:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSourceStatus_lift(_ buf: RustBuffer) throws -> SourceStatus {
+    return try FfiConverterTypeSourceStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSourceStatus_lower(_ value: SourceStatus) -> RustBuffer {
+    return FfiConverterTypeSourceStatus.lower(value)
+}
+
+
+
+extension SourceStatus: Equatable, Hashable {}
+
+
+
 
 /**
  * Errors that cross the FFI from the sync engine. Coarse like [`crate::CryptoError`]: enough
@@ -7717,6 +7935,30 @@ fileprivate struct FfiConverterOptionTypeQuestionRecord: FfiConverterRustBuffer 
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeQuestionRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeSourceStatus: FfiConverterRustBuffer {
+    typealias SwiftType = SourceStatus?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSourceStatus.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSourceStatus.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -8380,6 +8622,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_import_merge() != 65) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_braird_core_checksum_method_syncengine_library_sort() != 31826) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_braird_core_checksum_method_syncengine_list_books() != 22597) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8459,6 +8704,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_set_access_token() != 47386) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_set_library_sort() != 48647) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_set_prompt_cadence() != 59597) {

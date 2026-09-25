@@ -6,6 +6,29 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **BREAKING (FFI + schema): source lifecycle `books.status` + Library sort (SUR-1106, for
+  SUR-1100 / SUR-1102).** Consumes surfc 0059 (`status text not null`, `to_read | reading |
+  shelved`; existing server rows backfilled `shelved`, new rows default `to_read`), re-vendored
+  in `sync-schema.json`. New UniFFI enum `SourceStatus`.
+  - `BookUpsert.status: Option<SourceStatus>` — every host construction site must pass it.
+    `None` keeps the stored value on an edit, and starts a NEW book as `ToRead` (written locally,
+    so this device does not read the book as Shelved until it re-pulls).
+  - `BookRecord.status` (a pre-0059 local row, SQL NULL, reads `Shelved` — 0059's backfill does
+    not bump `change_seq`, so such rows are never re-pulled) and `BookRecord.last_captured_at`
+    (newest live note `created_at` under the book; `None` when it has none) for the note picker's
+    reading-first order.
+  - The flush omits a null `books.status` on both the upsert and the sparse-PATCH arm: the server
+    column is NOT NULL, and merge/unmerge/import stage the FULL stored row. One guard in `push.rs`
+    covers every caller.
+  - Snapshot export writes `status` (never null); import copies it and defaults a missing or
+    unknown value to `shelved` (the sources predate 0059). The frozen schema-19 import oracles
+    now carry `"status": "shelved"`. Known divergence, accepted under the PWA sunset: a PWA import
+    of the same archive leaves `status` unset, so its NEW rows take the server default `to_read`.
+  - `library_sort()` / `set_library_sort()` over the synced `user_settings` key `library_sort`
+    (`LibrarySort::{DateAdded, Alphabetical}`, default and unknown → `DateAdded`; an unchanged
+    value is not a write). No `native-schema.json` change: `user_settings` is key/value.
+
 ## [0.17.0] - 2026-09-24
 
 ### Changed
