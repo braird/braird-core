@@ -6,6 +6,8 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-09-25
+
 ### Changed
 - **BREAKING (FFI + schema): source lifecycle `books.status` + Library sort (SUR-1106, for
   SUR-1100 / SUR-1102).** Consumes surfc 0059 (`status text not null`, `to_read | reading |
@@ -42,7 +44,7 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     `merge_books`/`unmerge_books` stage the full stored row, so a stale local status can overwrite
     a newer one from another device (the documented whole-row LWW, user-initiated).
   - **Rollout:** surfc 0059 merges first (this repo's schema-drift check reads surfc/main). Apply
-    0059 to production BEFORE publishing any app release that pins this version: against a server
+    0059 to production BEFORE publishing any app release that pins v0.18.0: against a server
     without the column every book push is rejected and `fk_deps` holds its notes behind it. Probe
     first: `select status from public.books limit 0` must succeed on prod.
 
