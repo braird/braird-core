@@ -607,12 +607,23 @@ impl Store {
     /// re-opening an existing store is a no-op — plus the additive column migration
     /// below for stores created before a descriptor column existed.
     fn init_schema(&self) -> rusqlite::Result<()> {
-        // SUR-1106 — an EXISTING books table about to gain `status` (a store opened by core
-        // <= v0.17.0). Read before the migration below adds it.
-        let books_gains_status = {
-            let cols = self.table_columns("books")?;
-            !cols.is_empty() && !cols.iter().any(|(name, _)| name == "status")
-        };
+        // Local-only tables first (none references a synced table): the SUR-1106 repair below
+        // writes `meta` before the synced ALTERs run.
+        for ddl in LOCAL_ONLY_DDL {
+            self.conn.execute_batch(ddl)?;
+        }
+        // SUR-1106 — an EXISTING books table about to gain `status` is a store opened by core
+        // <= v0.17.0, which dropped `status` from every book it pulled while surfc 0059 was live:
+        // those rows will read NULL (→ Shelved) whatever the server holds. Forget the books cursor
+        // for ONE full re-pull; `sync::pull` fills a NULL status from an equal-stamp row (see
+        // `Store::fill_null_book_status`), which the strict-`>` LWW alone would never apply.
+        // BEFORE the ALTER, not after: the column's presence is the only record that the repair
+        // ran, so a crash between the two must lose the cursor (one extra re-pull), never the
+        // repair. The cursor is only a watermark, so forgetting it early is always safe.
+        let cols = self.table_columns("books")?;
+        if !cols.is_empty() && !cols.iter().any(|(name, _)| name == "status") {
+            self.meta_delete(&sync_seq_key("books"))?;
+        }
         for t in descriptor_tables() {
             self.conn.execute_batch(&create_table_sql(t))?;
             // SUR-1005 — additive local-DB migration (see `ensure_columns`): a store
@@ -628,20 +639,10 @@ impl Store {
             self.ensure_columns(t.name, &wanted)?;
             self.conn.execute_batch(&create_updated_at_index_sql(t))?;
         }
-        for ddl in LOCAL_ONLY_DDL {
-            self.conn.execute_batch(ddl)?;
-        }
         // SUR-997 — the same additive migration for the local-only `embeddings` table:
         // `content_token` postdates the original DDL, and every store created before it
         // (the table has existed, writer-less, since SUR-723) needs the ALTER on open.
         self.ensure_columns("embeddings", &[("content_token", "TEXT")])?;
-        // SUR-1106 — that store dropped `status` from every book it pulled while surfc 0059 was
-        // live, so those rows now read NULL (→ Shelved) whatever the server holds. Forget the books
-        // cursor for ONE full re-pull; `sync::pull` fills a NULL status from an equal-stamp row
-        // (see `Store::fill_null_book_status`), which the strict-`>` LWW alone would never apply.
-        if books_gains_status {
-            self.meta_delete(&sync_seq_key("books"))?;
-        }
         Ok(())
     }
 

@@ -22,16 +22,18 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     picker's reading-first order.
   - **One-time repair for stores opened by core <= v0.17.0:** such a store dropped `status` from
     every book it pulled while 0059 was live. When the local column is first added, the books pull
-    cursor is forgotten (one full books re-pull), and a pulled book that LOSES the LWW compare
+    cursor is forgotten BEFORE the ALTER (a crash between the two costs one extra re-pull, never
+    the repair), and a pulled book that LOSES the LWW compare
     (e.g. an equal stamp) still fills a local NULL `status` — that column only, no stamp, no outbox.
     Sound for `status` alone because the server column is NOT NULL, so a local NULL is never a
     value anyone chose.
   - The flush omits a null `books.status` on both the upsert and the sparse-PATCH arm (merge,
     unmerge and import stage the FULL stored row). One guard in `push.rs`.
-  - Snapshot export always writes `status` (never null). Import copies a valid status; an archive
-    without one (a PWA export or a pre-0059 archive) keeps the NEWER existing local/server row's
-    status, and uses `shelved` only for a book new to this account. The frozen schema-19 import
-    oracles carry `"status": "shelved"` (their books are new).
+  - Snapshot export always writes `status` (never null). Import (a PWA snapshot — the PWA never
+    authors a status, it only carries a pulled copy): an EXISTING book keeps the newer existing
+    local/server row's status, whatever the archive says; a book new to this account takes the
+    archive's valid status, else `shelved`. The frozen schema-19 import oracles carry
+    `"status": "shelved"` (their books are new).
   - `library_sort()` / `set_library_sort()` over the synced `user_settings` key `library_sort`
     (`LibrarySort::{DateAdded, Alphabetical}`, default and unknown → `DateAdded`; an unchanged
     value is not a write). No `native-schema.json` change: `user_settings` is key/value.

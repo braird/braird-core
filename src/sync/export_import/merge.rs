@@ -221,10 +221,12 @@ fn select_prepare_and_stage(
 
             increment(&mut imported, table)?;
             let mut candidate = candidate;
-            if table == "books" && !candidate.row.contains_key("status") {
-                // SUR-1106 — the archive does not know this book's status. The accepted row is
-                // stamped newer than everything, so inventing one would overwrite a real status:
-                // take the newer existing row's instead, and `shelved` only for a book new here.
+            if table == "books" {
+                // SUR-1106 — an existing book keeps its status. The archive is a PWA snapshot, and
+                // the PWA never authors a status (it only carries a pulled copy), so the archive's
+                // value is never a choice — and the accepted row is stamped newer than everything,
+                // so taking it would overwrite a real one. The newer existing row's status wins;
+                // the archive's only for a book new here, else `shelved` (it predates 0059).
                 let server_row = server
                     .get(table)
                     .and_then(|rows| rows.get(&candidate.primary_key));
@@ -236,7 +238,9 @@ fn select_prepare_and_stage(
                     .into_iter()
                     .flatten()
                     .find_map(|row| row.get("status").and_then(Value::as_str))
-                    .unwrap_or("shelved");
+                    .or(candidate.row.get("status").and_then(Value::as_str))
+                    .unwrap_or("shelved")
+                    .to_owned();
                 candidate.row.insert("status".into(), Value::from(status));
             }
             for timestamp in [Some(candidate.updated_at), local_updated, server_updated]
@@ -965,6 +969,7 @@ mod tests {
                 json!({"id":"both","title":"a","updatedAt":50}),
                 json!({"id":"fresh","title":"a","updatedAt":50}),
                 json!({"id":"explicit","title":"a","updatedAt":50,"status":"to_read"}),
+                json!({"id":"archived","title":"a","updatedAt":50,"status":"to_read"}),
             ],
             10,
         );
@@ -976,6 +981,7 @@ mod tests {
         };
         local("local", 5, "reading");
         local("both", 7, "to_read"); // the NEWER existing row wins
+        local("archived", 5, "reading"); // an existing status beats the archive's copy
         let sink = RecordingSink::default();
         sink.fetch_result(
             "books",
@@ -1006,7 +1012,12 @@ mod tests {
         assert_eq!(
             status("explicit"),
             json!("to_read"),
-            "the archive's own value wins"
+            "a new book takes the archive's"
+        );
+        assert_eq!(
+            status("archived"),
+            json!("reading"),
+            "an existing book keeps its own"
         );
     }
 
