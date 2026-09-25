@@ -224,11 +224,13 @@ async fn pull_table<S: PostgrestSink>(
 
             // The local row's updated_at (None = no local row) is the only thing the LWW decision
             // needs; a full-row replace on a win comes from `apply_row`.
-            let local_updated = store
+            let local = store
                 .get_row(table, id)
                 // No record id in the error (Codex review): SUR-1031 carries these strings across
                 // the FFI, and SyncError's contract is coarse — never per-record server detail.
-                .map_err(|e| format!("read local {table} row: {e}"))?
+                .map_err(|e| format!("read local {table} row: {e}"))?;
+            let local_updated = local
+                .as_ref()
                 .map(|r| r.get("updated_at").and_then(Value::as_i64).unwrap_or(0));
 
             // Tombstone: a delete for a row we don't have locally is NOT resurrected — mirrors JS
@@ -271,6 +273,18 @@ async fn pull_table<S: PostgrestSink>(
                         discarded_updated_at: discarded,
                         winning_updated_at: incoming_updated,
                     });
+                }
+            } else if table == "books"
+                && local
+                    .as_ref()
+                    .is_some_and(|r| r.get("status").is_none_or(Value::is_null))
+            {
+                // SUR-1106 — the losing row still carries the status this device never stored
+                // (dropped by a pre-v0.18 core). Fill that one column; the LWW decision stands.
+                if let Some(status) = obj.get("status").and_then(Value::as_str) {
+                    store
+                        .fill_null_book_status(id, status)
+                        .map_err(|e| format!("fill a {table} status: {e}"))?;
                 }
             }
         }
@@ -571,6 +585,41 @@ mod tests {
             store.get_row("notes", "n1").unwrap().unwrap()["text"],
             json!("local")
         );
+    }
+
+    /// SUR-1106 — a losing book row (tie or older) fills a local NULL `status` and nothing else;
+    /// a local status that is set is never touched by a losing row.
+    #[test]
+    fn a_losing_book_row_fills_only_a_null_local_status() {
+        let store = Store::open_in_memory().unwrap();
+        let book = |id: &str, ts: i64, title: &str, status: Option<&str>| {
+            json!({ "id": id, "title": title, "created_at": 1, "updated_at": ts,
+                    "deleted": false, "status": status })
+        };
+        apply_local(&store, "books", book("tie", 1000, "local", None));
+        apply_local(&store, "books", book("older", 1000, "local", None));
+        apply_local(&store, "books", book("set", 1000, "local", Some("reading")));
+        let sink = MapSink::new().with(
+            "books",
+            vec![
+                book("tie", 1000, "remote", Some("to_read")),
+                book("older", 900, "remote", Some("reading")),
+                book("set", 1000, "remote", Some("shelved")),
+            ],
+        );
+        let res = block(pull(&store, &sink, &["books"])).unwrap();
+        assert_eq!(res.merged, 0, "the LWW decision is unchanged");
+        let row = |id: &str| store.get_row("books", id).unwrap().unwrap();
+        assert_eq!(row("tie")["status"], json!("to_read"));
+        assert_eq!(row("tie")["title"], json!("local"), "status only");
+        assert_eq!(row("tie")["updated_at"], json!(1000), "no stamp change");
+        assert_eq!(row("older")["status"], json!("reading"));
+        assert_eq!(
+            row("set")["status"],
+            json!("reading"),
+            "a set status is kept"
+        );
+        assert!(store.outbox_items().unwrap().is_empty(), "no outbox write");
     }
 
     #[test]

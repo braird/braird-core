@@ -241,6 +241,7 @@ pub fn synced_schema() -> &'static [TableSchema] {
                 ("cover_source", Text),
                 ("cover_resolved_at", Int),
                 ("merged_into", Text), // SUR-1005 synced loser→survivor pointer (SUR-916 Option 1)
+                ("status", Text), // SUR-1106 to_read|reading|shelved; NULL on pre-0059 local rows
                 ("created_at", Int),
                 ("updated_at", Int),
                 ("deleted", Bool),
@@ -606,6 +607,23 @@ impl Store {
     /// re-opening an existing store is a no-op — plus the additive column migration
     /// below for stores created before a descriptor column existed.
     fn init_schema(&self) -> rusqlite::Result<()> {
+        // Local-only tables first (none references a synced table): the SUR-1106 repair below
+        // writes `meta` before the synced ALTERs run.
+        for ddl in LOCAL_ONLY_DDL {
+            self.conn.execute_batch(ddl)?;
+        }
+        // SUR-1106 — an EXISTING books table about to gain `status` is a store opened by core
+        // <= v0.17.0, which dropped `status` from every book it pulled while surfc 0059 was live:
+        // those rows will read NULL (→ Shelved) whatever the server holds. Forget the books cursor
+        // for ONE full re-pull; `sync::pull` fills a NULL status from an equal-stamp row (see
+        // `Store::fill_null_book_status`), which the strict-`>` LWW alone would never apply.
+        // BEFORE the ALTER, not after: the column's presence is the only record that the repair
+        // ran, so a crash between the two must lose the cursor (one extra re-pull), never the
+        // repair. The cursor is only a watermark, so forgetting it early is always safe.
+        let cols = self.table_columns("books")?;
+        if !cols.is_empty() && !cols.iter().any(|(name, _)| name == "status") {
+            self.meta_delete(&sync_seq_key("books"))?;
+        }
         for t in descriptor_tables() {
             self.conn.execute_batch(&create_table_sql(t))?;
             // SUR-1005 — additive local-DB migration (see `ensure_columns`): a store
@@ -620,9 +638,6 @@ impl Store {
                 .collect();
             self.ensure_columns(t.name, &wanted)?;
             self.conn.execute_batch(&create_updated_at_index_sql(t))?;
-        }
-        for ddl in LOCAL_ONLY_DDL {
-            self.conn.execute_batch(ddl)?;
         }
         // SUR-997 — the same additive migration for the local-only `embeddings` table:
         // `content_token` postdates the original DDL, and every store created before it
@@ -1028,6 +1043,34 @@ impl Store {
             }
             None => self.conn.query_row(&sql, [], |row| row.get(0)),
         }
+    }
+
+    /// The largest `col` among live rows matching `filter` (SUR-1106: a book's newest capture), or
+    /// `None` when no live row matches. Identifier safety as [`Store::count_live`].
+    pub fn max_live_int(
+        &self,
+        table: &str,
+        col: &str,
+        filter: (&str, &str),
+    ) -> rusqlite::Result<Option<i64>> {
+        let schema = schema_or_err(table)?;
+        let (fcol, val) = filter;
+        let sql = format!(
+            "SELECT max({col}) FROM {} WHERE deleted = 0 AND {fcol} = ?1",
+            schema.name
+        );
+        self.conn.query_row(&sql, [val], |row| row.get(0))
+    }
+
+    /// SUR-1106 — set a book's `status` ONLY where the local row has none. Status only: no other
+    /// column, no stamp, no outbox. Sound for this one column because the server's is NOT NULL, so
+    /// a local NULL is never a value anyone chose (unlike a cleared cover, where NULL is the edit).
+    pub fn fill_null_book_status(&self, id: &str, status: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE books SET status = ?2 WHERE id = ?1 AND status IS NULL",
+            [id, status],
+        )?;
+        Ok(())
     }
 
     /// Count rows INCLUDING tombstones — the counterpart to [`Store::count_live`], for the one
@@ -2174,6 +2217,48 @@ mod tests {
     // ── SUR-1005 additive column migration ───────────────────────────────────
 
     #[test]
+    fn a_store_gaining_book_status_forgets_only_the_books_cursor() {
+        // SUR-1106 — a pre-v0.18 store dropped `status` from rows it pulled while 0059 was live;
+        // one full books re-pull (plus the pull's NULL fill) repairs them. Other tables keep theirs,
+        // and a store that already has the column is untouched on every later open.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE books (id TEXT, title TEXT, author TEXT, isbn TEXT,                  cover_url TEXT, cover_source TEXT, cover_resolved_at INTEGER, merged_into TEXT,                  created_at INTEGER, updated_at INTEGER, deleted INTEGER, PRIMARY KEY (id));",
+            )
+            .unwrap();
+        }
+        let path = path.to_str().unwrap();
+        {
+            let store = Store::open(path).unwrap(); // gains the column; cursor was never set
+            store.set_seq_cursor("books", 40).unwrap();
+            store.set_seq_cursor("notes", 41).unwrap();
+            store
+                .conn
+                .execute_batch("ALTER TABLE books DROP COLUMN status;")
+                .unwrap();
+        }
+        let store = Store::open(path).unwrap();
+        assert_eq!(
+            store.get_seq_cursor("books").unwrap(),
+            None,
+            "books re-pulls"
+        );
+        assert_eq!(store.get_seq_cursor("notes").unwrap(), Some(41));
+
+        store.set_seq_cursor("books", 42).unwrap();
+        drop(store);
+        let store = Store::open(path).unwrap();
+        assert_eq!(
+            store.get_seq_cursor("books").unwrap(),
+            Some(42),
+            "once only"
+        );
+    }
+
+    #[test]
     fn init_schema_alters_an_existing_store_missing_a_descriptor_column() {
         // A store created BEFORE merged_into existed: hand-create books with the old DDL
         // (CREATE IF NOT EXISTS makes init_schema's create a no-op on it), then run the
@@ -2951,7 +3036,7 @@ mod tests {
         let book = json!({
             "id":"b1", "title":"Imported", "author":null, "isbn":null,
             "cover_url":null, "cover_source":null, "cover_resolved_at":null,
-            "merged_into":null, "created_at":1, "updated_at":99, "deleted":false
+            "merged_into":null, "status":"reading", "created_at":1, "updated_at":99, "deleted":false
         });
         let note = json!({
             "id":"n1", "book_id":"b1", "text":"enc:v2:cipher", "page":null,

@@ -920,6 +920,10 @@ internal open class UniffiVTableCallbackInterfaceEmbedder(
 
 
 
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -1004,6 +1008,8 @@ internal interface UniffiLib : Library {
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_import_merge(`ptr`: Pointer,`json`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_library_sort(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_list_books(`ptr`: Pointer,`limit`: Int,`offset`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_list_collections(`ptr`: Pointer,`limit`: Int,`offset`: Int,uniffi_out_err: UniffiRustCallStatus, 
@@ -1057,6 +1063,8 @@ internal interface UniffiLib : Library {
     fun uniffi_braird_core_fn_method_syncengine_semantic_search(`ptr`: Pointer,`query`: RustBuffer.ByValue,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_set_access_token(`ptr`: Pointer,`jwt`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_braird_core_fn_method_syncengine_set_library_sort(`ptr`: Pointer,`sort`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_set_prompt_cadence(`ptr`: Pointer,`cadenceHours`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -1276,6 +1284,8 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_import_merge(
     ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_library_sort(
+    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_list_books(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_list_collections(
@@ -1329,6 +1339,8 @@ internal interface UniffiLib : Library {
     fun uniffi_braird_core_checksum_method_syncengine_semantic_search(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_set_access_token(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_set_library_sort(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_set_prompt_cadence(
     ): Short
@@ -1476,6 +1488,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_import_merge() != 65.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_library_sort() != 31826.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_braird_core_checksum_method_syncengine_list_books() != 22597.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1555,6 +1570,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_set_access_token() != 47386.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_set_library_sort() != 48647.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_set_prompt_cadence() != 59597.toShort()) {
@@ -2784,6 +2802,11 @@ public interface SyncEngineInterface {
     fun `importMerge`(`json`: kotlin.String): ImportSummary
     
     /**
+     * The Library's within-rail sort (SUR-1106). Unset or unrecognised → `DateAdded`.
+     */
+    fun `librarySort`(): LibrarySort
+    
+    /**
      * Books for the Library / Sources grid, newest-first, each with its live `note_count`.
      */
     fun `listBooks`(`limit`: kotlin.UInt, `offset`: kotlin.UInt): List<BookRecord>
@@ -3142,6 +3165,12 @@ public interface SyncEngineInterface {
      * PostgREST calls with it; the `user_id` stamped on each row is the token's `sub` claim.
      */
     fun `setAccessToken`(`jwt`: kotlin.String)
+    
+    /**
+     * Set the Library sort. An unchanged value is not a write, compared against the RAW stored
+     * string for the reason [`SyncEngine::set_prompt_cadence`] gives (an absent row must write).
+     */
+    fun `setLibrarySort`(`sort`: LibrarySort)
     
     /**
      * Set the check-in cadence, clamped to 72..=672 hours (SUR-996 R4).
@@ -3944,6 +3973,22 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
 
     
     /**
+     * The Library's within-rail sort (SUR-1106). Unset or unrecognised → `DateAdded`.
+     */
+    @Throws(SyncException::class)override fun `librarySort`(): LibrarySort {
+            return FfiConverterTypeLibrarySort.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_library_sort(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * Books for the Library / Sources grid, newest-first, each with its live `note_count`.
      */
     @Throws(SyncException::class)override fun `listBooks`(`limit`: kotlin.UInt, `offset`: kotlin.UInt): List<BookRecord> {
@@ -4592,6 +4637,22 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_set_access_token(
         it, FfiConverterString.lower(`jwt`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Set the Library sort. An unchanged value is not a write, compared against the RAW stored
+     * string for the reason [`SyncEngine::set_prompt_cadence`] gives (an absent row must write).
+     */
+    @Throws(SyncException::class)override fun `setLibrarySort`(`sort`: LibrarySort)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_set_library_sort(
+        it, FfiConverterTypeLibrarySort.lower(`sort`),_status)
 }
     }
     
@@ -5453,9 +5514,18 @@ data class BookRecord (
     var `coverUrl`: kotlin.String?, 
     var `coverSource`: kotlin.String?, 
     var `coverResolvedAt`: kotlin.Long?, 
+    /**
+     * SUR-1106. A pre-0059 local row (NULL) reads as `Shelved`, matching the server backfill.
+     */
+    var `status`: SourceStatus, 
     var `createdAt`: kotlin.Long, 
     var `updatedAt`: kotlin.Long, 
-    var `noteCount`: kotlin.UInt
+    var `noteCount`: kotlin.UInt, 
+    /**
+     * SUR-1106 — the newest live note's `created_at` under this book, for the picker's
+     * reading-first order. `None` when the book has no live notes.
+     */
+    var `latestNoteCreatedAt`: kotlin.Long?
 ) {
     
     companion object
@@ -5474,9 +5544,11 @@ public object FfiConverterTypeBookRecord: FfiConverterRustBuffer<BookRecord> {
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalLong.read(buf),
+            FfiConverterTypeSourceStatus.read(buf),
             FfiConverterLong.read(buf),
             FfiConverterLong.read(buf),
             FfiConverterUInt.read(buf),
+            FfiConverterOptionalLong.read(buf),
         )
     }
 
@@ -5488,9 +5560,11 @@ public object FfiConverterTypeBookRecord: FfiConverterRustBuffer<BookRecord> {
             FfiConverterOptionalString.allocationSize(value.`coverUrl`) +
             FfiConverterOptionalString.allocationSize(value.`coverSource`) +
             FfiConverterOptionalLong.allocationSize(value.`coverResolvedAt`) +
+            FfiConverterTypeSourceStatus.allocationSize(value.`status`) +
             FfiConverterLong.allocationSize(value.`createdAt`) +
             FfiConverterLong.allocationSize(value.`updatedAt`) +
-            FfiConverterUInt.allocationSize(value.`noteCount`)
+            FfiConverterUInt.allocationSize(value.`noteCount`) +
+            FfiConverterOptionalLong.allocationSize(value.`latestNoteCreatedAt`)
     )
 
     override fun write(value: BookRecord, buf: ByteBuffer) {
@@ -5501,9 +5575,11 @@ public object FfiConverterTypeBookRecord: FfiConverterRustBuffer<BookRecord> {
             FfiConverterOptionalString.write(value.`coverUrl`, buf)
             FfiConverterOptionalString.write(value.`coverSource`, buf)
             FfiConverterOptionalLong.write(value.`coverResolvedAt`, buf)
+            FfiConverterTypeSourceStatus.write(value.`status`, buf)
             FfiConverterLong.write(value.`createdAt`, buf)
             FfiConverterLong.write(value.`updatedAt`, buf)
             FfiConverterUInt.write(value.`noteCount`, buf)
+            FfiConverterOptionalLong.write(value.`latestNoteCreatedAt`, buf)
     }
 }
 
@@ -5532,6 +5608,10 @@ data class BookUpsert (
     var `coverUrl`: kotlin.String?, 
     var `coverSource`: kotlin.String?, 
     var `coverResolvedAt`: kotlin.Long?, 
+    /**
+     * SUR-1106. `None` keeps the stored status, or starts a NEW book as `ToRead`.
+     */
+    var `status`: SourceStatus?, 
     var `createdAt`: kotlin.Long, 
     var `deleted`: kotlin.Boolean, 
     var `clearNullableFields`: List<kotlin.String>
@@ -5553,6 +5633,7 @@ public object FfiConverterTypeBookUpsert: FfiConverterRustBuffer<BookUpsert> {
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalLong.read(buf),
+            FfiConverterOptionalTypeSourceStatus.read(buf),
             FfiConverterLong.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterSequenceString.read(buf),
@@ -5567,6 +5648,7 @@ public object FfiConverterTypeBookUpsert: FfiConverterRustBuffer<BookUpsert> {
             FfiConverterOptionalString.allocationSize(value.`coverUrl`) +
             FfiConverterOptionalString.allocationSize(value.`coverSource`) +
             FfiConverterOptionalLong.allocationSize(value.`coverResolvedAt`) +
+            FfiConverterOptionalTypeSourceStatus.allocationSize(value.`status`) +
             FfiConverterLong.allocationSize(value.`createdAt`) +
             FfiConverterBoolean.allocationSize(value.`deleted`) +
             FfiConverterSequenceString.allocationSize(value.`clearNullableFields`)
@@ -5580,6 +5662,7 @@ public object FfiConverterTypeBookUpsert: FfiConverterRustBuffer<BookUpsert> {
             FfiConverterOptionalString.write(value.`coverUrl`, buf)
             FfiConverterOptionalString.write(value.`coverSource`, buf)
             FfiConverterOptionalLong.write(value.`coverResolvedAt`, buf)
+            FfiConverterOptionalTypeSourceStatus.write(value.`status`, buf)
             FfiConverterLong.write(value.`createdAt`, buf)
             FfiConverterBoolean.write(value.`deleted`, buf)
             FfiConverterSequenceString.write(value.`clearNullableFields`, buf)
@@ -7461,6 +7544,40 @@ public object FfiConverterTypeEmbedderError : FfiConverterRustBuffer<EmbedderExc
 
 
 /**
+ * How the Library orders sources inside each status rail. The sort itself is the host's — core
+ * owns only the synced choice, so both platforms agree on which order is in force.
+ */
+
+enum class LibrarySort {
+    
+    DATE_ADDED,
+    ALPHABETICAL;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeLibrarySort: FfiConverterRustBuffer<LibrarySort> {
+    override fun read(buf: ByteBuffer) = try {
+        LibrarySort.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: LibrarySort) = 4UL
+
+    override fun write(value: LibrarySort, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
  * The kind of behavioural signal a host records for a note (SUR-966), mirroring surfc
  * `applyNoteSignal`. Collection lives HERE (not host-side) because `note_signals` is a
  * whole-row LWW table with no FFI read-back — a host can't increment a counter it can't read
@@ -7671,6 +7788,47 @@ public object FfiConverterTypeSemanticStatus: FfiConverterRustBuffer<SemanticSta
     override fun allocationSize(value: SemanticStatus) = 4UL
 
     override fun write(value: SemanticStatus, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * Where a source sits in the reader's lifecycle. Stored as `to_read | reading | shelved`.
+ *
+ * "Source" is the product word for a book: this is `books.status`, carried on [`BookRecord`] and
+ * [`BookUpsert`] (named for the user-facing Sources surface, founder 2026-09-25). Unrelated to
+ * `BookRecord::cover_source`, which says where a cover image came from.
+ *
+ * [`BookRecord`]: crate::sync::read::BookRecord
+ * [`BookUpsert`]: crate::sync::BookUpsert
+ */
+
+enum class SourceStatus {
+    
+    TO_READ,
+    READING,
+    SHELVED;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSourceStatus: FfiConverterRustBuffer<SourceStatus> {
+    override fun read(buf: ByteBuffer) = try {
+        SourceStatus.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: SourceStatus) = 4UL
+
+    override fun write(value: SourceStatus, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
@@ -8002,6 +8160,38 @@ public object FfiConverterOptionalTypeQuestionRecord: FfiConverterRustBuffer<Que
         } else {
             buf.put(1)
             FfiConverterTypeQuestionRecord.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeSourceStatus: FfiConverterRustBuffer<SourceStatus?> {
+    override fun read(buf: ByteBuffer): SourceStatus? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeSourceStatus.read(buf)
+    }
+
+    override fun allocationSize(value: SourceStatus?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeSourceStatus.allocationSize(value)
+        }
+    }
+
+    override fun write(value: SourceStatus?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeSourceStatus.write(value, buf)
         }
     }
 }

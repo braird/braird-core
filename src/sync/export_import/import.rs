@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
+use crate::library::{parse_status, status_value};
 use crate::sync::SyncError;
 
 const MAX_SCHEMA_VERSION: u32 = 19;
@@ -274,6 +275,15 @@ fn normalize_book(input: &Map<String, Value>, now: i64) -> Result<Map<String, Va
         true,
     )?;
     copy_integer(input, &mut output, "createdAt", "created_at", false)?;
+    // SUR-1106 — copied only when it is a real lifecycle value. An archive with none (a PWA export,
+    // or one from before 0059) leaves it absent, and the merge keeps the existing row's status.
+    if let Some(status) = input
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|raw| status_value(parse_status(Some(raw))) == *raw)
+    {
+        output.insert("status".into(), Value::from(status));
+    }
     output.insert(
         "updated_at".into(),
         Value::from(defaulted_timestamp(input, "updatedAt", now)?),

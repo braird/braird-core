@@ -11,6 +11,7 @@
       "coverUrl": "https://example.invalid/core-cover.jpg",
       "coverSource": "manual",
       "coverResolvedAt": 29001,
+      "status": "shelved",
       "createdAt": 29000,
       "updatedAt": 29002,
       "deleted": 0

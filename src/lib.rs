@@ -57,6 +57,11 @@ pub mod fusion;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod prompt;
 
+// The source lifecycle + Library sort vocabularies (SUR-1106). Gated like `prompt`: `sync` is the
+// only consumer and the PWA carries `books.status` through without core.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod library;
+
 pub use vault::Vault;
 
 uniffi::setup_scaffolding!();

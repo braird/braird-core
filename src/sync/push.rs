@@ -193,6 +193,13 @@ pub async fn flush<S: PostgrestSink>(
                     .insert("book_id".into(), Value::String(resolved));
             }
 
+            // SUR-1106 — `books.status` is NOT NULL server-side, but a pre-0059 local row holds
+            // NULL, and merge/unmerge/import stage the FULL stored row. Omit rather than send it:
+            // the server keeps its value (or applies its default). One guard for every caller.
+            if table == "books" && group.payload.get("status").is_some_and(Value::is_null) {
+                group.payload.remove("status");
+            }
+
             // The record's own pk value — `on_conflict_for` is the pk column (`id`, or `note_id` for
             // note_signals). Recorded in `failed` if this group can't flush, so its children hold.
             let record_id = group
@@ -330,17 +337,14 @@ mod tests {
         calls: RefCell<Vec<String>>,
         conflicts: RefCell<Vec<(String, String)>>,
         patches: RefCell<Vec<(String, String, String, Value)>>,
+        upserted: RefCell<Vec<Value>>,
         fail_table: Option<String>,
     }
 
     impl PostgrestSink for VecSink {
-        async fn upsert(
-            &self,
-            table: &str,
-            on_conflict: &str,
-            _rows: &Value,
-        ) -> Result<(), String> {
+        async fn upsert(&self, table: &str, on_conflict: &str, rows: &Value) -> Result<(), String> {
             self.calls.borrow_mut().push(table.to_string());
+            self.upserted.borrow_mut().push(rows.clone());
             self.conflicts
                 .borrow_mut()
                 .push((table.to_string(), on_conflict.to_string()));
@@ -385,6 +389,7 @@ mod tests {
             calls: RefCell::new(Vec::new()),
             conflicts: RefCell::new(Vec::new()),
             patches: RefCell::new(Vec::new()),
+            upserted: RefCell::new(Vec::new()),
             fail_table: fail_table.map(String::from),
         }
     }
@@ -574,6 +579,60 @@ mod tests {
             "a complete book row must insert, not patch"
         );
         assert_eq!(result.ok.len(), 1);
+    }
+
+    /// SUR-1106 — a pre-0059 local book holds `status` NULL, and merge/unmerge/import stage the
+    /// FULL stored row. The server column is NOT NULL, so the flush must omit the key on both
+    /// dispatch arms (upsert and sparse patch), never send the null.
+    #[test]
+    fn a_null_book_status_is_omitted_from_upsert_and_patch() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .enqueue(
+                "books",
+                "full",
+                r#"{"id":"full","title":"T","created_at":1,"updated_at":2,"status":null}"#,
+                100,
+            )
+            .unwrap();
+        store
+            .enqueue(
+                "books",
+                "sparse",
+                r#"{"id":"sparse","deleted":true,"updated_at":2,"status":null}"#,
+                100,
+            )
+            .unwrap();
+        store
+            .enqueue(
+                "books",
+                "set",
+                r#"{"id":"set","title":"T","created_at":1,"status":"reading"}"#,
+                100,
+            )
+            .unwrap();
+
+        let sink = sink(None);
+        block(flush(&store, &sink, "user-1")).unwrap();
+
+        let upserted = sink.upserted.borrow();
+        let row = |id: &str| {
+            upserted
+                .iter()
+                .map(|body| &body[0])
+                .find(|row| row["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert!(row("full").get("status").is_none(), "upsert omits a null");
+        assert_eq!(
+            row("set")["status"],
+            json!("reading"),
+            "a real value is sent"
+        );
+        let patches = sink.patches.borrow();
+        assert_eq!(patches.len(), 1);
+        assert!(patches[0].3.get("status").is_none(), "patch omits a null");
     }
 
     /// SUR-1009's actual damage: the sparse book FAILED, and `fk_deps` then held every note whose

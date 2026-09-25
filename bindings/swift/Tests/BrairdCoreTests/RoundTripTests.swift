@@ -349,7 +349,7 @@ final class RoundTripTests: XCTestCase {
 
         try engine.enqueueBook(draft: BookUpsert(
             id: "b1", title: "Meditations", author: "Aurelius", isbn: nil, coverUrl: nil,
-            coverSource: nil, coverResolvedAt: nil, createdAt: 1, deleted: false,
+            coverSource: nil, coverResolvedAt: nil, status: .reading, createdAt: 1, deleted: false,
             clearNullableFields: []))
         try engine.enqueueNote(draft: NoteUpsert(
             id: "n1", bookId: "b1", plaintext: "the unexamined life is not worth living",
@@ -376,6 +376,12 @@ final class RoundTripTests: XCTestCase {
         XCTAssertEqual(books.count, 1)
         XCTAssertEqual(books[0].title, "Meditations")
         XCTAssertEqual(books[0].noteCount, 1)
+        // SUR-1106 — the lifecycle status and newest capture cross the FFI boundary.
+        XCTAssertEqual(books[0].status, .reading)
+        XCTAssertEqual(books[0].latestNoteCreatedAt, 10)
+        XCTAssertEqual(try engine.librarySort(), .dateAdded)
+        try engine.setLibrarySort(sort: .alphabetical)
+        XCTAssertEqual(try engine.librarySort(), .alphabetical)
 
         // Commonplace flat list: newest-first, decrypted plaintext, never a ciphertext sentinel.
         let all = try engine.listNotes(bookId: nil, limit: 50, offset: 0)
@@ -558,7 +564,8 @@ final class RoundTripTests: XCTestCase {
         func book(_ id: String, _ createdAt: Int64) -> BookUpsert {
             BookUpsert(
                 id: id, title: "T-\(id)", author: nil, isbn: nil, coverUrl: nil, coverSource: nil,
-                coverResolvedAt: nil, createdAt: createdAt, deleted: false, clearNullableFields: [])
+                coverResolvedAt: nil, status: nil, createdAt: createdAt, deleted: false,
+                clearNullableFields: [])
         }
         func note(_ id: String, _ bookId: String?) -> NoteUpsert {
             NoteUpsert(

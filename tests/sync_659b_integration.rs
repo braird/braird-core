@@ -98,6 +98,7 @@ fn flush_seals_text_and_upserts_via_token_handoff() {
             cover_url: None,
             cover_source: None,
             cover_resolved_at: None,
+            status: None,
             created_at: 1_700_000_000_000,
             deleted: false,
             clear_nullable_fields: vec![],

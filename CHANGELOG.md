@@ -6,6 +6,46 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING (FFI + schema): source lifecycle `books.status` + Library sort (SUR-1106, for
+  SUR-1100 / SUR-1102).** Consumes surfc 0059 (`status text not null`, `to_read | reading |
+  shelved`; existing server rows backfilled `shelved`, new rows default `to_read`), re-vendored
+  in `sync-schema.json`. New UniFFI enums `SourceStatus` ("source" = the product word for a book)
+  and `LibrarySort`.
+  - **Host break — both book records gain required fields:** `BookUpsert.status:
+    Option<SourceStatus>` and `BookRecord.status` + `BookRecord.latest_note_created_at`. Every host
+    site that constructs either record (app code AND test fixtures) must pass them.
+  - `BookUpsert.status: None` keeps the stored value on an edit and starts a book NEW TO THIS
+    DEVICE as `ToRead` (written locally; the check and the write share one store lock).
+  - `BookRecord.status`: a local NULL reads `Shelved`. `BookRecord.latest_note_created_at`: the
+    newest live note's `created_at` under the book (`None` when it has none), for the note
+    picker's reading-first order.
+  - **One-time repair for stores opened by core <= v0.17.0:** such a store dropped `status` from
+    every book it pulled while 0059 was live. When the local column is first added, the books pull
+    cursor is forgotten BEFORE the ALTER (a crash between the two costs one extra re-pull, never
+    the repair), and a pulled book that LOSES the LWW compare
+    (e.g. an equal stamp) still fills a local NULL `status` — that column only, no stamp, no outbox.
+    Sound for `status` alone because the server column is NOT NULL, so a local NULL is never a
+    value anyone chose.
+  - The flush omits a null `books.status` on both the upsert and the sparse-PATCH arm (merge,
+    unmerge and import stage the FULL stored row). One guard in `push.rs`.
+  - Snapshot export always writes `status` (never null). Import (a PWA snapshot — the PWA never
+    authors a status, it only carries a pulled copy): an EXISTING book keeps the newer existing
+    local/server row's status, whatever the archive says; a book new to this account takes the
+    archive's valid status, else `shelved`. The frozen schema-19 import oracles carry
+    `"status": "shelved"` (their books are new).
+  - `library_sort()` / `set_library_sort()` over the synced `user_settings` key `library_sort`
+    (`LibrarySort::{DateAdded, Alphabetical}`, default and unknown → `DateAdded`; an unchanged
+    value is not a write). No `native-schema.json` change: `user_settings` is key/value.
+  - Accepted residuals (founder 2026-09-25): an id the server has but this device has not pulled
+    yet, enqueued with no status, sends an explicit `to_read` over it (hosts mint fresh ids); and
+    `merge_books`/`unmerge_books` stage the full stored row, so a stale local status can overwrite
+    a newer one from another device (the documented whole-row LWW, user-initiated).
+  - **Rollout:** surfc 0059 merges first (this repo's schema-drift check reads surfc/main). Apply
+    0059 to production BEFORE publishing any app release that pins this version: against a server
+    without the column every book push is rejected and `fk_deps` holds its notes behind it. Probe
+    first: `select status from public.books limit 0` must succeed on prod.
+
 ## [0.17.0] - 2026-09-24
 
 ### Changed
