@@ -1143,6 +1143,8 @@ public protocol SyncEngineProtocol : AnyObject {
      * The lookup and the create share one store lock, so two quick shares of one link make one
      * source. `draft.url` is required (the raw shared link; normalised here). On a hit nothing is
      * written and the existing source is returned as it is — the draft's other fields are ignored.
+     * A `deleted` draft is rejected before anything is read or written: this call creates or
+     * finds a live source, never a tombstone.
      */
     func findOrCreateBookByUrl(draft: BookUpsert) throws  -> BookRecord
     
@@ -2195,6 +2197,8 @@ open func findBookByUrl(url: String)throws  -> BookRecord? {
      * The lookup and the create share one store lock, so two quick shares of one link make one
      * source. `draft.url` is required (the raw shared link; normalised here). On a hit nothing is
      * written and the existing source is returned as it is — the draft's other fields are ignored.
+     * A `deleted` draft is rejected before anything is read or written: this call creates or
+     * finds a live source, never a tombstone.
      */
 open func findOrCreateBookByUrl(draft: BookUpsert)throws  -> BookRecord {
     return try  FfiConverterTypeBookRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
@@ -8889,7 +8893,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_find_book_by_url() != 44761) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_find_or_create_book_by_url() != 32282) {
+    if (uniffi_braird_core_checksum_method_syncengine_find_or_create_book_by_url() != 19972) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_flush() != 39156) {

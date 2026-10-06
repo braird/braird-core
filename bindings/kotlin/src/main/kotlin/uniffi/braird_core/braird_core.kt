@@ -1512,7 +1512,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_find_book_by_url() != 44761.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_find_or_create_book_by_url() != 32282.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_find_or_create_book_by_url() != 19972.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_flush() != 39156.toShort()) {
@@ -2819,6 +2819,8 @@ public interface SyncEngineInterface {
      * The lookup and the create share one store lock, so two quick shares of one link make one
      * source. `draft.url` is required (the raw shared link; normalised here). On a hit nothing is
      * written and the existing source is returned as it is — the draft's other fields are ignored.
+     * A `deleted` draft is rejected before anything is read or written: this call creates or
+     * finds a live source, never a tombstone.
      */
     fun `findOrCreateBookByUrl`(`draft`: BookUpsert): BookRecord
     
@@ -3950,6 +3952,8 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * The lookup and the create share one store lock, so two quick shares of one link make one
      * source. `draft.url` is required (the raw shared link; normalised here). On a hit nothing is
      * written and the existing source is returned as it is — the draft's other fields are ignored.
+     * A `deleted` draft is rejected before anything is read or written: this call creates or
+     * finds a live source, never a tombstone.
      */
     @Throws(SyncException::class)override fun `findOrCreateBookByUrl`(`draft`: BookUpsert): BookRecord {
             return FfiConverterTypeBookRecord.lift(

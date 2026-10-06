@@ -565,7 +565,14 @@ impl SyncEngine {
     /// The lookup and the create share one store lock, so two quick shares of one link make one
     /// source. `draft.url` is required (the raw shared link; normalised here). On a hit nothing is
     /// written and the existing source is returned as it is — the draft's other fields are ignored.
+    /// A `deleted` draft is rejected before anything is read or written: this call creates or
+    /// finds a live source, never a tombstone.
     pub fn find_or_create_book_by_url(&self, draft: BookUpsert) -> Result<BookRecord, SyncError> {
+        if draft.deleted {
+            return Err(SyncError::Store(
+                "find_or_create_book_by_url needs a live draft".into(),
+            ));
+        }
         let url = draft
             .url
             .clone()
@@ -4328,6 +4335,27 @@ mod tests {
             engine.find_or_create_book_by_url(book_upsert("n1", "No link")),
             Err(SyncError::Store(_))
         ));
+    }
+
+    #[test]
+    fn find_or_create_rejects_a_tombstone_draft_and_stages_nothing() {
+        // Codex P2 on #106: a `deleted: true` draft with no match used to stage a tombstone, then
+        // fail to read it back — an error AFTER the store and outbox had changed.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        let draft = BookUpsert {
+            deleted: true,
+            ..shared("t1", SourceKind::Article, "https://e.com/gone")
+        };
+        assert!(matches!(
+            engine.find_or_create_book_by_url(draft),
+            Err(SyncError::Store(_))
+        ));
+        let store = Store::open(db_path).unwrap();
+        assert!(store.get_row("books", "t1").unwrap().is_none(), "no row");
+        assert!(store.outbox_items().unwrap().is_empty(), "no outbox write");
     }
 
     #[test]

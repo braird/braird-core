@@ -43,7 +43,8 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     so a later rule change still matches old rows — and returns the oldest
     live match, else the live survivor of a merged-away match; a deleted, unmerged match is no
     match), and `SyncEngine::find_or_create_book_by_url(draft)` — the share path: the lookup and the
-    create share one store lock, so two quick shares of one link make one source. Frozen cross-client
+    create share one store lock, so two quick shares of one link make one source; a `deleted`
+    draft is rejected before anything is read or written. Frozen cross-client
     vectors in `vendored/source-url/vectors.json`, read by the Rust, Kotlin and Swift tests.
   - Icons are NOT extracted here: the device never sees page HTML. surfc's `fetch-link-metadata`
     returns `imageUrl` / `iconUrl`; the host picks with `pick_source_cover`, fetches that image ONCE
