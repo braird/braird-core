@@ -6,6 +6,8 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-06
+
 ### Added
 - **BREAKING (FFI + schema): source kinds `books.kind` + share-link dedup `books.url` (SUR-1112,
   for SUR-1111 / SUR-1113 / SUR-1114).** Consumes surfc 0061 (`kind text not null default 'book'`,
@@ -72,11 +74,11 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     url that does not open as `null` without a count; the pull NULL-fill does not replace a local url
     that does not open (it fills only NULL).
   - **Rollout:** surfc 0061 merges first (this repo's schema-drift check reads surfc/main), and it
-    must be applied to the project a build points at before any host on this release syncs: a
+    must be applied to the project a build points at before any host on v0.19.0 syncs: a
     pre-0061 server rejects every book upsert that carries `kind` or `url`. A device still on
     v0.18 (or a PWA bundle older than surfc SUR-1112) reads an Other Media row as a book and can
     give a cover-less one an Open Library cover, sending its title there; so the host share flow
-    (SUR-1113) should ship only once the fleet runs this release.
+    (SUR-1113) should ship only once the fleet runs v0.19.0.
 
 ## [0.18.0] - 2026-09-25
 
