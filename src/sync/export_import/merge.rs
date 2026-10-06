@@ -248,6 +248,11 @@ fn select_prepare_and_stage(
                         .iter()
                         .flatten()
                         .find_map(|row| row.get(col).and_then(Value::as_str))
+                        // A stored url counts only if it opens here (as on read): otherwise the
+                        // archive's link restores it.
+                        .filter(|v| {
+                            col != "url" || vault.open_book_url(&candidate.primary_key, v).is_some()
+                        })
                         .or((col == "kind" && exists).then_some("book"))
                         .or(candidate.row.get(col).and_then(Value::as_str))
                         .or(default)

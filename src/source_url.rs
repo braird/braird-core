@@ -155,9 +155,12 @@ pub fn classify_source_url(url: String) -> SourceKind {
     }
 }
 
-/// The cover for a source created from a shared link: a podcast or a video shows its artwork or
-/// thumbnail (`image_url`, og:image), anything else its site icon (`icon_url`); each falls back to
-/// the other. Both come from the `fetch-link-metadata` unfurl. `None` → the host's kind glyph.
+/// The image to use as the cover of a source created from a shared link: a podcast or a video shows
+/// its artwork or thumbnail (`image_url`, og:image), anything else its site icon (`icon_url`); each
+/// falls back to the other. Both come from the `fetch-link-metadata` unfurl. `None` → the host's
+/// kind glyph. The result is a THIRD-PARTY URL to fetch once and copy into the app's own storage —
+/// never store it as `cover_url`: it would sync in plaintext (a video thumbnail URL names the
+/// video, defeating the sealed link) and every device would fetch it from the page owner's CDN.
 #[uniffi::export]
 pub fn pick_source_cover(
     kind: SourceKind,

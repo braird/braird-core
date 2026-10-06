@@ -635,21 +635,21 @@ mod tests {
         apply_local(
             &store,
             "books",
-            book("held", Some("article"), Some("https://a.example/x")),
+            book("held", Some("article"), Some("enc:v2:held")),
         );
         let sink = MapSink::new().with(
             "books",
             vec![
-                book("dropped", Some("video"), Some("https://youtu.be/x")),
-                book("held", Some("podcast"), Some("https://b.example/y")),
+                book("dropped", Some("video"), Some("enc:v2:server")),
+                book("held", Some("podcast"), Some("enc:v2:other")),
             ],
         );
         block(pull(&store, &sink, &["books"])).unwrap();
         let row = |id: &str| store.get_row("books", id).unwrap().unwrap();
         assert_eq!(row("dropped")["kind"], json!("video"));
-        assert_eq!(row("dropped")["url"], json!("https://youtu.be/x"));
+        assert_eq!(row("dropped")["url"], json!("enc:v2:server"));
         assert_eq!(row("held")["kind"], json!("article"));
-        assert_eq!(row("held")["url"], json!("https://a.example/x"));
+        assert_eq!(row("held")["url"], json!("enc:v2:held"));
         assert!(store.outbox_items().unwrap().is_empty(), "no outbox write");
     }
 

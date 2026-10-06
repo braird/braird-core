@@ -21,6 +21,7 @@ use crate::library::{self, SourceKind, SourceStatus};
 use crate::note_encryption::is_encrypted_v2;
 use crate::prompt::{is_active, QuestionMeta};
 use crate::search::{SearchDoc, SearchDocKind};
+use crate::source_url::normalize_source_url;
 use crate::store::Store;
 use crate::vault::Vault;
 
@@ -251,7 +252,14 @@ pub fn find_book_by_url(
     let matches: Vec<_> = store
         .books_with_a_url()?
         .into_iter()
-        .filter(|(id, _, _, sealed)| vault.open_book_url(id, sealed).as_deref() == Some(url))
+        // Re-normalised after opening, so a link stored under older normalisation rules still matches.
+        .filter(|(id, _, _, sealed)| {
+            vault
+                .open_book_url(id, sealed)
+                .and_then(normalize_source_url)
+                .as_deref()
+                == Some(url)
+        })
         .collect();
     if let Some((id, ..)) = matches.iter().find(|(_, deleted, ..)| !deleted) {
         return get_book(store, vault, id);

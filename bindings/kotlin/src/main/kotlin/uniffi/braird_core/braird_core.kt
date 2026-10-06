@@ -1446,7 +1446,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_func_normalize_source_url() != 51841.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_func_pick_source_cover() != 54204.toShort()) {
+    if (lib.uniffi_braird_core_checksum_func_pick_source_cover() != 39418.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_embedder_descriptor() != 22797.toShort()) {
@@ -9062,9 +9062,12 @@ public object FfiConverterSequenceTypeWrappedBlob: FfiConverterRustBuffer<List<W
     
 
         /**
-         * The cover for a source created from a shared link: a podcast or a video shows its artwork or
-         * thumbnail (`image_url`, og:image), anything else its site icon (`icon_url`); each falls back to
-         * the other. Both come from the `fetch-link-metadata` unfurl. `None` → the host's kind glyph.
+         * The image to use as the cover of a source created from a shared link: a podcast or a video shows
+         * its artwork or thumbnail (`image_url`, og:image), anything else its site icon (`icon_url`); each
+         * falls back to the other. Both come from the `fetch-link-metadata` unfurl. `None` → the host's
+         * kind glyph. The result is a THIRD-PARTY URL to fetch once and copy into the app's own storage —
+         * never store it as `cover_url`: it would sync in plaintext (a video thumbnail URL names the
+         * video, defeating the sealed link) and every device would fetch it from the page owner's CDN.
          */ fun `pickSourceCover`(`kind`: SourceKind, `imageUrl`: kotlin.String?, `iconUrl`: kotlin.String?): kotlin.String? {
             return FfiConverterOptionalString.lift(
     uniffiRustCall() { _status ->

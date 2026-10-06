@@ -2319,8 +2319,7 @@ impl SyncEngine {
         loser_ids: Vec<String>,
     ) -> Result<BookMergeUndo, SyncError> {
         let store = lock!(self.store);
-        reconcile::merge_books(&store, &self.vault, &survivor_id, &loser_ids)
-            .map_err(SyncError::Store)
+        reconcile::merge_books(&store, &survivor_id, &loser_ids).map_err(SyncError::Store)
     }
 
     /// Reverse a `merge_books` within the host's undo window (SUR-915). Idempotent.
@@ -2397,9 +2396,13 @@ impl SyncEngine {
         // SUR-1112 — the url is set once: a book that already has one keeps it, whatever the draft
         // says. Sealed here (enc:v2, AAD `url:{id}`), so the store, the outbox and the server hold
         // only ciphertext.
-        let has_url = existing
-            .as_ref()
-            .is_some_and(|row| row.get("url").is_some_and(|v| !v.is_null()));
+        // A stored value that does not open under this vault (another key's) is no link at all, as
+        // on read and in dedup — so a share can still set one.
+        let has_url = existing.as_ref().is_some_and(|row| {
+            row.get("url")
+                .and_then(Value::as_str)
+                .is_some_and(|sealed| self.vault.open_book_url(&id, sealed).is_some())
+        });
         if !has_url {
             insert_opt(
                 &mut row,
@@ -4294,49 +4297,6 @@ mod tests {
             engine.find_or_create_book_by_url(book_upsert("n1", "No link")),
             Err(SyncError::Store(_))
         ));
-    }
-
-    #[test]
-    fn a_merge_survivor_without_a_link_takes_the_losers_resealed() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.sqlite");
-        let db_path = db.to_str().unwrap();
-        let engine = engine_at(db_path);
-        engine
-            .enqueue_book(shared("p1", SourceKind::Podcast, "https://overcast.fm/+x"))
-            .unwrap();
-        engine.enqueue_book(book_upsert("s1", "Survivor")).unwrap();
-        engine.merge_books("s1".into(), vec!["p1".into()]).unwrap();
-        let s1 = engine.get_book("s1".into()).unwrap().unwrap();
-        assert_eq!(
-            s1.url.as_deref(),
-            Some("https://overcast.fm/+x"),
-            "opens under its own id"
-        );
-
-        // A device that pulled only the live survivor (never the tombstone) still finds it.
-        let other = dir.path().join("other.sqlite");
-        let other_path = other.to_str().unwrap();
-        let s1_row = Store::open(db_path)
-            .unwrap()
-            .get_row("books", "s1")
-            .unwrap()
-            .unwrap();
-        Store::open(other_path)
-            .unwrap()
-            .apply_row("books", &s1_row)
-            .unwrap();
-        let device = SyncEngine::open(
-            other_path.into(),
-            "https://x.supabase.co".into(),
-            "anon".into(),
-            engine.vault.clone(),
-        )
-        .unwrap();
-        let found = device
-            .find_book_by_url("https://overcast.fm/+x".into())
-            .unwrap();
-        assert_eq!(found.map(|b| b.id), Some("s1".into()));
     }
 
     #[test]
