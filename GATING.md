@@ -70,7 +70,7 @@ repo by name (`shared/personas/<name>.md`).
 | `vendored/crypto-parity/**` — the crypto parity vectors vendored from `surfc/main` | **GCE only** | Vendored-drift guard green — byte-identical to `surfc/main` (§4) — + founder sign-off | `crypto-reviewer` confirms the vectors against `surfc/main` |
 | `vendored/native-parity/**`, `scripts/check-native-parity.mjs`, `.github/workflows/native-parity-drift.yml` — the sync-behavior parity surface vendored from `surfc/main`'s SUR-845 registry snapshot + its coverage manifest (SUR-842) | **GCE only** | Native-parity drift guard green — vendored snapshot current with `surfc/main` **and** every registered behavior manifest-covered (ticket or reasoned waiver) — + founder sign-off | Founder sign-off after `security-reviewer` (the cross-repo read PAT / new CI workflow) **+** `sync-reviewer` (what a "synced behavior" is, and that the manifest maps each honestly) pass |
 | `scripts/**` — the build, codegen and gate-checking tooling. **Catch-all for scripts — kept after the specific rows above, which win first-match** (a script named in the release, bindings, sync or native-parity row is gated there, by that row's persona). Exists because enumerating scripts one at a time has silently ungated three of them: an unmatched path contributes NO row and therefore NO persona (`matchedRows` drops it), so a script-only PR weakening a gate would have reached `main` reviewed by nobody | **GCE only** | The gate the script itself enforces stays green, and its failure mode stays fail-closed — a check that can pass without running is worse than no check | Founder sign-off after a `release-integrity-reviewer` pass (these scripts ARE the gates; the question is always "can this now pass while doing nothing?") |
-| `src/**`, `tests/**`, `Cargo.toml`, `Cargo.lock` — the crate, every line of crypto, and the parity harness (`tests/parity.rs`; a harness that lies is worse than none). **Catch-all — kept LAST so the specific rows above win first-match** | **GCE only** | Parity eval green — the 10 in-scope + the normalization vectors **bit-identical**, foreign-ciphertext decrypt passes — + founder sign-off | Founder sign-off after a `crypto-reviewer` pass + a manual round-trip against a real `surfc`-written ciphertext |
+| `src/**`, `tests/**`, `Cargo.toml`, `Cargo.lock`, `vendored/source-url/**` (SUR-1112 — the frozen share-link vectors that pin src/source_url.rs) — the crate, every line of crypto, and the parity harness (`tests/parity.rs`; a harness that lies is worse than none). **Catch-all — kept LAST so the specific rows above win first-match** | **GCE only** | Parity eval green — the 10 in-scope + the normalization vectors **bit-identical**, foreign-ciphertext decrypt passes — + founder sign-off | Founder sign-off after a `crypto-reviewer` pass + a manual round-trip against a real `surfc`-written ciphertext |
 
 ### 3.2 Meta / docs / CI paths
 
@@ -127,7 +127,8 @@ production `cdylib` / bindings — a leaked nonce/salt override is a catastrophi
 nonce-reuse footgun. Production generates salt/IV internally.
 
 **Frozen wire-format constants (`crypto-reviewer` verifies verbatim):** the `surfc-*` HKDF
-info strings (`surfc-master-key-wrap-v1`, `surfc-content-tag-v1`), the 600 000 PBKDF2
+info strings (`surfc-master-key-wrap-v1`, `surfc-content-tag-v1`), the core-only book-url subkey
+info `braird-book-url-v1` (SUR-1112; `books.url` is enc:v2 under that subkey, AAD = book id), the 600 000 PBKDF2
 iteration count, standard (not URL) base64, the 12-byte IV, the **64-byte** content-tag
 HMAC subkey, and the `enc:v1` / `enc:v2` / `0x02` headers. These are protocol constants,
 not branding — they stay `surfc-*` despite the Braird rename (SUR-680 allowlist).

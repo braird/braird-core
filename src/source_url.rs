@@ -191,11 +191,12 @@ mod tests {
     fn normalize_matches_the_frozen_vectors() {
         for case in vectors()["normalize"].as_array().unwrap() {
             let input = case["in"].as_str().unwrap();
-            assert_eq!(
-                normalize_source_url(input.into()),
-                opt(&case["out"]),
-                "{input}"
-            );
+            let out = normalize_source_url(input.into());
+            assert_eq!(out, opt(&case["out"]), "{input}");
+            // Idempotent: dedup re-normalises an opened link, so a second pass must change nothing.
+            if let Some(out) = out {
+                assert_eq!(normalize_source_url(out.clone()), Some(out), "{input}");
+            }
         }
     }
 

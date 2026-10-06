@@ -253,7 +253,20 @@ mod zeroization {
 
 #[cfg(test)]
 mod book_url_seal {
-    use super::Vault;
+    use super::{new_vault, Vault};
+    use zeroize::Zeroizing;
+
+    /// Known answer for the url subkey (MK = 0x11 × 32, the parity vectors' MK). A change to the
+    /// salt, the info string or the length orphans every synced `books.url`; this pins all three.
+    #[test]
+    fn the_url_subkey_is_frozen() {
+        let vault = new_vault(Zeroizing::new([0x11u8; 32]));
+        // Cross-checked with Node: crypto.hkdfSync("sha256", 0x11×32, 0x00×32, "braird-book-url-v1", 32).
+        assert_eq!(
+            hex::encode(*vault.book_url_key()),
+            "b20d1486c7f2027dca744a4749cb0c7e3045c8403507d0daa124088e5e22c759"
+        );
+    }
 
     /// SUR-1112 — a sealed link opens only under its own row and this vault, and nothing else
     /// opens as a link: not another row's link, not note text under the same id (the subkey

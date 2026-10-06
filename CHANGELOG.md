@@ -68,7 +68,8 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     `status` alone (an Other Media row still stores the default `to_read`).
   - Accepted residuals: set-once checks the local row, so in the re-pull window after an upgrade
     an import could set a url the server already holds (same class as SUR-1106's); an export drops a
-    url that does not open as `null` without a count.
+    url that does not open as `null` without a count; the pull NULL-fill does not replace a local url
+    that does not open (it fills only NULL).
   - **Rollout:** surfc 0061 merges first (this repo's schema-drift check reads surfc/main), and it
     must be applied to the project a build points at before any host on this release syncs: a
     pre-0061 server rejects every book upsert that carries `kind` or `url`. A device still on

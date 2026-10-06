@@ -247,11 +247,13 @@ fn select_prepare_and_stage(
                     let value = existing
                         .iter()
                         .flatten()
-                        .find_map(|row| row.get(col).and_then(Value::as_str))
-                        // A stored url counts only if it opens here (as on read): otherwise the
-                        // archive's link restores it.
-                        .filter(|v| {
-                            col != "url" || vault.open_book_url(&candidate.primary_key, v).is_some()
+                        // A stored url counts only if it opens here (as on read), like a NULL:
+                        // the next row's, else the archive's, restores the link.
+                        .find_map(|row| {
+                            row.get(col).and_then(Value::as_str).filter(|v| {
+                                col != "url"
+                                    || vault.open_book_url(&candidate.primary_key, v).is_some()
+                            })
                         })
                         .or((col == "kind" && exists).then_some("book"))
                         .or(candidate.row.get(col).and_then(Value::as_str))
@@ -1082,6 +1084,39 @@ mod tests {
             vault.open_book_url("new", &sealed).as_deref(),
             Some("https://youtu.be/x")
         );
+    }
+
+    #[test]
+    fn a_stored_url_that_does_not_open_falls_through_to_the_next_row() {
+        // SUR-1112 — the newer local row holds a url that does not open (another key's); the older
+        // server row holds a valid one. Import must keep the valid one, never stage NULL over it.
+        let archive = parsed(
+            "books",
+            vec![json!({"id":"b1","title":"a","updatedAt":50})],
+            10,
+        );
+        let store = Store::open_in_memory().unwrap();
+        let vault = Vault::generate();
+        let foreign = Vault::generate().seal_book_url("b1", "https://bad.example/x");
+        let good = vault.seal_book_url("b1", "https://good.example/y");
+        let local = json!({"id":"b1","title":"l","created_at":1,"updated_at":7,"deleted":false,
+                           "url":foreign});
+        store
+            .apply_row("books", local.as_object().unwrap())
+            .unwrap();
+        let sink = RecordingSink::default();
+        sink.fetch_result(
+            "books",
+            Ok(vec![
+                json!({"id":"b1","updated_at":6,"deleted":false,"url":good}),
+            ]),
+        );
+
+        run(merge_parsed_with_sink(&store, &sink, &vault, archive, 10)).unwrap();
+
+        let sealed = store.get_row("books", "b1").unwrap().unwrap()["url"].clone();
+        let opened = vault.open_book_url("b1", sealed.as_str().unwrap());
+        assert_eq!(opened.as_deref(), Some("https://good.example/y"));
     }
 
     #[test]

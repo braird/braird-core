@@ -2394,7 +2394,7 @@ impl SyncEngine {
         insert_opt(&mut row, "status", status.map(library::status_value));
         insert_opt(&mut row, "kind", kind.map(library::kind_value));
         // SUR-1112 — the url is set once: a book that already has one keeps it, whatever the draft
-        // says. Sealed here (enc:v2, AAD `url:{id}`), so the store, the outbox and the server hold
+        // says. Sealed here (enc:v2 under the url subkey, AAD = the id), so the store, the outbox and the server hold
         // only ciphertext.
         // A stored value that does not open under this vault (another key's) is no link at all, as
         // on read and in dedup — so a share can still set one.
@@ -4271,6 +4271,37 @@ mod tests {
             Some("https://docs.example/d/secret-id/edit")
         );
         assert!(outbox_payload(db_path, 1).get("url").is_none());
+    }
+
+    #[test]
+    fn a_stored_url_that_does_not_open_is_no_link_and_old_rules_still_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        let store = Store::open(db_path).unwrap();
+        let book = |id: &str, url: String| json!({"id":id,"title":"t","created_at":1,"updated_at":1,"deleted":false,"url":url});
+        // Another key's ciphertext: set-once must not count it, so a share can set a real link.
+        let foreign = Vault::generate().seal_book_url("x1", "https://e.com/a");
+        store
+            .apply_row("books", book("x1", foreign).as_object().unwrap())
+            .unwrap();
+        // A link stored under looser rules than today's: dedup re-normalises it after opening.
+        let loose = engine.vault.seal_book_url("o1", "http://E.com/b/");
+        store
+            .apply_row("books", book("o1", loose).as_object().unwrap())
+            .unwrap();
+        drop(store);
+
+        assert_eq!(engine.get_book("x1".into()).unwrap().unwrap().url, None);
+        engine
+            .enqueue_book(shared("x1", SourceKind::Article, "https://e.com/a"))
+            .unwrap();
+        let x1 = engine.get_book("x1".into()).unwrap().unwrap();
+        assert_eq!(x1.url.as_deref(), Some("https://e.com/a"));
+
+        let found = engine.find_book_by_url("https://e.com/b".into()).unwrap();
+        assert_eq!(found.map(|b| b.id), Some("o1".into()));
     }
 
     #[test]
