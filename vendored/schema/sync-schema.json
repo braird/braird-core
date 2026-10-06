@@ -8,10 +8,12 @@
     "deleted": "bool",
     "id": "text",
     "isbn": "text",
+    "kind": "text",
     "merged_into": "text",
     "status": "text",
     "title": "text",
-    "updated_at": "int"
+    "updated_at": "int",
+    "url": "text"
   },
   "notes": {
     "book_id": "text",

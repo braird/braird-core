@@ -6,6 +6,48 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **BREAKING (FFI + schema): source kinds `books.kind` + share-link dedup `books.url` (SUR-1112,
+  for SUR-1111 / SUR-1113 / SUR-1114).** Consumes surfc 0061 (`kind text not null default 'book'`,
+  CHECK over `book | podcast | article | research_paper | video | social`; `url text`, nullable and
+  deliberately NOT unique — an offline-first push would 23505 on every retry, so dedup is local),
+  re-vendored in `sync-schema.json`. New UniFFI enum `SourceKind`.
+  - **Host break — both book records gain required fields:** `BookUpsert.kind:
+    Option<SourceKind>`, `BookUpsert.url: Option<String>`, `BookRecord.kind`, `BookRecord.url`.
+    Every host site that constructs `BookUpsert` (app code AND test fixtures) must pass them.
+  - `BookUpsert.kind: None` keeps the stored kind and starts a book new to this device as `Book`
+    (same rule as `status`). `BookUpsert.url` is stored as `normalize_url` gives it; a link that
+    does not normalise is rejected (`SyncError::Store`, nothing staged). `url` is set once, by share
+    capture: it is not clearable, and an edit form should never send it. A local NULL kind reads
+    `Book`; an unknown stored kind (from a newer core) reads `Book` but is never written back, so a
+    merge restage pushes it unchanged.
+  - New exports: `normalize_url(raw)` (http → https, host lowercased, credentials, fragment and
+    tracking parameters — `utm_*`, `fbclid`, `gclid`, `mc_cid`, `mc_eid`, `ref`, `si` — dropped, a
+    trailing `/` dropped from a non-root path; `None` for a non-http(s) link),
+    `classify_source_url(url) -> SourceKind` (host lists in `src/source_url.rs`; anything unlisted
+    is an `Article`), `pick_source_icon(kind, image_url, icon_url)` (podcast/video → the unfurl's
+    `imageUrl`, else its `iconUrl`; the rest the other way round), and
+    `SyncEngine::find_book_by_url(url)` (normalises, returns the oldest live match, else the live
+    survivor of a merged-away match; a deleted, unmerged match is no match). Frozen cross-client
+    vectors in `vendored/source-url/vectors.json`, read by the Rust, Kotlin and Swift tests.
+  - Icons are NOT extracted here: the device never sees page HTML. surfc's `fetch-link-metadata`
+    returns `imageUrl` / `iconUrl`; the host picks with `pick_source_icon` and stores the result as
+    `cover_url` with `cover_source = "unfurl"`.
+  - `reconcile_covers` now skips every non-`Book` kind: a cover-less podcast or article would
+    otherwise get a random Open Library book cover and send its title to Open Library.
+  - The SUR-1106 repair is generalised to `BOOK_FILLABLE_COLUMNS` (`status`, `kind`, `url`): a
+    store missing any of them forgets the books cursor once (before the ALTER), a pulled book that
+    loses the LWW compare fills only those columns where the local row is NULL, and the flush omits
+    a null value of any of them. Sound for `url` because it is never cleared.
+  - Snapshot export always writes `kind` (never null) and writes `url`. Import keeps an existing
+    book's kind and url (the newer existing row's), else the archive's valid kind and normalised
+    url, else `book` / none. `merge_books` keeps the survivor's whole row, so its kind and url.
+  - The Reading pin and the Library rails are host code: filter them on `kind == Book`, never on
+    `status` alone (an Other Media row still stores the default `to_read`).
+  - **Rollout:** surfc 0061 merges first (this repo's schema-drift check reads surfc/main), and it
+    must be applied to the project a build points at before any host on this release syncs: a
+    pre-0061 server rejects every book upsert that carries `kind` or `url`.
+
 ## [0.18.0] - 2026-09-25
 
 ### Changed

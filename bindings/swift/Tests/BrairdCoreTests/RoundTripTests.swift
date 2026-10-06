@@ -349,7 +349,7 @@ final class RoundTripTests: XCTestCase {
 
         try engine.enqueueBook(draft: BookUpsert(
             id: "b1", title: "Meditations", author: "Aurelius", isbn: nil, coverUrl: nil,
-            coverSource: nil, coverResolvedAt: nil, status: .reading, createdAt: 1, deleted: false,
+            coverSource: nil, coverResolvedAt: nil, status: .reading, kind: nil, url: nil, createdAt: 1, deleted: false,
             clearNullableFields: []))
         try engine.enqueueNote(draft: NoteUpsert(
             id: "n1", bookId: "b1", plaintext: "the unexamined life is not worth living",
@@ -564,7 +564,7 @@ final class RoundTripTests: XCTestCase {
         func book(_ id: String, _ createdAt: Int64) -> BookUpsert {
             BookUpsert(
                 id: id, title: "T-\(id)", author: nil, isbn: nil, coverUrl: nil, coverSource: nil,
-                coverResolvedAt: nil, status: nil, createdAt: createdAt, deleted: false,
+                coverResolvedAt: nil, status: nil, kind: nil, url: nil, createdAt: createdAt, deleted: false,
                 clearNullableFields: [])
         }
         func note(_ id: String, _ bookId: String?) -> NoteUpsert {
@@ -1148,5 +1148,45 @@ final class RoundTripTests: XCTestCase {
         let quiet = try events(fresh, created + 6_000, created)
         XCTAssertEqual(quiet.map { $0.kind }, [.initial])
         XCTAssertEqual(quiet[0].dueAt, created + 5_000 + 168 * hourMs)
+    }
+
+    /// SUR-1112 — the frozen source-link vectors through the binding, so iOS dedups and classifies a
+    /// shared link exactly as Rust and Kotlin do. Plus share-to-source dedup by url.
+    func testSourceUrlVectorsAndFindBookByUrlOverFfi() throws {
+        let url = repoRoot().appendingPathComponent("vendored/source-url/vectors.json")
+        let v = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        let kinds: [String: SourceKind] = [
+            "book": .book, "podcast": .podcast, "article": .article,
+            "research_paper": .researchPaper, "video": .video, "social": .social,
+        ]
+        func cases(_ key: String) throws -> [[String: Any]] {
+            try XCTUnwrap(v[key] as? [[String: Any]])
+        }
+        for c in try cases("normalize") {
+            let input = try XCTUnwrap(c["in"] as? String)
+            XCTAssertEqual(normalizeUrl(raw: input), c["out"] as? String, input)
+        }
+        for c in try cases("classify") {
+            let link = try XCTUnwrap(c["url"] as? String)
+            XCTAssertEqual(classifySourceUrl(url: link), kinds[try XCTUnwrap(c["kind"] as? String)], link)
+        }
+        for c in try cases("pick") {
+            let kind = try XCTUnwrap(kinds[try XCTUnwrap(c["kind"] as? String)])
+            let got = pickSourceIcon(kind: kind, imageUrl: c["image"] as? String, iconUrl: c["icon"] as? String)
+            XCTAssertEqual(got, c["out"] as? String)
+        }
+
+        let db = FileManager.default.temporaryDirectory
+            .appendingPathComponent("braird-kind-\(UUID().uuidString).sqlite")
+        let engine = try SyncEngine.open(
+            dbPath: db.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon", vault: Vault.generate())
+        try engine.enqueueBook(draft: BookUpsert(
+            id: "a1", title: "Post", author: nil, isbn: nil, coverUrl: nil, coverSource: nil,
+            coverResolvedAt: nil, status: nil, kind: .article, url: "https://example.com/post?utm_source=x",
+            createdAt: 1, deleted: false, clearNullableFields: []))
+        let hit = try engine.findBookByUrl(url: "http://example.com/post/?utm_medium=y")
+        XCTAssertEqual(hit?.id, "a1")
+        XCTAssertEqual(hit?.kind, .article)
+        XCTAssertEqual(hit?.url, "https://example.com/post")
     }
 }

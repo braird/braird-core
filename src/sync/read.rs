@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
-use crate::library::{self, SourceStatus};
+use crate::library::{self, SourceKind, SourceStatus};
 use crate::note_encryption::is_encrypted_v2;
 use crate::prompt::{is_active, QuestionMeta};
 use crate::search::{SearchDoc, SearchDocKind};
@@ -42,6 +42,10 @@ pub struct BookRecord {
     pub cover_resolved_at: Option<i64>,
     /// SUR-1106. A pre-0059 local row (NULL) reads as `Shelved`, matching the server backfill.
     pub status: SourceStatus,
+    /// SUR-1112. A pre-0061 local row (NULL) reads as `Book`, matching the server backfill.
+    pub kind: SourceKind,
+    /// SUR-1112 — the normalised link a shared source was created from; `None` for a hand-added one.
+    pub url: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub note_count: u32,
@@ -222,6 +226,34 @@ pub fn get_book(store: &Store, id: &str) -> rusqlite::Result<Option<BookRecord>>
         Some(row) if !is_deleted(&row) => Ok(Some(book_record(store, &row)?)),
         _ => Ok(None),
     }
+}
+
+/// Hops followed through `merged_into` before giving up — merges chain only as deep as a user
+/// merges a merge survivor, and a cycle (two devices merging each way offline) must still end.
+const MAX_MERGE_HOPS: usize = 16;
+
+/// The live book for an already-normalised `url` (SUR-1112): the oldest live match (a race can
+/// leave two), else the live survivor of a book with that url that was merged away. A deleted,
+/// unmerged match is no match: the user removed that source.
+pub fn find_book_by_url(store: &Store, url: &str) -> rusqlite::Result<Option<BookRecord>> {
+    let matches = store.books_with_url(url)?;
+    if let Some((id, ..)) = matches.iter().find(|(_, deleted, _)| !deleted) {
+        return get_book(store, id);
+    }
+    for (_, _, merged_into) in &matches {
+        let mut next = merged_into.clone();
+        for _ in 0..MAX_MERGE_HOPS {
+            let Some(id) = next.take() else { break };
+            let Some(row) = store.get_row("books", &id)? else {
+                break;
+            };
+            if !is_deleted(&row) {
+                return Ok(Some(book_record(store, &row)?));
+            }
+            next = string_field(&row, "merged_into");
+        }
+    }
+    Ok(None)
 }
 
 /// Notes newest-first — `book_id = None` is the Commonplace flat list (all notes), `Some` filters
@@ -771,6 +803,8 @@ fn book_record(store: &Store, row: &Map<String, Value>) -> rusqlite::Result<Book
         cover_source: string_field(row, "cover_source"),
         cover_resolved_at: opt_int_field(row, "cover_resolved_at"),
         status: library::parse_status(string_field(row, "status").as_deref()),
+        kind: library::parse_kind(string_field(row, "kind").as_deref()),
+        url: string_field(row, "url"),
         created_at: int_field(row, "created_at"),
         updated_at: int_field(row, "updated_at"),
         note_count,

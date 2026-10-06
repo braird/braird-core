@@ -1132,6 +1132,13 @@ public protocol SyncEngineProtocol : AnyObject {
     func exportSnapshot() throws  -> String
     
     /**
+     * The live source a shared link already belongs to (SUR-1112), or `None`. `url` is
+     * normalised here first, so a host passes the raw shared link. A link whose source was merged
+     * away resolves to the merge survivor; a link whose source was deleted matches nothing.
+     */
+    func findBookByUrl(url: String) throws  -> BookRecord?
+    
+    /**
      * Push every queued write to Supabase (books-first, remap, notes; failed stay queued).
      * Synchronous FFI — the async PostgREST calls run on the owned runtime via `block_on`.
      */
@@ -2158,6 +2165,19 @@ open func enqueueQuestionNote(draft: QuestionNote)throws  {try rustCallWithError
 open func exportSnapshot()throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_export_snapshot(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * The live source a shared link already belongs to (SUR-1112), or `None`. `url` is
+     * normalised here first, so a host passes the raw shared link. A link whose source was merged
+     * away resolves to the merge survivor; a link whose source was deleted matches nothing.
+     */
+open func findBookByUrl(url: String)throws  -> BookRecord? {
+    return try  FfiConverterOptionTypeBookRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_find_book_by_url(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),$0
     )
 })
 }
@@ -3489,6 +3509,14 @@ public struct BookRecord {
      * SUR-1106. A pre-0059 local row (NULL) reads as `Shelved`, matching the server backfill.
      */
     public var status: SourceStatus
+    /**
+     * SUR-1112. A pre-0061 local row (NULL) reads as `Book`, matching the server backfill.
+     */
+    public var kind: SourceKind
+    /**
+     * SUR-1112 — the normalised link a shared source was created from; `None` for a hand-added one.
+     */
+    public var url: String?
     public var createdAt: Int64
     public var updatedAt: Int64
     public var noteCount: UInt32
@@ -3503,7 +3531,13 @@ public struct BookRecord {
     public init(id: String, title: String?, author: String?, isbn: String?, coverUrl: String?, coverSource: String?, coverResolvedAt: Int64?, 
         /**
          * SUR-1106. A pre-0059 local row (NULL) reads as `Shelved`, matching the server backfill.
-         */status: SourceStatus, createdAt: Int64, updatedAt: Int64, noteCount: UInt32, 
+         */status: SourceStatus, 
+        /**
+         * SUR-1112. A pre-0061 local row (NULL) reads as `Book`, matching the server backfill.
+         */kind: SourceKind, 
+        /**
+         * SUR-1112 — the normalised link a shared source was created from; `None` for a hand-added one.
+         */url: String?, createdAt: Int64, updatedAt: Int64, noteCount: UInt32, 
         /**
          * SUR-1106 — the newest live note's `created_at` under this book, for the picker's
          * reading-first order. `None` when the book has no live notes.
@@ -3516,6 +3550,8 @@ public struct BookRecord {
         self.coverSource = coverSource
         self.coverResolvedAt = coverResolvedAt
         self.status = status
+        self.kind = kind
+        self.url = url
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.noteCount = noteCount
@@ -3551,6 +3587,12 @@ extension BookRecord: Equatable, Hashable {
         if lhs.status != rhs.status {
             return false
         }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.url != rhs.url {
+            return false
+        }
         if lhs.createdAt != rhs.createdAt {
             return false
         }
@@ -3575,6 +3617,8 @@ extension BookRecord: Equatable, Hashable {
         hasher.combine(coverSource)
         hasher.combine(coverResolvedAt)
         hasher.combine(status)
+        hasher.combine(kind)
+        hasher.combine(url)
         hasher.combine(createdAt)
         hasher.combine(updatedAt)
         hasher.combine(noteCount)
@@ -3598,6 +3642,8 @@ public struct FfiConverterTypeBookRecord: FfiConverterRustBuffer {
                 coverSource: FfiConverterOptionString.read(from: &buf), 
                 coverResolvedAt: FfiConverterOptionInt64.read(from: &buf), 
                 status: FfiConverterTypeSourceStatus.read(from: &buf), 
+                kind: FfiConverterTypeSourceKind.read(from: &buf), 
+                url: FfiConverterOptionString.read(from: &buf), 
                 createdAt: FfiConverterInt64.read(from: &buf), 
                 updatedAt: FfiConverterInt64.read(from: &buf), 
                 noteCount: FfiConverterUInt32.read(from: &buf), 
@@ -3614,6 +3660,8 @@ public struct FfiConverterTypeBookRecord: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.coverSource, into: &buf)
         FfiConverterOptionInt64.write(value.coverResolvedAt, into: &buf)
         FfiConverterTypeSourceStatus.write(value.status, into: &buf)
+        FfiConverterTypeSourceKind.write(value.kind, into: &buf)
+        FfiConverterOptionString.write(value.url, into: &buf)
         FfiConverterInt64.write(value.createdAt, into: &buf)
         FfiConverterInt64.write(value.updatedAt, into: &buf)
         FfiConverterUInt32.write(value.noteCount, into: &buf)
@@ -3664,6 +3712,18 @@ public struct BookUpsert {
      * SUR-1106. `None` keeps the stored status, or starts a NEW book as `ToRead`.
      */
     public var status: SourceStatus?
+    /**
+     * SUR-1112. `None` keeps the stored kind, or starts a NEW book as `Book`.
+     */
+    public var kind: SourceKind?
+    /**
+     * SUR-1112. The link a shared source was created from; stored as [`normalize_url`] gives it
+     * (a link that does not normalise is rejected). `None` keeps the stored url. Set once, by
+     * share capture: not clearable, and a host edit form should never send it.
+     *
+     * [`normalize_url`]: crate::source_url::normalize_url
+     */
+    public var url: String?
     public var createdAt: Int64
     public var deleted: Bool
     public var clearNullableFields: [String]
@@ -3673,7 +3733,17 @@ public struct BookUpsert {
     public init(id: String, title: String, author: String?, isbn: String?, coverUrl: String?, coverSource: String?, coverResolvedAt: Int64?, 
         /**
          * SUR-1106. `None` keeps the stored status, or starts a NEW book as `ToRead`.
-         */status: SourceStatus?, createdAt: Int64, deleted: Bool, clearNullableFields: [String]) {
+         */status: SourceStatus?, 
+        /**
+         * SUR-1112. `None` keeps the stored kind, or starts a NEW book as `Book`.
+         */kind: SourceKind?, 
+        /**
+         * SUR-1112. The link a shared source was created from; stored as [`normalize_url`] gives it
+         * (a link that does not normalise is rejected). `None` keeps the stored url. Set once, by
+         * share capture: not clearable, and a host edit form should never send it.
+         *
+         * [`normalize_url`]: crate::source_url::normalize_url
+         */url: String?, createdAt: Int64, deleted: Bool, clearNullableFields: [String]) {
         self.id = id
         self.title = title
         self.author = author
@@ -3682,6 +3752,8 @@ public struct BookUpsert {
         self.coverSource = coverSource
         self.coverResolvedAt = coverResolvedAt
         self.status = status
+        self.kind = kind
+        self.url = url
         self.createdAt = createdAt
         self.deleted = deleted
         self.clearNullableFields = clearNullableFields
@@ -3716,6 +3788,12 @@ extension BookUpsert: Equatable, Hashable {
         if lhs.status != rhs.status {
             return false
         }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.url != rhs.url {
+            return false
+        }
         if lhs.createdAt != rhs.createdAt {
             return false
         }
@@ -3737,6 +3815,8 @@ extension BookUpsert: Equatable, Hashable {
         hasher.combine(coverSource)
         hasher.combine(coverResolvedAt)
         hasher.combine(status)
+        hasher.combine(kind)
+        hasher.combine(url)
         hasher.combine(createdAt)
         hasher.combine(deleted)
         hasher.combine(clearNullableFields)
@@ -3759,6 +3839,8 @@ public struct FfiConverterTypeBookUpsert: FfiConverterRustBuffer {
                 coverSource: FfiConverterOptionString.read(from: &buf), 
                 coverResolvedAt: FfiConverterOptionInt64.read(from: &buf), 
                 status: FfiConverterOptionTypeSourceStatus.read(from: &buf), 
+                kind: FfiConverterOptionTypeSourceKind.read(from: &buf), 
+                url: FfiConverterOptionString.read(from: &buf), 
                 createdAt: FfiConverterInt64.read(from: &buf), 
                 deleted: FfiConverterBool.read(from: &buf), 
                 clearNullableFields: FfiConverterSequenceString.read(from: &buf)
@@ -3774,6 +3856,8 @@ public struct FfiConverterTypeBookUpsert: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.coverSource, into: &buf)
         FfiConverterOptionInt64.write(value.coverResolvedAt, into: &buf)
         FfiConverterOptionTypeSourceStatus.write(value.status, into: &buf)
+        FfiConverterOptionTypeSourceKind.write(value.kind, into: &buf)
+        FfiConverterOptionString.write(value.url, into: &buf)
         FfiConverterInt64.write(value.createdAt, into: &buf)
         FfiConverterBool.write(value.deleted, into: &buf)
         FfiConverterSequenceString.write(value.clearNullableFields, into: &buf)
@@ -7635,6 +7719,103 @@ extension SemanticStatus: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * What kind of source a book row is (SUR-1112, for SUR-1111). Stored as `book | podcast |
+ * article | research_paper | video | social` — a closed set (surfc 0061 CHECK); a new kind needs a
+ * core release. Only a `Book` has a reading status; the other five are the Library's "Other Media".
+ */
+
+public enum SourceKind {
+    
+    case book
+    case podcast
+    case article
+    case researchPaper
+    case video
+    case social
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSourceKind: FfiConverterRustBuffer {
+    typealias SwiftType = SourceKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SourceKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .book
+        
+        case 2: return .podcast
+        
+        case 3: return .article
+        
+        case 4: return .researchPaper
+        
+        case 5: return .video
+        
+        case 6: return .social
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SourceKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .book:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .podcast:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .article:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .researchPaper:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .video:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .social:
+            writeInt(&buf, Int32(6))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSourceKind_lift(_ buf: RustBuffer) throws -> SourceKind {
+    return try FfiConverterTypeSourceKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSourceKind_lower(_ value: SourceKind) -> RustBuffer {
+    return FfiConverterTypeSourceKind.lower(value)
+}
+
+
+
+extension SourceKind: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Where a source sits in the reader's lifecycle. Stored as `to_read | reading | shelved`.
  *
  * "Source" is the product word for a book: this is `books.status`, carried on [`BookRecord`] and
@@ -7942,6 +8123,30 @@ fileprivate struct FfiConverterOptionTypeQuestionRecord: FfiConverterRustBuffer 
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeQuestionRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeSourceKind: FfiConverterRustBuffer {
+    typealias SwiftType = SourceKind?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSourceKind.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSourceKind.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -8519,6 +8724,17 @@ fileprivate struct FfiConverterSequenceTypeWrappedBlob: FfiConverterRustBuffer {
     }
 }
 /**
+ * The kind a shared link is filed under. Takes a [`normalize_url`] result (a raw URL works too);
+ * an unparseable one, or any host not listed, is an `Article`.
+ */
+public func classifySourceUrl(url: String) -> SourceKind {
+    return try!  FfiConverterTypeSourceKind.lift(try! rustCall() {
+    uniffi_braird_core_fn_func_classify_source_url(
+        FfiConverterString.lower(url),$0
+    )
+})
+}
+/**
  * Derive a `collection_memberships` primary key from its `(collection_id, note_id)` pair — the
  * FFI-exported mirror of surfc's `membershipId(collectionId, noteId)`, so a host can look up or
  * join local membership rows by the same deterministic id the sync layer writes (SUR-726). Thin
@@ -8529,6 +8745,33 @@ public func membershipId(collectionId: String, noteId: String) -> String {
     uniffi_braird_core_fn_func_membership_id(
         FfiConverterString.lower(collectionId),
         FfiConverterString.lower(noteId),$0
+    )
+})
+}
+/**
+ * The canonical form of a shared link, or `None` when it is not an http(s) URL. Two shares of
+ * one page compare equal after this: `http` → `https`, host lowercased (the URL parser does
+ * this), credentials, fragment and tracking parameters dropped, a trailing `/` dropped from a
+ * non-root path. The path and the remaining query keep their order and their encoding.
+ */
+public func normalizeUrl(raw: String) -> String? {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_braird_core_fn_func_normalize_url(
+        FfiConverterString.lower(raw),$0
+    )
+})
+}
+/**
+ * The cover for a source created from a shared link: a podcast or a video shows its artwork or
+ * thumbnail (`image_url`, og:image), anything else its site icon (`icon_url`); each falls back to
+ * the other. Both come from the `fetch-link-metadata` unfurl. `None` → the host's kind glyph.
+ */
+public func pickSourceIcon(kind: SourceKind, imageUrl: String?, iconUrl: String?) -> String? {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_braird_core_fn_func_pick_source_icon(
+        FfiConverterTypeSourceKind.lower(kind),
+        FfiConverterOptionString.lower(imageUrl),
+        FfiConverterOptionString.lower(iconUrl),$0
     )
 })
 }
@@ -8548,7 +8791,16 @@ private var initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_braird_core_checksum_func_classify_source_url() != 34661) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_braird_core_checksum_func_membership_id() != 9610) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_func_normalize_url() != 1494) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_func_pick_source_icon() != 63477) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_embedder_descriptor() != 22797) {
@@ -8609,6 +8861,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_export_snapshot() != 42276) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_find_book_by_url() != 44761) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_flush() != 39156) {

@@ -95,6 +95,7 @@ use super::http::{CoverEgress, PostgrestSink};
 use super::outbox::resolve_book_id;
 use super::read::{decrypt_note_text, decrypt_v2_bound};
 use super::SyncEngine;
+use crate::library::{parse_kind, SourceKind};
 use crate::store::Store;
 use crate::vault::Vault;
 
@@ -1082,6 +1083,11 @@ async fn reconcile_covers<S: PostgrestSink + CoverEgress>(
     for book in &books {
         // A manual cover is the user's own choice — never overwritten.
         if row_str(book, "cover_source") == "manual" {
+            continue;
+        }
+        // SUR-1112 — Open Library has covers for books only. A podcast or an article with no
+        // icon would get a random book's cover, and its title would leave the device.
+        if parse_kind(book.get("kind").and_then(Value::as_str)) != SourceKind::Book {
             continue;
         }
         // A book that already has a cover is left as-is.
@@ -2987,6 +2993,27 @@ mod tests {
         // Second pass: already stamped → skipped, no re-query (never re-hammers Open Library).
         assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 0);
         assert_eq!(sink.search_count(), 1, "no second search for the same book");
+    }
+
+    #[test]
+    fn other_media_never_reaches_open_library_and_a_book_still_does() {
+        // SUR-1112 — a cover-less podcast (no ISBN, no icon) must not be searched by title; a
+        // book without a kind (a pre-0061 row) is still a Book.
+        let store = Store::open_in_memory().unwrap();
+        let mut podcast = cbook("p1", "Hard Fork", None);
+        podcast["kind"] = json!("podcast");
+        put(&store, "books", &podcast);
+        put(&store, "books", &cbook("b1", "Dune", None));
+        let sink = StubSink::new()
+            .with_cover("Hard Fork", hit(Some(7), None))
+            .with_cover("Dune", hit(Some(42), None));
+
+        assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 1);
+        assert_eq!(sink.search_count(), 1, "only the book was searched");
+        assert_eq!(
+            cover_of(&store, "p1"),
+            (Value::Null, Value::Null, Value::Null)
+        );
     }
 
     #[test]

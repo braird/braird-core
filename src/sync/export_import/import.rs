@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
-use crate::library::{parse_status, status_value};
+use crate::library::{kind_value, parse_kind, parse_status, status_value};
+use crate::source_url::normalize_url;
 use crate::sync::SyncError;
 
 const MAX_SCHEMA_VERSION: u32 = 19;
@@ -283,6 +284,21 @@ fn normalize_book(input: &Map<String, Value>, now: i64) -> Result<Map<String, Va
         .filter(|raw| status_value(parse_status(Some(raw))) == *raw)
     {
         output.insert("status".into(), Value::from(status));
+    }
+    // SUR-1112 — likewise a kind only when it is one of the six, and a url only in normalised form.
+    if let Some(kind) = input
+        .get("kind")
+        .and_then(Value::as_str)
+        .filter(|raw| kind_value(parse_kind(Some(raw))) == *raw)
+    {
+        output.insert("kind".into(), Value::from(kind));
+    }
+    if let Some(url) = input
+        .get("url")
+        .and_then(Value::as_str)
+        .and_then(|raw| normalize_url(raw.to_string()))
+    {
+        output.insert("url".into(), Value::from(url));
     }
     output.insert(
         "updated_at".into(),

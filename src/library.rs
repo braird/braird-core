@@ -1,4 +1,4 @@
-//! The source lifecycle and the Library sort (SUR-1106, for SUR-1100).
+//! The source lifecycle, source kinds and the Library sort (SUR-1106 for SUR-1100; SUR-1112).
 //!
 //! `books.status` is a manual, three-state lifecycle — nothing derives or clears it. The server
 //! column (surfc 0059) is `not null` with a CHECK, so the stored vocabulary is closed; the parse
@@ -35,6 +35,45 @@ pub fn parse_status(raw: Option<&str>) -> SourceStatus {
         Some("to_read") => SourceStatus::ToRead,
         Some("reading") => SourceStatus::Reading,
         _ => SourceStatus::Shelved,
+    }
+}
+
+/// What kind of source a book row is (SUR-1112, for SUR-1111). Stored as `book | podcast |
+/// article | research_paper | video | social` — a closed set (surfc 0061 CHECK); a new kind needs a
+/// core release. Only a `Book` has a reading status; the other five are the Library's "Other Media".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SourceKind {
+    Book,
+    Podcast,
+    Article,
+    ResearchPaper,
+    Video,
+    Social,
+}
+
+/// The stored form of a kind — the inverse of [`parse_kind`].
+pub fn kind_value(kind: SourceKind) -> &'static str {
+    match kind {
+        SourceKind::Book => "book",
+        SourceKind::Podcast => "podcast",
+        SourceKind::Article => "article",
+        SourceKind::ResearchPaper => "research_paper",
+        SourceKind::Video => "video",
+        SourceKind::Social => "social",
+    }
+}
+
+/// Absent or unrecognised → `Book`: the value 0061 gave every row that existed before it. A read
+/// fallback only — core never writes it back, so a kind from a newer core survives a full-row
+/// restage (merge, unmerge) unchanged.
+pub fn parse_kind(raw: Option<&str>) -> SourceKind {
+    match raw {
+        Some("podcast") => SourceKind::Podcast,
+        Some("article") => SourceKind::Article,
+        Some("research_paper") => SourceKind::ResearchPaper,
+        Some("video") => SourceKind::Video,
+        Some("social") => SourceKind::Social,
+        _ => SourceKind::Book,
     }
 }
 
@@ -80,5 +119,21 @@ mod tests {
         }
         assert_eq!(parse_status(None), SourceStatus::Shelved);
         assert_eq!(parse_status(Some("finished")), SourceStatus::Shelved);
+    }
+
+    #[test]
+    fn kind_round_trips_and_falls_back_to_book() {
+        for k in [
+            SourceKind::Book,
+            SourceKind::Podcast,
+            SourceKind::Article,
+            SourceKind::ResearchPaper,
+            SourceKind::Video,
+            SourceKind::Social,
+        ] {
+            assert_eq!(parse_kind(Some(kind_value(k))), k);
+        }
+        assert_eq!(parse_kind(None), SourceKind::Book);
+        assert_eq!(parse_kind(Some("zine")), SourceKind::Book);
     }
 }

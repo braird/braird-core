@@ -100,6 +100,8 @@
         "cover_resolved_at": null,
         "merged_into": null,
         "status": "shelved",
+        "kind": "book",
+        "url": null,
         "created_at": null,
         "updated_at": 1700000000000,
         "deleted": false

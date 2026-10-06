@@ -234,14 +234,24 @@ fn select_prepare_and_stage(
                     (Some(l), Some(s)) if local_updated >= server_updated => [Some(l), Some(s)],
                     (l, s) => [s, l],
                 };
-                let status = existing
-                    .into_iter()
-                    .flatten()
-                    .find_map(|row| row.get("status").and_then(Value::as_str))
-                    .or(candidate.row.get("status").and_then(Value::as_str))
-                    .unwrap_or("shelved")
-                    .to_owned();
-                candidate.row.insert("status".into(), Value::from(status));
+                // SUR-1112 — the same rule for `kind` (default `book`, what 0061 gave every older
+                // row) and `url` (no default: a hand-added source has none).
+                for (col, default) in [
+                    ("status", Some("shelved")),
+                    ("kind", Some("book")),
+                    ("url", None),
+                ] {
+                    let value = existing
+                        .iter()
+                        .flatten()
+                        .find_map(|row| row.get(col).and_then(Value::as_str))
+                        .or(candidate.row.get(col).and_then(Value::as_str))
+                        .or(default)
+                        .map(str::to_owned);
+                    if let Some(value) = value {
+                        candidate.row.insert(col.into(), Value::from(value));
+                    }
+                }
             }
             for timestamp in [Some(candidate.updated_at), local_updated, server_updated]
                 .into_iter()

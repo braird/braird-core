@@ -924,6 +924,14 @@ internal open class UniffiVTableCallbackInterfaceEmbedder(
 
 
 
+
+
+
+
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -995,6 +1003,8 @@ internal interface UniffiLib : Library {
     fun uniffi_braird_core_fn_method_syncengine_enqueue_question_note(`ptr`: Pointer,`draft`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_export_snapshot(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_find_book_by_url(`ptr`: Pointer,`url`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_flush(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1116,7 +1126,13 @@ internal interface UniffiLib : Library {
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_vault_wrap_with_prf(`ptr`: Pointer,`prf`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_func_classify_source_url(`url`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_func_membership_id(`collectionId`: RustBuffer.ByValue,`noteId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_func_normalize_url(`raw`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_func_pick_source_icon(`kind`: RustBuffer.ByValue,`imageUrl`: RustBuffer.ByValue,`iconUrl`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun ffi_braird_core_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1230,7 +1246,13 @@ internal interface UniffiLib : Library {
     ): Unit
     fun ffi_braird_core_rust_future_complete_void(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    fun uniffi_braird_core_checksum_func_classify_source_url(
+    ): Short
     fun uniffi_braird_core_checksum_func_membership_id(
+    ): Short
+    fun uniffi_braird_core_checksum_func_normalize_url(
+    ): Short
+    fun uniffi_braird_core_checksum_func_pick_source_icon(
     ): Short
     fun uniffi_braird_core_checksum_method_embedder_descriptor(
     ): Short
@@ -1271,6 +1293,8 @@ internal interface UniffiLib : Library {
     fun uniffi_braird_core_checksum_method_syncengine_enqueue_question_note(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_export_snapshot(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_find_book_by_url(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_flush(
     ): Short
@@ -1407,7 +1431,16 @@ private fun uniffiCheckContractApiVersion(lib: UniffiLib) {
 
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: UniffiLib) {
+    if (lib.uniffi_braird_core_checksum_func_classify_source_url() != 34661.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_braird_core_checksum_func_membership_id() != 9610.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_func_normalize_url() != 1494.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_func_pick_source_icon() != 63477.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_embedder_descriptor() != 22797.toShort()) {
@@ -1468,6 +1501,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_export_snapshot() != 42276.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_find_book_by_url() != 44761.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_flush() != 39156.toShort()) {
@@ -2763,6 +2799,13 @@ public interface SyncEngineInterface {
     fun `exportSnapshot`(): kotlin.String
     
     /**
+     * The live source a shared link already belongs to (SUR-1112), or `None`. `url` is
+     * normalised here first, so a host passes the raw shared link. A link whose source was merged
+     * away resolves to the merge survivor; a link whose source was deleted matches nothing.
+     */
+    fun `findBookByUrl`(`url`: kotlin.String): BookRecord?
+    
+    /**
      * Push every queued write to Supabase (books-first, remap, notes; failed stay queued).
      * Synchronous FFI — the async PostgREST calls run on the owned runtime via `block_on`.
      */
@@ -3860,6 +3903,24 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_export_snapshot(
         it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * The live source a shared link already belongs to (SUR-1112), or `None`. `url` is
+     * normalised here first, so a host passes the raw shared link. A link whose source was merged
+     * away resolves to the merge survivor; a link whose source was deleted matches nothing.
+     */
+    @Throws(SyncException::class)override fun `findBookByUrl`(`url`: kotlin.String): BookRecord? {
+            return FfiConverterOptionalTypeBookRecord.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_find_book_by_url(
+        it, FfiConverterString.lower(`url`),_status)
 }
     }
     )
@@ -5518,6 +5579,14 @@ data class BookRecord (
      * SUR-1106. A pre-0059 local row (NULL) reads as `Shelved`, matching the server backfill.
      */
     var `status`: SourceStatus, 
+    /**
+     * SUR-1112. A pre-0061 local row (NULL) reads as `Book`, matching the server backfill.
+     */
+    var `kind`: SourceKind, 
+    /**
+     * SUR-1112 — the normalised link a shared source was created from; `None` for a hand-added one.
+     */
+    var `url`: kotlin.String?, 
     var `createdAt`: kotlin.Long, 
     var `updatedAt`: kotlin.Long, 
     var `noteCount`: kotlin.UInt, 
@@ -5545,6 +5614,8 @@ public object FfiConverterTypeBookRecord: FfiConverterRustBuffer<BookRecord> {
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalLong.read(buf),
             FfiConverterTypeSourceStatus.read(buf),
+            FfiConverterTypeSourceKind.read(buf),
+            FfiConverterOptionalString.read(buf),
             FfiConverterLong.read(buf),
             FfiConverterLong.read(buf),
             FfiConverterUInt.read(buf),
@@ -5561,6 +5632,8 @@ public object FfiConverterTypeBookRecord: FfiConverterRustBuffer<BookRecord> {
             FfiConverterOptionalString.allocationSize(value.`coverSource`) +
             FfiConverterOptionalLong.allocationSize(value.`coverResolvedAt`) +
             FfiConverterTypeSourceStatus.allocationSize(value.`status`) +
+            FfiConverterTypeSourceKind.allocationSize(value.`kind`) +
+            FfiConverterOptionalString.allocationSize(value.`url`) +
             FfiConverterLong.allocationSize(value.`createdAt`) +
             FfiConverterLong.allocationSize(value.`updatedAt`) +
             FfiConverterUInt.allocationSize(value.`noteCount`) +
@@ -5576,6 +5649,8 @@ public object FfiConverterTypeBookRecord: FfiConverterRustBuffer<BookRecord> {
             FfiConverterOptionalString.write(value.`coverSource`, buf)
             FfiConverterOptionalLong.write(value.`coverResolvedAt`, buf)
             FfiConverterTypeSourceStatus.write(value.`status`, buf)
+            FfiConverterTypeSourceKind.write(value.`kind`, buf)
+            FfiConverterOptionalString.write(value.`url`, buf)
             FfiConverterLong.write(value.`createdAt`, buf)
             FfiConverterLong.write(value.`updatedAt`, buf)
             FfiConverterUInt.write(value.`noteCount`, buf)
@@ -5612,6 +5687,18 @@ data class BookUpsert (
      * SUR-1106. `None` keeps the stored status, or starts a NEW book as `ToRead`.
      */
     var `status`: SourceStatus?, 
+    /**
+     * SUR-1112. `None` keeps the stored kind, or starts a NEW book as `Book`.
+     */
+    var `kind`: SourceKind?, 
+    /**
+     * SUR-1112. The link a shared source was created from; stored as [`normalize_url`] gives it
+     * (a link that does not normalise is rejected). `None` keeps the stored url. Set once, by
+     * share capture: not clearable, and a host edit form should never send it.
+     *
+     * [`normalize_url`]: crate::source_url::normalize_url
+     */
+    var `url`: kotlin.String?, 
     var `createdAt`: kotlin.Long, 
     var `deleted`: kotlin.Boolean, 
     var `clearNullableFields`: List<kotlin.String>
@@ -5634,6 +5721,8 @@ public object FfiConverterTypeBookUpsert: FfiConverterRustBuffer<BookUpsert> {
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalLong.read(buf),
             FfiConverterOptionalTypeSourceStatus.read(buf),
+            FfiConverterOptionalTypeSourceKind.read(buf),
+            FfiConverterOptionalString.read(buf),
             FfiConverterLong.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterSequenceString.read(buf),
@@ -5649,6 +5738,8 @@ public object FfiConverterTypeBookUpsert: FfiConverterRustBuffer<BookUpsert> {
             FfiConverterOptionalString.allocationSize(value.`coverSource`) +
             FfiConverterOptionalLong.allocationSize(value.`coverResolvedAt`) +
             FfiConverterOptionalTypeSourceStatus.allocationSize(value.`status`) +
+            FfiConverterOptionalTypeSourceKind.allocationSize(value.`kind`) +
+            FfiConverterOptionalString.allocationSize(value.`url`) +
             FfiConverterLong.allocationSize(value.`createdAt`) +
             FfiConverterBoolean.allocationSize(value.`deleted`) +
             FfiConverterSequenceString.allocationSize(value.`clearNullableFields`)
@@ -5663,6 +5754,8 @@ public object FfiConverterTypeBookUpsert: FfiConverterRustBuffer<BookUpsert> {
             FfiConverterOptionalString.write(value.`coverSource`, buf)
             FfiConverterOptionalLong.write(value.`coverResolvedAt`, buf)
             FfiConverterOptionalTypeSourceStatus.write(value.`status`, buf)
+            FfiConverterOptionalTypeSourceKind.write(value.`kind`, buf)
+            FfiConverterOptionalString.write(value.`url`, buf)
             FfiConverterLong.write(value.`createdAt`, buf)
             FfiConverterBoolean.write(value.`deleted`, buf)
             FfiConverterSequenceString.write(value.`clearNullableFields`, buf)
@@ -7797,6 +7890,45 @@ public object FfiConverterTypeSemanticStatus: FfiConverterRustBuffer<SemanticSta
 
 
 /**
+ * What kind of source a book row is (SUR-1112, for SUR-1111). Stored as `book | podcast |
+ * article | research_paper | video | social` — a closed set (surfc 0061 CHECK); a new kind needs a
+ * core release. Only a `Book` has a reading status; the other five are the Library's "Other Media".
+ */
+
+enum class SourceKind {
+    
+    BOOK,
+    PODCAST,
+    ARTICLE,
+    RESEARCH_PAPER,
+    VIDEO,
+    SOCIAL;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSourceKind: FfiConverterRustBuffer<SourceKind> {
+    override fun read(buf: ByteBuffer) = try {
+        SourceKind.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: SourceKind) = 4UL
+
+    override fun write(value: SourceKind, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
  * Where a source sits in the reader's lifecycle. Stored as `to_read | reading | shelved`.
  *
  * "Source" is the product word for a book: this is `books.status`, carried on [`BookRecord`] and
@@ -8160,6 +8292,38 @@ public object FfiConverterOptionalTypeQuestionRecord: FfiConverterRustBuffer<Que
         } else {
             buf.put(1)
             FfiConverterTypeQuestionRecord.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeSourceKind: FfiConverterRustBuffer<SourceKind?> {
+    override fun read(buf: ByteBuffer): SourceKind? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeSourceKind.read(buf)
+    }
+
+    override fun allocationSize(value: SourceKind?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeSourceKind.allocationSize(value)
+        }
+    }
+
+    override fun write(value: SourceKind?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeSourceKind.write(value, buf)
         }
     }
 }
@@ -8820,6 +8984,19 @@ public object FfiConverterSequenceTypeWrappedBlob: FfiConverterRustBuffer<List<W
     }
 }
         /**
+         * The kind a shared link is filed under. Takes a [`normalize_url`] result (a raw URL works too);
+         * an unparseable one, or any host not listed, is an `Article`.
+         */ fun `classifySourceUrl`(`url`: kotlin.String): SourceKind {
+            return FfiConverterTypeSourceKind.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_func_classify_source_url(
+        FfiConverterString.lower(`url`),_status)
+}
+    )
+    }
+    
+
+        /**
          * Derive a `collection_memberships` primary key from its `(collection_id, note_id)` pair — the
          * FFI-exported mirror of surfc's `membershipId(collectionId, noteId)`, so a host can look up or
          * join local membership rows by the same deterministic id the sync layer writes (SUR-726). Thin
@@ -8829,6 +9006,35 @@ public object FfiConverterSequenceTypeWrappedBlob: FfiConverterRustBuffer<List<W
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_func_membership_id(
         FfiConverterString.lower(`collectionId`),FfiConverterString.lower(`noteId`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * The canonical form of a shared link, or `None` when it is not an http(s) URL. Two shares of
+         * one page compare equal after this: `http` → `https`, host lowercased (the URL parser does
+         * this), credentials, fragment and tracking parameters dropped, a trailing `/` dropped from a
+         * non-root path. The path and the remaining query keep their order and their encoding.
+         */ fun `normalizeUrl`(`raw`: kotlin.String): kotlin.String? {
+            return FfiConverterOptionalString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_func_normalize_url(
+        FfiConverterString.lower(`raw`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * The cover for a source created from a shared link: a podcast or a video shows its artwork or
+         * thumbnail (`image_url`, og:image), anything else its site icon (`icon_url`); each falls back to
+         * the other. Both come from the `fetch-link-metadata` unfurl. `None` → the host's kind glyph.
+         */ fun `pickSourceIcon`(`kind`: SourceKind, `imageUrl`: kotlin.String?, `iconUrl`: kotlin.String?): kotlin.String? {
+            return FfiConverterOptionalString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_func_pick_source_icon(
+        FfiConverterTypeSourceKind.lower(`kind`),FfiConverterOptionalString.lower(`imageUrl`),FfiConverterOptionalString.lower(`iconUrl`),_status)
 }
     )
     }
