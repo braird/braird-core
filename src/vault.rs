@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use zeroize::Zeroizing;
 
-use crate::primitives::{fill_random, hkdf32};
+use crate::primitives::fill_random;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::primitives::hkdf32_unsalted;
 use crate::{byte_encryption, content_tag, key_manager, note_encryption};
 use crate::{CryptoError, WrappedBlob};
 
@@ -142,10 +144,12 @@ impl Vault {
 
 /// HKDF info for the book-url subkey (SUR-1112). Frozen wire constant: changing it orphans every
 /// sealed `books.url`.
+#[cfg(not(target_arch = "wasm32"))]
 const BOOK_URL_INFO: &[u8] = b"braird-book-url-v1";
 
 // Crate-internal field sealing (SUR-1112). NOT `#[uniffi::export]`ed: core seals at write and opens
-// at read; a host never handles the sealed form.
+// at read; a host never handles the sealed form. Native-only, like `sync`, its only caller.
+#[cfg(not(target_arch = "wasm32"))]
 impl Vault {
     /// Seal a book's share link: enc:v2 (AAD = the book id) under a SUBKEY of the MK, HKDF info
     /// [`BOOK_URL_INFO`]. A separate key, not an AAD prefix, keeps it apart from note and question
@@ -154,8 +158,7 @@ impl Vault {
     /// A shared link can be a capability (an "anyone with the link" document), so the server and
     /// every backup hold only ciphertext; dedup runs on the device after opening.
     pub(crate) fn seal_book_url(&self, book_id: &str, url: &str) -> String {
-        let mut iv = [0u8; 12];
-        fill_random(&mut iv);
+        let (_, iv) = fresh_salt_iv(); // a fresh CSPRNG IV per call (the salt is unused)
         note_encryption::encrypt_note(self.book_url_key().as_slice(), Some(book_id), url, &iv)
     }
 
@@ -169,7 +172,7 @@ impl Vault {
     }
 
     fn book_url_key(&self) -> Zeroizing<[u8; 32]> {
-        hkdf32(&[0u8; 32], mk!(self).as_slice(), BOOK_URL_INFO)
+        hkdf32_unsalted(mk!(self).as_slice(), BOOK_URL_INFO)
     }
 }
 
