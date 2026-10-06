@@ -1,5 +1,5 @@
 {
-  "_comment": "SUR-1112 frozen vectors for normalize_url, classify_source_url and pick_source_icon. Read by Rust (src/source_url.rs), Kotlin (RoundTripTest.kt) and Swift (RoundTripTests.swift). out: null = None. kind is the stored books.kind value.",
+  "_comment": "SUR-1112 frozen vectors for normalize_source_url, classify_source_url and pick_source_cover. Read by Rust (src/source_url.rs), Kotlin (RoundTripTest.kt) and Swift (RoundTripTests.swift). out: null = None. kind is the stored books.kind value.",
   "normalize": [
     { "in": "https://example.com/post", "out": "https://example.com/post" },
     { "in": "http://example.com/post", "out": "https://example.com/post" },
@@ -15,6 +15,10 @@
     { "in": "https://example.com/post?referrer=keep", "out": "https://example.com/post?referrer=keep" },
     { "in": "https://youtu.be/dQw4w9WgXcQ?si=abc123", "out": "https://youtu.be/dQw4w9WgXcQ" },
     { "in": "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=42", "out": "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=42" },
+    { "in": "https://x.com/someone/status/123?t=AbC&s=20", "out": "https://x.com/someone/status/123" },
+    { "in": "https://www.instagram.com/p/abc/?igsh=xyz", "out": "https://www.instagram.com/p/abc" },
+    { "in": "https://www.linkedin.com/posts/a-1?trk=public&rcm=x&keep=1", "out": "https://www.linkedin.com/posts/a-1?keep=1" },
+    { "in": "https://example.com/a?t=5&s=2", "out": "https://example.com/a?t=5&s=2" },
     { "in": "https://user:pw@example.com/a", "out": "https://example.com/a" },
     { "in": "https://example.com:8443/a/", "out": "https://example.com:8443/a" },
     { "in": "http://example.com:80/a", "out": "https://example.com/a" },

@@ -11,6 +11,24 @@ use crate::library::SourceKind;
 
 /// Query keys that only track a click. `utm_*` is a prefix; the rest are exact (case-insensitive).
 const TRACKING_PARAMS: &[&str] = &["fbclid", "gclid", "mc_cid", "mc_eid", "ref", "si"];
+/// Share tokens that identify the SENDER, per host — stripped there only, because the same key
+/// means content elsewhere (YouTube's `t` is a timestamp). The link is synced, so these must not
+/// carry a third party's identity into the user's store.
+const HOST_TRACKING_PARAMS: &[(&str, &[&str])] = &[
+    ("x.com", &["t", "s"]),
+    ("twitter.com", &["t", "s"]),
+    ("instagram.com", &["igsh", "igshid"]),
+    ("linkedin.com", &["trk", "rcm"]),
+    ("tiktok.com", &["_r", "_t"]),
+];
+
+/// `host` is `domain` or one of its subdomains.
+fn on_domain(host: &str, domain: &str) -> bool {
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|rest| rest.ends_with('.'))
+}
 
 const VIDEO_HOSTS: &[&str] = &["youtube.com", "youtu.be", "vimeo.com"];
 /// Podcast apps and hosting platforms whose every page is an episode or a show.
@@ -69,7 +87,7 @@ const SOCIAL_HOSTS: &[&str] = &[
 /// this), credentials, fragment and tracking parameters dropped, a trailing `/` dropped from a
 /// non-root path. The path and the remaining query keep their order and their encoding.
 #[uniffi::export]
-pub fn normalize_url(raw: String) -> Option<String> {
+pub fn normalize_source_url(raw: String) -> Option<String> {
     let mut url = Url::parse(raw.trim()).ok()?;
     match url.scheme() {
         "https" => {}
@@ -80,11 +98,19 @@ pub fn normalize_url(raw: String) -> Option<String> {
     url.set_username("").ok()?;
     url.set_password(None).ok()?;
     url.set_fragment(None);
+    let host = url.host_str().unwrap_or("").to_string();
+    let host_params: &[&str] = HOST_TRACKING_PARAMS
+        .iter()
+        .find(|(domain, _)| on_domain(&host, domain))
+        .map_or(&[], |(_, keys)| keys);
     let query = url.query().map(|q| {
         q.split('&')
             .filter(|pair| {
                 let key = pair.split('=').next().unwrap_or("").to_ascii_lowercase();
-                !key.is_empty() && !key.starts_with("utm_") && !TRACKING_PARAMS.contains(&&*key)
+                !key.is_empty()
+                    && !key.starts_with("utm_")
+                    && !TRACKING_PARAMS.contains(&&*key)
+                    && !host_params.contains(&&*key)
             })
             .collect::<Vec<_>>()
             .join("&")
@@ -97,7 +123,7 @@ pub fn normalize_url(raw: String) -> Option<String> {
     Some(url.into())
 }
 
-/// The kind a shared link is filed under. Takes a [`normalize_url`] result (a raw URL works too);
+/// The kind a shared link is filed under. Takes a [`normalize_source_url`] result (a raw URL works too);
 /// an unparseable one, or any host not listed, is an `Article`.
 #[uniffi::export]
 pub fn classify_source_url(url: String) -> SourceKind {
@@ -105,11 +131,7 @@ pub fn classify_source_url(url: String) -> SourceKind {
         return SourceKind::Article;
     };
     let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
-    let on = |hosts: &[&str]| {
-        hosts
-            .iter()
-            .any(|h| host == *h || host.ends_with(&format!(".{h}")))
-    };
+    let on = |hosts: &[&str]| hosts.iter().any(|h| on_domain(&host, h));
     let spotify_episode = host == "open.spotify.com"
         && (parsed.path().starts_with("/episode/") || parsed.path().starts_with("/show/"));
     if on(VIDEO_HOSTS) {
@@ -129,7 +151,7 @@ pub fn classify_source_url(url: String) -> SourceKind {
 /// thumbnail (`image_url`, og:image), anything else its site icon (`icon_url`); each falls back to
 /// the other. Both come from the `fetch-link-metadata` unfurl. `None` → the host's kind glyph.
 #[uniffi::export]
-pub fn pick_source_icon(
+pub fn pick_source_cover(
     kind: SourceKind,
     image_url: Option<String>,
     icon_url: Option<String>,
@@ -158,7 +180,11 @@ mod tests {
     fn normalize_matches_the_frozen_vectors() {
         for case in vectors()["normalize"].as_array().unwrap() {
             let input = case["in"].as_str().unwrap();
-            assert_eq!(normalize_url(input.into()), opt(&case["out"]), "{input}");
+            assert_eq!(
+                normalize_source_url(input.into()),
+                opt(&case["out"]),
+                "{input}"
+            );
         }
     }
 
@@ -175,15 +201,15 @@ mod tests {
     fn pick_matches_the_frozen_vectors() {
         for case in vectors()["pick"].as_array().unwrap() {
             let kind = parse_kind(case["kind"].as_str());
-            let got = pick_source_icon(kind, opt(&case["image"]), opt(&case["icon"]));
+            let got = pick_source_cover(kind, opt(&case["image"]), opt(&case["icon"]));
             assert_eq!(got, opt(&case["out"]), "{case}");
         }
     }
 
     #[test]
     fn utm_variants_of_one_article_normalize_equal() {
-        let a = normalize_url("https://example.com/post?utm_source=x&utm_medium=y".into());
-        let b = normalize_url("http://EXAMPLE.com/post/?utm_campaign=z#comments".into());
+        let a = normalize_source_url("https://example.com/post?utm_source=x&utm_medium=y".into());
+        let b = normalize_source_url("http://EXAMPLE.com/post/?utm_campaign=z#comments".into());
         assert_eq!(a, b);
         assert_eq!(a.as_deref(), Some("https://example.com/post"));
     }

@@ -1164,7 +1164,7 @@ final class RoundTripTests: XCTestCase {
         }
         for c in try cases("normalize") {
             let input = try XCTUnwrap(c["in"] as? String)
-            XCTAssertEqual(normalizeUrl(raw: input), c["out"] as? String, input)
+            XCTAssertEqual(normalizeSourceUrl(raw: input), c["out"] as? String, input)
         }
         for c in try cases("classify") {
             let link = try XCTUnwrap(c["url"] as? String)
@@ -1172,7 +1172,7 @@ final class RoundTripTests: XCTestCase {
         }
         for c in try cases("pick") {
             let kind = try XCTUnwrap(kinds[try XCTUnwrap(c["kind"] as? String)])
-            let got = pickSourceIcon(kind: kind, imageUrl: c["image"] as? String, iconUrl: c["icon"] as? String)
+            let got = pickSourceCover(kind: kind, imageUrl: c["image"] as? String, iconUrl: c["icon"] as? String)
             XCTAssertEqual(got, c["out"] as? String)
         }
 

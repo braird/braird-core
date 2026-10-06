@@ -95,7 +95,6 @@ use super::http::{CoverEgress, PostgrestSink};
 use super::outbox::resolve_book_id;
 use super::read::{decrypt_note_text, decrypt_v2_bound};
 use super::SyncEngine;
-use crate::library::{parse_kind, SourceKind};
 use crate::store::Store;
 use crate::vault::Vault;
 
@@ -1086,8 +1085,13 @@ async fn reconcile_covers<S: PostgrestSink + CoverEgress>(
             continue;
         }
         // SUR-1112 — Open Library has covers for books only. A podcast or an article with no
-        // icon would get a random book's cover, and its title would leave the device.
-        if parse_kind(book.get("kind").and_then(Value::as_str)) != SourceKind::Book {
+        // icon would get a random book's cover, and its title would leave the device. Only a
+        // stored `book` or a pre-0061 NULL qualifies: a kind this core does not know (a newer
+        // core's) reads as Book elsewhere, but its title must not leave the device either.
+        if !matches!(
+            book.get("kind").and_then(Value::as_str),
+            None | Some("book")
+        ) {
             continue;
         }
         // A book that already has a cover is left as-is.
@@ -3003,9 +3007,13 @@ mod tests {
         let mut podcast = cbook("p1", "Hard Fork", None);
         podcast["kind"] = json!("podcast");
         put(&store, "books", &podcast);
+        let mut zine = cbook("z1", "Unknown Kind", None);
+        zine["kind"] = json!("zine"); // a newer core's kind
+        put(&store, "books", &zine);
         put(&store, "books", &cbook("b1", "Dune", None));
         let sink = StubSink::new()
             .with_cover("Hard Fork", hit(Some(7), None))
+            .with_cover("Unknown Kind", hit(Some(8), None))
             .with_cover("Dune", hit(Some(42), None));
 
         assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 1);

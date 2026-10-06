@@ -15,26 +15,28 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   - **Host break — both book records gain required fields:** `BookUpsert.kind:
     Option<SourceKind>`, `BookUpsert.url: Option<String>`, `BookRecord.kind`, `BookRecord.url`.
     Every host site that constructs `BookUpsert` (app code AND test fixtures) must pass them.
-  - `BookUpsert.kind: None` keeps the stored kind and starts a book new to this device as `Book`
-    (same rule as `status`). `BookUpsert.url` is stored as `normalize_url` gives it; a link that
+  - `BookUpsert.kind: None` keeps the stored kind; a new book with none stays NULL locally and
+    reads `Book`, the server default (no explicit write, unlike `status`, so an unpulled server
+    row's kind is never overwritten). `BookUpsert.url` is stored as `normalize_source_url` gives it; a link that
     does not normalise is rejected (`SyncError::Store`, nothing staged). `url` is set once, by share
     capture: it is not clearable, and an edit form should never send it. A local NULL kind reads
     `Book`; an unknown stored kind (from a newer core) reads `Book` but is never written back, so a
     merge restage pushes it unchanged.
-  - New exports: `normalize_url(raw)` (http → https, host lowercased, credentials, fragment and
+  - New exports: `normalize_source_url(raw)` (http → https, host lowercased, credentials, fragment and
     tracking parameters — `utm_*`, `fbclid`, `gclid`, `mc_cid`, `mc_eid`, `ref`, `si` — dropped, a
     trailing `/` dropped from a non-root path; `None` for a non-http(s) link),
     `classify_source_url(url) -> SourceKind` (host lists in `src/source_url.rs`; anything unlisted
-    is an `Article`), `pick_source_icon(kind, image_url, icon_url)` (podcast/video → the unfurl's
+    is an `Article`), `pick_source_cover(kind, image_url, icon_url)` (podcast/video → the unfurl's
     `imageUrl`, else its `iconUrl`; the rest the other way round), and
     `SyncEngine::find_book_by_url(url)` (normalises, returns the oldest live match, else the live
     survivor of a merged-away match; a deleted, unmerged match is no match). Frozen cross-client
     vectors in `vendored/source-url/vectors.json`, read by the Rust, Kotlin and Swift tests.
   - Icons are NOT extracted here: the device never sees page HTML. surfc's `fetch-link-metadata`
-    returns `imageUrl` / `iconUrl`; the host picks with `pick_source_icon` and stores the result as
+    returns `imageUrl` / `iconUrl`; the host picks with `pick_source_cover` and stores the result as
     `cover_url` with `cover_source = "unfurl"`.
-  - `reconcile_covers` now skips every non-`Book` kind: a cover-less podcast or article would
-    otherwise get a random Open Library book cover and send its title to Open Library.
+  - `reconcile_covers` now resolves only a stored `book` or a NULL kind (an unknown kind is
+    skipped too): a cover-less podcast or article would otherwise get a random Open Library book
+    cover and send its title to Open Library.
   - The SUR-1106 repair is generalised to `BOOK_FILLABLE_COLUMNS` (`status`, `kind`, `url`): a
     store missing any of them forgets the books cursor once (before the ALTER), a pulled book that
     loses the LWW compare fills only those columns where the local row is NULL, and the flush omits
@@ -46,7 +48,10 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     `status` alone (an Other Media row still stores the default `to_read`).
   - **Rollout:** surfc 0061 merges first (this repo's schema-drift check reads surfc/main), and it
     must be applied to the project a build points at before any host on this release syncs: a
-    pre-0061 server rejects every book upsert that carries `kind` or `url`.
+    pre-0061 server rejects every book upsert that carries `kind` or `url`. A device still on
+    v0.18 (or a PWA bundle older than surfc SUR-1112) reads an Other Media row as a book and can
+    give a cover-less one an Open Library cover, sending its title there; so the host share flow
+    (SUR-1113) should ship only once the fleet runs this release.
 
 ## [0.18.0] - 2026-09-25
 

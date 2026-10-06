@@ -1130,9 +1130,9 @@ internal interface UniffiLib : Library {
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_func_membership_id(`collectionId`: RustBuffer.ByValue,`noteId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    fun uniffi_braird_core_fn_func_normalize_url(`raw`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_braird_core_fn_func_normalize_source_url(`raw`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    fun uniffi_braird_core_fn_func_pick_source_icon(`kind`: RustBuffer.ByValue,`imageUrl`: RustBuffer.ByValue,`iconUrl`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_braird_core_fn_func_pick_source_cover(`kind`: RustBuffer.ByValue,`imageUrl`: RustBuffer.ByValue,`iconUrl`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun ffi_braird_core_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1250,9 +1250,9 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_braird_core_checksum_func_membership_id(
     ): Short
-    fun uniffi_braird_core_checksum_func_normalize_url(
+    fun uniffi_braird_core_checksum_func_normalize_source_url(
     ): Short
-    fun uniffi_braird_core_checksum_func_pick_source_icon(
+    fun uniffi_braird_core_checksum_func_pick_source_cover(
     ): Short
     fun uniffi_braird_core_checksum_method_embedder_descriptor(
     ): Short
@@ -1431,16 +1431,16 @@ private fun uniffiCheckContractApiVersion(lib: UniffiLib) {
 
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: UniffiLib) {
-    if (lib.uniffi_braird_core_checksum_func_classify_source_url() != 34661.toShort()) {
+    if (lib.uniffi_braird_core_checksum_func_classify_source_url() != 16780.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_func_membership_id() != 9610.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_func_normalize_url() != 1494.toShort()) {
+    if (lib.uniffi_braird_core_checksum_func_normalize_source_url() != 51841.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_func_pick_source_icon() != 63477.toShort()) {
+    if (lib.uniffi_braird_core_checksum_func_pick_source_cover() != 54204.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_embedder_descriptor() != 22797.toShort()) {
@@ -5580,7 +5580,8 @@ data class BookRecord (
      */
     var `status`: SourceStatus, 
     /**
-     * SUR-1112. A pre-0061 local row (NULL) reads as `Book`, matching the server backfill.
+     * SUR-1112. A pre-0061 local row (NULL) reads as `Book`, matching the server backfill; so does a
+     * kind from a newer core that this one does not know.
      */
     var `kind`: SourceKind, 
     /**
@@ -5688,15 +5689,13 @@ data class BookUpsert (
      */
     var `status`: SourceStatus?, 
     /**
-     * SUR-1112. `None` keeps the stored kind, or starts a NEW book as `Book`.
+     * SUR-1112. `None` keeps the stored kind; a new book with none is a `Book` (the server default).
      */
     var `kind`: SourceKind?, 
     /**
-     * SUR-1112. The link a shared source was created from; stored as [`normalize_url`] gives it
-     * (a link that does not normalise is rejected). `None` keeps the stored url. Set once, by
-     * share capture: not clearable, and a host edit form should never send it.
-     *
-     * [`normalize_url`]: crate::source_url::normalize_url
+     * SUR-1112. The link a shared source was created from, stored as `normalize_source_url`
+     * gives it (a link that does not normalise is rejected). `None` keeps the stored url. Set
+     * once, by share capture: not clearable, and a host edit form should never send it.
      */
     var `url`: kotlin.String?, 
     var `createdAt`: kotlin.Long, 
@@ -8984,7 +8983,7 @@ public object FfiConverterSequenceTypeWrappedBlob: FfiConverterRustBuffer<List<W
     }
 }
         /**
-         * The kind a shared link is filed under. Takes a [`normalize_url`] result (a raw URL works too);
+         * The kind a shared link is filed under. Takes a [`normalize_source_url`] result (a raw URL works too);
          * an unparseable one, or any host not listed, is an `Article`.
          */ fun `classifySourceUrl`(`url`: kotlin.String): SourceKind {
             return FfiConverterTypeSourceKind.lift(
@@ -9016,10 +9015,10 @@ public object FfiConverterSequenceTypeWrappedBlob: FfiConverterRustBuffer<List<W
          * one page compare equal after this: `http` → `https`, host lowercased (the URL parser does
          * this), credentials, fragment and tracking parameters dropped, a trailing `/` dropped from a
          * non-root path. The path and the remaining query keep their order and their encoding.
-         */ fun `normalizeUrl`(`raw`: kotlin.String): kotlin.String? {
+         */ fun `normalizeSourceUrl`(`raw`: kotlin.String): kotlin.String? {
             return FfiConverterOptionalString.lift(
     uniffiRustCall() { _status ->
-    UniffiLib.INSTANCE.uniffi_braird_core_fn_func_normalize_url(
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_func_normalize_source_url(
         FfiConverterString.lower(`raw`),_status)
 }
     )
@@ -9030,10 +9029,10 @@ public object FfiConverterSequenceTypeWrappedBlob: FfiConverterRustBuffer<List<W
          * The cover for a source created from a shared link: a podcast or a video shows its artwork or
          * thumbnail (`image_url`, og:image), anything else its site icon (`icon_url`); each falls back to
          * the other. Both come from the `fetch-link-metadata` unfurl. `None` → the host's kind glyph.
-         */ fun `pickSourceIcon`(`kind`: SourceKind, `imageUrl`: kotlin.String?, `iconUrl`: kotlin.String?): kotlin.String? {
+         */ fun `pickSourceCover`(`kind`: SourceKind, `imageUrl`: kotlin.String?, `iconUrl`: kotlin.String?): kotlin.String? {
             return FfiConverterOptionalString.lift(
     uniffiRustCall() { _status ->
-    UniffiLib.INSTANCE.uniffi_braird_core_fn_func_pick_source_icon(
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_func_pick_source_cover(
         FfiConverterTypeSourceKind.lower(`kind`),FfiConverterOptionalString.lower(`imageUrl`),FfiConverterOptionalString.lower(`iconUrl`),_status)
 }
     )

@@ -3510,7 +3510,8 @@ public struct BookRecord {
      */
     public var status: SourceStatus
     /**
-     * SUR-1112. A pre-0061 local row (NULL) reads as `Book`, matching the server backfill.
+     * SUR-1112. A pre-0061 local row (NULL) reads as `Book`, matching the server backfill; so does a
+     * kind from a newer core that this one does not know.
      */
     public var kind: SourceKind
     /**
@@ -3533,7 +3534,8 @@ public struct BookRecord {
          * SUR-1106. A pre-0059 local row (NULL) reads as `Shelved`, matching the server backfill.
          */status: SourceStatus, 
         /**
-         * SUR-1112. A pre-0061 local row (NULL) reads as `Book`, matching the server backfill.
+         * SUR-1112. A pre-0061 local row (NULL) reads as `Book`, matching the server backfill; so does a
+         * kind from a newer core that this one does not know.
          */kind: SourceKind, 
         /**
          * SUR-1112 — the normalised link a shared source was created from; `None` for a hand-added one.
@@ -3713,15 +3715,13 @@ public struct BookUpsert {
      */
     public var status: SourceStatus?
     /**
-     * SUR-1112. `None` keeps the stored kind, or starts a NEW book as `Book`.
+     * SUR-1112. `None` keeps the stored kind; a new book with none is a `Book` (the server default).
      */
     public var kind: SourceKind?
     /**
-     * SUR-1112. The link a shared source was created from; stored as [`normalize_url`] gives it
-     * (a link that does not normalise is rejected). `None` keeps the stored url. Set once, by
-     * share capture: not clearable, and a host edit form should never send it.
-     *
-     * [`normalize_url`]: crate::source_url::normalize_url
+     * SUR-1112. The link a shared source was created from, stored as `normalize_source_url`
+     * gives it (a link that does not normalise is rejected). `None` keeps the stored url. Set
+     * once, by share capture: not clearable, and a host edit form should never send it.
      */
     public var url: String?
     public var createdAt: Int64
@@ -3735,14 +3735,12 @@ public struct BookUpsert {
          * SUR-1106. `None` keeps the stored status, or starts a NEW book as `ToRead`.
          */status: SourceStatus?, 
         /**
-         * SUR-1112. `None` keeps the stored kind, or starts a NEW book as `Book`.
+         * SUR-1112. `None` keeps the stored kind; a new book with none is a `Book` (the server default).
          */kind: SourceKind?, 
         /**
-         * SUR-1112. The link a shared source was created from; stored as [`normalize_url`] gives it
-         * (a link that does not normalise is rejected). `None` keeps the stored url. Set once, by
-         * share capture: not clearable, and a host edit form should never send it.
-         *
-         * [`normalize_url`]: crate::source_url::normalize_url
+         * SUR-1112. The link a shared source was created from, stored as `normalize_source_url`
+         * gives it (a link that does not normalise is rejected). `None` keeps the stored url. Set
+         * once, by share capture: not clearable, and a host edit form should never send it.
          */url: String?, createdAt: Int64, deleted: Bool, clearNullableFields: [String]) {
         self.id = id
         self.title = title
@@ -8724,7 +8722,7 @@ fileprivate struct FfiConverterSequenceTypeWrappedBlob: FfiConverterRustBuffer {
     }
 }
 /**
- * The kind a shared link is filed under. Takes a [`normalize_url`] result (a raw URL works too);
+ * The kind a shared link is filed under. Takes a [`normalize_source_url`] result (a raw URL works too);
  * an unparseable one, or any host not listed, is an `Article`.
  */
 public func classifySourceUrl(url: String) -> SourceKind {
@@ -8754,9 +8752,9 @@ public func membershipId(collectionId: String, noteId: String) -> String {
  * this), credentials, fragment and tracking parameters dropped, a trailing `/` dropped from a
  * non-root path. The path and the remaining query keep their order and their encoding.
  */
-public func normalizeUrl(raw: String) -> String? {
+public func normalizeSourceUrl(raw: String) -> String? {
     return try!  FfiConverterOptionString.lift(try! rustCall() {
-    uniffi_braird_core_fn_func_normalize_url(
+    uniffi_braird_core_fn_func_normalize_source_url(
         FfiConverterString.lower(raw),$0
     )
 })
@@ -8766,9 +8764,9 @@ public func normalizeUrl(raw: String) -> String? {
  * thumbnail (`image_url`, og:image), anything else its site icon (`icon_url`); each falls back to
  * the other. Both come from the `fetch-link-metadata` unfurl. `None` → the host's kind glyph.
  */
-public func pickSourceIcon(kind: SourceKind, imageUrl: String?, iconUrl: String?) -> String? {
+public func pickSourceCover(kind: SourceKind, imageUrl: String?, iconUrl: String?) -> String? {
     return try!  FfiConverterOptionString.lift(try! rustCall() {
-    uniffi_braird_core_fn_func_pick_source_icon(
+    uniffi_braird_core_fn_func_pick_source_cover(
         FfiConverterTypeSourceKind.lower(kind),
         FfiConverterOptionString.lower(imageUrl),
         FfiConverterOptionString.lower(iconUrl),$0
@@ -8791,16 +8789,16 @@ private var initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_braird_core_checksum_func_classify_source_url() != 34661) {
+    if (uniffi_braird_core_checksum_func_classify_source_url() != 16780) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_func_membership_id() != 9610) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_func_normalize_url() != 1494) {
+    if (uniffi_braird_core_checksum_func_normalize_source_url() != 51841) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_func_pick_source_icon() != 63477) {
+    if (uniffi_braird_core_checksum_func_pick_source_cover() != 54204) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_embedder_descriptor() != 22797) {

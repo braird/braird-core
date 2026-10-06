@@ -43,7 +43,7 @@ use crate::prompt::{
     PROMPT_CADENCE_KEY, PROMPT_SKIPPED_AT_KEY, PROMPT_TONE_KEY,
 };
 use crate::search::{SearchDoc, SearchDocKind, SearchHit};
-use crate::source_url::normalize_url;
+use crate::source_url::normalize_source_url;
 use crate::store::{synced_table_names, StageExistingWriteError, Store};
 use crate::vault::Vault;
 use export_import::import::{compute_importance, source_prior};
@@ -251,13 +251,11 @@ pub struct BookUpsert {
     pub cover_resolved_at: Option<i64>,
     /// SUR-1106. `None` keeps the stored status, or starts a NEW book as `ToRead`.
     pub status: Option<SourceStatus>,
-    /// SUR-1112. `None` keeps the stored kind, or starts a NEW book as `Book`.
+    /// SUR-1112. `None` keeps the stored kind; a new book with none is a `Book` (the server default).
     pub kind: Option<SourceKind>,
-    /// SUR-1112. The link a shared source was created from; stored as [`normalize_url`] gives it
-    /// (a link that does not normalise is rejected). `None` keeps the stored url. Set once, by
-    /// share capture: not clearable, and a host edit form should never send it.
-    ///
-    /// [`normalize_url`]: crate::source_url::normalize_url
+    /// SUR-1112. The link a shared source was created from, stored as `normalize_source_url`
+    /// gives it (a link that does not normalise is rejected). `None` keeps the stored url. Set
+    /// once, by share capture: not clearable, and a host edit form should never send it.
     pub url: Option<String>,
     pub created_at: i64,
     pub deleted: bool,
@@ -575,7 +573,7 @@ impl SyncEngine {
         } = draft;
         let url = url
             .map(|raw| {
-                normalize_url(raw)
+                normalize_source_url(raw)
                     .ok_or_else(|| SyncError::Store("book url is not an http(s) URL".into()))
             })
             .transpose()?;
@@ -601,10 +599,10 @@ impl SyncEngine {
         // Accepted residual (founder 2026-09-25): "new" means new HERE, so an id the server has
         // but this device has not pulled yet would send an explicit `to_read` over it. Hosts
         // mint a fresh id for a new book, so that needs a host bug.
-        // SUR-1112 — a new book with no kind is a `Book`, written locally for the same reason.
+        // SUR-1112 — no such default for `kind`: a local NULL already reads `Book`, the server
+        // default, so writing it would only risk the residual above for a non-book source.
         let is_new = store.get_row("books", &id).map_err(store_err)?.is_none();
         let status = status.or(is_new.then_some(SourceStatus::ToRead));
-        let kind = kind.or(is_new.then_some(SourceKind::Book));
         insert_opt(&mut row, "status", status.map(library::status_value));
         insert_opt(&mut row, "kind", kind.map(library::kind_value));
         store
@@ -2137,7 +2135,7 @@ impl SyncEngine {
     /// normalised here first, so a host passes the raw shared link. A link whose source was merged
     /// away resolves to the merge survivor; a link whose source was deleted matches nothing.
     pub fn find_book_by_url(&self, url: String) -> Result<Option<BookRecord>, SyncError> {
-        let Some(url) = normalize_url(url) else {
+        let Some(url) = normalize_source_url(url) else {
             return Ok(None);
         };
         let store = lock!(self.store);

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Map, Value};
 
 use crate::library::{kind_value, parse_kind, parse_status, status_value};
-use crate::source_url::normalize_url;
+use crate::source_url::normalize_source_url;
 use crate::sync::SyncError;
 
 const MAX_SCHEMA_VERSION: u32 = 19;
@@ -296,7 +296,7 @@ fn normalize_book(input: &Map<String, Value>, now: i64) -> Result<Map<String, Va
     if let Some(url) = input
         .get("url")
         .and_then(Value::as_str)
-        .and_then(|raw| normalize_url(raw.to_string()))
+        .and_then(|raw| normalize_source_url(raw.to_string()))
     {
         output.insert("url".into(), Value::from(url));
     }

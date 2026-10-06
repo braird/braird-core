@@ -42,7 +42,8 @@ pub struct BookRecord {
     pub cover_resolved_at: Option<i64>,
     /// SUR-1106. A pre-0059 local row (NULL) reads as `Shelved`, matching the server backfill.
     pub status: SourceStatus,
-    /// SUR-1112. A pre-0061 local row (NULL) reads as `Book`, matching the server backfill.
+    /// SUR-1112. A pre-0061 local row (NULL) reads as `Book`, matching the server backfill; so does a
+    /// kind from a newer core that this one does not know.
     pub kind: SourceKind,
     /// SUR-1112 — the normalised link a shared source was created from; `None` for a hand-added one.
     pub url: Option<String>,

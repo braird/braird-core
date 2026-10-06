@@ -32,8 +32,8 @@ import uniffi.braird_core.NoteUpsert
 import uniffi.braird_core.SourceKind
 import uniffi.braird_core.SourceStatus
 import uniffi.braird_core.classifySourceUrl
-import uniffi.braird_core.normalizeUrl
-import uniffi.braird_core.pickSourceIcon
+import uniffi.braird_core.normalizeSourceUrl
+import uniffi.braird_core.pickSourceCover
 import uniffi.braird_core.PromptEventKind
 import uniffi.braird_core.PromptSettings
 import uniffi.braird_core.PromptTone
@@ -1238,7 +1238,7 @@ class RoundTripTest {
         val normalize = v.getJSONArray("normalize")
         for (i in 0 until normalize.length()) {
             val c = normalize.getJSONObject(i)
-            assertEquals(opt(c, "out"), normalizeUrl(c.getString("in")), c.getString("in"))
+            assertEquals(opt(c, "out"), normalizeSourceUrl(c.getString("in")), c.getString("in"))
         }
         val classify = v.getJSONArray("classify")
         for (i in 0 until classify.length()) {
@@ -1248,7 +1248,7 @@ class RoundTripTest {
         val pick = v.getJSONArray("pick")
         for (i in 0 until pick.length()) {
             val c = pick.getJSONObject(i)
-            assertEquals(opt(c, "out"), pickSourceIcon(kind(c.getString("kind")), opt(c, "image"), opt(c, "icon")))
+            assertEquals(opt(c, "out"), pickSourceCover(kind(c.getString("kind")), opt(c, "image"), opt(c, "icon")))
         }
 
         val db = File.createTempFile("braird-kind", ".sqlite").apply { deleteOnExit() }
