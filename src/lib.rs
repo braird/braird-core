@@ -62,6 +62,11 @@ pub mod prompt;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod library;
 
+// Source-link normalisation, classification and cover choice (SUR-1112). Gated like `library`
+// (its vocabulary): the PWA has no Other Media flow, so the `url` crate stays off the wasm build.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod source_url;
+
 pub use vault::Vault;
 
 uniffi::setup_scaffolding!();

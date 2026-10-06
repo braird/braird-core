@@ -30,7 +30,9 @@ That is why parity vectors, not functional tests, are the real gate.
 - **Mirror the constants verbatim.** HKDF info strings `surfc-master-key-wrap-v1` and
   `surfc-content-tag-v1`; PBKDF2 = **600 000** iters; **standard** base64 (not URL-safe);
   12-byte IV; 32-byte MK; `enc:v1` (no AAD) / `enc:v2` (AAD = UTF-8 noteId); the embedding
-  seal's `0x02` header (AAD = noteId). These are wire-format protocol constants, not
+  seal's `0x02` header (AAD = noteId); the core-only book-url subkey (HKDF info
+  `braird-book-url-v1`, zero salt, 32 bytes; `books.url` is enc:v2 under it, AAD = book id —
+  SUR-1112, pinned by `vault::book_url_seal::the_url_subkey_is_frozen`). These are wire-format protocol constants, not
   branding — they stay `surfc-*` despite the Braird rename (SUR-680 allowlist).
 - **The content-tag HMAC subkey is 64 bytes, not 32.** WebCrypto's `deriveKey` with no
   `length` defaults the HMAC key to the SHA-256 block size (64). A 32-byte port produces a

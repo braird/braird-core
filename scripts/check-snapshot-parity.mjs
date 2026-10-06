@@ -64,6 +64,8 @@ const CORE_EXPORT_KEYS = {
     'coverSource',
     'coverResolvedAt',
     'status', // SUR-1106 — the PWA import carries it onto the Dexie row
+    'kind', // SUR-1112 — likewise
+    'url', // SUR-1112 — likewise
     'createdAt',
     'updatedAt',
     'deleted',

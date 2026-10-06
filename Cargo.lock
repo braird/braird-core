@@ -221,6 +221,7 @@ dependencies = [
  "unicode-general-category",
  "unicode-normalization",
  "uniffi",
+ "url",
  "zeroize",
 ]
 

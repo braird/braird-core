@@ -44,7 +44,7 @@ use serde_json::Value;
 
 use super::http::PostgrestSink;
 use super::SupersededEdit;
-use crate::store::{table_schema, Store};
+use crate::store::{table_schema, Store, BOOK_FILLABLE_COLUMNS};
 
 /// PostgREST page size for the incremental pull (SUR-652) — matches the PWA's `SYNC_PAGE_SIZE`
 /// (`surfc/src/supabase.js`). `pull_table` loops `fetch_page` until a page shorter than this.
@@ -275,17 +275,17 @@ async fn pull_table<S: PostgrestSink>(
                     });
                 }
             } else if table == "books"
-                && local
-                    .as_ref()
-                    .is_some_and(|r| r.get("status").is_none_or(Value::is_null))
+                && local.as_ref().is_some_and(|r| {
+                    BOOK_FILLABLE_COLUMNS
+                        .iter()
+                        .any(|col| r.get(*col).is_none_or(Value::is_null))
+                })
             {
-                // SUR-1106 — the losing row still carries the status this device never stored
-                // (dropped by a pre-v0.18 core). Fill that one column; the LWW decision stands.
-                if let Some(status) = obj.get("status").and_then(Value::as_str) {
-                    store
-                        .fill_null_book_status(id, status)
-                        .map_err(|e| format!("fill a {table} status: {e}"))?;
-                }
+                // SUR-1106/SUR-1112 — the losing row still carries a status, kind or url this device
+                // never stored (dropped by an older core). Fill only those; the LWW decision stands.
+                store
+                    .fill_null_book_columns(id, obj)
+                    .map_err(|e| format!("fill {table} columns: {e}"))?;
             }
         }
 
@@ -619,6 +619,37 @@ mod tests {
             json!("reading"),
             "a set status is kept"
         );
+        assert!(store.outbox_items().unwrap().is_empty(), "no outbox write");
+    }
+
+    #[test]
+    fn a_losing_book_row_fills_only_a_null_local_kind_and_url() {
+        // SUR-1112 — a v0.18 core dropped `kind`/`url` from rows it pulled; the re-pull fills them
+        // where the local row has none, and never overwrites a value this device holds.
+        let store = Store::open_in_memory().unwrap();
+        let book = |id: &str, kind: Option<&str>, url: Option<&str>| {
+            json!({ "id": id, "title": "t", "created_at": 1, "updated_at": 1000, "deleted": false,
+                    "status": "to_read", "kind": kind, "url": url })
+        };
+        apply_local(&store, "books", book("dropped", None, None));
+        apply_local(
+            &store,
+            "books",
+            book("held", Some("article"), Some("enc:v2:held")),
+        );
+        let sink = MapSink::new().with(
+            "books",
+            vec![
+                book("dropped", Some("video"), Some("enc:v2:server")),
+                book("held", Some("podcast"), Some("enc:v2:other")),
+            ],
+        );
+        block(pull(&store, &sink, &["books"])).unwrap();
+        let row = |id: &str| store.get_row("books", id).unwrap().unwrap();
+        assert_eq!(row("dropped")["kind"], json!("video"));
+        assert_eq!(row("dropped")["url"], json!("enc:v2:server"));
+        assert_eq!(row("held")["kind"], json!("article"));
+        assert_eq!(row("held")["url"], json!("enc:v2:held"));
         assert!(store.outbox_items().unwrap().is_empty(), "no outbox write");
     }
 

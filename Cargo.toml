@@ -79,6 +79,9 @@ tokio = { version = "1", default-features = false, features = ["rt", "net", "tim
 # the PWA WASM build does not acquire a new direct dependency.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# SUR-1112 — normalize_source_url / classify_source_url. Already in the tree via reqwest; a direct dep pins
+# the WHATWG parser we rely on for host lowercasing and default-port stripping.
+url = "2"
 # Native snapshot exports mirror JavaScript Date#toISOString exactly: UTC with a fixed
 # three-digit millisecond field. `time` replaces the error-prone hand-rolled civil calendar.
 time = { version = "0.3", default-features = false, features = ["formatting", "macros"] }

@@ -29,7 +29,11 @@ import uniffi.braird_core.ImportSummary
 import uniffi.braird_core.LibrarySort
 import uniffi.braird_core.NoteSignalKind
 import uniffi.braird_core.NoteUpsert
+import uniffi.braird_core.SourceKind
 import uniffi.braird_core.SourceStatus
+import uniffi.braird_core.classifySourceUrl
+import uniffi.braird_core.normalizeSourceUrl
+import uniffi.braird_core.pickSourceCover
 import uniffi.braird_core.PromptEventKind
 import uniffi.braird_core.PromptSettings
 import uniffi.braird_core.PromptTone
@@ -321,7 +325,7 @@ class RoundTripTest {
 
         engine.enqueueBook(BookUpsert(
             id = "b1", title = "Meditations", author = "Aurelius", isbn = null, coverUrl = null,
-            coverSource = null, coverResolvedAt = null, status = SourceStatus.READING, createdAt = 1L,
+            coverSource = null, coverResolvedAt = null, status = SourceStatus.READING, kind = null, url = null, createdAt = 1L,
             deleted = false, clearNullableFields = emptyList(),
         ))
         engine.enqueueNote(NoteUpsert(
@@ -536,7 +540,7 @@ class RoundTripTest {
 
         fun book(id: String, createdAt: Long) = BookUpsert(
             id = id, title = "T-$id", author = null, isbn = null, coverUrl = null,
-            coverSource = null, coverResolvedAt = null, status = null, createdAt = createdAt,
+            coverSource = null, coverResolvedAt = null, status = null, kind = null, url = null, createdAt = createdAt,
             deleted = false, clearNullableFields = emptyList(),
         )
         fun note(id: String, bookId: String?) = NoteUpsert(
@@ -1222,5 +1226,49 @@ class RoundTripTest {
         val reason = FfiConverterString.lift(status.error_buf) // frees error_buf
         assertTrue(reason.contains("InternalException"), "reason should carry the throwable class: $reason")
         assertFalse(reason.contains("Invalid handle"), "only the class name may cross — no message content: $reason")
+    }
+
+    /** SUR-1112 — the frozen source-link vectors, through the binding, so Android dedups and
+     * classifies a shared link exactly as Rust and Swift do. Plus share-to-source dedup by url. */
+    @Test
+    fun sourceUrlVectorsAndFindBookByUrlOverFfi() {
+        val v = JSONObject(File(repoRoot, "vendored/source-url/vectors.json").readText())
+        fun kind(s: String) = SourceKind.valueOf(s.uppercase())
+        fun opt(o: JSONObject, key: String): String? = if (o.isNull(key)) null else o.getString(key)
+        val normalize = v.getJSONArray("normalize")
+        for (i in 0 until normalize.length()) {
+            val c = normalize.getJSONObject(i)
+            assertEquals(opt(c, "out"), normalizeSourceUrl(c.getString("in")), c.getString("in"))
+        }
+        val classify = v.getJSONArray("classify")
+        for (i in 0 until classify.length()) {
+            val c = classify.getJSONObject(i)
+            assertEquals(kind(c.getString("kind")), classifySourceUrl(c.getString("url")), c.getString("url"))
+        }
+        val pick = v.getJSONArray("pick")
+        for (i in 0 until pick.length()) {
+            val c = pick.getJSONObject(i)
+            assertEquals(opt(c, "out"), pickSourceCover(kind(c.getString("kind")), opt(c, "image"), opt(c, "icon")))
+        }
+
+        val db = File.createTempFile("braird-kind", ".sqlite").apply { deleteOnExit() }
+        val engine = SyncEngine.open(db.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
+        engine.enqueueBook(BookUpsert(
+            id = "a1", title = "Post", author = null, isbn = null, coverUrl = null, coverSource = null,
+            coverResolvedAt = null, status = null, kind = SourceKind.ARTICLE,
+            url = "https://example.com/post?utm_source=x", createdAt = 1L, deleted = false,
+            clearNullableFields = emptyList(),
+        ))
+        val hit = engine.findBookByUrl("http://example.com/post/?utm_medium=y")
+        assertEquals("a1", hit?.id)
+        assertEquals(SourceKind.ARTICLE, hit?.kind)
+        assertEquals("https://example.com/post", hit?.url)
+        val again = engine.findOrCreateBookByUrl(BookUpsert(
+            id = "a2", title = "Post", author = null, isbn = null, coverUrl = null, coverSource = null,
+            coverResolvedAt = null, status = null, kind = SourceKind.ARTICLE,
+            url = "https://example.com/post#top", createdAt = 2L, deleted = false,
+            clearNullableFields = emptyList(),
+        ))
+        assertEquals("a1", again.id)
     }
 }

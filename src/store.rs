@@ -227,6 +227,10 @@ fn sql_to_json(sv: SqlValue, ty: ColType) -> Value {
 /// land PWA+core in lockstep — explicitly out of scope here.
 ///
 /// Ratification pin tests live in `pull.rs` (`sur737_*`).
+/// Book columns a core older than the server dropped on pull, and that a local NULL can never mean
+/// a chosen value for — so pull may fill them from an equal-or-older server row (SUR-1106, SUR-1112).
+pub const BOOK_FILLABLE_COLUMNS: &[&str] = &["status", "kind", "url"];
+
 pub fn synced_schema() -> &'static [TableSchema] {
     &[
         TableSchema {
@@ -242,6 +246,8 @@ pub fn synced_schema() -> &'static [TableSchema] {
                 ("cover_resolved_at", Int),
                 ("merged_into", Text), // SUR-1005 synced loser→survivor pointer (SUR-916 Option 1)
                 ("status", Text), // SUR-1106 to_read|reading|shelved; NULL on pre-0059 local rows
+                ("kind", Text),   // SUR-1112 book|podcast|…; NULL on pre-0061 local rows (→ Book)
+                ("url", Text),    // SUR-1112 normalised share link; set once by share capture
                 ("created_at", Int),
                 ("updated_at", Int),
                 ("deleted", Bool),
@@ -616,12 +622,14 @@ impl Store {
         // <= v0.17.0, which dropped `status` from every book it pulled while surfc 0059 was live:
         // those rows will read NULL (→ Shelved) whatever the server holds. Forget the books cursor
         // for ONE full re-pull; `sync::pull` fills a NULL status from an equal-stamp row (see
-        // `Store::fill_null_book_status`), which the strict-`>` LWW alone would never apply.
+        // `Store::fill_null_book_columns`), which the strict-`>` LWW alone would never apply.
         // BEFORE the ALTER, not after: the column's presence is the only record that the repair
         // ran, so a crash between the two must lose the cursor (one extra re-pull), never the
         // repair. The cursor is only a watermark, so forgetting it early is always safe.
+        // SUR-1112 — the same repair for `kind` and `url` (surfc 0061), which core <= v0.18.0 drops.
         let cols = self.table_columns("books")?;
-        if !cols.is_empty() && !cols.iter().any(|(name, _)| name == "status") {
+        let has = |col: &str| cols.iter().any(|(name, _)| name == col);
+        if !cols.is_empty() && !BOOK_FILLABLE_COLUMNS.iter().all(|col| has(col)) {
             self.meta_delete(&sync_seq_key("books"))?;
         }
         for t in descriptor_tables() {
@@ -1062,14 +1070,40 @@ impl Store {
         self.conn.query_row(&sql, [val], |row| row.get(0))
     }
 
-    /// SUR-1106 — set a book's `status` ONLY where the local row has none. Status only: no other
-    /// column, no stamp, no outbox. Sound for this one column because the server's is NOT NULL, so
-    /// a local NULL is never a value anyone chose (unlike a cleared cover, where NULL is the edit).
-    pub fn fill_null_book_status(&self, id: &str, status: &str) -> rusqlite::Result<()> {
-        self.conn.execute(
-            "UPDATE books SET status = ?2 WHERE id = ?1 AND status IS NULL",
-            [id, status],
+    /// Every book row with a url (tombstones included), oldest first, as `(id, deleted,
+    /// merged_into, sealed url)` — the scan behind `read::find_book_by_url` (SUR-1112). The url is
+    /// sealed per row, so the caller opens and compares; no SQL predicate could match it.
+    #[allow(clippy::type_complexity)]
+    pub fn books_with_a_url(
+        &self,
+    ) -> rusqlite::Result<Vec<(String, bool, Option<String>, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, deleted, merged_into, url FROM books WHERE url IS NOT NULL \
+             ORDER BY created_at, id",
         )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        rows.collect()
+    }
+
+    /// SUR-1106/SUR-1112 — copy each [`BOOK_FILLABLE_COLUMNS`] value from `incoming` ONLY where the
+    /// local row has none. Those columns only: no stamp, no outbox. Sound because a local NULL in
+    /// them is never a value anyone chose: `status` and `kind` are NOT NULL on the server, and
+    /// `url` is set once by share capture and never cleared (unlike a cover, where NULL is an edit).
+    pub fn fill_null_book_columns(
+        &self,
+        id: &str,
+        incoming: &Map<String, Value>,
+    ) -> rusqlite::Result<()> {
+        for col in BOOK_FILLABLE_COLUMNS {
+            if let Some(value) = incoming.get(*col).and_then(Value::as_str) {
+                self.conn.execute(
+                    &format!("UPDATE books SET {col} = ?2 WHERE id = ?1 AND {col} IS NULL"),
+                    [id, value],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -2217,6 +2251,38 @@ mod tests {
     // ── SUR-1005 additive column migration ───────────────────────────────────
 
     #[test]
+    fn a_v018_store_gaining_book_kind_and_url_forgets_the_books_cursor() {
+        // SUR-1112 — a v0.18 store has `status` but not `kind`/`url`, which it dropped from rows
+        // pulled while 0061 was live. The same one-time re-pull repairs them.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v018.sqlite");
+        let path = path.to_str().unwrap();
+        {
+            let store = Store::open(path).unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "ALTER TABLE books DROP COLUMN kind; ALTER TABLE books DROP COLUMN url;",
+                )
+                .unwrap();
+            store.set_seq_cursor("books", 40).unwrap();
+        }
+        let store = Store::open(path).unwrap();
+        assert_eq!(
+            store.get_seq_cursor("books").unwrap(),
+            None,
+            "books re-pulls"
+        );
+        store.set_seq_cursor("books", 42).unwrap();
+        drop(store);
+        assert_eq!(
+            Store::open(path).unwrap().get_seq_cursor("books").unwrap(),
+            Some(42),
+            "once only"
+        );
+    }
+
+    #[test]
     fn a_store_gaining_book_status_forgets_only_the_books_cursor() {
         // SUR-1106 — a pre-v0.18 store dropped `status` from rows it pulled while 0059 was live;
         // one full books re-pull (plus the pull's NULL fill) repairs them. Other tables keep theirs,
@@ -3036,7 +3102,7 @@ mod tests {
         let book = json!({
             "id":"b1", "title":"Imported", "author":null, "isbn":null,
             "cover_url":null, "cover_source":null, "cover_resolved_at":null,
-            "merged_into":null, "status":"reading", "created_at":1, "updated_at":99, "deleted":false
+            "merged_into":null, "status":"reading", "kind":"book", "url":null, "created_at":1, "updated_at":99, "deleted":false
         });
         let note = json!({
             "id":"n1", "book_id":"b1", "text":"enc:v2:cipher", "page":null,

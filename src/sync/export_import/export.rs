@@ -4,7 +4,7 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use time::{macros::format_description, OffsetDateTime};
 
-use crate::library::{parse_status, status_value};
+use crate::library::{kind_value, parse_kind, parse_status, status_value};
 use crate::store::Store;
 use crate::sync::read::decrypt_note_text_for_archive;
 use crate::sync::SyncError;
@@ -22,6 +22,8 @@ const BOOK_FIELDS: &[(&str, &str)] = &[
     ("cover_source", "coverSource"),
     ("cover_resolved_at", "coverResolvedAt"),
     ("status", "status"), // SUR-1106 — the PWA keeps it on the Dexie row under the same name
+    ("kind", "kind"),     // SUR-1112 — likewise
+    ("url", "url"),       // SUR-1112 — likewise
     ("created_at", "createdAt"),
     ("updated_at", "updatedAt"),
     ("deleted", "deleted"),
@@ -123,9 +125,21 @@ pub(in crate::sync) fn build_snapshot_at(
 ) -> Result<String, SyncError> {
     let mut books = mapped_live_rows(store, "books", BOOK_FIELDS)?;
     // SUR-1106 — never export a null status (a pre-0059 local row): the PWA would push it back.
+    // SUR-1112 — nor a null kind (a pre-0061 row). An unknown kind from a newer core is kept as is.
+    // The url is sealed in the store and opened here: the archive is plaintext, like note text. A
+    // value that does not open under its own row exports as null, never as an unchecked string.
     for book in &mut books {
         let status = parse_status(book.get("status").and_then(Value::as_str));
         book["status"] = json!(status_value(status));
+        if book.get("kind").is_none_or(Value::is_null) {
+            book["kind"] = json!(kind_value(parse_kind(None)));
+        }
+        let id = book.get("id").and_then(Value::as_str).unwrap_or_default();
+        let url = book
+            .get("url")
+            .and_then(Value::as_str)
+            .and_then(|sealed| vault.open_book_url(id, sealed));
+        book["url"] = json!(url);
     }
     let note_rows = live_rows(store, "notes")?;
     let mut notes = note_rows
@@ -839,7 +853,7 @@ mod tests {
             json!({
                 "id": "b1", "title": "The Republic", "author": "Plato", "isbn": "9781",
                 "coverUrl": "https://covers/b1", "coverSource": "openlibrary",
-                "coverResolvedAt": 101, "status": "shelved", "createdAt": 100, "updatedAt": 102,
+                "coverResolvedAt": 101, "status": "shelved", "kind": "book", "url": null, "createdAt": 100, "updatedAt": 102,
                 "deleted": 0
             })
         );

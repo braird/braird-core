@@ -37,12 +37,13 @@ use crate::embeddings::{
     self, EmbedSummary, Embedder, EmbedderError, RegisterEmbedderSummary, SemanticHit,
 };
 use crate::fusion::{self, RankedHit, RankedSearchPage, SemanticStatus};
-use crate::library::{self, LibrarySort, SourceStatus, LIBRARY_SORT_KEY};
+use crate::library::{self, LibrarySort, SourceKind, SourceStatus, LIBRARY_SORT_KEY};
 use crate::prompt::{
     self, PromptEvent, PromptSettings, PromptState, PromptTone, PROMPT_ANSWERED_AT_KEY,
     PROMPT_CADENCE_KEY, PROMPT_SKIPPED_AT_KEY, PROMPT_TONE_KEY,
 };
 use crate::search::{SearchDoc, SearchDocKind, SearchHit};
+use crate::source_url::normalize_source_url;
 use crate::store::{synced_table_names, StageExistingWriteError, Store};
 use crate::vault::Vault;
 use export_import::import::{compute_importance, source_prior};
@@ -250,6 +251,12 @@ pub struct BookUpsert {
     pub cover_resolved_at: Option<i64>,
     /// SUR-1106. `None` keeps the stored status, or starts a NEW book as `ToRead`.
     pub status: Option<SourceStatus>,
+    /// SUR-1112. `None` keeps the stored kind; a new book with none is a `Book` (the server default).
+    pub kind: Option<SourceKind>,
+    /// SUR-1112. The link a shared source was created from, stored as `normalize_source_url`
+    /// gives it (a link that does not normalise is rejected). `None` keeps the stored url. Set
+    /// once, by share capture: not clearable, and a host edit form should never send it.
+    pub url: Option<String>,
     pub created_at: i64,
     pub deleted: bool,
     pub clear_nullable_fields: Vec<String>,
@@ -549,50 +556,37 @@ impl SyncEngine {
     /// Takes a single [`BookUpsert`] record, not positional args (SUR-843 — arm64 FFI stack-spill fix;
     /// see the [`BookUpsert`] doc). Field semantics are unchanged.
     pub fn enqueue_book(&self, draft: BookUpsert) -> Result<(), SyncError> {
-        let BookUpsert {
-            id,
-            title,
-            author,
-            isbn,
-            cover_url,
-            cover_source,
-            cover_resolved_at,
-            status,
-            created_at,
-            deleted,
-            clear_nullable_fields,
-        } = draft;
-        let now = epoch_ms();
-        let mut row = Map::new();
-        row.insert("id".into(), json!(id));
-        row.insert("title".into(), json!(title));
-        insert_opt(&mut row, "author", author);
-        insert_opt(&mut row, "isbn", isbn);
-        insert_opt(&mut row, "cover_url", cover_url);
-        insert_opt(&mut row, "cover_source", cover_source);
-        insert_opt(&mut row, "cover_resolved_at", cover_resolved_at);
-        row.insert("created_at".into(), json!(created_at));
-        row.insert("updated_at".into(), json!(now));
-        row.insert("deleted".into(), json!(deleted));
-        // Tri-state clears — validated against the clearable allowlist; nothing staged on reject.
-        apply_clears("books", &mut row, &clear_nullable_fields)?;
         // One guard for the existence check AND the write, so a pull cannot land between them.
         let store = lock!(self.store);
-        // SUR-1106 — a new book with no status starts `to_read`, written locally too (the server
-        // default alone would leave this device reading NULL → Shelved until the row re-pulls).
-        // Accepted residual (founder 2026-09-25): "new" means new HERE, so an id the server has
-        // but this device has not pulled yet would send an explicit `to_read` over it. Hosts
-        // mint a fresh id for a new book, so that needs a host bug.
-        let status = match status {
-            None if store.get_row("books", &id).map_err(store_err)?.is_none() => {
-                Some(SourceStatus::ToRead)
-            }
-            s => s,
-        };
-        insert_opt(&mut row, "status", status.map(library::status_value));
-        store
-            .stage_local_write("books", &id, row, epoch_ms())
-            .map_err(|e| SyncError::Store(e.to_string()))
+        self.stage_book(&store, draft)
+    }
+
+    /// The source a shared link belongs to, creating it from `draft` when there is none (SUR-1112).
+    /// The lookup and the create share one store lock, so two quick shares of one link make one
+    /// source. `draft.url` is required (the raw shared link; normalised here). On a hit nothing is
+    /// written and the existing source is returned as it is — the draft's other fields are ignored.
+    /// A `deleted` draft is rejected before anything is read or written: this call creates or
+    /// finds a live source, never a tombstone.
+    pub fn find_or_create_book_by_url(&self, draft: BookUpsert) -> Result<BookRecord, SyncError> {
+        if draft.deleted {
+            return Err(SyncError::Store(
+                "find_or_create_book_by_url needs a live draft".into(),
+            ));
+        }
+        let url = draft
+            .url
+            .clone()
+            .and_then(normalize_source_url)
+            .ok_or_else(|| SyncError::Store("book url is not an http(s) URL".into()))?;
+        let store = lock!(self.store);
+        if let Some(found) = read::find_book_by_url(&store, &self.vault, &url).map_err(store_err)? {
+            return Ok(found);
+        }
+        let id = draft.id.clone();
+        self.stage_book(&store, draft)?;
+        read::get_book(&store, &self.vault, &id)
+            .map_err(store_err)?
+            .ok_or_else(|| SyncError::Store("book missing after staging".into()))
     }
 
     /// Enqueue a full note write or a plaintext-free patch. `plaintext: Some` is the existing
@@ -2107,13 +2101,24 @@ impl SyncEngine {
     /// Books for the Library / Sources grid, newest-first, each with its live `note_count`.
     pub fn list_books(&self, limit: u32, offset: u32) -> Result<Vec<BookRecord>, SyncError> {
         let store = lock!(self.store);
-        read::list_books(&store, limit as i64, offset as i64).map_err(store_err)
+        read::list_books(&store, &self.vault, limit as i64, offset as i64).map_err(store_err)
     }
 
     /// One book by id, or `None` if absent or soft-deleted.
     pub fn get_book(&self, id: String) -> Result<Option<BookRecord>, SyncError> {
         let store = lock!(self.store);
-        read::get_book(&store, &id).map_err(store_err)
+        read::get_book(&store, &self.vault, &id).map_err(store_err)
+    }
+
+    /// The live source a shared link already belongs to (SUR-1112), or `None`. `url` is
+    /// normalised here first, so a host passes the raw shared link. A link whose source was merged
+    /// away resolves to the merge survivor; a link whose source was deleted matches nothing.
+    pub fn find_book_by_url(&self, url: String) -> Result<Option<BookRecord>, SyncError> {
+        let Some(url) = normalize_source_url(url) else {
+            return Ok(None);
+        };
+        let store = lock!(self.store);
+        read::find_book_by_url(&store, &self.vault, &url).map_err(store_err)
     }
 
     /// The SUR-996 question log — every live question, **active first** then newest-first, each
@@ -2347,6 +2352,76 @@ impl SyncEngine {
 }
 
 impl SyncEngine {
+    /// [`SyncEngine::enqueue_book`]'s body, under a store guard the caller already holds.
+    fn stage_book(&self, store: &Store, draft: BookUpsert) -> Result<(), SyncError> {
+        let BookUpsert {
+            id,
+            title,
+            author,
+            isbn,
+            cover_url,
+            cover_source,
+            cover_resolved_at,
+            status,
+            kind,
+            url,
+            created_at,
+            deleted,
+            clear_nullable_fields,
+        } = draft;
+        let url = url
+            .map(|raw| {
+                normalize_source_url(raw)
+                    .ok_or_else(|| SyncError::Store("book url is not an http(s) URL".into()))
+            })
+            .transpose()?;
+        let now = epoch_ms();
+        let mut row = Map::new();
+        row.insert("id".into(), json!(id));
+        row.insert("title".into(), json!(title));
+        insert_opt(&mut row, "author", author);
+        insert_opt(&mut row, "isbn", isbn);
+        insert_opt(&mut row, "cover_url", cover_url);
+        insert_opt(&mut row, "cover_source", cover_source);
+        insert_opt(&mut row, "cover_resolved_at", cover_resolved_at);
+        row.insert("created_at".into(), json!(created_at));
+        row.insert("updated_at".into(), json!(now));
+        row.insert("deleted".into(), json!(deleted));
+        // Tri-state clears — validated against the clearable allowlist; nothing staged on reject.
+        apply_clears("books", &mut row, &clear_nullable_fields)?;
+        // SUR-1106 — a new book with no status starts `to_read`, written locally too (the server
+        // default alone would leave this device reading NULL → Shelved until the row re-pulls).
+        // Accepted residual (founder 2026-09-25): "new" means new HERE, so an id the server has
+        // but this device has not pulled yet would send an explicit `to_read` over it. Hosts
+        // mint a fresh id for a new book, so that needs a host bug.
+        // SUR-1112 — no such default for `kind`: a local NULL already reads `Book`, the server
+        // default, so writing it would only risk the residual above for a non-book source.
+        let existing = store.get_row("books", &id).map_err(store_err)?;
+        let status = status.or(existing.is_none().then_some(SourceStatus::ToRead));
+        insert_opt(&mut row, "status", status.map(library::status_value));
+        insert_opt(&mut row, "kind", kind.map(library::kind_value));
+        // SUR-1112 — the url is set once: a book that already has one keeps it, whatever the draft
+        // says. Sealed here (enc:v2 under the url subkey, AAD = the id), so the store, the outbox and the server hold
+        // only ciphertext.
+        // A stored value that does not open under this vault (another key's) is no link at all, as
+        // on read and in dedup — so a share can still set one.
+        let has_url = existing.as_ref().is_some_and(|row| {
+            row.get("url")
+                .and_then(Value::as_str)
+                .is_some_and(|sealed| self.vault.open_book_url(&id, sealed).is_some())
+        });
+        if !has_url {
+            insert_opt(
+                &mut row,
+                "url",
+                url.map(|u| self.vault.seal_book_url(&id, &u)),
+            );
+        }
+        store
+            .stage_local_write("books", &id, row, epoch_ms())
+            .map_err(|e| SyncError::Store(e.to_string()))
+    }
+
     /// Whether the prompt machine's inputs are knowable on this device (SUR-1075).
     ///
     /// The prompt rules decide from ABSENCE — no live question means "offer one", no
@@ -4035,6 +4110,272 @@ mod tests {
         assert_eq!(parsed.books[0].row["status"], json!("reading"));
     }
 
+    // ── SUR-1112: source kinds + share-link dedup ────────────────────────────────
+
+    fn shared(id: &str, kind: SourceKind, url: &str) -> BookUpsert {
+        BookUpsert {
+            kind: Some(kind),
+            url: Some(url.into()),
+            ..book_upsert(id, "T")
+        }
+    }
+
+    #[test]
+    fn a_new_book_is_a_book_and_an_edit_without_kind_or_url_keeps_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+        engine.enqueue_book(book_upsert("b1", "T")).unwrap();
+        let b1 = engine.get_book("b1".into()).unwrap().unwrap();
+        assert_eq!((b1.kind, b1.url), (SourceKind::Book, None));
+
+        engine
+            .enqueue_book(shared(
+                "v1",
+                SourceKind::Video,
+                "http://YouTu.be/x?si=abc#t",
+            ))
+            .unwrap();
+        engine.enqueue_book(book_upsert("v1", "Renamed")).unwrap();
+        let v1 = engine.get_book("v1".into()).unwrap().unwrap();
+        assert_eq!(v1.kind, SourceKind::Video, "a kind-less edit keeps it");
+        assert_eq!(
+            v1.url.as_deref(),
+            Some("https://youtu.be/x"),
+            "stored normalised"
+        );
+        let p = outbox_payload(db.to_str().unwrap(), 2);
+        assert!(
+            p.get("kind").is_none() && p.get("url").is_none(),
+            "the edit omits both"
+        );
+    }
+
+    #[test]
+    fn a_url_that_does_not_normalize_is_rejected_and_nothing_is_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+        let err = engine.enqueue_book(shared("b1", SourceKind::Article, "ftp://x/y"));
+        assert!(matches!(err, Err(SyncError::Store(_))));
+        assert!(engine.get_book("b1".into()).unwrap().is_none());
+    }
+
+    #[test]
+    fn find_book_by_url_matches_utm_variants_follows_merges_and_skips_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+        let find = |url: &str| engine.find_book_by_url(url.into()).unwrap().map(|b| b.id);
+        engine
+            .enqueue_book(shared(
+                "a1",
+                SourceKind::Article,
+                "https://example.com/post?utm_source=x",
+            ))
+            .unwrap();
+        assert_eq!(
+            find("http://example.com/post/?utm_medium=y#c"),
+            Some("a1".into())
+        );
+        assert_eq!(find("https://example.com/other"), None);
+        assert_eq!(find("not a url"), None);
+
+        // Merged away → the survivor (which has no url of its own).
+        engine
+            .enqueue_book(shared("p1", SourceKind::Podcast, "https://overcast.fm/+x"))
+            .unwrap();
+        engine.enqueue_book(book_upsert("s1", "Survivor")).unwrap();
+        engine.merge_books("s1".into(), vec!["p1".into()]).unwrap();
+        assert_eq!(find("https://overcast.fm/+x"), Some("s1".into()));
+
+        // Deleted (not merged) → no match: the user removed that source.
+        engine
+            .enqueue_book(BookUpsert {
+                deleted: true,
+                ..shared("a1", SourceKind::Article, "https://example.com/post")
+            })
+            .unwrap();
+        assert_eq!(find("https://example.com/post"), None);
+    }
+
+    #[test]
+    fn merge_keeps_the_survivors_kind_and_url_and_an_unknown_kind_is_restaged_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_book(book_upsert("book", "T")).unwrap();
+        engine
+            .enqueue_book(shared("art", SourceKind::Article, "https://example.com/a"))
+            .unwrap();
+        engine
+            .merge_books("art".into(), vec!["book".into()])
+            .unwrap();
+        let art = engine.get_book("art".into()).unwrap().unwrap();
+        assert_eq!(art.kind, SourceKind::Article);
+        assert_eq!(art.url.as_deref(), Some("https://example.com/a"));
+
+        // A kind from a newer core reads as Book here, but a merge restage pushes it unchanged.
+        let store = Store::open(db_path).unwrap();
+        let row = json!({"id":"zine","title":"Z","created_at":1,"updated_at":1,"deleted":false,
+                         "status":"to_read","kind":"zine"});
+        store.apply_row("books", row.as_object().unwrap()).unwrap();
+        drop(store);
+        assert_eq!(
+            engine.get_book("zine".into()).unwrap().unwrap().kind,
+            SourceKind::Book
+        );
+        engine
+            .merge_books("zine".into(), vec!["art".into()])
+            .unwrap();
+        let rows = Store::open(db_path).unwrap().outbox_items().unwrap();
+        let staged = rows
+            .iter()
+            .rev()
+            .map(|r| serde_json::from_str::<Value>(&r.3).unwrap())
+            .find(|p| p["id"] == "zine")
+            .unwrap();
+        assert_eq!(staged["kind"], json!("zine"));
+    }
+
+    #[test]
+    fn the_url_is_sealed_at_rest_and_on_the_wire_and_set_only_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_book(shared(
+                "d1",
+                SourceKind::Article,
+                "https://docs.example/d/secret-id/edit",
+            ))
+            .unwrap();
+        let payload = outbox_payload(db_path, 0);
+        let wire = payload["url"].as_str().unwrap();
+        assert!(
+            wire.starts_with("enc:v2:") && !wire.contains("secret-id"),
+            "{wire}"
+        );
+        let stored = Store::open(db_path)
+            .unwrap()
+            .get_row("books", "d1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored["url"], payload["url"],
+            "the store holds the same ciphertext"
+        );
+
+        // A second, different url is ignored: the link is set once.
+        engine
+            .enqueue_book(shared("d1", SourceKind::Article, "https://other.example/x"))
+            .unwrap();
+        let book = engine.get_book("d1".into()).unwrap().unwrap();
+        assert_eq!(
+            book.url.as_deref(),
+            Some("https://docs.example/d/secret-id/edit")
+        );
+        assert!(outbox_payload(db_path, 1).get("url").is_none());
+    }
+
+    #[test]
+    fn a_stored_url_that_does_not_open_is_no_link_and_old_rules_still_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        let store = Store::open(db_path).unwrap();
+        let book = |id: &str, url: String| json!({"id":id,"title":"t","created_at":1,"updated_at":1,"deleted":false,"url":url});
+        // Another key's ciphertext: set-once must not count it, so a share can set a real link.
+        let foreign = Vault::generate().seal_book_url("x1", "https://e.com/a");
+        store
+            .apply_row("books", book("x1", foreign).as_object().unwrap())
+            .unwrap();
+        // A link stored under looser rules than today's: dedup re-normalises it after opening.
+        let loose = engine.vault.seal_book_url("o1", "http://E.com/b/");
+        store
+            .apply_row("books", book("o1", loose).as_object().unwrap())
+            .unwrap();
+        drop(store);
+
+        assert_eq!(engine.get_book("x1".into()).unwrap().unwrap().url, None);
+        engine
+            .enqueue_book(shared("x1", SourceKind::Article, "https://e.com/a"))
+            .unwrap();
+        let x1 = engine.get_book("x1".into()).unwrap().unwrap();
+        assert_eq!(x1.url.as_deref(), Some("https://e.com/a"));
+
+        let found = engine.find_book_by_url("https://e.com/b".into()).unwrap();
+        assert_eq!(found.map(|b| b.id), Some("o1".into()));
+    }
+
+    #[test]
+    fn find_or_create_book_by_url_creates_once_and_then_finds() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+        let first = engine
+            .find_or_create_book_by_url(shared(
+                "a1",
+                SourceKind::Article,
+                "https://e.com/p?utm_source=x",
+            ))
+            .unwrap();
+        let again = engine
+            .find_or_create_book_by_url(shared("a2", SourceKind::Article, "http://e.com/p/"))
+            .unwrap();
+        assert_eq!((first.id.as_str(), again.id.as_str()), ("a1", "a1"));
+        assert!(
+            engine.get_book("a2".into()).unwrap().is_none(),
+            "no second source"
+        );
+        assert!(matches!(
+            engine.find_or_create_book_by_url(book_upsert("n1", "No link")),
+            Err(SyncError::Store(_))
+        ));
+    }
+
+    #[test]
+    fn find_or_create_rejects_a_tombstone_draft_and_stages_nothing() {
+        // Codex P2 on #106: a `deleted: true` draft with no match used to stage a tombstone, then
+        // fail to read it back — an error AFTER the store and outbox had changed.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        let draft = BookUpsert {
+            deleted: true,
+            ..shared("t1", SourceKind::Article, "https://e.com/gone")
+        };
+        assert!(matches!(
+            engine.find_or_create_book_by_url(draft),
+            Err(SyncError::Store(_))
+        ));
+        let store = Store::open(db_path).unwrap();
+        assert!(store.get_row("books", "t1").unwrap().is_none(), "no row");
+        assert!(store.outbox_items().unwrap().is_empty(), "no outbox write");
+    }
+
+    #[test]
+    fn kind_and_url_survive_export_then_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+        engine
+            .enqueue_book(shared("v1", SourceKind::Video, "https://youtu.be/x"))
+            .unwrap();
+        engine.enqueue_book(book_upsert("b1", "T")).unwrap();
+        let archive = engine.export_snapshot().unwrap();
+        let parsed = export_import::import::parse_import_at(&archive, 1).unwrap();
+        let row = |id: &str| &parsed.books.iter().find(|b| b.row["id"] == id).unwrap().row;
+        assert_eq!(row("v1")["kind"], json!("video"));
+        assert_eq!(row("v1")["url"], json!("https://youtu.be/x"));
+        assert_eq!(row("b1")["kind"], json!("book"));
+        assert!(row("b1").get("url").is_none());
+    }
+
     // ── SUR-741: widened enqueue_book / enqueue_note authoring surface ──────────
 
     fn outbox_payload(db_path: &str, idx: usize) -> Value {
@@ -4799,6 +5140,8 @@ mod tests {
             cover_source: None,
             cover_resolved_at: None,
             status: None,
+            kind: None,
+            url: None,
             created_at: 0,
             deleted: false,
             clear_nullable_fields: vec![],

@@ -1084,6 +1084,16 @@ async fn reconcile_covers<S: PostgrestSink + CoverEgress>(
         if row_str(book, "cover_source") == "manual" {
             continue;
         }
+        // SUR-1112 — Open Library has covers for books only. A podcast or an article with no
+        // icon would get a random book's cover, and its title would leave the device. Only a
+        // stored `book` or a pre-0061 NULL qualifies: a kind this core does not know (a newer
+        // core's) reads as Book elsewhere, but its title must not leave the device either.
+        if !matches!(
+            book.get("kind").and_then(Value::as_str),
+            None | Some("book")
+        ) {
+            continue;
+        }
         // A book that already has a cover is left as-is.
         if book.get("cover_url").is_some_and(|v| !v.is_null()) {
             continue;
@@ -2987,6 +2997,31 @@ mod tests {
         // Second pass: already stamped → skipped, no re-query (never re-hammers Open Library).
         assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 0);
         assert_eq!(sink.search_count(), 1, "no second search for the same book");
+    }
+
+    #[test]
+    fn other_media_never_reaches_open_library_and_a_book_still_does() {
+        // SUR-1112 — a cover-less podcast (no ISBN, no icon) must not be searched by title; a
+        // book without a kind (a pre-0061 row) is still a Book.
+        let store = Store::open_in_memory().unwrap();
+        let mut podcast = cbook("p1", "Hard Fork", None);
+        podcast["kind"] = json!("podcast");
+        put(&store, "books", &podcast);
+        let mut zine = cbook("z1", "Unknown Kind", None);
+        zine["kind"] = json!("zine"); // a newer core's kind
+        put(&store, "books", &zine);
+        put(&store, "books", &cbook("b1", "Dune", None));
+        let sink = StubSink::new()
+            .with_cover("Hard Fork", hit(Some(7), None))
+            .with_cover("Unknown Kind", hit(Some(8), None))
+            .with_cover("Dune", hit(Some(42), None));
+
+        assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 1);
+        assert_eq!(sink.search_count(), 1, "only the book was searched");
+        assert_eq!(
+            cover_of(&store, "p1"),
+            (Value::Null, Value::Null, Value::Null)
+        );
     }
 
     #[test]

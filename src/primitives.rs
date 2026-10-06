@@ -21,6 +21,17 @@ pub fn hkdf32(salt: &[u8], ikm: &[u8], info: &[u8]) -> Zeroizing<[u8; 32]> {
     okm
 }
 
+/// HKDF-SHA256 → 32-byte key with NO salt. RFC 5869 §2.2: an absent salt is HashLen zero bytes,
+/// so this equals `hkdf32(&[0u8; 32], ikm, info)` byte-for-byte — for a uniformly random IKM (the
+/// MK), where a salt adds nothing (SUR-1112 book-url subkey).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn hkdf32_unsalted(ikm: &[u8], info: &[u8]) -> Zeroizing<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(None, ikm);
+    let mut okm = Zeroizing::new([0u8; 32]);
+    hk.expand(info, okm.as_mut_slice()).expect("hkdf expand 32");
+    okm
+}
+
 /// HKDF-SHA256 → `len`-byte key. The content-tag HMAC key MUST be 64 bytes:
 /// WebCrypto `deriveKey({name:'HMAC',hash:'SHA-256'})` with NO `length` defaults the
 /// key to the hash BLOCK size (64), not the 32-byte output size — a 32-byte port is

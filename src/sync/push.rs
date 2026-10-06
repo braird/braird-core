@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 
 use super::http::PostgrestSink;
 use super::outbox::{collapse, resolve_book_id, Collapsed, OutboxItem};
-use crate::store::{synced_table_names, table_schema, Store};
+use crate::store::{synced_table_names, table_schema, Store, BOOK_FILLABLE_COLUMNS};
 
 /// `meta` key holding the offline-merge temp→server book-id map (JSON object). Persisted so a
 /// remap survives a process restart between the book flush and a later note flush.
@@ -196,8 +196,14 @@ pub async fn flush<S: PostgrestSink>(
             // SUR-1106 — `books.status` is NOT NULL server-side, but a pre-0059 local row holds
             // NULL, and merge/unmerge/import stage the FULL stored row. Omit rather than send it:
             // the server keeps its value (or applies its default). One guard for every caller.
-            if table == "books" && group.payload.get("status").is_some_and(Value::is_null) {
-                group.payload.remove("status");
+            // SUR-1112 — the same for `kind` (NOT NULL) and `url` (never cleared): a local NULL
+            // is a column this device never pulled, not an edit.
+            if table == "books" {
+                for col in BOOK_FILLABLE_COLUMNS {
+                    if group.payload.get(*col).is_some_and(Value::is_null) {
+                        group.payload.remove(*col);
+                    }
+                }
             }
 
             // The record's own pk value — `on_conflict_for` is the pk column (`id`, or `note_id` for
@@ -585,13 +591,13 @@ mod tests {
     /// FULL stored row. The server column is NOT NULL, so the flush must omit the key on both
     /// dispatch arms (upsert and sparse patch), never send the null.
     #[test]
-    fn a_null_book_status_is_omitted_from_upsert_and_patch() {
+    fn a_null_book_status_kind_or_url_is_omitted_from_upsert_and_patch() {
         let store = Store::open_in_memory().unwrap();
         store
             .enqueue(
                 "books",
                 "full",
-                r#"{"id":"full","title":"T","created_at":1,"updated_at":2,"status":null}"#,
+                r#"{"id":"full","title":"T","created_at":1,"updated_at":2,"status":null,"kind":null,"url":null}"#,
                 100,
             )
             .unwrap();
@@ -599,7 +605,7 @@ mod tests {
             .enqueue(
                 "books",
                 "sparse",
-                r#"{"id":"sparse","deleted":true,"updated_at":2,"status":null}"#,
+                r#"{"id":"sparse","deleted":true,"updated_at":2,"status":null,"kind":null,"url":null}"#,
                 100,
             )
             .unwrap();
@@ -607,7 +613,7 @@ mod tests {
             .enqueue(
                 "books",
                 "set",
-                r#"{"id":"set","title":"T","created_at":1,"status":"reading"}"#,
+                r#"{"id":"set","title":"T","created_at":1,"status":"reading","kind":"video","url":"https://youtu.be/x"}"#,
                 100,
             )
             .unwrap();
@@ -624,15 +630,21 @@ mod tests {
                 .unwrap()
                 .clone()
         };
-        assert!(row("full").get("status").is_none(), "upsert omits a null");
+        for col in ["status", "kind", "url"] {
+            assert!(row("full").get(col).is_none(), "upsert omits a null {col}");
+            assert!(
+                sink.patches.borrow()[0].3.get(col).is_none(),
+                "patch omits a null {col}"
+            );
+        }
+        assert_eq!(row("set")["kind"], json!("video"));
+        assert_eq!(row("set")["url"], json!("https://youtu.be/x"));
         assert_eq!(
             row("set")["status"],
             json!("reading"),
             "a real value is sent"
         );
-        let patches = sink.patches.borrow();
-        assert_eq!(patches.len(), 1);
-        assert!(patches[0].3.get("status").is_none(), "patch omits a null");
+        assert_eq!(sink.patches.borrow().len(), 1);
     }
 
     /// SUR-1009's actual damage: the sparse book FAILED, and `fk_deps` then held every note whose

@@ -6,6 +6,78 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **BREAKING (FFI + schema): source kinds `books.kind` + share-link dedup `books.url` (SUR-1112,
+  for SUR-1111 / SUR-1113 / SUR-1114).** Consumes surfc 0061 (`kind text not null default 'book'`,
+  CHECK over `book | podcast | article | research_paper | video | social`; `url text`, nullable and
+  deliberately NOT unique — an offline-first push would 23505 on every retry, so dedup is local),
+  re-vendored in `sync-schema.json`. New UniFFI enum `SourceKind`.
+  - **Host break — both book records gain required fields:** `BookUpsert.kind:
+    Option<SourceKind>`, `BookUpsert.url: Option<String>`, `BookRecord.kind`, `BookRecord.url`.
+    Every host site that constructs `BookUpsert` (app code AND test fixtures) must pass them.
+  - `BookUpsert.kind: None` keeps the stored kind; a new book with none stays NULL locally and
+    reads `Book`, the server default (no explicit write, unlike `status`, so an unpulled server
+    row's kind is never overwritten). A local NULL kind reads `Book`; an unknown stored kind (from
+    a newer core) reads `Book` but is never written back, so a merge restage pushes it unchanged.
+  - **`books.url` is sealed (founder 2026-10-06, crypto-reviewer):** a shared link can be a
+    capability (an "anyone with the link" document, an unlisted video), so core seals it at write —
+    enc:v2 (AAD = the book id) under an HKDF subkey of the MK (info `braird-book-url-v1`, a new
+    frozen constant), so no free-text note or question id can make a url ciphertext open as text —
+    and the local store, the outbox, the server and every backup hold only ciphertext.
+    `BookRecord.url` is opened on read; a value that does not open (another key's) is no link
+    anywhere — read, dedup, set-once and import alike. The snapshot archive carries plaintext, like
+    note text, and import re-seals it. The PWA never reads it.
+  - `BookUpsert.url` is normalised with `normalize_source_url`; a link that does not normalise is
+    rejected (`SyncError::Store`, nothing staged). The url is **set once**: a book that already has
+    one keeps it and a different draft url is ignored; it is not clearable.
+  - New exports: `normalize_source_url(raw)` (http → https, host lowercased, credentials, fragment and
+    tracking parameters — `utm_*`, `fbclid`, `gclid`, `mc_cid`, `mc_eid`, `ref`, `si` — dropped, a
+    trailing `/` dropped from a non-root path; `si` only on YouTube and Spotify, `ref` kept on
+    GitHub where it names a branch, and per-host sender tokens — x.com `t`/`s`, Instagram
+    `igsh`/`igshid`, LinkedIn `trk`/`rcm`, TikTok `_r`/`_t` — dropped; `None` for a non-http(s)
+    link),
+    `classify_source_url(url) -> SourceKind` (host lists in `src/source_url.rs`; anything unlisted
+    is an `Article`), `pick_source_cover(kind, image_url, icon_url)` (podcast/video → the unfurl's
+    `imageUrl`, else its `iconUrl`; the rest the other way round), and
+    `SyncEngine::find_book_by_url(url)` (normalises, opens and re-normalises every stored link —
+    so a later rule change still matches old rows — and returns the oldest
+    live match, else the live survivor of a merged-away match; a deleted, unmerged match is no
+    match), and `SyncEngine::find_or_create_book_by_url(draft)` — the share path: the lookup and the
+    create share one store lock, so two quick shares of one link make one source; a `deleted`
+    draft is rejected before anything is read or written. Frozen cross-client
+    vectors in `vendored/source-url/vectors.json`, read by the Rust, Kotlin and Swift tests.
+  - Icons are NOT extracted here: the device never sees page HTML. surfc's `fetch-link-metadata`
+    returns `imageUrl` / `iconUrl`; the host picks with `pick_source_cover`, fetches that image ONCE
+    and stores a copy in the app's own storage as `cover_url` with `cover_source = "unfurl"` (founder
+    2026-10-06). Never store the third-party URL: it would sync in plaintext next to the sealed link
+    (a video thumbnail URL names the video).
+  - `reconcile_covers` now resolves only a stored `book` or a NULL kind (an unknown kind is
+    skipped too): a cover-less podcast or article would otherwise get a random Open Library book
+    cover and send its title to Open Library.
+  - The SUR-1106 repair is generalised to `BOOK_FILLABLE_COLUMNS` (`status`, `kind`, `url`): a
+    store missing any of them forgets the books cursor once (before the ALTER), a pulled book that
+    loses the LWW compare fills only those columns where the local row is NULL, and the flush omits
+    a null value of any of them. Sound for `url` because it is never cleared.
+  - Snapshot export always writes `kind` (never null) and writes `url`. Import keeps an existing
+    book's kind and url (the newer existing row's), else the archive's valid kind and normalised
+    url, else `book` / none; an existing book with a NULL kind is a `book`, never re-kinded by an
+    archive. `merge_books` keeps the survivor's whole row, so its kind and url, and copies nothing
+    from the losers. Accepted residual (founder 2026-10-06, after a copy-to-survivor attempt bred two
+    review findings): a device that never pulled a merged-away row (a fresh install) does not match
+    that row's link, so re-sharing it there makes a new source to merge again.
+  - The Reading pin and the Library rails are host code: filter them on `kind == Book`, never on
+    `status` alone (an Other Media row still stores the default `to_read`).
+  - Accepted residuals: set-once checks the local row, so in the re-pull window after an upgrade
+    an import could set a url the server already holds (same class as SUR-1106's); an export drops a
+    url that does not open as `null` without a count; the pull NULL-fill does not replace a local url
+    that does not open (it fills only NULL).
+  - **Rollout:** surfc 0061 merges first (this repo's schema-drift check reads surfc/main), and it
+    must be applied to the project a build points at before any host on this release syncs: a
+    pre-0061 server rejects every book upsert that carries `kind` or `url`. A device still on
+    v0.18 (or a PWA bundle older than surfc SUR-1112) reads an Other Media row as a book and can
+    give a cover-less one an Open Library cover, sending its title there; so the host share flow
+    (SUR-1113) should ship only once the fleet runs this release.
+
 ## [0.18.0] - 2026-09-25
 
 ### Changed

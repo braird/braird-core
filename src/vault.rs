@@ -8,8 +8,15 @@ use std::sync::{Arc, Mutex};
 use zeroize::Zeroizing;
 
 use crate::primitives::fill_random;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::primitives::hkdf32_unsalted;
 use crate::{byte_encryption, content_tag, key_manager, note_encryption};
 use crate::{CryptoError, WrappedBlob};
+#[cfg(not(target_arch = "wasm32"))]
+use aes_gcm::{
+    aead::{AeadCore, OsRng},
+    Aes256Gcm,
+};
 
 #[derive(uniffi::Object)]
 pub struct Vault {
@@ -140,6 +147,41 @@ impl Vault {
     }
 }
 
+/// HKDF info for the book-url subkey (SUR-1112). Frozen wire constant: changing it orphans every
+/// sealed `books.url`.
+#[cfg(not(target_arch = "wasm32"))]
+const BOOK_URL_INFO: &[u8] = b"braird-book-url-v1";
+
+// Crate-internal field sealing (SUR-1112). NOT `#[uniffi::export]`ed: core seals at write and opens
+// at read; a host never handles the sealed form. Native-only, like `sync`, its only caller.
+#[cfg(not(target_arch = "wasm32"))]
+impl Vault {
+    /// Seal a book's share link: enc:v2 (AAD = the book id) under a SUBKEY of the MK, HKDF info
+    /// [`BOOK_URL_INFO`]. A separate key, not an AAD prefix, keeps it apart from note and question
+    /// text (enc:v2 under the MK, AAD = a bare record id): ids are free text, so no AAD prefix
+    /// alone could stop a hostile server presenting a url ciphertext as a note `url:<id>`.
+    /// A shared link can be a capability (an "anyone with the link" document), so the server and
+    /// every backup hold only ciphertext; dedup runs on the device after opening.
+    pub(crate) fn seal_book_url(&self, book_id: &str, url: &str) -> String {
+        // A fresh 12-byte nonce per call, straight from the OS CSPRNG.
+        let iv = Aes256Gcm::generate_nonce(&mut OsRng);
+        note_encryption::encrypt_note(self.book_url_key().as_slice(), Some(book_id), url, &iv)
+    }
+
+    /// Open [`Vault::seal_book_url`]'s output, or `None`. Only a bound enc:v2 value under the url
+    /// subkey opens: an enc:v1, a plaintext, a note ciphertext or another row's url never does.
+    pub(crate) fn open_book_url(&self, book_id: &str, sealed: &str) -> Option<String> {
+        if !note_encryption::is_encrypted_v2(sealed) {
+            return None;
+        }
+        note_encryption::decrypt_note(self.book_url_key().as_slice(), Some(book_id), sealed).ok()
+    }
+
+    fn book_url_key(&self) -> Zeroizing<[u8; 32]> {
+        hkdf32_unsalted(mk!(self).as_slice(), BOOK_URL_INFO)
+    }
+}
+
 fn fresh_salt_iv() -> ([u8; 32], [u8; 12]) {
     let mut salt = [0u8; 32];
     let mut iv = [0u8; 12];
@@ -214,6 +256,60 @@ mod zeroization {
         assert!(
             after.iter().all(|&b| b == 0),
             "MK bytes must be all-zero after zeroize"
+        );
+    }
+}
+
+#[cfg(test)]
+mod book_url_seal {
+    use super::{new_vault, Vault};
+    use zeroize::Zeroizing;
+
+    /// Known answer for the url subkey (MK = 0x11 × 32, the parity vectors' MK). A change to the
+    /// salt, the info string or the length orphans every synced `books.url`; this pins all three.
+    #[test]
+    fn the_url_subkey_is_frozen() {
+        let vault = new_vault(Zeroizing::new([0x11u8; 32]));
+        // Cross-checked with Node: crypto.hkdfSync("sha256", 0x11×32, 0x00×32, "braird-book-url-v1", 32).
+        assert_eq!(
+            hex::encode(*vault.book_url_key()),
+            "b20d1486c7f2027dca744a4749cb0c7e3045c8403507d0daa124088e5e22c759"
+        );
+    }
+
+    /// SUR-1112 — a sealed link opens only under its own row and this vault, and nothing else
+    /// opens as a link: not another row's link, not note text under the same id (the subkey
+    /// separates them), not enc:v1, not plaintext, not another vault's ciphertext.
+    #[test]
+    fn only_the_rows_own_link_opens() {
+        let vault = Vault::generate();
+        let sealed = vault.seal_book_url("b1", "https://e.com/x");
+        assert!(sealed.starts_with("enc:v2:") && !sealed.contains("e.com"));
+        assert_eq!(
+            vault.open_book_url("b1", &sealed).as_deref(),
+            Some("https://e.com/x")
+        );
+        assert_eq!(vault.open_book_url("b2", &sealed), None, "another row");
+
+        let note = vault.encrypt_note(Some("b1".into()), "https://e.com/x".into());
+        assert_eq!(vault.open_book_url("b1", &note), None, "note text, same id");
+        assert!(
+            vault
+                .decrypt_note(Some("b1".into()), sealed.clone())
+                .is_err(),
+            "and back"
+        );
+        let v1 = vault.encrypt_note(None, "https://e.com/x".into());
+        assert_eq!(vault.open_book_url("b1", &v1), None, "enc:v1");
+        assert_eq!(
+            vault.open_book_url("b1", "https://e.com/x"),
+            None,
+            "plaintext"
+        );
+        assert_eq!(
+            Vault::generate().open_book_url("b1", &sealed),
+            None,
+            "another key"
         );
     }
 }

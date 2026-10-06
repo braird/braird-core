@@ -17,10 +17,11 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
-use crate::library::{self, SourceStatus};
+use crate::library::{self, SourceKind, SourceStatus};
 use crate::note_encryption::is_encrypted_v2;
 use crate::prompt::{is_active, QuestionMeta};
 use crate::search::{SearchDoc, SearchDocKind};
+use crate::source_url::normalize_source_url;
 use crate::store::Store;
 use crate::vault::Vault;
 
@@ -42,6 +43,11 @@ pub struct BookRecord {
     pub cover_resolved_at: Option<i64>,
     /// SUR-1106. A pre-0059 local row (NULL) reads as `Shelved`, matching the server backfill.
     pub status: SourceStatus,
+    /// SUR-1112. A pre-0061 local row (NULL) reads as `Book`, matching the server backfill; so does a
+    /// kind from a newer core that this one does not know.
+    pub kind: SourceKind,
+    /// SUR-1112 — the normalised link a shared source was created from; `None` for a hand-added one.
+    pub url: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub note_count: u32,
@@ -209,19 +215,69 @@ pub struct QuestionLogEntry {
 /// Library grid page: books newest-first, each with its live note count. N+1 counts, one per
 /// book on the page. ponytail: fine at page scale (a page is dozens of books); a single
 /// `GROUP BY` join only if a page ever grows large enough to matter.
-pub fn list_books(store: &Store, limit: i64, offset: i64) -> rusqlite::Result<Vec<BookRecord>> {
+pub fn list_books(
+    store: &Store,
+    vault: &Vault,
+    limit: i64,
+    offset: i64,
+) -> rusqlite::Result<Vec<BookRecord>> {
     let mut out = Vec::new();
     for row in store.list_live("books", None, limit, offset)? {
-        out.push(book_record(store, &row)?);
+        out.push(book_record(store, vault, &row)?);
     }
     Ok(out)
 }
 
-pub fn get_book(store: &Store, id: &str) -> rusqlite::Result<Option<BookRecord>> {
+pub fn get_book(store: &Store, vault: &Vault, id: &str) -> rusqlite::Result<Option<BookRecord>> {
     match store.get_row("books", id)? {
-        Some(row) if !is_deleted(&row) => Ok(Some(book_record(store, &row)?)),
+        Some(row) if !is_deleted(&row) => Ok(Some(book_record(store, vault, &row)?)),
         _ => Ok(None),
     }
+}
+
+/// Hops followed through `merged_into` before giving up — merges chain only as deep as a user
+/// merges a merge survivor, and a cycle (two devices merging each way offline) must still end.
+const MAX_MERGE_HOPS: usize = 16;
+
+/// The live book for an already-normalised `url` (SUR-1112): the oldest live match (a race can
+/// leave two), else the live survivor of a book with that url that was merged away. A deleted,
+/// unmerged match is no match: the user removed that source. Each stored url is sealed under its
+/// own row, so every one is opened and compared here. ponytail: a linear scan with one AES-GCM
+/// open per linked source, once per share — an index would need a keyed hash column.
+pub fn find_book_by_url(
+    store: &Store,
+    vault: &Vault,
+    url: &str,
+) -> rusqlite::Result<Option<BookRecord>> {
+    let matches: Vec<_> = store
+        .books_with_a_url()?
+        .into_iter()
+        // Re-normalised after opening, so a link stored under older normalisation rules still matches.
+        .filter(|(id, _, _, sealed)| {
+            vault
+                .open_book_url(id, sealed)
+                .and_then(normalize_source_url)
+                .as_deref()
+                == Some(url)
+        })
+        .collect();
+    if let Some((id, ..)) = matches.iter().find(|(_, deleted, ..)| !deleted) {
+        return get_book(store, vault, id);
+    }
+    for (_, _, merged_into, _) in &matches {
+        let mut next = merged_into.clone();
+        for _ in 0..MAX_MERGE_HOPS {
+            let Some(id) = next.take() else { break };
+            let Some(row) = store.get_row("books", &id)? else {
+                break;
+            };
+            if !is_deleted(&row) {
+                return Ok(Some(book_record(store, vault, &row)?));
+            }
+            next = string_field(&row, "merged_into");
+        }
+    }
+    Ok(None)
 }
 
 /// Notes newest-first — `book_id = None` is the Commonplace flat list (all notes), `Some` filters
@@ -759,7 +815,11 @@ pub fn build_search_docs(store: &Store, vault: &Vault) -> rusqlite::Result<Vec<S
 
 // ── row → DTO helpers ────────────────────────────────────────────────────────
 
-fn book_record(store: &Store, row: &Map<String, Value>) -> rusqlite::Result<BookRecord> {
+fn book_record(
+    store: &Store,
+    vault: &Vault,
+    row: &Map<String, Value>,
+) -> rusqlite::Result<BookRecord> {
     let id = string_field(row, "id").unwrap_or_default();
     let note_count = store.count_live("notes", Some(("book_id", &id)))? as u32;
     let latest_note_created_at = store.max_live_int("notes", "created_at", ("book_id", &id))?;
@@ -771,6 +831,8 @@ fn book_record(store: &Store, row: &Map<String, Value>) -> rusqlite::Result<Book
         cover_source: string_field(row, "cover_source"),
         cover_resolved_at: opt_int_field(row, "cover_resolved_at"),
         status: library::parse_status(string_field(row, "status").as_deref()),
+        kind: library::parse_kind(string_field(row, "kind").as_deref()),
+        url: string_field(row, "url").and_then(|sealed| vault.open_book_url(&id, &sealed)),
         created_at: int_field(row, "created_at"),
         updated_at: int_field(row, "updated_at"),
         note_count,
@@ -1200,7 +1262,7 @@ mod tests {
         del.insert("deleted".into(), json!(true));
         store.apply_row("notes", &del).unwrap();
 
-        let book = get_book(&store, "b1").unwrap().expect("live book");
+        let book = get_book(&store, &vault, "b1").unwrap().expect("live book");
         assert_eq!(book.title.as_deref(), Some("Meditations"));
         assert_eq!(book.note_count, 2);
     }
