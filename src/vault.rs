@@ -12,6 +12,11 @@ use crate::primitives::fill_random;
 use crate::primitives::hkdf32_unsalted;
 use crate::{byte_encryption, content_tag, key_manager, note_encryption};
 use crate::{CryptoError, WrappedBlob};
+#[cfg(not(target_arch = "wasm32"))]
+use aes_gcm::{
+    aead::{AeadCore, OsRng},
+    Aes256Gcm,
+};
 
 #[derive(uniffi::Object)]
 pub struct Vault {
@@ -158,7 +163,8 @@ impl Vault {
     /// A shared link can be a capability (an "anyone with the link" document), so the server and
     /// every backup hold only ciphertext; dedup runs on the device after opening.
     pub(crate) fn seal_book_url(&self, book_id: &str, url: &str) -> String {
-        let (_, iv) = fresh_salt_iv(); // a fresh CSPRNG IV per call (the salt is unused)
+        // A fresh 12-byte nonce per call, straight from the OS CSPRNG.
+        let iv = Aes256Gcm::generate_nonce(&mut OsRng);
         note_encryption::encrypt_note(self.book_url_key().as_slice(), Some(book_id), url, &iv)
     }
 
