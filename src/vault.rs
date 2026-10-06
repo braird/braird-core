@@ -140,6 +140,28 @@ impl Vault {
     }
 }
 
+// Crate-internal field sealing (SUR-1112). NOT `#[uniffi::export]`ed: core seals at write and opens
+// at read; a host never handles the sealed form.
+impl Vault {
+    /// Seal a book's share link: enc:v2 under AAD `url:{book_id}`, so the value is bound to its row
+    /// and domain-separated from note text (AAD = a bare note id) and embeddings (`emb:{noteId}`).
+    /// A shared link can be a capability (an "anyone with the link" document), so the server and
+    /// every backup hold only ciphertext; dedup runs on the device after opening.
+    pub(crate) fn seal_book_url(&self, book_id: &str, url: &str) -> String {
+        self.encrypt_note(Some(format!("url:{book_id}")), url.to_string())
+    }
+
+    /// Open [`Vault::seal_book_url`]'s output, or `None`. Only a bound enc:v2 value opens: an
+    /// enc:v1, a plaintext or a foreign value (another row's, another key's) is never trusted.
+    pub(crate) fn open_book_url(&self, book_id: &str, sealed: &str) -> Option<String> {
+        if !crate::note_encryption::is_encrypted_v2(sealed) {
+            return None;
+        }
+        self.decrypt_note(Some(format!("url:{book_id}")), sealed.to_string())
+            .ok()
+    }
+}
+
 fn fresh_salt_iv() -> ([u8; 32], [u8; 12]) {
     let mut salt = [0u8; 32];
     let mut iv = [0u8; 12];

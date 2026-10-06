@@ -1070,17 +1070,20 @@ impl Store {
         self.conn.query_row(&sql, [val], |row| row.get(0))
     }
 
-    /// Every book row (tombstones included) whose `url` is exactly `url`, oldest first, as
-    /// `(id, deleted, merged_into)` — the dedup lookup behind `read::find_book_by_url` (SUR-1112).
-    /// No index: a user's books table is small, and the lookup runs once per share.
-    pub fn books_with_url(
+    /// Every book row with a url (tombstones included), oldest first, as `(id, deleted,
+    /// merged_into, sealed url)` — the scan behind `read::find_book_by_url` (SUR-1112). The url is
+    /// sealed per row, so the caller opens and compares; no SQL predicate could match it.
+    #[allow(clippy::type_complexity)]
+    pub fn books_with_a_url(
         &self,
-        url: &str,
-    ) -> rusqlite::Result<Vec<(String, bool, Option<String>)>> {
+    ) -> rusqlite::Result<Vec<(String, bool, Option<String>, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, deleted, merged_into FROM books WHERE url = ?1 ORDER BY created_at, id",
+            "SELECT id, deleted, merged_into, url FROM books WHERE url IS NOT NULL \
+             ORDER BY created_at, id",
         )?;
-        let rows = stmt.query_map([url], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
         rows.collect()
     }
 

@@ -556,58 +556,30 @@ impl SyncEngine {
     /// Takes a single [`BookUpsert`] record, not positional args (SUR-843 — arm64 FFI stack-spill fix;
     /// see the [`BookUpsert`] doc). Field semantics are unchanged.
     pub fn enqueue_book(&self, draft: BookUpsert) -> Result<(), SyncError> {
-        let BookUpsert {
-            id,
-            title,
-            author,
-            isbn,
-            cover_url,
-            cover_source,
-            cover_resolved_at,
-            status,
-            kind,
-            url,
-            created_at,
-            deleted,
-            clear_nullable_fields,
-        } = draft;
-        let url = url
-            .map(|raw| {
-                normalize_source_url(raw)
-                    .ok_or_else(|| SyncError::Store("book url is not an http(s) URL".into()))
-            })
-            .transpose()?;
-        let now = epoch_ms();
-        let mut row = Map::new();
-        row.insert("id".into(), json!(id));
-        row.insert("title".into(), json!(title));
-        insert_opt(&mut row, "author", author);
-        insert_opt(&mut row, "isbn", isbn);
-        insert_opt(&mut row, "cover_url", cover_url);
-        insert_opt(&mut row, "cover_source", cover_source);
-        insert_opt(&mut row, "cover_resolved_at", cover_resolved_at);
-        insert_opt(&mut row, "url", url);
-        row.insert("created_at".into(), json!(created_at));
-        row.insert("updated_at".into(), json!(now));
-        row.insert("deleted".into(), json!(deleted));
-        // Tri-state clears — validated against the clearable allowlist; nothing staged on reject.
-        apply_clears("books", &mut row, &clear_nullable_fields)?;
         // One guard for the existence check AND the write, so a pull cannot land between them.
         let store = lock!(self.store);
-        // SUR-1106 — a new book with no status starts `to_read`, written locally too (the server
-        // default alone would leave this device reading NULL → Shelved until the row re-pulls).
-        // Accepted residual (founder 2026-09-25): "new" means new HERE, so an id the server has
-        // but this device has not pulled yet would send an explicit `to_read` over it. Hosts
-        // mint a fresh id for a new book, so that needs a host bug.
-        // SUR-1112 — no such default for `kind`: a local NULL already reads `Book`, the server
-        // default, so writing it would only risk the residual above for a non-book source.
-        let is_new = store.get_row("books", &id).map_err(store_err)?.is_none();
-        let status = status.or(is_new.then_some(SourceStatus::ToRead));
-        insert_opt(&mut row, "status", status.map(library::status_value));
-        insert_opt(&mut row, "kind", kind.map(library::kind_value));
-        store
-            .stage_local_write("books", &id, row, epoch_ms())
-            .map_err(|e| SyncError::Store(e.to_string()))
+        self.stage_book(&store, draft)
+    }
+
+    /// The source a shared link belongs to, creating it from `draft` when there is none (SUR-1112).
+    /// The lookup and the create share one store lock, so two quick shares of one link make one
+    /// source. `draft.url` is required (the raw shared link; normalised here). On a hit nothing is
+    /// written and the existing source is returned as it is — the draft's other fields are ignored.
+    pub fn find_or_create_book_by_url(&self, draft: BookUpsert) -> Result<BookRecord, SyncError> {
+        let url = draft
+            .url
+            .clone()
+            .and_then(normalize_source_url)
+            .ok_or_else(|| SyncError::Store("book url is not an http(s) URL".into()))?;
+        let store = lock!(self.store);
+        if let Some(found) = read::find_book_by_url(&store, &self.vault, &url).map_err(store_err)? {
+            return Ok(found);
+        }
+        let id = draft.id.clone();
+        self.stage_book(&store, draft)?;
+        read::get_book(&store, &self.vault, &id)
+            .map_err(store_err)?
+            .ok_or_else(|| SyncError::Store("book missing after staging".into()))
     }
 
     /// Enqueue a full note write or a plaintext-free patch. `plaintext: Some` is the existing
@@ -2122,13 +2094,13 @@ impl SyncEngine {
     /// Books for the Library / Sources grid, newest-first, each with its live `note_count`.
     pub fn list_books(&self, limit: u32, offset: u32) -> Result<Vec<BookRecord>, SyncError> {
         let store = lock!(self.store);
-        read::list_books(&store, limit as i64, offset as i64).map_err(store_err)
+        read::list_books(&store, &self.vault, limit as i64, offset as i64).map_err(store_err)
     }
 
     /// One book by id, or `None` if absent or soft-deleted.
     pub fn get_book(&self, id: String) -> Result<Option<BookRecord>, SyncError> {
         let store = lock!(self.store);
-        read::get_book(&store, &id).map_err(store_err)
+        read::get_book(&store, &self.vault, &id).map_err(store_err)
     }
 
     /// The live source a shared link already belongs to (SUR-1112), or `None`. `url` is
@@ -2139,7 +2111,7 @@ impl SyncEngine {
             return Ok(None);
         };
         let store = lock!(self.store);
-        read::find_book_by_url(&store, &url).map_err(store_err)
+        read::find_book_by_url(&store, &self.vault, &url).map_err(store_err)
     }
 
     /// The SUR-996 question log — every live question, **active first** then newest-first, each
@@ -2347,7 +2319,8 @@ impl SyncEngine {
         loser_ids: Vec<String>,
     ) -> Result<BookMergeUndo, SyncError> {
         let store = lock!(self.store);
-        reconcile::merge_books(&store, &survivor_id, &loser_ids).map_err(SyncError::Store)
+        reconcile::merge_books(&store, &self.vault, &survivor_id, &loser_ids)
+            .map_err(SyncError::Store)
     }
 
     /// Reverse a `merge_books` within the host's undo window (SUR-915). Idempotent.
@@ -2373,6 +2346,72 @@ impl SyncEngine {
 }
 
 impl SyncEngine {
+    /// [`SyncEngine::enqueue_book`]'s body, under a store guard the caller already holds.
+    fn stage_book(&self, store: &Store, draft: BookUpsert) -> Result<(), SyncError> {
+        let BookUpsert {
+            id,
+            title,
+            author,
+            isbn,
+            cover_url,
+            cover_source,
+            cover_resolved_at,
+            status,
+            kind,
+            url,
+            created_at,
+            deleted,
+            clear_nullable_fields,
+        } = draft;
+        let url = url
+            .map(|raw| {
+                normalize_source_url(raw)
+                    .ok_or_else(|| SyncError::Store("book url is not an http(s) URL".into()))
+            })
+            .transpose()?;
+        let now = epoch_ms();
+        let mut row = Map::new();
+        row.insert("id".into(), json!(id));
+        row.insert("title".into(), json!(title));
+        insert_opt(&mut row, "author", author);
+        insert_opt(&mut row, "isbn", isbn);
+        insert_opt(&mut row, "cover_url", cover_url);
+        insert_opt(&mut row, "cover_source", cover_source);
+        insert_opt(&mut row, "cover_resolved_at", cover_resolved_at);
+        row.insert("created_at".into(), json!(created_at));
+        row.insert("updated_at".into(), json!(now));
+        row.insert("deleted".into(), json!(deleted));
+        // Tri-state clears — validated against the clearable allowlist; nothing staged on reject.
+        apply_clears("books", &mut row, &clear_nullable_fields)?;
+        // SUR-1106 — a new book with no status starts `to_read`, written locally too (the server
+        // default alone would leave this device reading NULL → Shelved until the row re-pulls).
+        // Accepted residual (founder 2026-09-25): "new" means new HERE, so an id the server has
+        // but this device has not pulled yet would send an explicit `to_read` over it. Hosts
+        // mint a fresh id for a new book, so that needs a host bug.
+        // SUR-1112 — no such default for `kind`: a local NULL already reads `Book`, the server
+        // default, so writing it would only risk the residual above for a non-book source.
+        let existing = store.get_row("books", &id).map_err(store_err)?;
+        let status = status.or(existing.is_none().then_some(SourceStatus::ToRead));
+        insert_opt(&mut row, "status", status.map(library::status_value));
+        insert_opt(&mut row, "kind", kind.map(library::kind_value));
+        // SUR-1112 — the url is set once: a book that already has one keeps it, whatever the draft
+        // says. Sealed here (enc:v2, AAD `url:{id}`), so the store, the outbox and the server hold
+        // only ciphertext.
+        let has_url = existing
+            .as_ref()
+            .is_some_and(|row| row.get("url").is_some_and(|v| !v.is_null()));
+        if !has_url {
+            insert_opt(
+                &mut row,
+                "url",
+                url.map(|u| self.vault.seal_book_url(&id, &u)),
+            );
+        }
+        store
+            .stage_local_write("books", &id, row, epoch_ms())
+            .map_err(|e| SyncError::Store(e.to_string()))
+    }
+
     /// Whether the prompt machine's inputs are knowable on this device (SUR-1075).
     ///
     /// The prompt rules decide from ABSENCE — no live question means "offer one", no
@@ -4188,6 +4227,116 @@ mod tests {
             .find(|p| p["id"] == "zine")
             .unwrap();
         assert_eq!(staged["kind"], json!("zine"));
+    }
+
+    #[test]
+    fn the_url_is_sealed_at_rest_and_on_the_wire_and_set_only_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_book(shared(
+                "d1",
+                SourceKind::Article,
+                "https://docs.example/d/secret-id/edit",
+            ))
+            .unwrap();
+        let payload = outbox_payload(db_path, 0);
+        let wire = payload["url"].as_str().unwrap();
+        assert!(
+            wire.starts_with("enc:v2:") && !wire.contains("secret-id"),
+            "{wire}"
+        );
+        let stored = Store::open(db_path)
+            .unwrap()
+            .get_row("books", "d1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored["url"], payload["url"],
+            "the store holds the same ciphertext"
+        );
+
+        // A second, different url is ignored: the link is set once.
+        engine
+            .enqueue_book(shared("d1", SourceKind::Article, "https://other.example/x"))
+            .unwrap();
+        let book = engine.get_book("d1".into()).unwrap().unwrap();
+        assert_eq!(
+            book.url.as_deref(),
+            Some("https://docs.example/d/secret-id/edit")
+        );
+        assert!(outbox_payload(db_path, 1).get("url").is_none());
+    }
+
+    #[test]
+    fn find_or_create_book_by_url_creates_once_and_then_finds() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let engine = engine_at(db.to_str().unwrap());
+        let first = engine
+            .find_or_create_book_by_url(shared(
+                "a1",
+                SourceKind::Article,
+                "https://e.com/p?utm_source=x",
+            ))
+            .unwrap();
+        let again = engine
+            .find_or_create_book_by_url(shared("a2", SourceKind::Article, "http://e.com/p/"))
+            .unwrap();
+        assert_eq!((first.id.as_str(), again.id.as_str()), ("a1", "a1"));
+        assert!(
+            engine.get_book("a2".into()).unwrap().is_none(),
+            "no second source"
+        );
+        assert!(matches!(
+            engine.find_or_create_book_by_url(book_upsert("n1", "No link")),
+            Err(SyncError::Store(_))
+        ));
+    }
+
+    #[test]
+    fn a_merge_survivor_without_a_link_takes_the_losers_resealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_book(shared("p1", SourceKind::Podcast, "https://overcast.fm/+x"))
+            .unwrap();
+        engine.enqueue_book(book_upsert("s1", "Survivor")).unwrap();
+        engine.merge_books("s1".into(), vec!["p1".into()]).unwrap();
+        let s1 = engine.get_book("s1".into()).unwrap().unwrap();
+        assert_eq!(
+            s1.url.as_deref(),
+            Some("https://overcast.fm/+x"),
+            "opens under its own id"
+        );
+
+        // A device that pulled only the live survivor (never the tombstone) still finds it.
+        let other = dir.path().join("other.sqlite");
+        let other_path = other.to_str().unwrap();
+        let s1_row = Store::open(db_path)
+            .unwrap()
+            .get_row("books", "s1")
+            .unwrap()
+            .unwrap();
+        Store::open(other_path)
+            .unwrap()
+            .apply_row("books", &s1_row)
+            .unwrap();
+        let device = SyncEngine::open(
+            other_path.into(),
+            "https://x.supabase.co".into(),
+            "anon".into(),
+            engine.vault.clone(),
+        )
+        .unwrap();
+        let found = device
+            .find_book_by_url("https://overcast.fm/+x".into())
+            .unwrap();
+        assert_eq!(found.map(|b| b.id), Some("s1".into()));
     }
 
     #[test]

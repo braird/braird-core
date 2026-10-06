@@ -126,12 +126,20 @@ pub(in crate::sync) fn build_snapshot_at(
     let mut books = mapped_live_rows(store, "books", BOOK_FIELDS)?;
     // SUR-1106 — never export a null status (a pre-0059 local row): the PWA would push it back.
     // SUR-1112 — nor a null kind (a pre-0061 row). An unknown kind from a newer core is kept as is.
+    // The url is sealed in the store and opened here: the archive is plaintext, like note text. A
+    // value that does not open under its own row exports as null, never as an unchecked string.
     for book in &mut books {
         let status = parse_status(book.get("status").and_then(Value::as_str));
         book["status"] = json!(status_value(status));
         if book.get("kind").is_none_or(Value::is_null) {
             book["kind"] = json!(kind_value(parse_kind(None)));
         }
+        let id = book.get("id").and_then(Value::as_str).unwrap_or_default();
+        let url = book
+            .get("url")
+            .and_then(Value::as_str)
+            .and_then(|sealed| vault.open_book_url(id, sealed));
+        book["url"] = json!(url);
     }
     let note_rows = live_rows(store, "notes")?;
     let mut notes = note_rows

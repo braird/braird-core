@@ -1139,6 +1139,14 @@ public protocol SyncEngineProtocol : AnyObject {
     func findBookByUrl(url: String) throws  -> BookRecord?
     
     /**
+     * The source a shared link belongs to, creating it from `draft` when there is none (SUR-1112).
+     * The lookup and the create share one store lock, so two quick shares of one link make one
+     * source. `draft.url` is required (the raw shared link; normalised here). On a hit nothing is
+     * written and the existing source is returned as it is — the draft's other fields are ignored.
+     */
+    func findOrCreateBookByUrl(draft: BookUpsert) throws  -> BookRecord
+    
+    /**
      * Push every queued write to Supabase (books-first, remap, notes; failed stay queued).
      * Synchronous FFI — the async PostgREST calls run on the owned runtime via `block_on`.
      */
@@ -2178,6 +2186,20 @@ open func findBookByUrl(url: String)throws  -> BookRecord? {
     return try  FfiConverterOptionTypeBookRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_find_book_by_url(self.uniffiClonePointer(),
         FfiConverterString.lower(url),$0
+    )
+})
+}
+    
+    /**
+     * The source a shared link belongs to, creating it from `draft` when there is none (SUR-1112).
+     * The lookup and the create share one store lock, so two quick shares of one link make one
+     * source. `draft.url` is required (the raw shared link; normalised here). On a hit nothing is
+     * written and the existing source is returned as it is — the draft's other fields are ignored.
+     */
+open func findOrCreateBookByUrl(draft: BookUpsert)throws  -> BookRecord {
+    return try  FfiConverterTypeBookRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_find_or_create_book_by_url(self.uniffiClonePointer(),
+        FfiConverterTypeBookUpsert.lower(draft),$0
     )
 })
 }
@@ -8862,6 +8884,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_find_book_by_url() != 44761) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_find_or_create_book_by_url() != 32282) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_flush() != 39156) {

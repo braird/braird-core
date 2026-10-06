@@ -1263,5 +1263,12 @@ class RoundTripTest {
         assertEquals("a1", hit?.id)
         assertEquals(SourceKind.ARTICLE, hit?.kind)
         assertEquals("https://example.com/post", hit?.url)
+        val again = engine.findOrCreateBookByUrl(BookUpsert(
+            id = "a2", title = "Post", author = null, isbn = null, coverUrl = null, coverSource = null,
+            coverResolvedAt = null, status = null, kind = SourceKind.ARTICLE,
+            url = "https://example.com/post#top", createdAt = 2L, deleted = false,
+            clearNullableFields = emptyList(),
+        ))
+        assertEquals("a1", again.id)
     }
 }

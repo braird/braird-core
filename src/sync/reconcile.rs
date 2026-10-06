@@ -1296,6 +1296,7 @@ fn clean_loser_ids(survivor_id: &str, loser_ids: &[String]) -> Vec<String> {
 /// and its redirect is already present.
 pub fn merge_books(
     store: &Store,
+    vault: &Vault,
     survivor_id: &str,
     loser_ids: &[String],
 ) -> Result<BookMergeUndo, String> {
@@ -1431,6 +1432,20 @@ pub fn merge_books(
     // Wire-payload-only: `stage_local_write` already merges partials onto the stored row
     // locally, so carrying the stored columns changes nothing local.
     let mut sp = survivor.clone();
+    // SUR-1112 — a survivor with no share link takes the first loser's, re-sealed under its own id
+    // (each url is bound to its row). Without it the link would live only on a tombstone, which a
+    // fresh install never pulls, so re-sharing it there would make a duplicate. A survivor that
+    // has a link keeps it. Unmerge leaves the copy (a url is never cleared): two live sources then
+    // share the link, and `find_book_by_url` returns the older.
+    if sp.get("url").is_none_or(Value::is_null) {
+        let copied = to_tombstone.iter().find_map(|(lid, row)| {
+            let sealed = row.get("url").and_then(Value::as_str)?;
+            vault.open_book_url(lid, sealed)
+        });
+        if let Some(url) = copied {
+            sp.insert("url".into(), json!(vault.seal_book_url(survivor_id, &url)));
+        }
+    }
     sp.insert("created_at".into(), json!(earliest));
     sp.insert("updated_at".into(), json!(now));
     store
@@ -3373,7 +3388,7 @@ mod tests {
         put(&store, "notes", &note("n2", Some("l1"), &["b"], 2));
         put(&store, "notes", &note("keep", Some("s"), &["c"], 3));
 
-        let undo = merge_books(&store, "s", &["l1".into()]).unwrap();
+        let undo = merge_books(&store, &Vault::generate(), "s", &["l1".into()]).unwrap();
 
         // notes rehomed onto the survivor, content_tag nulled for re-derive.
         assert_eq!(book_id_of(&store, "n1").as_deref(), Some("s"));
@@ -3416,18 +3431,20 @@ mod tests {
         put(&store, "books", &book_at("s", 1));
         put(&store, "books", &book_at("l1", 1));
 
-        assert!(merge_books(&store, "", &["l1".into()]).is_err()); // empty survivor
-                                                                   // empty / self-only losers → no-op (survivor filtered out).
-        assert!(merge_books(&store, "s", &["s".into(), "".into()])
-            .unwrap()
-            .loser_ids
-            .is_empty());
+        assert!(merge_books(&store, &Vault::generate(), "", &["l1".into()]).is_err()); // empty survivor
+                                                                                       // empty / self-only losers → no-op (survivor filtered out).
+        assert!(
+            merge_books(&store, &Vault::generate(), "s", &["s".into(), "".into()])
+                .unwrap()
+                .loser_ids
+                .is_empty()
+        );
         // missing survivor row.
-        assert!(merge_books(&store, "ghost", &["l1".into()]).is_err());
+        assert!(merge_books(&store, &Vault::generate(), "ghost", &["l1".into()]).is_err());
 
         // cycle: the map already resolves s → l1, so merging l1 into s would loop.
         save_merged_book_ids(&store, &BTreeMap::from([("s".into(), "l1".into())])).unwrap();
-        assert!(merge_books(&store, "s", &["l1".into()]).is_err());
+        assert!(merge_books(&store, &Vault::generate(), "s", &["l1".into()]).is_err());
     }
 
     #[test]
@@ -3438,7 +3455,7 @@ mod tests {
         save_merged_book_ids(&store, &BTreeMap::from([("x".into(), "y".into())])).unwrap();
 
         // duplicate loser id collapses to one entry; existing x→y untouched.
-        merge_books(&store, "s", &["l1".into(), "l1".into()]).unwrap();
+        merge_books(&store, &Vault::generate(), "s", &["l1".into(), "l1".into()]).unwrap();
         let map = load_merged_book_ids(&store).unwrap();
         assert_eq!(map.get("x").map(String::as_str), Some("y"));
         assert_eq!(map.get("l1").map(String::as_str), Some("s"));
@@ -3451,12 +3468,12 @@ mod tests {
         put(&store, "books", &book_at("l1", 50));
         put(&store, "notes", &note("n1", Some("l1"), &["a"], 1));
 
-        let first = merge_books(&store, "s", &["l1".into()]).unwrap();
+        let first = merge_books(&store, &Vault::generate(), "s", &["l1".into()]).unwrap();
         assert_eq!(first.reassignments.len(), 1);
 
         // Second run: l1 is already tombstoned — it's skipped entirely, so the retry token is EMPTY
         // (no losers, no reassignments), not a token that would resurrect an empty duplicate on undo.
-        let second = merge_books(&store, "s", &["l1".into()]).unwrap();
+        let second = merge_books(&store, &Vault::generate(), "s", &["l1".into()]).unwrap();
         assert!(
             second.loser_ids.is_empty(),
             "an already-merged loser is not re-recorded"
@@ -3479,8 +3496,8 @@ mod tests {
         put(&store, "books", &book_at("l1", 50));
         put(&store, "notes", &note("n1", Some("l1"), &["a"], 1));
 
-        merge_books(&store, "s", &["l1".into()]).unwrap();
-        let retry = merge_books(&store, "s", &["l1".into()]).unwrap();
+        merge_books(&store, &Vault::generate(), "s", &["l1".into()]).unwrap();
+        let retry = merge_books(&store, &Vault::generate(), "s", &["l1".into()]).unwrap();
 
         unmerge_books(&store, &retry).unwrap();
 
@@ -3517,7 +3534,7 @@ mod tests {
             "precondition: loser still live"
         );
 
-        let undo = merge_books(&store, "s", &["l1".into()]).unwrap();
+        let undo = merge_books(&store, &Vault::generate(), "s", &["l1".into()]).unwrap();
         assert!(
             is_deleted(&store, "books", "l1"),
             "retry completes the tombstone"
@@ -3554,7 +3571,7 @@ mod tests {
         put(&store, "notes", &note("n2", Some("l1"), &["b"], 2)); // still on the loser
         save_merged_book_ids(&store, &BTreeMap::from([("l1".into(), "old".into())])).unwrap();
 
-        let undo = merge_books(&store, "new", &["l1".into()]).unwrap();
+        let undo = merge_books(&store, &Vault::generate(), "new", &["l1".into()]).unwrap();
         assert!(
             is_deleted(&store, "books", "l1"),
             "retry completes the tombstone"
@@ -3582,8 +3599,8 @@ mod tests {
         put(&store, "notes", &note("n1", Some("l1"), &["a"], 1));
         put(&store, "notes", &note("n2", Some("l2"), &["b"], 2));
 
-        let undo1 = merge_books(&store, "s", &["l1".into()]).unwrap();
-        merge_books(&store, "s", &["l2".into()]).unwrap();
+        let undo1 = merge_books(&store, &Vault::generate(), "s", &["l1".into()]).unwrap();
+        merge_books(&store, &Vault::generate(), "s", &["l2".into()]).unwrap();
         assert_eq!(
             store.get_row("books", "s").unwrap().unwrap()["created_at"].as_i64(),
             Some(20)
@@ -3625,7 +3642,7 @@ mod tests {
             &json!({ "id": "bad", "book_id": "l1", "text": "enc:v2:FOREIGN",
             "tags": [], "created_at": 1, "updated_at": 1, "deleted": false }),
         );
-        merge_books(&store, "s", &["l1".into()]).unwrap();
+        merge_books(&store, &Vault::generate(), "s", &["l1".into()]).unwrap();
         assert_eq!(book_id_of(&store, "bad").as_deref(), Some("s"));
 
         // Device B: note still on the (now soft-deleted) loser, map copied over → converges on pull.
@@ -3861,7 +3878,7 @@ mod tests {
         put(&store, "books", &book_at("s", 100));
         put(&store, "books", &book_at("l1", 50));
 
-        merge_books(&store, "s", &["l1".into()]).unwrap();
+        merge_books(&store, &Vault::generate(), "s", &["l1".into()]).unwrap();
 
         let row = store.get_row("books", "l1").unwrap().unwrap();
         assert_eq!(row.get("merged_into"), Some(&Value::String("s".into())));
@@ -3880,7 +3897,7 @@ mod tests {
         put(&store, "books", &book_at("l1", 50));
         put(&store, "notes", &note("n1", Some("l1"), &[], 1));
 
-        let undo = merge_books(&store, "s", &["l1".into()]).unwrap();
+        let undo = merge_books(&store, &Vault::generate(), "s", &["l1".into()]).unwrap();
         unmerge_books(&store, &undo).unwrap();
 
         let row = store.get_row("books", "l1").unwrap().unwrap();
@@ -3917,7 +3934,7 @@ mod tests {
         put(&store, "books", &book_at("s", 100));
         put(&store, "books", &book_at("l1", 50));
 
-        let undo = merge_books(&store, "s", &["l1".into()]).unwrap();
+        let undo = merge_books(&store, &Vault::generate(), "s", &["l1".into()]).unwrap();
 
         let tomb = collapsed_payload(&store, "books", "l1").expect("tombstone queued");
         assert_eq!(tomb.get("title").and_then(Value::as_str), Some("T"));
@@ -3981,7 +3998,7 @@ mod tests {
         // an UNRELATED redirect into a different survivor must survive the undo.
         save_merged_book_ids(&store, &BTreeMap::from([("other".into(), "z".into())])).unwrap();
 
-        let undo = merge_books(&store, "s", &["l1".into()]).unwrap();
+        let undo = merge_books(&store, &Vault::generate(), "s", &["l1".into()]).unwrap();
         unmerge_books(&store, &undo).unwrap();
 
         assert_eq!(
@@ -4040,7 +4057,7 @@ mod tests {
         put(&store, "books", &book_at("l1", 50));
         put(&store, "notes", &note("n1", Some("l1"), &["a"], 1));
 
-        let undo = merge_books(&store, "s", &["l1".into()]).unwrap();
+        let undo = merge_books(&store, &Vault::generate(), "s", &["l1".into()]).unwrap();
         assert_eq!(
             collapsed_book_deleted(&store, "l1"),
             Some(true),
@@ -4062,7 +4079,7 @@ mod tests {
         put(&store, "books", &book_at("l1", 50));
         put(&store, "notes", &note("n1", Some("l1"), &["a"], 1));
 
-        let undo = merge_books(&store, "s", &["l1".into()]).unwrap();
+        let undo = merge_books(&store, &Vault::generate(), "s", &["l1".into()]).unwrap();
         unmerge_books(&store, &undo).unwrap();
         unmerge_books(&store, &undo).unwrap(); // second call: no panic, state unchanged.
 

@@ -10,11 +10,16 @@ use url::Url;
 use crate::library::SourceKind;
 
 /// Query keys that only track a click. `utm_*` is a prefix; the rest are exact (case-insensitive).
-const TRACKING_PARAMS: &[&str] = &["fbclid", "gclid", "mc_cid", "mc_eid", "ref", "si"];
-/// Share tokens that identify the SENDER, per host — stripped there only, because the same key
-/// means content elsewhere (YouTube's `t` is a timestamp). The link is synced, so these must not
-/// carry a third party's identity into the user's store.
+const TRACKING_PARAMS: &[&str] = &["fbclid", "gclid", "mc_cid", "mc_eid", "ref"];
+/// Hosts where a global tracking key is content, and is kept: GitHub's `ref` names a branch.
+const HOST_KEPT_PARAMS: &[(&str, &[&str])] = &[("github.com", &["ref"])];
+/// Share and sender tokens, per host — stripped there only, because the same key means content
+/// elsewhere (YouTube's `t` is a timestamp). The link is synced, so these must not carry a third
+/// party's identity into the user's store.
 const HOST_TRACKING_PARAMS: &[(&str, &[&str])] = &[
+    ("youtube.com", &["si"]),
+    ("youtu.be", &["si"]),
+    ("spotify.com", &["si"]),
     ("x.com", &["t", "s"]),
     ("twitter.com", &["t", "s"]),
     ("instagram.com", &["igsh", "igshid"]),
@@ -99,18 +104,21 @@ pub fn normalize_source_url(raw: String) -> Option<String> {
     url.set_password(None).ok()?;
     url.set_fragment(None);
     let host = url.host_str().unwrap_or("").to_string();
-    let host_params: &[&str] = HOST_TRACKING_PARAMS
-        .iter()
-        .find(|(domain, _)| on_domain(&host, domain))
-        .map_or(&[], |(_, keys)| keys);
+    let for_host = |table: &[(&str, &'static [&'static str])]| -> &'static [&'static str] {
+        table
+            .iter()
+            .find(|(domain, _)| on_domain(&host, domain))
+            .map_or(&[], |(_, keys)| keys)
+    };
+    let (host_params, kept) = (for_host(HOST_TRACKING_PARAMS), for_host(HOST_KEPT_PARAMS));
     let query = url.query().map(|q| {
         q.split('&')
             .filter(|pair| {
                 let key = pair.split('=').next().unwrap_or("").to_ascii_lowercase();
-                !key.is_empty()
-                    && !key.starts_with("utm_")
-                    && !TRACKING_PARAMS.contains(&&*key)
-                    && !host_params.contains(&&*key)
+                let tracking = key.starts_with("utm_")
+                    || (TRACKING_PARAMS.contains(&&*key) && !kept.contains(&&*key))
+                    || host_params.contains(&&*key);
+                !key.is_empty() && !tracking
             })
             .collect::<Vec<_>>()
             .join("&")

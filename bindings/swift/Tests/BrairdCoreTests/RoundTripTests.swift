@@ -1188,5 +1188,10 @@ final class RoundTripTests: XCTestCase {
         XCTAssertEqual(hit?.id, "a1")
         XCTAssertEqual(hit?.kind, .article)
         XCTAssertEqual(hit?.url, "https://example.com/post")
+        let again = try engine.findOrCreateBookByUrl(draft: BookUpsert(
+            id: "a2", title: "Post", author: nil, isbn: nil, coverUrl: nil, coverSource: nil,
+            coverResolvedAt: nil, status: nil, kind: .article, url: "https://example.com/post#top",
+            createdAt: 2, deleted: false, clearNullableFields: []))
+        XCTAssertEqual(again.id, "a1")
     }
 }

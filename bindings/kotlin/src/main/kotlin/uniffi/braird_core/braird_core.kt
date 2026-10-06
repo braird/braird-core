@@ -932,6 +932,8 @@ internal open class UniffiVTableCallbackInterfaceEmbedder(
 
 
 
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -1005,6 +1007,8 @@ internal interface UniffiLib : Library {
     fun uniffi_braird_core_fn_method_syncengine_export_snapshot(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_find_book_by_url(`ptr`: Pointer,`url`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_find_or_create_book_by_url(`ptr`: Pointer,`draft`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_flush(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1296,6 +1300,8 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_find_book_by_url(
     ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_find_or_create_book_by_url(
+    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_flush(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_get_book(
@@ -1504,6 +1510,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_find_book_by_url() != 44761.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_find_or_create_book_by_url() != 32282.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_flush() != 39156.toShort()) {
@@ -2806,6 +2815,14 @@ public interface SyncEngineInterface {
     fun `findBookByUrl`(`url`: kotlin.String): BookRecord?
     
     /**
+     * The source a shared link belongs to, creating it from `draft` when there is none (SUR-1112).
+     * The lookup and the create share one store lock, so two quick shares of one link make one
+     * source. `draft.url` is required (the raw shared link; normalised here). On a hit nothing is
+     * written and the existing source is returned as it is — the draft's other fields are ignored.
+     */
+    fun `findOrCreateBookByUrl`(`draft`: BookUpsert): BookRecord
+    
+    /**
      * Push every queued write to Supabase (books-first, remap, notes; failed stay queued).
      * Synchronous FFI — the async PostgREST calls run on the owned runtime via `block_on`.
      */
@@ -3921,6 +3938,25 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_find_book_by_url(
         it, FfiConverterString.lower(`url`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * The source a shared link belongs to, creating it from `draft` when there is none (SUR-1112).
+     * The lookup and the create share one store lock, so two quick shares of one link make one
+     * source. `draft.url` is required (the raw shared link; normalised here). On a hit nothing is
+     * written and the existing source is returned as it is — the draft's other fields are ignored.
+     */
+    @Throws(SyncException::class)override fun `findOrCreateBookByUrl`(`draft`: BookUpsert): BookRecord {
+            return FfiConverterTypeBookRecord.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_find_or_create_book_by_url(
+        it, FfiConverterTypeBookUpsert.lower(`draft`),_status)
 }
     }
     )

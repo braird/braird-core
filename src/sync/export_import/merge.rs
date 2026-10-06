@@ -236,6 +236,9 @@ fn select_prepare_and_stage(
                 };
                 // SUR-1112 — the same rule for `kind` (default `book`, what 0061 gave every older
                 // row) and `url` (no default: a hand-added source has none).
+                // An EXISTING book is a `book` when its kind is NULL (pre-0061): the archive must
+                // not re-kind it. Its url stays sealed as stored; an archive url is sealed below.
+                let exists = existing.iter().flatten().next().is_some();
                 for (col, default) in [
                     ("status", Some("shelved")),
                     ("kind", Some("book")),
@@ -245,6 +248,7 @@ fn select_prepare_and_stage(
                         .iter()
                         .flatten()
                         .find_map(|row| row.get(col).and_then(Value::as_str))
+                        .or((col == "kind" && exists).then_some("book"))
                         .or(candidate.row.get(col).and_then(Value::as_str))
                         .or(default)
                         .map(str::to_owned);
@@ -337,6 +341,16 @@ fn prepare_write(
                 row.insert("content_tag".into(), Value::Null);
             }
             Some(_) => return Err(SyncError::InvalidImport("invalid normalized note".into())),
+        }
+    }
+    // SUR-1112 — an archive url is plaintext (normalised by `normalize_book`); seal it under this
+    // row. One kept from the existing row is already sealed under this same id.
+    if table == "books" {
+        if let Some(Value::String(url)) = row.get("url") {
+            if !crate::note_encryption::is_encrypted_v2(url) {
+                let sealed = vault.seal_book_url(&record_id, url);
+                row.insert("url".into(), Value::String(sealed));
+            }
         }
     }
 
@@ -1028,6 +1042,40 @@ mod tests {
             status("archived"),
             json!("reading"),
             "an existing book keeps its own"
+        );
+    }
+
+    #[test]
+    fn an_archive_never_re_kinds_an_existing_book_and_its_url_is_sealed() {
+        // SUR-1112 — a local book with a NULL kind (written by this core, or pre-0061) is a Book;
+        // the archive's kind must not win over it. A new book takes the archive's kind, and the
+        // archive's plaintext url is sealed under the row before it is staged.
+        let archive = parsed(
+            "books",
+            vec![
+                json!({"id":"mine","title":"a","updatedAt":50,"kind":"podcast"}),
+                json!({"id":"new","title":"a","updatedAt":50,"kind":"video",
+                       "url":"https://youtu.be/x?si=1"}),
+            ],
+            10,
+        );
+        let store = Store::open_in_memory().unwrap();
+        let row = json!({"id":"mine","title":"l","created_at":1,"updated_at":5,"deleted":false});
+        store.apply_row("books", row.as_object().unwrap()).unwrap();
+        let vault = Vault::generate();
+        let sink = RecordingSink::default();
+        sink.fetch_result("books", Ok(vec![]));
+
+        run(merge_parsed_with_sink(&store, &sink, &vault, archive, 10)).unwrap();
+
+        let get = |id: &str| store.get_row("books", id).unwrap().unwrap();
+        assert_eq!(get("mine")["kind"], json!("book"));
+        assert_eq!(get("new")["kind"], json!("video"));
+        let sealed = get("new")["url"].as_str().unwrap().to_string();
+        assert!(sealed.starts_with("enc:v2:"), "stored sealed, not {sealed}");
+        assert_eq!(
+            vault.open_book_url("new", &sealed).as_deref(),
+            Some("https://youtu.be/x")
         );
     }
 

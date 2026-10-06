@@ -17,19 +17,31 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     Every host site that constructs `BookUpsert` (app code AND test fixtures) must pass them.
   - `BookUpsert.kind: None` keeps the stored kind; a new book with none stays NULL locally and
     reads `Book`, the server default (no explicit write, unlike `status`, so an unpulled server
-    row's kind is never overwritten). `BookUpsert.url` is stored as `normalize_source_url` gives it; a link that
-    does not normalise is rejected (`SyncError::Store`, nothing staged). `url` is set once, by share
-    capture: it is not clearable, and an edit form should never send it. A local NULL kind reads
-    `Book`; an unknown stored kind (from a newer core) reads `Book` but is never written back, so a
-    merge restage pushes it unchanged.
+    row's kind is never overwritten). A local NULL kind reads `Book`; an unknown stored kind (from
+    a newer core) reads `Book` but is never written back, so a merge restage pushes it unchanged.
+  - **`books.url` is sealed (founder 2026-10-06, crypto-reviewer):** a shared link can be a
+    capability (an "anyone with the link" document, an unlisted video), so core seals it at write
+    (enc:v2 under AAD `url:{book_id}`, bound to its row and domain-separated from note text and
+    embeddings) and the local store, the outbox, the server and every backup hold only ciphertext.
+    `BookRecord.url` is opened on read (a value that does not open under its own row reads `None`);
+    the snapshot archive carries plaintext, like note text, and import re-seals it. The PWA never
+    reads it.
+  - `BookUpsert.url` is normalised with `normalize_source_url`; a link that does not normalise is
+    rejected (`SyncError::Store`, nothing staged). The url is **set once**: a book that already has
+    one keeps it and a different draft url is ignored; it is not clearable.
   - New exports: `normalize_source_url(raw)` (http → https, host lowercased, credentials, fragment and
     tracking parameters — `utm_*`, `fbclid`, `gclid`, `mc_cid`, `mc_eid`, `ref`, `si` — dropped, a
-    trailing `/` dropped from a non-root path; `None` for a non-http(s) link),
+    trailing `/` dropped from a non-root path; `si` only on YouTube and Spotify, `ref` kept on
+    GitHub where it names a branch, and per-host sender tokens — x.com `t`/`s`, Instagram
+    `igsh`/`igshid`, LinkedIn `trk`/`rcm`, TikTok `_r`/`_t` — dropped; `None` for a non-http(s)
+    link),
     `classify_source_url(url) -> SourceKind` (host lists in `src/source_url.rs`; anything unlisted
     is an `Article`), `pick_source_cover(kind, image_url, icon_url)` (podcast/video → the unfurl's
     `imageUrl`, else its `iconUrl`; the rest the other way round), and
-    `SyncEngine::find_book_by_url(url)` (normalises, returns the oldest live match, else the live
-    survivor of a merged-away match; a deleted, unmerged match is no match). Frozen cross-client
+    `SyncEngine::find_book_by_url(url)` (normalises, opens every stored link, returns the oldest
+    live match, else the live survivor of a merged-away match; a deleted, unmerged match is no
+    match), and `SyncEngine::find_or_create_book_by_url(draft)` — the share path: the lookup and the
+    create share one store lock, so two quick shares of one link make one source. Frozen cross-client
     vectors in `vendored/source-url/vectors.json`, read by the Rust, Kotlin and Swift tests.
   - Icons are NOT extracted here: the device never sees page HTML. surfc's `fetch-link-metadata`
     returns `imageUrl` / `iconUrl`; the host picks with `pick_source_cover` and stores the result as
@@ -43,7 +55,10 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     a null value of any of them. Sound for `url` because it is never cleared.
   - Snapshot export always writes `kind` (never null) and writes `url`. Import keeps an existing
     book's kind and url (the newer existing row's), else the archive's valid kind and normalised
-    url, else `book` / none. `merge_books` keeps the survivor's whole row, so its kind and url.
+    url, else `book` / none; an existing book with a NULL kind is a `book`, never re-kinded by an
+    archive. `merge_books` keeps the survivor's whole row, so its kind and url; a survivor with no
+    link takes the first loser's, re-sealed under its own id, so a device that never pulls the
+    tombstone still matches the link. Unmerge leaves that copy (a url is never cleared).
   - The Reading pin and the Library rails are host code: filter them on `kind == Book`, never on
     `status` alone (an Other Media row still stores the default `to_read`).
   - **Rollout:** surfc 0061 merges first (this repo's schema-drift check reads surfc/main), and it
