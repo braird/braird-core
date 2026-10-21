@@ -31,6 +31,13 @@ jobs:
     name: outbox flush against local Supabase
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      # SUR-1264. The supabase CLI pulls its images anonymously from public.ecr.aws by default, and
+      # ECR Public caps anonymous data per source IP. GitHub-hosted runners share IPs, so `supabase
+      # start` failed intermittently with "toomanyrequests: Data limit exceeded" (crons 2026-10-12
+      # and 10-19, both runs 2026-10-21). The CLI reads this as INTERNAL_IMAGE_REGISTRY and pulls
+      # ghcr.io/supabase/<image> instead; every image it pins is published there.
+      SUPABASE_INTERNAL_IMAGE_REGISTRY: ghcr.io
     steps:
       - uses: actions/checkout@v4
 
