@@ -6,6 +6,13 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Fixed
+- **`sync-integration` pulls the Supabase images from ghcr.io (SUR-1264).** The CLI's default
+  registry, public.ecr.aws, caps anonymous data per source IP, and GitHub-hosted runners share IPs,
+  so `supabase start` failed intermittently with "toomanyrequests: Data limit exceeded" before any
+  test ran (crons 2026-10-12 and 10-19, both runs on 2026-10-21). The job now sets
+  `SUPABASE_INTERNAL_IMAGE_REGISTRY: ghcr.io`, where every image the CLI pins is published. CI only.
+
 ### Changed
 - **Sync integration test user carries `app_metadata.password_sign_in` (SUR-1253).** surfc
   migration 0062 turns on a Custom Access Token hook (named in surfc's `config.toml`, which the
