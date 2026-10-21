@@ -6,6 +6,15 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Changed
+- **Sync integration test user carries `app_metadata.password_sign_in` (SUR-1253).** surfc
+  migration 0062 turns on a Custom Access Token hook (named in surfc's `config.toml`, which the
+  sync-integration lane starts the stack from) that refuses a password sign-in without that flag.
+  `mint_test_user_jwt` signs in with a password, so without the flag every real-Supabase
+  (`#[ignore]`d) test that mints a user panics on a 403: `sync_659b`, `sync_725`, `sync_726` and
+  `sync_1049`. A stack without the hook ignores the flag, so this
+  merges BEFORE the surfc change. Test harness only; no library or FFI change.
+
 ## [0.19.0] - 2026-10-06
 
 ### Added

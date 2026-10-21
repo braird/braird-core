@@ -64,12 +64,20 @@ pub fn mint_test_user_jwt(env: &SupabaseEnv) -> TestUser {
     );
     let password = "test-password-sur724";
 
-    // Admin-create a pre-confirmed user (bypasses email confirmation + captcha).
+    // Admin-create a pre-confirmed user (bypasses email confirmation + captcha). surfc's
+    // config.toml turns on a Custom Access Token hook (SUR-1253, surfc migration 0062) that
+    // refuses a password sign-in unless `app_metadata.password_sign_in` is true, so the test user
+    // carries the flag. A stack without the hook ignores it.
     let create: Value = http
         .post(format!("{}/auth/v1/admin/users", env.url))
         .header("apikey", &env.service_role_key)
         .header("Authorization", format!("Bearer {}", env.service_role_key))
-        .json(&json!({ "email": email, "password": password, "email_confirm": true }))
+        .json(&json!({
+            "email": email,
+            "password": password,
+            "email_confirm": true,
+            "app_metadata": { "password_sign_in": true }
+        }))
         .send()
         .expect("admin create user")
         .error_for_status()
