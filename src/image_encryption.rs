@@ -526,5 +526,21 @@ mod tests {
         for r in results {
             assert_eq!(r["ok"], true, "{r}");
         }
+
+        // The committed generator still reproduces the frozen file byte for byte (line endings aside).
+        let generated = std::process::Command::new("node")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/vendored/encimg/gen-v1-vectors.mjs"
+            ))
+            .output()
+            .expect("node ran above");
+        assert!(generated.status.success(), "generator failed");
+        let normalise = |s: &str| s.replace("\r\n", "\n");
+        assert_eq!(
+            normalise(&String::from_utf8_lossy(&generated.stdout)),
+            normalise(VECTORS),
+            "vendored/encimg/gen-v1-vectors.mjs no longer reproduces v1-vectors.json"
+        );
     }
 }

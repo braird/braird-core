@@ -396,6 +396,13 @@ mod image_seal {
         assert!(a.starts_with(b"encimg:v1"));
         assert_ne!(a[9..21], b[9..21], "a fresh wrap IV every call");
         assert_ne!(a[69..76], b[69..76], "a fresh nonce prefix every call");
+        // A fresh data key every call (rule 1's STREAM exception, condition (b)).
+        let (k_wrap, aad) = (vault.image_key_wrap_key(), image_aad("note-a"));
+        let dek = |s: &[u8]| {
+            crate::primitives::aes_decrypt(k_wrap.as_slice(), &s[9..21], &s[21..69], Some(&aad))
+                .unwrap()
+        };
+        assert_ne!(dek(&a), dek(&b), "a fresh data key every call");
         assert_eq!(
             vault.open_image(UID.into(), path.clone(), a).unwrap(),
             photo
@@ -451,7 +458,11 @@ mod image_seal {
             crate::primitives::b64encode(wrap_iv),
             crate::primitives::b64encode(wrapped)
         );
-        assert!(vault.decrypt_note(Some(aad), as_note).is_err());
+        // DecryptFailed exactly: a wrap under the bare MK would decrypt and then fail as UTF-8.
+        assert!(matches!(
+            vault.decrypt_note(Some(aad), as_note),
+            Err(CryptoError::DecryptFailed)
+        ));
 
         // The frozen vector's data key, re-wrapped under the bare MK: open must use K_wrap.
         let v = vectors();

@@ -59,6 +59,7 @@ const large = [
   ['chunk', p('note-chunk'), CHUNK],
   ['chunk-plus-1', p('note-chunk-plus-1'), CHUNK + 1],
   ['two-chunks', p('note-two-chunks'), 2 * CHUNK],
+  ['three-chunks', p('note-three-chunks'), 2 * CHUNK + 1],
 ];
 
 const cases = [];

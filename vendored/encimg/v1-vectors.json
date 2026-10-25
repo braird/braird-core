@@ -72,6 +72,13 @@
       "len": 524288,
       "sealed_len": 524396,
       "sealed_sha256": "045aa6e80d79425b14e1eb5a0ab789ba798a502aebde7a0f48864ca8d0e79a7a"
+    },
+    {
+      "name": "three-chunks",
+      "path": "3f2b8c1e-9d4a-4e6f-8b7c-0a1d2e3f4a5b/note-three-chunks.jpg",
+      "len": 524289,
+      "sealed_len": 524413,
+      "sealed_sha256": "d2ecb4e39511eff78467dfd8a112287af74c5887dabbf4cc10758c3a6ca8f8ed"
     }
   ]
 }

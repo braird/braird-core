@@ -55,8 +55,9 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     neither the key nor the plaintext).
   - Only `image_encryption::seal` draws the data key, wrap IV and nonce prefix; the function that
     takes them as arguments is private to the module, so no caller can reuse a data key.
-  - `vendored/encimg/gen-v1-vectors.mjs` is the independent generator of the frozen vectors;
-    re-running it reproduces the file byte for byte.
+  - `vendored/encimg/gen-v1-vectors.mjs` is the independent generator of the frozen vectors
+    (now including a three-chunk case); the oracle test fails if re-running it no longer
+    reproduces the file byte for byte.
   - No `__seal_image_fixed` test seam: the vectors reproduce through the module's own tests, so no
     fixed-key path exists behind `test-seams` (ADR 0008's API note is updated to say so).
 
