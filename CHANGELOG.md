@@ -29,9 +29,11 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     `seal_image(user_id, path, plaintext) -> bytes` and `open_image(user_id, path, sealed) ->
     bytes` (Kotlin `sealImage` / `openImage`, Swift `sealImage(userId:path:plaintext:)`). Core
     checks that `path` is exactly `<user_id>/<image_id>.jpg` and takes the stem itself, so a host
-    never parses ids and a swapped argument fails. Seal returns `BadInput` on a bad path; open
-    returns `DecryptFailed` for every failure and never partial plaintext. The data key, the
-    wrap key, the wrap IV and the nonce prefix are drawn and held in core.
+    never parses ids and a swapped argument fails. `user_id` is the lowercase UUID string exactly
+    as the JWT `sub` holds it (Swift's `UUID.uuidString` is uppercase and fails). Seal returns
+    `BadInput` naming the bad `user_id` or path; open returns `DecryptFailed` for every failure
+    and never partial plaintext. The data key, wrap IV and nonce prefix are drawn in core and the
+    wrap key is derived there; none crosses the FFI.
   - `src/image_encryption.rs`: the format — `aead::stream::StreamBE32` chunks (the `aes-gcm`
     `stream` feature; no new crate), the one AAD, the canonical open (an empty final chunk after a
     full one and a 1..15-byte remainder never open), the 2^32 − 1 chunk cap checked by the writer.
@@ -42,10 +44,19 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     `aead::stream`), checks the canonical length and rejects a tampered copy; it runs inside
     `cargo test` and fails, instead of skipping, when Node is missing and `CI` is set.
   - `K_wrap` known-answer test (`the_image_key_wrap_subkey_is_frozen`), tamper / truncate /
-    reorder / duplicate / wrong-id / wrong-key / path-rule tests, and a key-separation test: the
-    wrapped data key opens neither as `enc:v2` note text nor as a `0x02` byte seal.
+    reorder / duplicate / wrong-id / wrong-key / path-rule tests, and key separation: a fresh
+    seal's wrapped data key opens neither as a `0x02` byte seal nor as `enc:v2` note text under
+    the same MK, and an object whose data key is wrapped under the bare MK does not open.
+  - Test key material comes only from the vectors JSON or the OS RNG, never a literal (CodeQL
+    `rust/hard-coded-cryptographic-value`).
   - The `zeroize` features of `aes-gcm` and `aes` (a direct dependency only for that feature) are
-    on, so the expanded AES key schedule is wiped when a cipher drops — for every format.
+    on, so the expanded AES key schedule is wiped when a cipher drops — for every format. The
+    GHASH key H in the `ghash` / `polyval` state is still not wiped (accepted; H alone gives
+    neither the key nor the plaintext).
+  - Only `image_encryption::seal` draws the data key, wrap IV and nonce prefix; the function that
+    takes them as arguments is private to the module, so no caller can reuse a data key.
+  - `vendored/encimg/gen-v1-vectors.mjs` is the independent generator of the frozen vectors;
+    re-running it reproduces the file byte for byte.
   - No `__seal_image_fixed` test seam: the vectors reproduce through the module's own tests, so no
     fixed-key path exists behind `test-seams` (ADR 0008's API note is updated to say so).
 

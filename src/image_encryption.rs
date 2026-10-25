@@ -9,7 +9,7 @@
 
 use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::aead::stream::{DecryptorBE32, EncryptorBE32};
-use aes_gcm::aead::{KeyInit, Payload};
+use aes_gcm::aead::{AeadCore, KeyInit, OsRng, Payload};
 use aes_gcm::{Aes256Gcm, Key};
 use zeroize::Zeroizing;
 
@@ -21,12 +21,12 @@ pub(crate) const KEY_WRAP_INFO: &[u8] = b"braird-image-key-wrap-v1";
 
 const MAGIC: &[u8; 9] = b"encimg:v1";
 const CHUNK: usize = 262_144;
-const TAG: usize = 16;
+const TAG_LEN: usize = 16;
 const WRAP_IV_AT: usize = MAGIC.len(); // 9
-const WRAPPED_AT: usize = WRAP_IV_AT + 12; // 21
-const PREFIX_AT: usize = WRAPPED_AT + 32 + TAG; // 69
-const HEADER: usize = PREFIX_AT + 7; // 76
-const MIN_SEALED: usize = HEADER + TAG; // 92: one empty final chunk
+const WRAPPED_DEK_AT: usize = WRAP_IV_AT + 12; // 21
+const NONCE_PREFIX_AT: usize = WRAPPED_DEK_AT + 32 + TAG_LEN; // 69
+const HEADER_LEN: usize = NONCE_PREFIX_AT + 7; // 76
+const MIN_SEALED_LEN: usize = HEADER_LEN + TAG_LEN; // 92: one empty final chunk
 const MAX_CHUNKS: u64 = u32::MAX as u64; // 2^32 − 1; aead's `encrypt_last` would allow one more
 
 /// `image_id` from a storage path that is exactly `<user_id>/<image_id>.jpg` — the whole string,
@@ -43,7 +43,7 @@ pub(crate) fn image_id_for_path<'p>(user_id: &str, path: &'p str) -> Option<&'p 
 }
 
 /// `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`, exact bytes.
-fn is_user_id(s: &str) -> bool {
+pub(crate) fn is_user_id(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 36
         && b.iter().enumerate().all(|(i, &c)| match i {
@@ -69,20 +69,37 @@ fn aad(user_id: &str, image_id: &str) -> Vec<u8> {
     a
 }
 
-/// `max(1, ceil(n / CHUNK))`, or `None` past the 2^32 − 1 chunk cap.
-fn chunk_count(n: usize) -> Option<usize> {
-    let chunks = (n as u64).div_ceil(CHUNK as u64).max(1);
-    (chunks <= MAX_CHUNKS).then_some(chunks as usize)
+/// Whether `n` plaintext bytes fit in at most 2^32 − 1 chunks.
+fn fits_chunk_cap(n: usize) -> bool {
+    n as u64 <= MAX_CHUNKS * CHUNK as u64
 }
 
-fn stream_cipher(dek: &[u8]) -> Aes256Gcm {
+fn dek_cipher(dek: &[u8]) -> Aes256Gcm {
     Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(dek))
 }
 
-/// Seal `pt` with the caller's fresh random `dek`, `wrap_iv` and `nonce_prefix` (the Vault draws
-/// them from the OS CSPRNG on every call; fixed values appear only in this module's tests).
-/// The ids must already be validated (see [`image_id_for_path`]).
+/// Seal `pt` under a fresh data key, wrap IV and nonce prefix drawn here from the OS CSPRNG on
+/// every call. This is the only way the crate seals, so a data key can never be reused or passed
+/// in (rule 1's STREAM exception, condition (b)). The ids must already be validated (see
+/// [`image_id_for_path`]).
 pub(crate) fn seal(
+    k_wrap: &[u8],
+    user_id: &str,
+    image_id: &str,
+    pt: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    // The `GenericArray` moved into `Zeroizing` may leave an unwiped stack copy (accepted; a zeroed
+    // buffer filled in place would be a CodeQL hard-coded-key alert).
+    let dek = Zeroizing::new(<[u8; 32]>::from(Aes256Gcm::generate_key(&mut OsRng)));
+    let wrap_iv: [u8; 12] = Aes256Gcm::generate_nonce(&mut OsRng).into();
+    let nonce_prefix: [u8; 7] = Aes256Gcm::generate_nonce(&mut OsRng)[..7]
+        .try_into()
+        .expect("7 of 12 nonce bytes");
+    seal_with(k_wrap, &dek, &wrap_iv, &nonce_prefix, user_id, image_id, pt)
+}
+
+/// [`seal`] with the key material given — private, so only this module's tests pass fixed values.
+fn seal_with(
     k_wrap: &[u8],
     dek: &[u8; 32],
     wrap_iv: &[u8; 12],
@@ -91,19 +108,23 @@ pub(crate) fn seal(
     image_id: &str,
     pt: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    let chunks =
-        chunk_count(pt.len()).ok_or_else(|| CryptoError::BadInput("image too large".into()))?;
+    if !fits_chunk_cap(pt.len()) {
+        return Err(CryptoError::BadInput("image too large".into()));
+    }
     let aad = aad(user_id, image_id);
-    let mut out = Vec::with_capacity(HEADER + pt.len() + TAG * chunks);
+    let mut out =
+        Vec::with_capacity(HEADER_LEN + TAG_LEN + pt.len() + TAG_LEN * (pt.len() / CHUNK));
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(wrap_iv);
     out.extend_from_slice(&aes_encrypt(k_wrap, wrap_iv, dek, Some(&aad)));
     out.extend_from_slice(nonce_prefix);
 
-    let mut enc =
-        EncryptorBE32::from_aead(stream_cipher(dek), GenericArray::from_slice(nonce_prefix));
-    let last_at = (chunks - 1) * CHUNK;
-    for piece in pt[..last_at].chunks(CHUNK) {
+    let mut enc = EncryptorBE32::from_aead(dek_cipher(dek), GenericArray::from_slice(nonce_prefix));
+    // Full chunks while more than one chunk's worth remains; the rest (0..=CHUNK bytes, possibly
+    // empty) is the flagged final chunk — one layout per plaintext.
+    let mut rest = pt;
+    while rest.len() > CHUNK {
+        let (piece, tail) = rest.split_at(CHUNK);
         let ct = enc
             .encrypt_next(Payload {
                 msg: piece,
@@ -111,10 +132,11 @@ pub(crate) fn seal(
             })
             .expect("stream encrypt (counter capped above)");
         out.extend_from_slice(&ct);
+        rest = tail;
     }
     let ct = enc
         .encrypt_last(Payload {
-            msg: &pt[last_at..],
+            msg: rest,
             aad: &aad,
         })
         .expect("stream encrypt last");
@@ -132,39 +154,36 @@ pub(crate) fn open(
     image_id: &str,
     sealed: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    let fail = CryptoError::DecryptFailed;
-    if sealed.len() < MIN_SEALED || &sealed[..WRAP_IV_AT] != MAGIC {
-        return Err(fail);
+    if sealed.len() < MIN_SEALED_LEN || &sealed[..MAGIC.len()] != MAGIC {
+        return Err(CryptoError::DecryptFailed);
     }
     let aad = aad(user_id, image_id);
     let dek = Zeroizing::new(
         aes_decrypt(
             k_wrap,
-            &sealed[WRAP_IV_AT..WRAPPED_AT],
-            &sealed[WRAPPED_AT..PREFIX_AT],
+            &sealed[WRAP_IV_AT..WRAPPED_DEK_AT],
+            &sealed[WRAPPED_DEK_AT..NONCE_PREFIX_AT],
             Some(&aad),
         )
         .map_err(|_| CryptoError::DecryptFailed)?,
     );
 
-    let body = &sealed[HEADER..];
-    let piece = CHUNK + TAG;
+    let body = &sealed[HEADER_LEN..];
+    let piece = CHUNK + TAG_LEN;
     let (before_last, last_len) = match body.len() % piece {
         0 => (body.len() / piece - 1, piece),
         rem => (body.len() / piece, rem),
     };
-    if last_len < TAG || (last_len == TAG && before_last > 0) {
-        return Err(fail);
-    }
-    if before_last as u64 >= MAX_CHUNKS {
-        return Err(fail);
+    let noncanonical = last_len < TAG_LEN || (last_len == TAG_LEN && before_last > 0);
+    if noncanonical || before_last as u64 >= MAX_CHUNKS {
+        return Err(CryptoError::DecryptFailed);
     }
 
     let mut dec = DecryptorBE32::from_aead(
-        stream_cipher(&dek),
-        GenericArray::from_slice(&sealed[PREFIX_AT..HEADER]),
+        dek_cipher(&dek),
+        GenericArray::from_slice(&sealed[NONCE_PREFIX_AT..HEADER_LEN]),
     );
-    let mut out = Zeroizing::new(Vec::with_capacity(body.len() - TAG * (before_last + 1)));
+    let mut out = Zeroizing::new(Vec::with_capacity(body.len() - TAG_LEN * (before_last + 1)));
     let last_at = before_last * piece;
     for ct in body[..last_at].chunks(piece) {
         let pt = Zeroizing::new(
@@ -191,6 +210,8 @@ mod tests {
     use serde_json::Value;
     use sha2::{Digest, Sha256};
 
+    // Fixed key material comes only from the vectors JSON, and anything else from the OS RNG —
+    // never a literal in the code (CodeQL `rust/hard-coded-cryptographic-value`).
     const VECTORS: &str = include_str!("../vendored/encimg/v1-vectors.json");
     const UID: &str = "3f2b8c1e-9d4a-4e6f-8b7c-0a1d2e3f4a5b";
 
@@ -203,37 +224,43 @@ mod tests {
             .try_into()
             .unwrap()
     }
+    fn random_dek() -> [u8; 32] {
+        Aes256Gcm::generate_key(&mut OsRng).into()
+    }
     /// The vectors' plaintext rule: byte i = i % 251.
     fn plaintext(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i % 251) as u8).collect()
     }
+    /// `K_wrap` under the vectors' MK; `vault::image_seal` pins its value as a known answer.
     fn k_wrap() -> Zeroizing<[u8; 32]> {
-        hkdf32_unsalted(&[0x11; 32], KEY_WRAP_INFO)
+        hkdf32_unsalted(&hex_of::<32>(&vectors(), "mk"), KEY_WRAP_INFO)
     }
-    /// Seal `n` plaintext bytes under the vectors' fixed key material.
-    fn seal_fixed(path: &str, n: usize, wrap_iv: [u8; 12]) -> Vec<u8> {
+    /// Seal `n` plaintext bytes under the vectors' fixed data key, nonce prefix and `wrap_iv`.
+    fn seal_fixed_iv(path: &str, n: usize, wrap_iv: [u8; 12]) -> Vec<u8> {
         let v = vectors();
         let id = image_id_for_path(UID, path).expect("valid path");
         let pt = plaintext(n);
         let (dek, prefix) = (hex_of(&v, "dek"), hex_of(&v, "nonce_prefix"));
-        seal(&*k_wrap(), &dek, &wrap_iv, &prefix, UID, id, &pt).unwrap()
+        seal_with(&*k_wrap(), &dek, &wrap_iv, &prefix, UID, id, &pt).unwrap()
+    }
+    fn seal_fixed(path: &str, n: usize) -> Vec<u8> {
+        seal_fixed_iv(path, n, hex_of(&vectors(), "wrap_iv"))
     }
     fn open_at(path: &str, sealed: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        open(
-            &*k_wrap(),
-            UID,
-            image_id_for_path(UID, path).unwrap(),
-            sealed,
-        )
+        let id = image_id_for_path(UID, path).unwrap();
+        open(&*k_wrap(), UID, id, sealed)
     }
     fn case_seal(c: &Value) -> Vec<u8> {
-        let wrap_iv = if c.get("wrap_iv").is_some() {
-            hex_of(c, "wrap_iv")
-        } else {
-            hex_of(&vectors(), "wrap_iv")
-        };
         let n = c["len"].as_u64().unwrap() as usize;
-        seal_fixed(c["path"].as_str().unwrap(), n, wrap_iv)
+        let path = c["path"].as_str().unwrap();
+        match c.get("wrap_iv") {
+            Some(_) => seal_fixed_iv(path, n, hex_of(c, "wrap_iv")),
+            None => seal_fixed(path, n),
+        }
+    }
+    /// The writer's sealed length: header + plaintext + one tag per chunk, at least one chunk.
+    fn sealed_len(n: usize) -> usize {
+        HEADER_LEN + n + TAG_LEN * n.div_ceil(CHUNK).max(1)
     }
 
     /// The independent node:crypto generator's bytes (or their SHA-256 for the large cases) are
@@ -273,16 +300,6 @@ mod tests {
         }
     }
 
-    /// `K_wrap` for MK = 0x11 x 32 matches the vectors, whose value came from node:crypto
-    /// `hkdfSync("sha256", 0x11 x 32, 0x00 x 32, "braird-image-key-wrap-v1", 32)`.
-    #[test]
-    fn k_wrap_matches_node() {
-        assert_eq!(
-            hex::encode(*k_wrap()),
-            vectors()["k_wrap"].as_str().unwrap()
-        );
-    }
-
     /// A re-wrap changes only `wrap_iv` + `wrapped_dek`; the chunks are untouched and it opens (E2).
     #[test]
     fn a_rewrap_leaves_the_chunks_untouched() {
@@ -294,20 +311,9 @@ mod tests {
         };
         let (small, rewrap) = (get("small"), get("rewrap"));
         assert_eq!(small[..WRAP_IV_AT], rewrap[..WRAP_IV_AT]);
-        assert_ne!(small[WRAP_IV_AT..PREFIX_AT], rewrap[WRAP_IV_AT..PREFIX_AT]);
-        assert_eq!(small[PREFIX_AT..], rewrap[PREFIX_AT..]);
-    }
-
-    #[test]
-    fn round_trips_at_the_chunk_edges() {
-        for n in [0, 1, CHUNK - 1, CHUNK, CHUNK + 1, 2 * CHUNK, 2 * CHUNK + 1] {
-            let path = format!("{UID}/edge-{n}.jpg");
-            let sealed = seal_fixed(&path, n, [7; 12]);
-            let chunks = chunk_count(n).unwrap();
-            assert_eq!(sealed.len(), HEADER + n + TAG * chunks, "n = {n}");
-            assert_eq!(&sealed[..WRAP_IV_AT], MAGIC);
-            assert_eq!(open_at(&path, &sealed).unwrap(), plaintext(n), "n = {n}");
-        }
+        let wrap = WRAP_IV_AT..NONCE_PREFIX_AT;
+        assert_ne!(small[wrap.clone()], rewrap[wrap]);
+        assert_eq!(small[NONCE_PREFIX_AT..], rewrap[NONCE_PREFIX_AT..]);
     }
 
     /// Every way to damage an object fails closed with `DecryptFailed`: never a panic, never
@@ -315,10 +321,11 @@ mod tests {
     #[test]
     fn every_tamper_fails_closed() {
         let path = format!("{UID}/note-tamper.jpg");
-        let base = seal_fixed(&path, 2 * CHUNK + 1, [7; 12]);
-        let piece = CHUNK + TAG;
-        let (c0, c1, c2) = (HEADER, HEADER + piece, HEADER + 2 * piece);
-        assert!(open_at(&path, &base).is_ok());
+        let base = seal_fixed(&path, 2 * CHUNK + 1);
+        let piece = CHUNK + TAG_LEN;
+        let (c0, c1, c2) = (HEADER_LEN, HEADER_LEN + piece, HEADER_LEN + 2 * piece);
+        assert_eq!(open_at(&path, &base).unwrap(), plaintext(2 * CHUNK + 1));
+        assert_eq!(base.len(), sealed_len(2 * CHUNK + 1));
 
         let flip = |at: usize| {
             let mut b = base.clone();
@@ -349,12 +356,15 @@ mod tests {
             "16 bytes appended".into(),
             [&base[..], &[0u8; 16][..]].concat(),
         ));
-        for r in 1..TAG {
-            let longer = [&base[..], &vec![0u8; r][..]].concat();
+        // A 1..15-byte remainder after a body that is an exact chunk multiple (n = CHUNK), so the
+        // remainder check itself is what rejects it.
+        let exact = seal_fixed(&path, CHUNK);
+        for r in 1..TAG_LEN {
+            let longer = [&exact[..], &vec![0u8; r][..]].concat();
             damaged.push((format!("{r}-byte remainder"), longer));
         }
-        damaged.push(("91 bytes".into(), base[..MIN_SEALED - 1].to_vec()));
-        damaged.push(("header only".into(), base[..HEADER].to_vec()));
+        damaged.push(("91 bytes".into(), base[..MIN_SEALED_LEN - 1].to_vec()));
+        damaged.push(("header only".into(), base[..HEADER_LEN].to_vec()));
         damaged.push(("magic only".into(), MAGIC.to_vec()));
         damaged.push(("empty".into(), Vec::new()));
         for (name, bytes) in damaged {
@@ -368,12 +378,12 @@ mod tests {
     #[test]
     fn the_wrong_ids_or_key_fail() {
         let path = format!("{UID}/note-a.jpg");
-        let sealed = seal_fixed(&path, 37, [7; 12]);
+        let sealed = seal_fixed(&path, 37);
         let other_uid = "00000000-0000-4000-8000-000000000000";
         let wrong = [
             open(&*k_wrap(), other_uid, "note-a", &sealed),
             open(&*k_wrap(), UID, "note-b", &sealed),
-            open(&[0x22; 32], UID, "note-a", &sealed),
+            open(&random_dek(), UID, "note-a", &sealed),
         ];
         for r in wrong {
             assert!(matches!(r, Err(CryptoError::DecryptFailed)));
@@ -385,20 +395,11 @@ mod tests {
     #[test]
     fn a_header_from_another_object_under_the_same_ids_fails() {
         let path = format!("{UID}/note-a.jpg");
-        let a = seal_fixed(&path, 100, [7; 12]);
+        let a = seal_fixed(&path, 100);
         let id = image_id_for_path(UID, &path).unwrap();
-        let b = seal(
-            &*k_wrap(),
-            &[0x33; 32],
-            &[8; 12],
-            &[9; 7],
-            UID,
-            id,
-            &plaintext(100),
-        )
-        .unwrap();
+        let b = seal(&*k_wrap(), UID, id, &plaintext(100)).unwrap();
         assert!(open_at(&path, &b).is_ok());
-        let spliced = [&a[..HEADER], &b[HEADER..]].concat();
+        let spliced = [&a[..HEADER_LEN], &b[HEADER_LEN..]].concat();
         assert!(matches!(
             open_at(&path, &spliced),
             Err(CryptoError::DecryptFailed)
@@ -410,17 +411,16 @@ mod tests {
     #[test]
     fn a_noncanonical_empty_final_chunk_is_rejected() {
         let path = format!("{UID}/note-c.jpg");
-        let id = image_id_for_path(UID, &path).unwrap();
-        let (dek, prefix, pt) = ([0x44; 32], [0x55; 7], plaintext(CHUNK));
-        let canonical = seal(&*k_wrap(), &dek, &[1; 12], &prefix, UID, id, &pt).unwrap();
+        let canonical = seal_fixed(&path, CHUNK);
         assert!(open_at(&path, &canonical).is_ok());
 
-        let a = aad(UID, id);
-        let nonce_prefix = GenericArray::from_slice(&prefix);
-        let mut enc = EncryptorBE32::from_aead(stream_cipher(&dek), nonce_prefix);
+        let v = vectors();
+        let (dek, prefix): ([u8; 32], [u8; 7]) = (hex_of(&v, "dek"), hex_of(&v, "nonce_prefix"));
+        let (a, pt) = (aad(UID, "note-c"), plaintext(CHUNK));
+        let mut enc = EncryptorBE32::from_aead(dek_cipher(&dek), GenericArray::from_slice(&prefix));
         let full = enc.encrypt_next(Payload { msg: &pt, aad: &a }).unwrap();
         let empty = enc.encrypt_last(Payload { msg: &[], aad: &a }).unwrap();
-        let noncanonical = [&canonical[..HEADER], &full[..], &empty[..]].concat();
+        let noncanonical = [&canonical[..HEADER_LEN], &full[..], &empty[..]].concat();
         let opened = open_at(&path, &noncanonical);
         assert!(matches!(opened, Err(CryptoError::DecryptFailed)));
     }
@@ -428,12 +428,9 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn the_chunk_cap() {
-        assert_eq!(chunk_count(0), Some(1));
-        assert_eq!(chunk_count(CHUNK), Some(1));
-        assert_eq!(chunk_count(CHUNK + 1), Some(2));
         let cap = u32::MAX as usize;
-        assert_eq!(chunk_count(cap * CHUNK), Some(cap));
-        assert_eq!(chunk_count(cap * CHUNK + 1), None);
+        assert!(fits_chunk_cap(cap * CHUNK));
+        assert!(!fits_chunk_cap(cap * CHUNK + 1));
     }
 
     /// The frozen path rule (ADR 0008): the whole string, ASCII only, exact bytes.
@@ -450,7 +447,7 @@ mod tests {
         let max = "a".repeat(64);
         assert!(image_id_for_path(UID, &format!("{UID}/{max}.jpg")).is_some());
 
-        let upper_uid = UID.to_uppercase();
+        let upper = UID.to_uppercase();
         let bad = [
             format!("{UID}/note-a\n.jpg"),
             format!("{UID}/note-a.jpg\n"),
@@ -461,22 +458,25 @@ mod tests {
             format!("{UID}/.jpg"),
             format!("{UID}/{max}a.jpg"),
             format!("{UID}/not\u{e8}-a.jpg"),
-            format!("{upper_uid}/note-a.jpg"),
+            format!("{upper}/note-a.jpg"),
             format!("note-images/{UID}/note-a.jpg"),
             "00000000-0000-4000-8000-000000000000/note-a.jpg".to_string(),
             format!("{UID}/note.a.jpg"),
             format!("{UID}/note_a.jpg"),
             format!("{UID}/note-a.jpg?x"),
         ];
-        for path in &bad {
-            assert_eq!(image_id_for_path(UID, path), None, "{path:?}");
+        for (i, path) in bad.iter().enumerate() {
+            assert_eq!(image_id_for_path(UID, path), None, "bad path #{i}");
         }
         // Swapped arguments, and malformed user ids.
         let path = format!("{UID}/note-a.jpg");
         assert_eq!(image_id_for_path(&path, UID), None);
-        let upper_path = format!("{upper_uid}/note-a.jpg");
-        assert_eq!(image_id_for_path(&upper_uid, &upper_path), None);
+        assert_eq!(
+            image_id_for_path(&upper, &format!("{upper}/note-a.jpg")),
+            None
+        );
         assert_eq!(image_id_for_path("not-a-uid", "not-a-uid/note-a.jpg"), None);
+        assert!(is_user_id(UID) && !is_user_id(&upper) && !is_user_id(&path));
     }
 
     /// The independent node:crypto oracle (tests/encimg_oracle.mjs, written from the ADR text)

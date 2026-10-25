@@ -3144,10 +3144,11 @@ public protocol VaultProtocol : AnyObject {
     
     /**
      * Open an `encimg:v1` object (ADR 0008) read from its stored `path` (`notes.image_path` /
-     * `ink_crop_path`, exactly `<user_id>/<image_id>.jpg`). Fails closed with `DecryptFailed` for
-     * every failure — a malformed path, a wrong key, a moved, truncated, reordered or tampered
-     * object — and never returns partial plaintext. Hosts send bytes that start with `encimg:`
-     * here and never show the raw bytes when it fails.
+     * `ink_crop_path`, exactly `<user_id>/<image_id>.jpg`). `user_id` is the session's lowercase
+     * UUID string, as for [`Vault::seal_image`]. Fails closed with `DecryptFailed` for every
+     * failure — a malformed `user_id` or path, a wrong key, a moved, truncated, reordered or
+     * tampered object — and never returns partial plaintext. Hosts send bytes that start with
+     * `encimg:` here and never show the raw bytes when it fails.
      */
     func openImage(userId: String, path: String, sealed: Data) throws  -> Data
     
@@ -3172,10 +3173,12 @@ public protocol VaultProtocol : AnyObject {
     /**
      * Seal a note photo or margin ink crop as `encimg:v1` (ADR 0008) before upload. `path` is the
      * storage path the upload will create: exactly `<user_id>/<image_id>.jpg`, the shape
-     * `image-upload` returns. `user_id` is the session's auth user id as the auth library returns
-     * it; core cannot check that it belongs to this session (the per-user MK still stops a
-     * cross-user object). A fresh random data key, wrap IV and nonce prefix are drawn in-core on
-     * every call and never cross the FFI. `BadInput` when the path or an id is malformed.
+     * `image-upload` returns. `user_id` is the session's auth user id: the lowercase UUID string
+     * exactly as the JWT `sub` holds it, never re-formatted (Swift's `UUID.uuidString` is
+     * uppercase and fails). Core cannot check that it belongs to this session (the per-user MK
+     * still stops a cross-user object). A fresh random data key, wrap IV and nonce prefix are drawn
+     * in-core on every call, the wrap key is derived in-core, and none of them crosses the FFI.
+     * `BadInput` when `user_id` or the path is malformed.
      */
     func sealImage(userId: String, path: String, plaintext: Data) throws  -> Data
     
@@ -3347,10 +3350,11 @@ open func openBytes(sealed: Data, aad: String)throws  -> Data {
     
     /**
      * Open an `encimg:v1` object (ADR 0008) read from its stored `path` (`notes.image_path` /
-     * `ink_crop_path`, exactly `<user_id>/<image_id>.jpg`). Fails closed with `DecryptFailed` for
-     * every failure — a malformed path, a wrong key, a moved, truncated, reordered or tampered
-     * object — and never returns partial plaintext. Hosts send bytes that start with `encimg:`
-     * here and never show the raw bytes when it fails.
+     * `ink_crop_path`, exactly `<user_id>/<image_id>.jpg`). `user_id` is the session's lowercase
+     * UUID string, as for [`Vault::seal_image`]. Fails closed with `DecryptFailed` for every
+     * failure — a malformed `user_id` or path, a wrong key, a moved, truncated, reordered or
+     * tampered object — and never returns partial plaintext. Hosts send bytes that start with
+     * `encimg:` here and never show the raw bytes when it fails.
      */
 open func openImage(userId: String, path: String, sealed: Data)throws  -> Data {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCryptoError.lift) {
@@ -3402,10 +3406,12 @@ open func sealBytes(bytes: Data, aad: String) -> Data {
     /**
      * Seal a note photo or margin ink crop as `encimg:v1` (ADR 0008) before upload. `path` is the
      * storage path the upload will create: exactly `<user_id>/<image_id>.jpg`, the shape
-     * `image-upload` returns. `user_id` is the session's auth user id as the auth library returns
-     * it; core cannot check that it belongs to this session (the per-user MK still stops a
-     * cross-user object). A fresh random data key, wrap IV and nonce prefix are drawn in-core on
-     * every call and never cross the FFI. `BadInput` when the path or an id is malformed.
+     * `image-upload` returns. `user_id` is the session's auth user id: the lowercase UUID string
+     * exactly as the JWT `sub` holds it, never re-formatted (Swift's `UUID.uuidString` is
+     * uppercase and fails). Core cannot check that it belongs to this session (the per-user MK
+     * still stops a cross-user object). A fresh random data key, wrap IV and nonce prefix are drawn
+     * in-core on every call, the wrap key is derived in-core, and none of them crosses the FFI.
+     * `BadInput` when `user_id` or the path is malformed.
      */
 open func sealImage(userId: String, path: String, plaintext: Data)throws  -> Data {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCryptoError.lift) {
@@ -9100,7 +9106,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_vault_open_bytes() != 24917) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_vault_open_image() != 30654) {
+    if (uniffi_braird_core_checksum_method_vault_open_image() != 5217) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_vault_pin_wrap() != 28802) {
@@ -9112,7 +9118,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_vault_seal_bytes() != 46732) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_vault_seal_image() != 45267) {
+    if (uniffi_braird_core_checksum_method_vault_seal_image() != 54824) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_vault_wrap_with_prf() != 28929) {

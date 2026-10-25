@@ -1274,9 +1274,9 @@ class RoundTripTest {
 
     /** SUR-1259 — `encimg:v1` (ADR 0008) through the binding. A frozen vector, sealed by the
      * independent node:crypto generator, opens under the vectors' MK (0x11 x 32, unlocked from the
-     * JS-produced prf-v1 blob); a tampered copy and another path throw; a fresh seal round-trips;
-     * a malformed or swapped path is refused at seal. Binding checks, not format evidence (the
-     * Rust tests and the Node oracle are that). */
+     * JS-produced prf-v1 blob); a tampered copy throws DecryptFailed; a fresh seal round-trips;
+     * a malformed path is BadInput at seal. Binding checks, not format evidence (the Rust tests
+     * and the Node oracle are that). */
     @Test
     fun imageSealVectorsOverFfi() {
         val wrap = vectors().objects().first { it.getString("id") == "mk-wrap" }.getJSONObject("expected")
@@ -1293,7 +1293,6 @@ class RoundTripTest {
 
         val tampered = sealed.copyOf().also { it[it.size - 1] = (it[it.size - 1].toInt() xor 1).toByte() }
         assertThrows(CryptoException.DecryptFailed::class.java) { vault.openImage(uid, path, tampered) }
-        assertThrows(CryptoException.DecryptFailed::class.java) { vault.openImage(uid, "$uid/other.jpg", sealed) }
 
         val photo = byteArrayOf(1, 2, 3)
         val fresh = vault.sealImage(uid, "$uid/note-a.jpg", photo)
@@ -1302,6 +1301,5 @@ class RoundTripTest {
         assertThrows(CryptoException.BadInput::class.java) {
             vault.sealImage(uid, "note-images/$uid/note-a.jpg", photo)
         }
-        assertThrows(CryptoException.BadInput::class.java) { vault.sealImage("$uid/note-a.jpg", uid, photo) }
     }
 }

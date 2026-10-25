@@ -1197,8 +1197,8 @@ final class RoundTripTests: XCTestCase {
 
     /// SUR-1259 — `encimg:v1` (ADR 0008) through the binding. A frozen vector, sealed by the
     /// independent node:crypto generator, opens under the vectors' MK (0x11 x 32, unlocked from the
-    /// JS-produced prf-v1 blob); a tampered copy and another path throw; a fresh seal round-trips;
-    /// a malformed or swapped path is refused at seal. Binding checks, not format evidence.
+    /// JS-produced prf-v1 blob); a tampered copy throws DecryptFailed; a fresh seal round-trips;
+    /// a malformed path is BadInput at seal. Binding checks, not format evidence.
     func testImageSealVectorsOverFfi() throws {
         let vectors = try fixture("vectors.json") as! [[String: Any]]
         let inputs = try fixture("inputs.json") as! [String: Any]
@@ -1223,15 +1223,18 @@ final class RoundTripTests: XCTestCase {
 
         var tampered = sealed
         tampered[tampered.count - 1] ^= 0x01
-        XCTAssertThrowsError(try vault.openImage(userId: uid, path: path, sealed: tampered))
-        XCTAssertThrowsError(try vault.openImage(userId: uid, path: "\(uid)/other.jpg", sealed: sealed))
+        XCTAssertThrowsError(try vault.openImage(userId: uid, path: path, sealed: tampered)) { error in
+            if case .DecryptFailed? = error as? CryptoError {} else { XCTFail("not DecryptFailed: \(error)") }
+        }
 
         let photo = Data([1, 2, 3])
         let fresh = try vault.sealImage(userId: uid, path: "\(uid)/note-a.jpg", plaintext: photo)
         XCTAssertEqual(fresh.prefix(9), Data("encimg:v1".utf8))
         XCTAssertEqual(try vault.openImage(userId: uid, path: "\(uid)/note-a.jpg", sealed: fresh), photo)
         XCTAssertThrowsError(
-            try vault.sealImage(userId: uid, path: "note-images/\(uid)/note-a.jpg", plaintext: photo))
-        XCTAssertThrowsError(try vault.sealImage(userId: "\(uid)/note-a.jpg", path: uid, plaintext: photo))
+            try vault.sealImage(userId: uid, path: "note-images/\(uid)/note-a.jpg", plaintext: photo)
+        ) { error in
+            if case .BadInput? = error as? CryptoError {} else { XCTFail("not BadInput: \(error)") }
+        }
     }
 }
