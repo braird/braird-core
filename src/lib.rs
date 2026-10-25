@@ -11,6 +11,10 @@
 
 mod byte_encryption;
 mod content_tag;
+// The `encimg:v1` image seal (SUR-1259, ADR 0008). Native-only like its `Vault` exports: the PWA
+// does not open sealed photos (it shows a placeholder, SUR-1270).
+#[cfg(not(target_arch = "wasm32"))]
+mod image_encryption;
 mod key_manager;
 mod normalize;
 mod note_encryption;

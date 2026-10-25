@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use zeroize::Zeroizing;
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::image_encryption;
 use crate::primitives::fill_random;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::primitives::hkdf32_unsalted;
@@ -14,7 +16,7 @@ use crate::{byte_encryption, content_tag, key_manager, note_encryption};
 use crate::{CryptoError, WrappedBlob};
 #[cfg(not(target_arch = "wasm32"))]
 use aes_gcm::{
-    aead::{AeadCore, OsRng},
+    aead::{AeadCore, KeyInit, OsRng},
     Aes256Gcm,
 };
 
@@ -147,6 +149,63 @@ impl Vault {
     }
 }
 
+// Image sealing (SUR-1259, ADR 0008). Native-only: the PWA does not open sealed photos (SUR-1270),
+// and the subkey derivation (`hkdf32_unsalted`) is native-only.
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export]
+impl Vault {
+    /// Seal a note photo or margin ink crop as `encimg:v1` (ADR 0008) before upload. `path` is the
+    /// storage path the upload will create: exactly `<user_id>/<image_id>.jpg`, the shape
+    /// `image-upload` returns. `user_id` is the session's auth user id as the auth library returns
+    /// it; core cannot check that it belongs to this session (the per-user MK still stops a
+    /// cross-user object). A fresh random data key, wrap IV and nonce prefix are drawn in-core on
+    /// every call and never cross the FFI. `BadInput` when the path or an id is malformed.
+    pub fn seal_image(
+        &self,
+        user_id: String,
+        path: String,
+        plaintext: Vec<u8>,
+    ) -> Result<Vec<u8>, CryptoError> {
+        let image_id = image_encryption::image_id_for_path(&user_id, &path)
+            .ok_or_else(|| CryptoError::BadInput("path is not <user_id>/<image_id>.jpg".into()))?;
+        let dek = Zeroizing::new(<[u8; 32]>::from(Aes256Gcm::generate_key(&mut OsRng)));
+        let wrap_iv: [u8; 12] = Aes256Gcm::generate_nonce(&mut OsRng).into();
+        let nonce_prefix: [u8; 7] = Aes256Gcm::generate_nonce(&mut OsRng)[..7]
+            .try_into()
+            .expect("7 of 12 nonce bytes");
+        image_encryption::seal(
+            self.image_key_wrap_key().as_slice(),
+            &dek,
+            &wrap_iv,
+            &nonce_prefix,
+            &user_id,
+            image_id,
+            &plaintext,
+        )
+    }
+
+    /// Open an `encimg:v1` object (ADR 0008) read from its stored `path` (`notes.image_path` /
+    /// `ink_crop_path`, exactly `<user_id>/<image_id>.jpg`). Fails closed with `DecryptFailed` for
+    /// every failure — a malformed path, a wrong key, a moved, truncated, reordered or tampered
+    /// object — and never returns partial plaintext. Hosts send bytes that start with `encimg:`
+    /// here and never show the raw bytes when it fails.
+    pub fn open_image(
+        &self,
+        user_id: String,
+        path: String,
+        sealed: Vec<u8>,
+    ) -> Result<Vec<u8>, CryptoError> {
+        let image_id = image_encryption::image_id_for_path(&user_id, &path)
+            .ok_or(CryptoError::DecryptFailed)?;
+        image_encryption::open(
+            self.image_key_wrap_key().as_slice(),
+            &user_id,
+            image_id,
+            &sealed,
+        )
+    }
+}
+
 /// HKDF info for the book-url subkey (SUR-1112). Frozen wire constant: changing it orphans every
 /// sealed `books.url`.
 #[cfg(not(target_arch = "wasm32"))]
@@ -179,6 +238,11 @@ impl Vault {
 
     fn book_url_key(&self) -> Zeroizing<[u8; 32]> {
         hkdf32_unsalted(mk!(self).as_slice(), BOOK_URL_INFO)
+    }
+
+    /// `K_wrap` for `encimg:v1` (ADR 0008): HKDF-SHA256(MK, zero salt, `braird-image-key-wrap-v1`).
+    fn image_key_wrap_key(&self) -> Zeroizing<[u8; 32]> {
+        hkdf32_unsalted(mk!(self).as_slice(), image_encryption::KEY_WRAP_INFO)
     }
 }
 
@@ -257,6 +321,145 @@ mod zeroization {
             after.iter().all(|&b| b == 0),
             "MK bytes must be all-zero after zeroize"
         );
+    }
+}
+
+#[cfg(test)]
+mod image_seal {
+    use super::{new_vault, Vault};
+    use crate::CryptoError;
+    use zeroize::Zeroizing;
+
+    const UID: &str = "3f2b8c1e-9d4a-4e6f-8b7c-0a1d2e3f4a5b";
+
+    fn small_vector() -> (String, Vec<u8>) {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../vendored/encimg/v1-vectors.json")).unwrap();
+        let cases = v["cases"].as_array().unwrap();
+        let c = cases.iter().find(|c| c["name"] == "small").unwrap();
+        let sealed = hex::decode(c["sealed"].as_str().unwrap()).unwrap();
+        (c["path"].as_str().unwrap().to_string(), sealed)
+    }
+
+    /// Known answer for `K_wrap` (MK = 0x11 x 32). A change to the salt, the info string or the
+    /// length orphans every sealed image. Cross-checked with Node:
+    /// crypto.hkdfSync("sha256", 0x11 x 32, 0x00 x 32, "braird-image-key-wrap-v1", 32).
+    #[test]
+    fn the_image_key_wrap_subkey_is_frozen() {
+        let vault = new_vault(Zeroizing::new([0x11u8; 32]));
+        assert_eq!(
+            hex::encode(*vault.image_key_wrap_key()),
+            "1f9742e87ae885412c2e959cf24939c89d4e95e19a0fa331f6e9843e2fd55cfd"
+        );
+    }
+
+    /// The exported calls open a frozen vector under the vectors' MK — the same path the Kotlin
+    /// and Swift round trips take through the FFI.
+    #[test]
+    fn the_exports_open_a_frozen_vector() {
+        let (path, sealed) = small_vector();
+        let vault = new_vault(Zeroizing::new([0x11u8; 32]));
+        let pt = vault.open_image(UID.into(), path.clone(), sealed).unwrap();
+        assert_eq!(pt, (0..37).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn seal_and_open_round_trip_with_fresh_randomness() {
+        let vault = Vault::generate();
+        let path = format!("{UID}/note-a.jpg");
+        let photo = b"\xff\xd8\xff\xe0 not really a jpeg".to_vec();
+        let a = vault
+            .seal_image(UID.into(), path.clone(), photo.clone())
+            .unwrap();
+        let b = vault
+            .seal_image(UID.into(), path.clone(), photo.clone())
+            .unwrap();
+        assert!(a.starts_with(b"encimg:v1") && a[..2] != [0xff, 0xd8]);
+        assert_ne!(a, b, "a fresh data key, wrap IV and prefix every call");
+        assert_ne!(a[9..76], b[9..76], "every header field is fresh");
+        assert_eq!(
+            vault.open_image(UID.into(), path.clone(), a).unwrap(),
+            photo
+        );
+        assert_eq!(vault.open_image(UID.into(), path, b).unwrap(), photo);
+    }
+
+    #[test]
+    fn a_bad_path_is_bad_input_at_seal_and_decrypt_failed_at_open() {
+        let vault = Vault::generate();
+        let good = format!("{UID}/note-a.jpg");
+        let sealed = vault
+            .seal_image(UID.into(), good.clone(), vec![1, 2, 3])
+            .unwrap();
+        for (user_id, path) in [
+            (UID.to_string(), format!("{UID}/note-a.png")),
+            (UID.to_string(), format!("note-images/{UID}/note-a.jpg")),
+            (
+                UID.to_uppercase(),
+                format!("{}/note-a.jpg", UID.to_uppercase()),
+            ),
+            (good.clone(), UID.to_string()),
+        ] {
+            assert!(matches!(
+                vault.seal_image(user_id.clone(), path.clone(), vec![1]),
+                Err(CryptoError::BadInput(_))
+            ));
+            assert!(matches!(
+                vault.open_image(user_id, path, sealed.clone()),
+                Err(CryptoError::DecryptFailed)
+            ));
+        }
+        let elsewhere = format!("{UID}/note-b.jpg");
+        assert!(matches!(
+            vault.open_image(UID.into(), elsewhere, sealed.clone()),
+            Err(CryptoError::DecryptFailed)
+        ));
+        assert!(matches!(
+            Vault::generate().open_image(UID.into(), good, sealed),
+            Err(CryptoError::DecryptFailed)
+        ));
+    }
+
+    /// The wrapped data key lives under its own subkey, so no other format opens it: not as an
+    /// enc:v2 note whose id equals the image AAD, and not as a `0x02` byte seal with that AAD —
+    /// which, under the bare MK, would hand the raw data key across the FFI (ADR 0008, row 3).
+    /// And neither other format opens as an image.
+    #[test]
+    fn the_wrapped_key_never_opens_as_another_format() {
+        let vault = new_vault(Zeroizing::new([0x11u8; 32]));
+        let (path, sealed) = small_vector();
+        let image_id = path
+            .strip_prefix(&format!("{UID}/"))
+            .unwrap()
+            .strip_suffix(".jpg")
+            .unwrap();
+        let mut aad = b"encimg:v1".to_vec();
+        for id in [UID, image_id] {
+            aad.extend_from_slice(&(id.len() as u16).to_be_bytes());
+            aad.extend_from_slice(id.as_bytes());
+        }
+        let aad = String::from_utf8(aad).unwrap();
+        let (wrap_iv, wrapped) = (&sealed[9..21], &sealed[21..69]);
+
+        let as_note = format!(
+            "enc:v2:{}.{}",
+            crate::primitives::b64encode(wrap_iv),
+            crate::primitives::b64encode(wrapped)
+        );
+        assert!(vault.decrypt_note(Some(aad.clone()), as_note).is_err());
+        let as_bytes = [&[0x02][..], wrap_iv, wrapped].concat();
+        assert!(vault.open_bytes(as_bytes, aad.clone()).is_err());
+
+        let note = vault
+            .encrypt_note(Some(aad.clone()), "x".into())
+            .into_bytes();
+        let bytes = vault.seal_bytes(vec![1, 2, 3], aad);
+        for other in [note, bytes] {
+            assert!(matches!(
+                vault.open_image(UID.into(), path.clone(), other),
+                Err(CryptoError::DecryptFailed)
+            ));
+        }
     }
 }
 

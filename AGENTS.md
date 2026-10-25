@@ -57,7 +57,8 @@ That is why parity vectors, not functional tests, are the real gate.
 ## Layout (as it lands)
 
 - `src/` — the crate: `key_manager`, `note_encryption`, `content_tag`, `normalize`,
-  `byte_encryption`, `primitives`, `store` (the SQLite local store, SUR-723), `vault` (the
+  `byte_encryption`, `image_encryption` (the `encimg:v1` image seal, ADR 0008), `primitives`,
+  `store` (the SQLite local store, SUR-723), `vault` (the
   FFI handle), `lib.rs` (UniFFI scaffolding), `bin/uniffi-bindgen.rs` (the bindgen binary).
 - `#[uniffi::export]` items in `src/` (chiefly `vault.rs`, `lib.rs`) — the public binding
   surface. This crate uses UniFFI's proc-macro mode; there is **no `.udl`**.

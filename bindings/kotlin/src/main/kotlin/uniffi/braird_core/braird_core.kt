@@ -934,6 +934,10 @@ internal open class UniffiVTableCallbackInterfaceEmbedder(
 
 
 
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -1122,11 +1126,15 @@ internal interface UniffiLib : Library {
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_vault_open_bytes(`ptr`: Pointer,`sealed`: RustBuffer.ByValue,`aad`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_vault_open_image(`ptr`: Pointer,`userId`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,`sealed`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_vault_pin_wrap(`ptr`: Pointer,`pin`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_vault_rewrap(`ptr`: Pointer,`newPrf`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_vault_seal_bytes(`ptr`: Pointer,`bytes`: RustBuffer.ByValue,`aad`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_vault_seal_image(`ptr`: Pointer,`userId`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,`plaintext`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_vault_wrap_with_prf(`ptr`: Pointer,`prf`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1402,11 +1410,15 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_braird_core_checksum_method_vault_open_bytes(
     ): Short
+    fun uniffi_braird_core_checksum_method_vault_open_image(
+    ): Short
     fun uniffi_braird_core_checksum_method_vault_pin_wrap(
     ): Short
     fun uniffi_braird_core_checksum_method_vault_rewrap(
     ): Short
     fun uniffi_braird_core_checksum_method_vault_seal_bytes(
+    ): Short
+    fun uniffi_braird_core_checksum_method_vault_seal_image(
     ): Short
     fun uniffi_braird_core_checksum_method_vault_wrap_with_prf(
     ): Short
@@ -1665,6 +1677,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_vault_open_bytes() != 24917.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_braird_core_checksum_method_vault_open_image() != 30654.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_braird_core_checksum_method_vault_pin_wrap() != 28802.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1672,6 +1687,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_vault_seal_bytes() != 46732.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_vault_seal_image() != 45267.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_vault_wrap_with_prf() != 28929.toShort()) {
@@ -5215,6 +5233,15 @@ public interface VaultInterface {
     fun `openBytes`(`sealed`: kotlin.ByteArray, `aad`: kotlin.String): kotlin.ByteArray
     
     /**
+     * Open an `encimg:v1` object (ADR 0008) read from its stored `path` (`notes.image_path` /
+     * `ink_crop_path`, exactly `<user_id>/<image_id>.jpg`). Fails closed with `DecryptFailed` for
+     * every failure — a malformed path, a wrong key, a moved, truncated, reordered or tampered
+     * object — and never returns partial plaintext. Hosts send bytes that start with `encimg:`
+     * here and never show the raw bytes when it fails.
+     */
+    fun `openImage`(`userId`: kotlin.String, `path`: kotlin.String, `sealed`: kotlin.ByteArray): kotlin.ByteArray
+    
+    /**
      * PIN-wrap the owned MK for device transfer (PBKDF2-SHA256 @ 600k → AES-256-GCM).
      */
     fun `pinWrap`(`pin`: kotlin.String): WrappedBlob
@@ -5231,6 +5258,16 @@ public interface VaultInterface {
      * domain-separated from enc:v2's bare-noteId AAD). Fresh random IV per call.
      */
     fun `sealBytes`(`bytes`: kotlin.ByteArray, `aad`: kotlin.String): kotlin.ByteArray
+    
+    /**
+     * Seal a note photo or margin ink crop as `encimg:v1` (ADR 0008) before upload. `path` is the
+     * storage path the upload will create: exactly `<user_id>/<image_id>.jpg`, the shape
+     * `image-upload` returns. `user_id` is the session's auth user id as the auth library returns
+     * it; core cannot check that it belongs to this session (the per-user MK still stops a
+     * cross-user object). A fresh random data key, wrap IV and nonce prefix are drawn in-core on
+     * every call and never cross the FFI. `BadInput` when the path or an id is malformed.
+     */
+    fun `sealImage`(`userId`: kotlin.String, `path`: kotlin.String, `plaintext`: kotlin.ByteArray): kotlin.ByteArray
     
     /**
      * Wrap the owned MK with a PRF-derived key → a storable prf-v1 blob. Salt (32B)
@@ -5387,6 +5424,26 @@ open class Vault: Disposable, AutoCloseable, VaultInterface {
 
     
     /**
+     * Open an `encimg:v1` object (ADR 0008) read from its stored `path` (`notes.image_path` /
+     * `ink_crop_path`, exactly `<user_id>/<image_id>.jpg`). Fails closed with `DecryptFailed` for
+     * every failure — a malformed path, a wrong key, a moved, truncated, reordered or tampered
+     * object — and never returns partial plaintext. Hosts send bytes that start with `encimg:`
+     * here and never show the raw bytes when it fails.
+     */
+    @Throws(CryptoException::class)override fun `openImage`(`userId`: kotlin.String, `path`: kotlin.String, `sealed`: kotlin.ByteArray): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithPointer {
+    uniffiRustCallWithError(CryptoException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_vault_open_image(
+        it, FfiConverterString.lower(`userId`),FfiConverterString.lower(`path`),FfiConverterByteArray.lower(`sealed`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * PIN-wrap the owned MK for device transfer (PBKDF2-SHA256 @ 600k → AES-256-GCM).
      */override fun `pinWrap`(`pin`: kotlin.String): WrappedBlob {
             return FfiConverterTypeWrappedBlob.lift(
@@ -5427,6 +5484,27 @@ open class Vault: Disposable, AutoCloseable, VaultInterface {
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_vault_seal_bytes(
         it, FfiConverterByteArray.lower(`bytes`),FfiConverterString.lower(`aad`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Seal a note photo or margin ink crop as `encimg:v1` (ADR 0008) before upload. `path` is the
+     * storage path the upload will create: exactly `<user_id>/<image_id>.jpg`, the shape
+     * `image-upload` returns. `user_id` is the session's auth user id as the auth library returns
+     * it; core cannot check that it belongs to this session (the per-user MK still stops a
+     * cross-user object). A fresh random data key, wrap IV and nonce prefix are drawn in-core on
+     * every call and never cross the FFI. `BadInput` when the path or an id is malformed.
+     */
+    @Throws(CryptoException::class)override fun `sealImage`(`userId`: kotlin.String, `path`: kotlin.String, `plaintext`: kotlin.ByteArray): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithPointer {
+    uniffiRustCallWithError(CryptoException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_vault_seal_image(
+        it, FfiConverterString.lower(`userId`),FfiConverterString.lower(`path`),FfiConverterByteArray.lower(`plaintext`),_status)
 }
     }
     )

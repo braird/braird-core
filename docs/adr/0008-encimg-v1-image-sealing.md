@@ -146,8 +146,9 @@ for every host, and a swapped argument fails the check. Seal refuses a bad id or
 Three arguments each, well under the arm64 slot limit (`scripts/check-ffi-arg-slots.mjs`). The
 exported doc comments name the `encimg:v1` format and the path rule, because UniFFI copies them
 into Kotlin and Swift. The DEK and `K_wrap` live in `Zeroizing` buffers inside core and never
-cross the FFI. A fixed-input seam for vectors (`__seal_image_fixed`, which fixes the DEK,
-`wrap_iv` and `nonce_prefix`) exists only behind `test-seams`.
+cross the FFI. There is no fixed-input seam: the frozen vectors reproduce through
+`src/image_encryption.rs`'s own tests against the module's pure seal, so no fixed-key path exists
+behind `test-seams` either (implementation note, SUR-1259 code PR).
 
 Calls are one-shot (D3). A later streaming API is additive over the same format, with two
 constraints it must keep: a streaming seal makes its DEK internally and never restarts, and a
@@ -284,9 +285,8 @@ decision.
     `cargo test --all-features` on `parity.yml`'s pinned Node; it fails instead of skipping when
     Node is absent in CI;
   - Kotlin and Swift round-trip tests that open one vector and reject one tamper each — binding
-    checks, not format evidence (the Swift leg needs the `touches-ffi` label). `GATING.md`'s
-    test-seams paragraph and the AGENTS / CLAUDE "test seams" bullet name `__seal_image_fixed`
-    in the same PR.
+    checks, not format evidence (the Swift leg needs the `touches-ffi` label). No test seam is
+    added (see API), so the test-seams rules in `GATING.md` and AGENTS / CLAUDE are unchanged.
 - **Legacy data check:** before SUR-1261 ships, the founder counts prod `note-images` object names
   that do not match `<uuid>/<image_id>.jpg`. Such an object can be shown as legacy plaintext but
   can never be sealed; if the count is not zero, SUR-1263 decides its fate before any user's

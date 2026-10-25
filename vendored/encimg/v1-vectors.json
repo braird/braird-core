@@ -1,0 +1,77 @@
+{
+  "_note": "encimg:v1 frozen vectors (SUR-1259, ADR 0008). Generated once by an independent node:crypto implementation written from the ADR text, then reproduced byte for byte by the Rust seal (src/image_encryption.rs tests) before freezing. Every case uses the same fixed data key, wrap IV and nonce prefix: fine for vectors, never for real seals (a DEK seals one image). Plaintext of length len: byte i = i % 251. Large cases pin the sealed bytes by length + SHA-256; small cases inline them. `rewrap` is `small` with a second wrap IV: the chunks are byte-identical, so an in-place re-wrap opens.",
+  "mk": "1111111111111111111111111111111111111111111111111111111111111111",
+  "k_wrap": "1f9742e87ae885412c2e959cf24939c89d4e95e19a0fa331f6e9843e2fd55cfd",
+  "user_id": "3f2b8c1e-9d4a-4e6f-8b7c-0a1d2e3f4a5b",
+  "chunk": 262144,
+  "dek": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "wrap_iv": "a0a1a2a3a4a5a6a7a8a9aaab",
+  "nonce_prefix": "b0b1b2b3b4b5b6",
+  "cases": [
+    {
+      "name": "empty",
+      "path": "3f2b8c1e-9d4a-4e6f-8b7c-0a1d2e3f4a5b/note-empty.jpg",
+      "len": 0,
+      "sealed": "656e63696d673a7631a0a1a2a3a4a5a6a7a8a9aaabbd5bdf6b6d1efe0798cb5b204648de113b3ab2f988bae11e033b18390391f76601b38f9b0373edb8c34d6baba726a94eb0b1b2b3b4b5b62e53fbc586d277c6e75132d3def2288d"
+    },
+    {
+      "name": "one-byte",
+      "path": "3f2b8c1e-9d4a-4e6f-8b7c-0a1d2e3f4a5b/note-one.jpg",
+      "len": 1,
+      "sealed": "656e63696d673a7631a0a1a2a3a4a5a6a7a8a9aaabbd5bdf6b6d1efe0798cb5b204648de113b3ab2f988bae11e033b18390391f7661f9ae42257ea8fb44476a446a6daf642b0b1b2b3b4b5b69f50252b0ccb9b3c9e9991f558d4f75fba"
+    },
+    {
+      "name": "small",
+      "path": "3f2b8c1e-9d4a-4e6f-8b7c-0a1d2e3f4a5b/note-small.jpg",
+      "len": 37,
+      "sealed": "656e63696d673a7631a0a1a2a3a4a5a6a7a8a9aaabbd5bdf6b6d1efe0798cb5b204648de113b3ab2f988bae11e033b18390391f766522d7af40a6a4a5f789b8c8ebf761204b0b1b2b3b4b5b69f4c6128e907160411dfd902829d5976f892b064cea2d52914e4582f3b338d655eec40209d590cb338ff71d9f653daf122692f6b65"
+    },
+    {
+      "name": "pwa-id",
+      "path": "3f2b8c1e-9d4a-4e6f-8b7c-0a1d2e3f4a5b/k3x9a0bq.jpg",
+      "len": 37,
+      "sealed": "656e63696d673a7631a0a1a2a3a4a5a6a7a8a9aaabbd5bdf6b6d1efe0798cb5b204648de113b3ab2f988bae11e033b18390391f766e009c05e27a78fe29a9c5296753bc962b0b1b2b3b4b5b69f4c6128e907160411dfd902829d5976f892b064cea2d52914e4582f3b338d655eec40209dfc7914929a8e511870f3362d1bb85940"
+    },
+    {
+      "name": "uuid-id",
+      "path": "3f2b8c1e-9d4a-4e6f-8b7c-0a1d2e3f4a5b/9c1d4e2f-6a7b-4c8d-9e0f-1a2b3c4d5e6f.jpg",
+      "len": 37,
+      "sealed": "656e63696d673a7631a0a1a2a3a4a5a6a7a8a9aaabbd5bdf6b6d1efe0798cb5b204648de113b3ab2f988bae11e033b18390391f76613b3135f148f2d1a1a7cf276789a65fcb0b1b2b3b4b5b69f4c6128e907160411dfd902829d5976f892b064cea2d52914e4582f3b338d655eec40209d4809f802ef668befba3b6814f960da49"
+    },
+    {
+      "name": "rewrap",
+      "path": "3f2b8c1e-9d4a-4e6f-8b7c-0a1d2e3f4a5b/note-small.jpg",
+      "len": 37,
+      "wrap_iv": "c0c1c2c3c4c5c6c7c8c9cacb",
+      "sealed": "656e63696d673a7631c0c1c2c3c4c5c6c7c8c9cacb35f40cb12c7e99f8958f20902910bf2ebd6b6b5364308de18550b01c86c53474b2296b97425f217661c46b34908f63e9b0b1b2b3b4b5b69f4c6128e907160411dfd902829d5976f892b064cea2d52914e4582f3b338d655eec40209d590cb338ff71d9f653daf122692f6b65"
+    },
+    {
+      "name": "chunk-minus-1",
+      "path": "3f2b8c1e-9d4a-4e6f-8b7c-0a1d2e3f4a5b/note-chunk-minus-1.jpg",
+      "len": 262143,
+      "sealed_len": 262235,
+      "sealed_sha256": "36543aa9ec5f0dfb00f430f5bf3574d124a9abcdd7488a2e0d486604305a2c58"
+    },
+    {
+      "name": "chunk",
+      "path": "3f2b8c1e-9d4a-4e6f-8b7c-0a1d2e3f4a5b/note-chunk.jpg",
+      "len": 262144,
+      "sealed_len": 262236,
+      "sealed_sha256": "04b82b48849c8b3f9d10644e3d8f020218bb01a433a5a8648dcce64e9422bec7"
+    },
+    {
+      "name": "chunk-plus-1",
+      "path": "3f2b8c1e-9d4a-4e6f-8b7c-0a1d2e3f4a5b/note-chunk-plus-1.jpg",
+      "len": 262145,
+      "sealed_len": 262253,
+      "sealed_sha256": "63fc9c20887d72a92ea21ef6d84abd86112745137b0dbac7a7aee4e18f2d3180"
+    },
+    {
+      "name": "two-chunks",
+      "path": "3f2b8c1e-9d4a-4e6f-8b7c-0a1d2e3f4a5b/note-two-chunks.jpg",
+      "len": 524288,
+      "sealed_len": 524396,
+      "sealed_sha256": "045aa6e80d79425b14e1eb5a0ab789ba798a502aebde7a0f48864ca8d0e79a7a"
+    }
+  ]
+}
