@@ -1,11 +1,9 @@
 # ADR 0008 — `encimg:v1` image sealing for note photos and ink crops
 
-- **Status:** Proposed (SUR-1259; agent under the GCE gate). Awaits `crypto-reviewer` +
-  `architecture-decision-reviewer` + `naming-reviewer` + founder sign-off. `GATING.md` §3.2 routes
+- **Status:** Accepted (crypto-reviewer + architecture-decision-reviewer + naming-reviewer +
+  founder sign-off, 2026-10-25 — SUR-1259 gate, braird-core#110). `GATING.md` §3.2 routes
   `docs/adr/**` to `architecture-decision-reviewer` only; `crypto-reviewer` (§4 item 6) and
-  `naming-reviewer` (this record freezes protocol words) are dispatched by hand. At sign-off this
-  line becomes "Accepted (… founder sign-off, <date>)" and the CHANGELOG entry loses the word
-  "proposed", in the same PR, before merge.
+  `naming-reviewer` (this record freezes protocol words) were dispatched by hand.
 - **Date:** 2026-10-25
 - **Supersedes:** none. Departs from `crypto-reviewer` rule 1 (counter nonces — reasoned below)
   and from ADR 0002's throughput premise (see Consequences).

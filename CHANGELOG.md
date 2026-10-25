@@ -7,7 +7,7 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 ## [Unreleased]
 
 ### Added
-- **ADR 0008, proposed: the `encimg:v1` image-sealing wire format (SUR-1259).** Note photos and
+- **ADR 0008, accepted: the `encimg:v1` image-sealing wire format (SUR-1259).** Note photos and
   margin ink crops are to be sealed on the device before upload (epic SUR-1258). The record
   freezes the format before any code: a 76-byte header (ASCII magic `encimg:v1`, a random data
   key for each photo wrapped under a new MK subkey `braird-image-key-wrap-v1`, a STREAM nonce
