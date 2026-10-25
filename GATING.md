@@ -130,8 +130,13 @@ nonce-reuse footgun. Production generates salt/IV internally.
 info strings (`surfc-master-key-wrap-v1`, `surfc-content-tag-v1`), the core-only book-url subkey
 info `braird-book-url-v1` (SUR-1112; `books.url` is enc:v2 under that subkey, AAD = book id), the 600 000 PBKDF2
 iteration count, standard (not URL) base64, the 12-byte IV, the **64-byte** content-tag
-HMAC subkey, and the `enc:v1` / `enc:v2` / `0x02` headers. These are protocol constants,
-not branding — they stay `surfc-*` despite the Braird rename (SUR-680 allowlist).
+HMAC subkey, the `enc:v1` / `enc:v2` / `0x02` headers, and the core-only image key-wrap subkey
+info `braird-image-key-wrap-v1` with the whole `encimg:v1` layout as ADR 0008 §Wire format
+defines it (the offsets, the AAD, the ids taken from the storage path and their exact patterns,
+the StreamBE32 nonce, the 256 KiB chunk, the 92-byte minimum and the canonical open; SUR-1259).
+That section is not edited after acceptance: a change to the bytes is a new ADR with a new magic,
+and a change to the path rule is a new ADR. These are protocol constants, not branding — the
+`surfc-*` ones stay `surfc-*` despite the Braird rename (SUR-680 allowlist).
 
 ### Not yet in scope
 

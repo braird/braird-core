@@ -6,6 +6,23 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **ADR 0008, accepted: the `encimg:v1` image-sealing wire format (SUR-1259).** Note photos and
+  margin ink crops are to be sealed on the device before upload (epic SUR-1258). The record
+  freezes the format before any code: a 76-byte header (ASCII magic `encimg:v1`, a random data
+  key for each photo wrapped under a new MK subkey `braird-image-key-wrap-v1`, a STREAM nonce
+  prefix) and 256 KiB AES-256-GCM chunks with a final-chunk flag, the magic and both ids (session
+  uid, path stem) in every AAD, and a canonical fail-closed open. It also sets the host rules
+  (magic dispatch, opened images never rest on the device, a returned-path check before a draft
+  is deleted) and records the plaintext that stays on the device until the seal or the backfill
+  (capture drafts, share staging, legacy downloads). It names the native-only, one-shot
+  `Vault::seal_image(user_id, path, plaintext)` / `open_image(user_id, path, sealed)` API to come,
+  which parses the storage path in core. `GATING.md`'s frozen-constants list and the AGENTS /
+  CLAUDE crypto rules now name the subkey and the layout. Docs only; no library or FFI change in
+  this entry. surfc (SUR-1260: `image-upload` and `anthropic-proxy`) depends on three things
+  defined here — the `encimg:` magic, the 92-byte minimum and the `image_id` pattern — and must
+  keep the same pattern.
+
 ### Fixed
 - **`sync-integration` pulls the Supabase images from ghcr.io (SUR-1264).** The CLI's default
   registry, public.ecr.aws, caps anonymous data per source IP, and GitHub-hosted runners share IPs,
