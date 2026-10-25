@@ -32,8 +32,11 @@ That is why parity vectors, not functional tests, are the real gate.
   12-byte IV; 32-byte MK; `enc:v1` (no AAD) / `enc:v2` (AAD = UTF-8 noteId); the embedding
   seal's `0x02` header (AAD = noteId); the core-only book-url subkey (HKDF info
   `braird-book-url-v1`, zero salt, 32 bytes; `books.url` is enc:v2 under it, AAD = book id —
-  SUR-1112, pinned by `vault::book_url_seal::the_url_subkey_is_frozen`). These are wire-format protocol constants, not
-  branding — they stay `surfc-*` despite the Braird rename (SUR-680 allowlist).
+  SUR-1112, pinned by `vault::book_url_seal::the_url_subkey_is_frozen`); the core-only image
+  key-wrap subkey (HKDF info `braird-image-key-wrap-v1`, zero salt, 32 bytes) and the whole
+  `encimg:v1` layout of ADR 0008 §Wire format (SUR-1259). These are wire-format protocol
+  constants, not branding — the `surfc-*` ones stay `surfc-*` despite the Braird rename (SUR-680
+  allowlist).
 - **The content-tag HMAC subkey is 64 bytes, not 32.** WebCrypto's `deriveKey` with no
   `length` defaults the HMAC key to the SHA-256 block size (64). A 32-byte port produces a
   wrong-but-plausible tag. The known-answer vector locks this.
