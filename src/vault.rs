@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use zeroize::Zeroizing;
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::image_encryption;
 use crate::primitives::fill_random;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::primitives::hkdf32_unsalted;
@@ -147,6 +149,63 @@ impl Vault {
     }
 }
 
+// Image sealing (SUR-1259, ADR 0008). Native-only: the PWA does not open sealed photos (SUR-1270),
+// and the subkey derivation (`hkdf32_unsalted`) is native-only.
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export]
+impl Vault {
+    /// Seal a note photo or margin ink crop as `encimg:v1` (ADR 0008) before upload. `path` is the
+    /// storage path the upload will create: exactly `<user_id>/<image_id>.jpg`, the shape
+    /// `image-upload` returns. `user_id` is the session's auth user id: the lowercase UUID string
+    /// exactly as the JWT `sub` holds it, never re-formatted (Swift's `UUID.uuidString` is
+    /// uppercase and fails). Core cannot check that it belongs to this session (the per-user MK
+    /// still stops a cross-user object). A fresh random data key, wrap IV and nonce prefix are drawn
+    /// in-core on every call, the wrap key is derived in-core, and none of them crosses the FFI.
+    /// `BadInput` when `user_id` or the path is malformed.
+    pub fn seal_image(
+        &self,
+        user_id: String,
+        path: String,
+        plaintext: Vec<u8>,
+    ) -> Result<Vec<u8>, CryptoError> {
+        if !image_encryption::is_user_id(&user_id) {
+            return Err(CryptoError::BadInput(
+                "user_id is not a lowercase UUID string".into(),
+            ));
+        }
+        let image_id = image_encryption::image_id_for_path(&user_id, &path)
+            .ok_or_else(|| CryptoError::BadInput("path is not <user_id>/<image_id>.jpg".into()))?;
+        image_encryption::seal(
+            self.image_key_wrap_key().as_slice(),
+            &user_id,
+            image_id,
+            &plaintext,
+        )
+    }
+
+    /// Open an `encimg:v1` object (ADR 0008) read from its stored `path` (`notes.image_path` /
+    /// `ink_crop_path`, exactly `<user_id>/<image_id>.jpg`). `user_id` is the session's lowercase
+    /// UUID string, as for [`Vault::seal_image`]. Fails closed with `DecryptFailed` for every
+    /// failure — a malformed `user_id` or path, a wrong key, a moved, truncated, reordered or
+    /// tampered object — and never returns partial plaintext. Hosts send bytes that start with
+    /// `encimg:` here and never show the raw bytes when it fails.
+    pub fn open_image(
+        &self,
+        user_id: String,
+        path: String,
+        sealed: Vec<u8>,
+    ) -> Result<Vec<u8>, CryptoError> {
+        let image_id = image_encryption::image_id_for_path(&user_id, &path)
+            .ok_or(CryptoError::DecryptFailed)?;
+        image_encryption::open(
+            self.image_key_wrap_key().as_slice(),
+            &user_id,
+            image_id,
+            &sealed,
+        )
+    }
+}
+
 /// HKDF info for the book-url subkey (SUR-1112). Frozen wire constant: changing it orphans every
 /// sealed `books.url`.
 #[cfg(not(target_arch = "wasm32"))]
@@ -179,6 +238,11 @@ impl Vault {
 
     fn book_url_key(&self) -> Zeroizing<[u8; 32]> {
         hkdf32_unsalted(mk!(self).as_slice(), BOOK_URL_INFO)
+    }
+
+    /// `K_wrap` for `encimg:v1` (ADR 0008): HKDF-SHA256(MK, zero salt, `braird-image-key-wrap-v1`).
+    fn image_key_wrap_key(&self) -> Zeroizing<[u8; 32]> {
+        hkdf32_unsalted(mk!(self).as_slice(), image_encryption::KEY_WRAP_INFO)
     }
 }
 
@@ -257,6 +321,169 @@ mod zeroization {
             after.iter().all(|&b| b == 0),
             "MK bytes must be all-zero after zeroize"
         );
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod image_seal {
+    use super::{new_vault, Vault};
+    use crate::CryptoError;
+    use zeroize::Zeroizing;
+
+    const UID: &str = "3f2b8c1e-9d4a-4e6f-8b7c-0a1d2e3f4a5b";
+
+    fn vectors() -> serde_json::Value {
+        serde_json::from_str(include_str!("../vendored/encimg/v1-vectors.json")).unwrap()
+    }
+    fn small_vector() -> (String, Vec<u8>) {
+        let v = vectors();
+        let cases = v["cases"].as_array().unwrap();
+        let c = cases.iter().find(|c| c["name"] == "small").unwrap();
+        let sealed = hex::decode(c["sealed"].as_str().unwrap()).unwrap();
+        (c["path"].as_str().unwrap().to_string(), sealed)
+    }
+    /// A vault holding the vectors' MK (0x11 x 32), read from the JSON so no key is a literal.
+    fn vectors_vault() -> std::sync::Arc<Vault> {
+        let mk: [u8; 32] = hex::decode(vectors()["mk"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        new_vault(Zeroizing::new(mk))
+    }
+    /// `magic ‖ u16be(len) ‖ user_id ‖ u16be(len) ‖ image_id`, built here from the ADR text.
+    fn image_aad(image_id: &str) -> Vec<u8> {
+        let mut aad = b"encimg:v1".to_vec();
+        for id in [UID, image_id] {
+            aad.extend_from_slice(&(id.len() as u16).to_be_bytes());
+            aad.extend_from_slice(id.as_bytes());
+        }
+        aad
+    }
+
+    /// Known answer for `K_wrap` (MK = 0x11 x 32). A change to the salt, the info string or the
+    /// length orphans every sealed image. Cross-checked with Node:
+    /// crypto.hkdfSync("sha256", 0x11 x 32, 0x00 x 32, "braird-image-key-wrap-v1", 32).
+    #[test]
+    fn the_image_key_wrap_subkey_is_frozen() {
+        let vault = vectors_vault();
+        assert_eq!(
+            hex::encode(*vault.image_key_wrap_key()),
+            "1f9742e87ae885412c2e959cf24939c89d4e95e19a0fa331f6e9843e2fd55cfd"
+        );
+    }
+
+    /// The exported calls open a frozen vector under the vectors' MK — the same path the Kotlin
+    /// and Swift round trips take through the FFI.
+    #[test]
+    fn the_exports_open_a_frozen_vector() {
+        let (path, sealed) = small_vector();
+        let vault = vectors_vault();
+        let pt = vault.open_image(UID.into(), path.clone(), sealed).unwrap();
+        assert_eq!(pt, (0..37).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn seal_and_open_round_trip_with_fresh_randomness() {
+        let vault = Vault::generate();
+        let path = format!("{UID}/note-a.jpg");
+        let photo = b"\xff\xd8\xff\xe0 not really a jpeg".to_vec();
+        let a = vault
+            .seal_image(UID.into(), path.clone(), photo.clone())
+            .unwrap();
+        let b = vault
+            .seal_image(UID.into(), path.clone(), photo.clone())
+            .unwrap();
+        assert!(a.starts_with(b"encimg:v1"));
+        assert_ne!(a[9..21], b[9..21], "a fresh wrap IV every call");
+        assert_ne!(a[69..76], b[69..76], "a fresh nonce prefix every call");
+        // A fresh data key every call (rule 1's STREAM exception, condition (b)).
+        let (k_wrap, aad) = (vault.image_key_wrap_key(), image_aad("note-a"));
+        let dek = |s: &[u8]| {
+            crate::primitives::aes_decrypt(k_wrap.as_slice(), &s[9..21], &s[21..69], Some(&aad))
+                .unwrap()
+        };
+        assert_ne!(dek(&a), dek(&b), "a fresh data key every call");
+        assert_eq!(
+            vault.open_image(UID.into(), path.clone(), a).unwrap(),
+            photo
+        );
+        assert_eq!(vault.open_image(UID.into(), path, b).unwrap(), photo);
+    }
+
+    #[test]
+    fn a_bad_user_id_or_path_is_bad_input_at_seal_and_decrypt_failed_at_open() {
+        let vault = Vault::generate();
+        let good = format!("{UID}/note-a.jpg");
+        let sealed = vault
+            .seal_image(UID.into(), good.clone(), vec![1, 2, 3])
+            .unwrap();
+        for (user_id, path) in [
+            (UID.to_string(), format!("{UID}/note-a.png")),
+            (UID.to_string(), format!("note-images/{UID}/note-a.jpg")),
+            (
+                UID.to_uppercase(),
+                format!("{}/note-a.jpg", UID.to_uppercase()),
+            ),
+            (good.clone(), UID.to_string()),
+        ] {
+            assert!(matches!(
+                vault.seal_image(user_id.clone(), path.clone(), vec![1]),
+                Err(CryptoError::BadInput(_))
+            ));
+            assert!(matches!(
+                vault.open_image(user_id, path, sealed.clone()),
+                Err(CryptoError::DecryptFailed)
+            ));
+        }
+        // The uid is named as the cause when it is the cause (Swift's `uuidString` is uppercase).
+        let upper = vault.seal_image(UID.to_uppercase(), good, vec![1]);
+        assert!(matches!(upper, Err(CryptoError::BadInput(m)) if m.contains("user_id")));
+    }
+
+    /// The data key is wrapped under its own subkey, never the bare MK (ADR 0008, row 3). A fresh
+    /// seal's wrap opens under the same vault's MK neither as a `0x02` byte seal with the image AAD
+    /// (which would hand the raw data key across the FFI) nor as enc:v2 note text; and an object
+    /// whose data key is wrapped under the bare MK does not open as an image.
+    #[test]
+    fn the_wrapped_dek_never_opens_under_the_bare_mk() {
+        let vault = Vault::generate();
+        let path = format!("{UID}/note-a.jpg");
+        let sealed = vault.seal_image(UID.into(), path, vec![1, 2, 3]).unwrap();
+        let aad = String::from_utf8(image_aad("note-a")).unwrap();
+        let (wrap_iv, wrapped) = (&sealed[9..21], &sealed[21..69]);
+        let as_bytes = [&[0x02][..], wrap_iv, wrapped].concat();
+        assert!(vault.open_bytes(as_bytes, aad.clone()).is_err());
+        let as_note = format!(
+            "enc:v2:{}.{}",
+            crate::primitives::b64encode(wrap_iv),
+            crate::primitives::b64encode(wrapped)
+        );
+        // DecryptFailed exactly: a wrap under the bare MK would decrypt and then fail as UTF-8.
+        assert!(matches!(
+            vault.decrypt_note(Some(aad), as_note),
+            Err(CryptoError::DecryptFailed)
+        ));
+
+        // The frozen vector's data key, re-wrapped under the bare MK: open must use K_wrap.
+        let v = vectors();
+        let hex_of = |k: &str| hex::decode(v[k].as_str().unwrap()).unwrap();
+        let (mk, dek) = (hex_of("mk"), hex_of("dek"));
+        let (path, sealed) = small_vector();
+        let image_id = path
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .strip_suffix(".jpg")
+            .unwrap();
+        let under_mk =
+            crate::primitives::aes_encrypt(&mk, &sealed[9..21], &dek, Some(&image_aad(image_id)));
+        let forged = [&sealed[..21], &under_mk[..], &sealed[69..]].concat();
+        let vault = new_vault(Zeroizing::new(mk.try_into().unwrap()));
+        assert!(vault.open_image(UID.into(), path.clone(), sealed).is_ok());
+        assert!(matches!(
+            vault.open_image(UID.into(), path, forged),
+            Err(CryptoError::DecryptFailed)
+        ));
     }
 }
 

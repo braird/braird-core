@@ -21,6 +21,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures",
+ "zeroize",
 ]
 
 [[package]]
@@ -35,6 +36,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -201,6 +203,7 @@ dependencies = [
 name = "braird-core"
 version = "0.19.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "base64",
  "getrandom 0.2.17",

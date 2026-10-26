@@ -51,6 +51,8 @@ divergence. One audited Rust core, bound to each platform, removes that risk.
 - **Content tags** — HMAC-SHA256 over Unicode-normalized text, for opaque client-side
   matching.
 - **Embedding seal** — at-rest AES-GCM protection for device-local binary blobs.
+- **Image seal** — `encimg:v1` (ADR 0008): note photos and ink crops in 256 KiB AES-GCM STREAM
+  chunks under a fresh per-image data key, bound to the image's storage path.
 
 ## Build & test
 

@@ -1271,4 +1271,35 @@ class RoundTripTest {
         ))
         assertEquals("a1", again.id)
     }
+
+    /** SUR-1259 — `encimg:v1` (ADR 0008) through the binding. A frozen vector, sealed by the
+     * independent node:crypto generator, opens under the vectors' MK (0x11 x 32, unlocked from the
+     * JS-produced prf-v1 blob); a tampered copy throws DecryptFailed; a fresh seal round-trips;
+     * a malformed path is BadInput at seal. Binding checks, not format evidence (the Rust tests
+     * and the Node oracle are that). */
+    @Test
+    fun imageSealVectorsOverFfi() {
+        val wrap = vectors().objects().first { it.getString("id") == "mk-wrap" }.getJSONObject("expected")
+        val blob = WrappedBlob(wrap.getString("wrappedKey"), wrap.getString("iv"), wrap.getString("salt"))
+        val vault = Vault.unlock(hex(inputs().getString("prf")), blob)
+
+        val v = JSONObject(File(repoRoot, "vendored/encimg/v1-vectors.json").readText())
+        val uid = v.getString("user_id")
+        val small = v.getJSONArray("cases").objects().first { it.getString("name") == "small" }
+        val path = small.getString("path")
+        val sealed = hex(small.getString("sealed"))
+        val expected = ByteArray(37) { (it % 251).toByte() }
+        assertTrue(expected.contentEquals(vault.openImage(uid, path, sealed)))
+
+        val tampered = sealed.copyOf().also { it[it.size - 1] = (it[it.size - 1].toInt() xor 1).toByte() }
+        assertThrows(CryptoException.DecryptFailed::class.java) { vault.openImage(uid, path, tampered) }
+
+        val photo = byteArrayOf(1, 2, 3)
+        val fresh = vault.sealImage(uid, "$uid/note-a.jpg", photo)
+        assertTrue(fresh.copyOfRange(0, 9).contentEquals("encimg:v1".toByteArray()))
+        assertTrue(photo.contentEquals(vault.openImage(uid, "$uid/note-a.jpg", fresh)))
+        assertThrows(CryptoException.BadInput::class.java) {
+            vault.sealImage(uid, "note-images/$uid/note-a.jpg", photo)
+        }
+    }
 }

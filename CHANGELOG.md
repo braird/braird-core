@@ -22,6 +22,44 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   this entry. surfc (SUR-1260: `image-upload` and `anthropic-proxy`) depends on three things
   defined here — the `encimg:` magic, the 92-byte minimum and the `image_id` pattern — and must
   keep the same pattern.
+- **FFI (additive, native-only): `encimg:v1` image sealing — `Vault::seal_image` /
+  `Vault::open_image` (SUR-1259, for SUR-1261 / SUR-1262 / SUR-1263).** The implementation of
+  ADR 0008. No schema change, no release prerequisite.
+  - New exports, native only (the PWA does not open sealed photos, SUR-1270):
+    `seal_image(user_id, path, plaintext) -> bytes` and `open_image(user_id, path, sealed) ->
+    bytes` (Kotlin `sealImage` / `openImage`, Swift `sealImage(userId:path:plaintext:)`). Core
+    checks that `path` is exactly `<user_id>/<image_id>.jpg` and takes the stem itself, so a host
+    never parses ids and a swapped argument fails. `user_id` is the lowercase UUID string exactly
+    as the JWT `sub` holds it (Swift's `UUID.uuidString` is uppercase and fails). Seal returns
+    `BadInput` naming the bad `user_id` or path; open returns `DecryptFailed` for every failure
+    and never partial plaintext. The data key, wrap IV and nonce prefix are drawn in core and the
+    wrap key is derived there; none crosses the FFI.
+  - `src/image_encryption.rs`: the format — `aead::stream::StreamBE32` chunks (the `aes-gcm`
+    `stream` feature; no new crate), the one AAD, the canonical open (an empty final chunk after a
+    full one and a 1..15-byte remainder never open), the 2^32 − 1 chunk cap checked by the writer.
+  - Frozen vectors in `vendored/encimg/v1-vectors.json` (added to the GATING §3.1 `src/**` row),
+    generated once by an independent `node:crypto` implementation written from the ADR text and
+    reproduced byte for byte by the Rust seal before freezing; read by the Rust, Kotlin and Swift
+    tests. `tests/encimg_oracle.mjs` opens every vector from the ADR text alone (not from
+    `aead::stream`), checks the canonical length and rejects a tampered copy; it runs inside
+    `cargo test` and fails, instead of skipping, when Node is missing and `CI` is set.
+  - `K_wrap` known-answer test (`the_image_key_wrap_subkey_is_frozen`), tamper / truncate /
+    reorder / duplicate / wrong-id / wrong-key / path-rule tests, and key separation: a fresh
+    seal's wrapped data key opens neither as a `0x02` byte seal nor as `enc:v2` note text under
+    the same MK, and an object whose data key is wrapped under the bare MK does not open.
+  - Test key material comes only from the vectors JSON or the OS RNG, never a literal (CodeQL
+    `rust/hard-coded-cryptographic-value`).
+  - The `zeroize` features of `aes-gcm` and `aes` (a direct dependency only for that feature) are
+    on, so the expanded AES key schedule is wiped when a cipher drops — for every format. The
+    GHASH key H in the `ghash` / `polyval` state is still not wiped (accepted; H alone gives
+    neither the key nor the plaintext).
+  - Only `image_encryption::seal` draws the data key, wrap IV and nonce prefix; the function that
+    takes them as arguments is private to the module, so no caller can reuse a data key.
+  - `vendored/encimg/gen-v1-vectors.mjs` is the independent generator of the frozen vectors
+    (now including a three-chunk case); the oracle test fails if re-running it no longer
+    reproduces the file byte for byte.
+  - No `__seal_image_fixed` test seam: the vectors reproduce through the module's own tests, so no
+    fixed-key path exists behind `test-seams` (ADR 0008's API note is updated to say so).
 
 ### Fixed
 - **`sync-integration` pulls the Supabase images from ghcr.io (SUR-1264).** The CLI's default

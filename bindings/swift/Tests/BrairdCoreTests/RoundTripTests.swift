@@ -1194,4 +1194,47 @@ final class RoundTripTests: XCTestCase {
             createdAt: 2, deleted: false, clearNullableFields: []))
         XCTAssertEqual(again.id, "a1")
     }
+
+    /// SUR-1259 — `encimg:v1` (ADR 0008) through the binding. A frozen vector, sealed by the
+    /// independent node:crypto generator, opens under the vectors' MK (0x11 x 32, unlocked from the
+    /// JS-produced prf-v1 blob); a tampered copy throws DecryptFailed; a fresh seal round-trips;
+    /// a malformed path is BadInput at seal. Binding checks, not format evidence.
+    func testImageSealVectorsOverFfi() throws {
+        let vectors = try fixture("vectors.json") as! [[String: Any]]
+        let inputs = try fixture("inputs.json") as! [String: Any]
+        let mkWrap = vectors.first { ($0["id"] as? String) == "mk-wrap" }!
+        let wrap = mkWrap["expected"] as! [String: Any]
+        let blob = WrappedBlob(
+            wrappedKey: wrap["wrappedKey"] as! String,
+            iv: wrap["iv"] as! String,
+            salt: wrap["salt"] as! String
+        )
+        let vault = try Vault.unlock(prf: hexData(inputs["prf"] as! String), blob: blob)
+
+        let url = repoRoot().appendingPathComponent("vendored/encimg/v1-vectors.json")
+        let v = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        let uid = try XCTUnwrap(v["user_id"] as? String)
+        let cases = try XCTUnwrap(v["cases"] as? [[String: Any]])
+        let small = try XCTUnwrap(cases.first { ($0["name"] as? String) == "small" })
+        let path = try XCTUnwrap(small["path"] as? String)
+        let sealed = hexData(try XCTUnwrap(small["sealed"] as? String))
+        let expected = Data((0..<37).map { UInt8($0 % 251) })
+        XCTAssertEqual(try vault.openImage(userId: uid, path: path, sealed: sealed), expected)
+
+        var tampered = sealed
+        tampered[tampered.count - 1] ^= 0x01
+        XCTAssertThrowsError(try vault.openImage(userId: uid, path: path, sealed: tampered)) { error in
+            if case .DecryptFailed? = error as? CryptoError {} else { XCTFail("not DecryptFailed: \(error)") }
+        }
+
+        let photo = Data([1, 2, 3])
+        let fresh = try vault.sealImage(userId: uid, path: "\(uid)/note-a.jpg", plaintext: photo)
+        XCTAssertEqual(fresh.prefix(9), Data("encimg:v1".utf8))
+        XCTAssertEqual(try vault.openImage(userId: uid, path: "\(uid)/note-a.jpg", sealed: fresh), photo)
+        XCTAssertThrowsError(
+            try vault.sealImage(userId: uid, path: "note-images/\(uid)/note-a.jpg", plaintext: photo)
+        ) { error in
+            if case .BadInput? = error as? CryptoError {} else { XCTFail("not BadInput: \(error)") }
+        }
+    }
 }

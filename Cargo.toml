@@ -43,7 +43,11 @@ test-seams = []
 
 [dependencies]
 uniffi = { version = "0.28", features = ["cli"] }
-aes-gcm = "0.10"
+# `stream` — the STREAM chunk construction (`aead::stream::StreamBE32`) for `encimg:v1` (SUR-1259,
+# ADR 0008). `zeroize` (here and on `aes`, a direct dep only for this feature) wipes the expanded AES
+# key schedule when a cipher drops, for every format.
+aes-gcm = { version = "0.10", features = ["stream", "zeroize"] }
+aes = { version = "0.8", features = ["zeroize"] }
 hkdf = "0.12"
 hmac = "0.12"
 sha2 = "0.10"
