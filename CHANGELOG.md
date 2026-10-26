@@ -6,6 +6,8 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-10-26
+
 ### Added
 - **ADR 0008, accepted: the `encimg:v1` image-sealing wire format (SUR-1259).** Note photos and
   margin ink crops are to be sealed on the device before upload (epic SUR-1258). The record
@@ -61,13 +63,6 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   - No `__seal_image_fixed` test seam: the vectors reproduce through the module's own tests, so no
     fixed-key path exists behind `test-seams` (ADR 0008's API note is updated to say so).
 
-### Fixed
-- **`sync-integration` pulls the Supabase images from ghcr.io (SUR-1264).** The CLI's default
-  registry, public.ecr.aws, caps anonymous data per source IP, and GitHub-hosted runners share IPs,
-  so `supabase start` failed intermittently with "toomanyrequests: Data limit exceeded" before any
-  test ran (crons 2026-10-12 and 10-19, both runs on 2026-10-21). The job now sets
-  `SUPABASE_INTERNAL_IMAGE_REGISTRY: ghcr.io`, where every image the CLI pins is published. CI only.
-
 ### Changed
 - **Sync integration test user carries `app_metadata.password_sign_in` (SUR-1253).** surfc
   migration 0062 turns on a Custom Access Token hook (named in surfc's `config.toml`, which the
@@ -76,6 +71,13 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   (`#[ignore]`d) test that mints a user panics on a 403: `sync_659b`, `sync_725`, `sync_726` and
   `sync_1049`. A stack without the hook ignores the flag, so this
   merges BEFORE the surfc change. Test harness only; no library or FFI change.
+
+### Fixed
+- **`sync-integration` pulls the Supabase images from ghcr.io (SUR-1264).** The CLI's default
+  registry, public.ecr.aws, caps anonymous data per source IP, and GitHub-hosted runners share IPs,
+  so `supabase start` failed intermittently with "toomanyrequests: Data limit exceeded" before any
+  test ran (crons 2026-10-12 and 10-19, both runs on 2026-10-21). The job now sets
+  `SUPABASE_INTERNAL_IMAGE_REGISTRY: ghcr.io`, where every image the CLI pins is published. CI only.
 
 ## [0.19.0] - 2026-10-06
 
