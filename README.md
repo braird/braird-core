@@ -1,6 +1,6 @@
 # braird-core
 
-The shared cryptographic core for [Braird](https://surfc.app)'s native clients.
+The shared cryptographic core for [Braird](https://marginborn.com)'s native clients.
 
 One Rust crate, exposed over [UniFFI](https://mozilla.github.io/uniffi-rs/) as a stateful
 `Vault` handle to **Swift** (iOS) and **Kotlin** (Android), and compiled to **WASM** for the

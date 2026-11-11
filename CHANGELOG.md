@@ -6,6 +6,9 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Changed
+- **README: the Braird link points to marginborn.com, not surfc.app.** Docs only; no code change.
+
 ## [0.20.0] - 2026-10-26
 
 ### Added
